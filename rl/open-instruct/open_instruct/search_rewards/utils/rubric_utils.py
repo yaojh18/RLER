@@ -11,7 +11,11 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
 
-from open_instruct.search_rewards.utils.run_utils import extract_json_from_response, run_litellm, run_litellm_async
+from open_instruct.search_rewards.utils.run_utils import (
+    extract_json_from_response,
+    run_chat_with_route,
+    run_chat_with_route_async,
+)
 from open_instruct.search_rewards.utils.format_utils import extract_answer_context_citations
 
 LOGGER = logging.getLogger(__name__)
@@ -39,7 +43,8 @@ def _score_property(response: str, question: str, prop: str, system_prompt: str 
     # wrap in try-except to handle litellm API errors
     # these might just be ephemeral, so we don't want to crash the whole training job.
     try:
-        resp = run_litellm(
+        resp = run_chat_with_route(
+            "rubric_judge",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_name=os.environ.get("RUBRIC_JUDGE_MODEL", "gpt-4.1"),
@@ -91,7 +96,8 @@ Return a score on a scale of 0 to 2 indicating how appropriate the response is b
     # wrap in try-except to handle litellm API errors
     # these might just be ephemeral, so we don't want to crash the whole training job.
     try:
-        resp = await run_litellm_async(
+        resp = await run_chat_with_route_async(
+            "rubric_judge",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_name=os.environ.get("RUBRIC_JUDGE_MODEL", "gpt-4.1"),
@@ -251,7 +257,8 @@ Return a score on a scale of 0 to 2 indicating how appropriate the response is b
     # wrap in try-except to handle litellm API errors
     # these might just be ephemeral, so we don't want to crash the whole training job.
     try:
-        resp = run_litellm(
+        resp = run_chat_with_route(
+            "rubric_judge",
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model_name=os.environ.get("RUBRIC_JUDGE_MODEL", "gpt-4.1"),
@@ -393,7 +400,8 @@ async def generate_instance_wise_adaptive_rubrics(question, response_list, exist
     prompt = INSTANCE_WISE_RUBRIC_GENERATION_PROMPT + prompt_suffix
     
     try:        
-        resp = await run_litellm_async(
+        resp = await run_chat_with_route_async(
+                "rubric_generation",
                 model_name=model_name,
                 user_prompt=prompt,
             )

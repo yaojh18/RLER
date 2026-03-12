@@ -1,0 +1,34 @@
+model:
+  model_name: deterministic
+  model_class: swe_agent.models.test_models.DeterministicModel
+  outputs:
+    - role: assistant
+      content: |
+        ```mswea_bash_command
+        echo hello
+        ```
+      extra:
+        cost: 1.0
+        actions:
+          - command: "printf 'hello\\n'"
+    - role: assistant
+      content: |
+        ```mswea_bash_command
+        printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\nexample submission\n'
+        ```
+      extra:
+        cost: 1.0
+        actions:
+          - command: "printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\nexample submission\\n'"
+
+environment:
+  environment_class: local
+  cwd: ""
+  timeout: 30
+
+agent:
+  agent_class: default
+  system_template: "You are a coding agent."
+  instance_template: "{{task}}"
+  step_limit: 4
+  cost_limit: 0

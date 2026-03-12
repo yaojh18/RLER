@@ -3,16 +3,28 @@ import asyncio
 import weakref
 import logging
 import os
-from typing import Any, Dict, Optional, List
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, List, Literal
 
 import jsonlines
 import litellm
+from agent_rl import ChatSamplingParams, call_model_service, call_model_service_async
 from openai import AzureOpenAI
 
 # Configure LiteLLM to drop unsupported parameters instead of raising errors
 litellm.drop_params = True
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class ModelRouteConfig:
+    backend: Literal["litellm", "service"] = "litellm"
+    service_name: Optional[str] = None
+    model_name: Optional[str] = None
+
+
+_MODEL_ROUTE_CONFIGS: Dict[str, ModelRouteConfig] = {}
 
 
 # Per-event-loop concurrency control for LiteLLM async calls to avoid event loop binding issues
@@ -31,6 +43,48 @@ def _get_litellm_semaphore() -> asyncio.Semaphore:
         sem = asyncio.Semaphore(max_concurrent)
         _LITELLM_SEMAPHORES[loop] = sem
     return sem
+
+
+def configure_model_route(name: str, config: ModelRouteConfig) -> None:
+    _MODEL_ROUTE_CONFIGS[name] = config
+
+
+def clear_model_routes() -> None:
+    _MODEL_ROUTE_CONFIGS.clear()
+
+
+def get_model_route(name: str) -> Optional[ModelRouteConfig]:
+    return _MODEL_ROUTE_CONFIGS.get(name)
+
+
+def _build_messages(
+    system_prompt: Optional[str] = None,
+    user_prompt: Optional[str] = None,
+    messages: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, str]]:
+    if messages is not None:
+        return messages
+    return (
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if system_prompt is not None
+        else [{"role": "user", "content": user_prompt}]
+    )
+
+
+def _build_service_sampling(chat_kwargs: Dict[str, Any]) -> ChatSamplingParams:
+    kwargs = dict(chat_kwargs)
+    json_mode = kwargs.pop("response_format", None) == {"type": "json_object"}
+    return ChatSamplingParams(
+        temperature=kwargs.pop("temperature", 0),
+        top_p=kwargs.pop("top_p", 1.0),
+        max_tokens=kwargs.pop("max_tokens", kwargs.pop("max_completion_tokens", 16384)),
+        stop=kwargs.pop("stop", None),
+        json_mode=json_mode,
+        extra=kwargs,
+    )
 
 
 def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
@@ -75,14 +129,7 @@ def run_chatopenai(
     chat_kwargs["temperature"] = chat_kwargs.get("temperature", 0)
     if json_mode:
         chat_kwargs["response_format"] = {"type": "json_object"}
-    msgs = (
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        if system_prompt is not None
-        else [{"role": "user", "content": user_prompt}]
-    )
+    msgs = _build_messages(system_prompt=system_prompt, user_prompt=user_prompt)
     resp = litellm.completion(
         model=model_name,
         messages=msgs,
@@ -159,14 +206,7 @@ def run_azure_openai(
     )
 
     # Prepare messages
-    msgs = (
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        if system_prompt is not None
-        else [{"role": "user", "content": user_prompt}]
-    )
+    msgs = _build_messages(system_prompt=system_prompt, user_prompt=user_prompt)
 
     # Create chat completion
     response = client.chat.completions.create(
@@ -182,6 +222,7 @@ def run_litellm(
     model_name: str,
     user_prompt: str,
     system_prompt: Optional[str] = None,
+    messages: Optional[List[Dict[str, str]]] = None,
     **chat_kwargs,
 ) -> str:
     """
@@ -211,14 +252,7 @@ def run_litellm(
     chat_kwargs["fallbacks"] = chat_kwargs.get("fallbacks", ["gpt-4.1-mini"])
 
     # Prepare messages
-    msgs = (
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        if system_prompt is not None
-        else [{"role": "user", "content": user_prompt}]
-    )
+    msgs = _build_messages(system_prompt=system_prompt, user_prompt=user_prompt, messages=messages)
 
     # Create chat completion
     try:
@@ -271,14 +305,7 @@ async def run_litellm_async(
     if messages is not None:
         msgs = messages
     else:
-        msgs = (
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-            if system_prompt is not None
-            else [{"role": "user", "content": user_prompt}]
-        )
+        msgs = _build_messages(system_prompt=system_prompt, user_prompt=user_prompt)
 
     # Apply default timeout if not provided
     chat_kwargs["timeout"] = chat_kwargs.get(
@@ -301,6 +328,76 @@ async def run_litellm_async(
         return ""
 
     return response.choices[0].message.content
+
+
+def run_chat_with_route(
+    route_name: str,
+    model_name: str,
+    user_prompt: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    messages: Optional[List[Dict[str, str]]] = None,
+    **chat_kwargs,
+) -> str:
+    route = get_model_route(route_name)
+    routed_kwargs = dict(chat_kwargs)
+    policy_version = routed_kwargs.pop("policy_version", None)
+    if route is None or route.backend == "litellm":
+        routed_model_name = route.model_name if route and route.model_name else model_name
+        return run_litellm(
+            model_name=routed_model_name,
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            messages=messages,
+            **routed_kwargs,
+        )
+
+    try:
+        completion = call_model_service(
+            route.service_name,
+            messages=_build_messages(system_prompt=system_prompt, user_prompt=user_prompt, messages=messages),
+            model_name=route.model_name or model_name,
+            sampling=_build_service_sampling(routed_kwargs),
+            policy_version=policy_version,
+        )
+    except Exception as e:
+        print(f"Error in run_chat_with_route({route_name}): {e}")
+        return ""
+    return completion.content
+
+
+async def run_chat_with_route_async(
+    route_name: str,
+    model_name: str,
+    user_prompt: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    messages: Optional[List[Dict[str, str]]] = None,
+    **chat_kwargs,
+) -> str:
+    route = get_model_route(route_name)
+    routed_kwargs = dict(chat_kwargs)
+    policy_version = routed_kwargs.pop("policy_version", None)
+    if route is None or route.backend == "litellm":
+        routed_model_name = route.model_name if route and route.model_name else model_name
+        return await run_litellm_async(
+            model_name=routed_model_name,
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            messages=messages,
+            **routed_kwargs,
+        )
+
+    try:
+        completion = await call_model_service_async(
+            route.service_name,
+            messages=_build_messages(system_prompt=system_prompt, user_prompt=user_prompt, messages=messages),
+            model_name=route.model_name or model_name,
+            sampling=_build_service_sampling(routed_kwargs),
+            policy_version=policy_version,
+        )
+    except Exception as e:
+        print(f"Error in run_chat_with_route_async({route_name}): {e}")
+        return ""
+    return completion.content
 
 
 if __name__ == "__main__":

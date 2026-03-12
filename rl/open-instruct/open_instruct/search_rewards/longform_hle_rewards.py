@@ -6,7 +6,7 @@ from typing import Any, Dict
 # from .judge_prompts import HLE_JUDGE_PROMPT, extract_hle_judge_response_from_response
 from .utils.judge_prompts import HLE_JUDGE_SCORE_PROMPT as HLE_JUDGE_PROMPT, extract_hle_score_judge_response_from_response as extract_hle_judge_response_from_response
 from .utils.judge_prompts import HLE_JUDGE_SCORE_NO_REASONING_PROMPT as HLE_JUDGE_PROMPT_NO_REASONING
-from .utils.run_utils import run_litellm
+from .utils.run_utils import run_chat_with_route
 from .utils.citation_utils import score_in_context_citations
 from .utils.format_utils import extract_answer_context_citations
 
@@ -19,7 +19,8 @@ def hle_judge_reward(question: str, response: str, correct_answer: str, no_reaso
         judge_prompt = HLE_JUDGE_PROMPT_NO_REASONING.format(question=question, response=response, correct_answer=correct_answer)
     else:
         judge_prompt = HLE_JUDGE_PROMPT.format(question=question, response=response, correct_answer=correct_answer)
-    judge_response = run_litellm(
+    judge_response = run_chat_with_route(
+        "judge",
         model_name=os.environ.get("HLE_JUDGE_MODEL", "gpt-4.1"), 
         system_prompt=None, 
         user_prompt=judge_prompt,
@@ -86,4 +87,3 @@ def compute_hle_reward(response: str, correct_answer: str, question: str, no_rea
     result["log_values"]["format_correct"] = 1.0
     
     return result
-

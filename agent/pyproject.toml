@@ -32,6 +32,7 @@ dependencies = [
     "python-dotenv",
     "requests",
     "pydantic",
+    "platformdirs",
     "tinydb",
     "tinydb-serialization",
     "tenacity",
@@ -48,9 +49,13 @@ dependencies = [
     "cohere",
     "litellm",
     "diskcache",
+    "jinja2",
+    "jsonlines",
     "typer",
+    "rich",
     "omegaconf",
     "datasets",
+    "prompt_toolkit",
     "retry",
 ]
 
@@ -74,7 +79,7 @@ all = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["dr_agent*"]
+include = ["dr_agent*", "swe_agent*", "agent_rl*"]
 exclude = ["tests*", "docs*"]
 
 [tool.setuptools.package-data]

@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union, Tuple
 
 import requests
-from litellm import acompletion
 
 from open_instruct.if_functions import IF_FUNCTIONS_MAP
 from open_instruct.judge_utils import (
@@ -44,7 +43,7 @@ from open_instruct.search_rewards.longform_finegrained_rewards_v2 import compute
 from open_instruct.search_rewards.utils.finegrained_utils import FinegrainedScore 
 from open_instruct.search_rewards.toy_case_multi_dataset_reward import compute_multi_question_reward
 from open_instruct.search_rewards.utils.search_utils import score_query_redundancy
-from open_instruct.search_rewards.utils.run_utils import run_litellm
+from open_instruct.search_rewards.utils.run_utils import run_chat_with_route, run_chat_with_route_async
 from open_instruct.utils import extract_final_answer
 from open_instruct.IFEvalG import instructions_registry
 
@@ -562,7 +561,7 @@ class LLMJudgeVerifier:
                 correct_answer=ground_truth,
                 response=prediction,
             )
-        grading_response = run_litellm(self.grader_model, grader_prompt, None)
+        grading_response = run_chat_with_route("judge", self.grader_model, grader_prompt, None)
 
         match = re.search(r"correct: (yes|no)", grading_response)
         judge_result = match.group(1) if match else "no"
@@ -901,15 +900,16 @@ class LMJudgeVerifier(VerifierFunction):
         for attempt in range(max_retries):
             try:
                 messages = build_messages(prompt)
-                response = await acompletion(
-                    model=self.verifier_config.llm_judge_model,
+                response_text = await run_chat_with_route_async(
+                    "judge",
+                    self.verifier_config.llm_judge_model,
                     messages=messages,
                     temperature=self.verifier_config.llm_judge_temperature,
                     max_completion_tokens=self.verifier_config.llm_judge_max_tokens,
                     seed=self.verifier_config.seed,
                 )
-                reasoning, score = self.parse_completion(response)
-                cost = self.get_cost(response, self.verifier_config.llm_judge_model)
+                reasoning, score = self.extractor(response_text)
+                cost = 0.0
                 # normalize score to be between 0 and 1
                 return VerificationResult(score=score, cost=cost, reasoning=reasoning)
 
