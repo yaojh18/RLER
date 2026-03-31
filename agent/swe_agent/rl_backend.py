@@ -100,6 +100,30 @@ class SWEAgentSession:
             },
         )
 
+    def _record_interrupt(self, *, step_index: int, messages: list[dict[str, Any]]) -> None:
+        self._record_event(
+            step_index=step_index,
+            kind="agent_interrupt",
+            payload={"messages": copy.deepcopy(messages)},
+        )
+        self.last_step_index = step_index
+
+    def _record_uncaught_exception(self, *, step_index: int, error: Exception) -> None:
+        added: list[dict[str, Any]] = []
+        if hasattr(self.agent, "handle_uncaught_exception"):
+            added = self.agent.handle_uncaught_exception(error)
+        self._record_event(
+            step_index=step_index,
+            kind="agent_error",
+            payload={
+                "messages": copy.deepcopy(added),
+                "error_type": type(error).__name__,
+                "error": str(error),
+            },
+        )
+        self.last_step_index = step_index
+        self.status = "finished" if self.is_finished() else "failed"
+
     def is_finished(self) -> bool:
         return bool(self.agent.messages and self.agent.messages[-1].get("role") == "exit")
 
@@ -126,7 +150,7 @@ class SWEAgentSession:
         self._record_event(
             step_index=step_index,
             kind="model_request",
-            payload={"messages": copy.deepcopy(query_messages)},
+            payload={"messages": query_messages},
             provenance={
                 "policy_ref": self.spec.policy_ref,
                 "policy_version": self.spec.policy_version,
@@ -136,57 +160,45 @@ class SWEAgentSession:
 
         try:
             model_message = self.agent.query()
-        except InterruptAgentFlow as exc:
-            added = self.agent.add_messages(*exc.messages)
             self._record_event(
                 step_index=step_index,
-                kind="agent_interrupt",
-                payload={"messages": copy.deepcopy(added)},
+                kind="model_response",
+                payload={"message": copy.deepcopy(model_message)},
             )
-            self.last_step_index = step_index
-            self.status = "finished" if self.is_finished() else "paused"
-            return
-
-        self._record_event(
-            step_index=step_index,
-            kind="model_response",
-            payload={"message": copy.deepcopy(model_message)},
-        )
-
-        self.model_turns.append(
-            ModelTurn(
-                session_id=self.spec.session_id,
-                step_index=step_index,
-                query_messages=_messages_to_protocol(query_messages, source="conversation", trainable=False),
-                response_message=_message_to_protocol(model_message, source="model", trainable=True),
-                metadata={
-                    "policy_ref": self.spec.policy_ref,
-                    "policy_version": self.spec.policy_version,
-                    "dataset_name": self.spec.dataset_name,
-                    "ground_truth": self.spec.ground_truth,
-                },
+            self.model_turns.append(
+                ModelTurn(
+                    session_id=self.spec.session_id,
+                    step_index=step_index,
+                    query_messages=_messages_to_protocol(query_messages, source="conversation", trainable=False),
+                    response_message=_message_to_protocol(model_message, source="model", trainable=True),
+                    metadata={
+                        "policy_ref": self.spec.policy_ref,
+                        "policy_version": self.spec.policy_version,
+                        "dataset_name": self.spec.dataset_name,
+                        "ground_truth": self.spec.ground_truth,
+                    },
+                )
             )
-        )
-
-        actions = copy.deepcopy(model_message.get("extra", {}).get("actions", []))
-        if actions:
-            self._record_event(
-                step_index=step_index,
-                kind="environment_action",
-                payload={"actions": actions},
-            )
-
-        try:
+            actions = copy.deepcopy(model_message.get("extra", {}).get("actions") or [])
+            if actions:
+                self._record_event(
+                    step_index=step_index,
+                    kind="environment_action",
+                    payload={"actions": actions},
+                )
             observation_messages = self.agent.execute_actions(model_message)
-            event_kind = "environment_result"
         except InterruptAgentFlow as exc:
-            observation_messages = self.agent.add_messages(*exc.messages)
-            event_kind = "agent_interrupt"
+            self._record_interrupt(step_index=step_index, messages=self.agent.add_messages(*exc.messages))
+            self.status = "finished" if self.is_finished() else "running"
+            return
+        except Exception as exc:
+            self._record_uncaught_exception(step_index=step_index, error=exc)
+            raise
 
         if observation_messages:
             self._record_event(
                 step_index=step_index,
-                kind=event_kind,
+                kind="environment_result",
                 payload={"messages": copy.deepcopy(observation_messages)},
             )
 

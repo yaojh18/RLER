@@ -47,6 +47,7 @@ class LitellmModelConfig(BaseModel):
 
 class LitellmModel:
     abort_exceptions: list[type[Exception]] = [
+        litellm.exceptions.BadRequestError,
         litellm.exceptions.UnsupportedParamsError,
         litellm.exceptions.NotFoundError,
         litellm.exceptions.PermissionDeniedError,

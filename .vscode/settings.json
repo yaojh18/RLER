@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/agent/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/agent"
+  ],
+  "python.envFile": "${workspaceFolder}/agent/.env",
+  "terminal.integrated.cwd": "${workspaceFolder}/agent"
+}

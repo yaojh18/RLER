@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from dr_agent.utils import launch_vllm_server as shared_launch_vllm_server
+
 try:
     import requests
     HAS_REQUESTS = True
@@ -138,107 +140,7 @@ def check_vllm_server(base_url: str) -> bool:
 
 def launch_vllm_server(model_name: str, port: int, gpu_id: int = 0) -> Optional[subprocess.Popen]:
     """Launch vLLM server in background."""
-    print(f"🚀 Launching vLLM server for model {model_name} on port {port}...")
-    
-    # Try to find vllm command - check multiple options
-    import shutil
-    vllm_base_cmd = None
-    
-    # Check if we're running through uv (check parent process or environment)
-    is_uv = (
-        "uv" in sys.executable.lower() or 
-        os.environ.get("UV_PROJECT_ENVIRONMENT") or
-        os.environ.get("VIRTUAL_ENV", "").endswith(".venv")
-    )
-    
-    # Try different ways to invoke vllm (in order of preference)
-    # 1. Try direct vllm command first (most reliable)
-    if shutil.which("vllm"):
-        vllm_base_cmd = ["vllm", "serve"]
-    # 2. Try uv run vllm if in uv environment
-    elif is_uv and shutil.which("uv"):
-        vllm_base_cmd = ["uv", "run", "vllm", "serve"]
-    # 3. Try python -m vllm.entrypoints.openai.api_server (module syntax)
-    elif sys.executable:
-        vllm_base_cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server"]
-    
-    if not vllm_base_cmd:
-        print("❌ Error: vllm command not found. Tried: vllm, uv run vllm, python -m vllm.entrypoints.openai.api_server")
-        print("💡 Install vllm with: uv pip install -e '.[vllm]' or uv pip install 'dr_agent[vllm]'")
-        print("💡 Or launch the server manually:")
-        if is_uv and shutil.which("uv"):
-            print(f"   CUDA_VISIBLE_DEVICES={gpu_id} uv run vllm serve {model_name} --port {port} --dtype auto --max-model-len 40960")
-        else:
-            print(f"   CUDA_VISIBLE_DEVICES={gpu_id} vllm serve {model_name} --port {port} --dtype auto --max-model-len 40960")
-        return None
-    
-    # Build vLLM command
-    # Note: vllm_base_cmd already includes 'serve' or equivalent
-    cmd = vllm_base_cmd + [
-        model_name,
-        "--port", str(port),
-        "--dtype", "auto",
-        "--max-model-len", "40960"
-    ]
-    
-    # Set CUDA_VISIBLE_DEVICES if specified
-    env = os.environ.copy()
-    if gpu_id is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    
-    log_file = Path(f"/tmp/vllm_server_{port}.log")
-    try:
-        print(f"📋 vLLM output for {model_name} will be logged to {log_file}")
-        print("⏳ Waiting for vLLM server to become ready (this may take a few minutes)...")
-        
-        # Launch with output redirected to file
-        with open(log_file, "w") as f:
-            process = subprocess.Popen(
-                cmd,
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                env=env,
-                preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
-            )
-        
-        # Wait for server to start
-        start_time = time.time()
-        while time.time() - start_time < 300:  # Wait up to 5 minutes
-            if check_port(port):
-                print(f"✓ vLLM server started (PID: {process.pid})")
-                return process
-            
-            # Check if process died
-            if process.poll() is not None:
-                print(f"❌ vLLM server failed to start (exit code: {process.returncode})")
-                print(f"Check logs: {log_file}")
-                # Print last few lines of log
-                try:
-                    with open(log_file, "r") as f:
-                        print("Last 10 lines of log:")
-                        print("".join(f.readlines()[-10:]))
-                except:
-                    pass
-                return None
-            
-            time.sleep(2)
-            
-            # Print status update every 30 seconds
-            elapsed = int(time.time() - start_time)
-            if elapsed > 0 and elapsed % 30 == 0:
-                print(f"⏳ Still waiting for vLLM server ({elapsed}s)...")
-        
-        # Check if process is still running
-        if process.poll() is None:
-            print(f"⚠ vLLM server process started but port check timed out. It may still be initializing...")
-            return process
-        else:
-            print(f"❌ vLLM server failed to start (exit code: {process.returncode})")
-            return None
-            
-    except Exception as e:
-        print(f"❌ Failed to launch vLLM server: {e}")
-        return None
+    return shared_launch_vllm_server(model_name, port, gpu_id)
 
 
 def _extract_port_from_url(url_str: str) -> Optional[int]:
@@ -503,4 +405,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-

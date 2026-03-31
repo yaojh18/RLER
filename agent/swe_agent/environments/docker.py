@@ -149,6 +149,14 @@ class DockerEnvironment:
         lines = output.get("output", "").lstrip().splitlines(keepends=True)
         if lines and lines[0].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" and output["returncode"] == 0:
             submission = "".join(lines[1:])
+            if not submission.strip():
+                output["returncode"] = 1
+                output["output"] = (
+                    "Submission rejected: COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT was printed, "
+                    "but no non-empty patch/output was emitted after it.\n"
+                    "Generate the final git diff first, then print the marker and the non-empty patch content."
+                )
+                return
             raise Submitted(
                 {
                     "role": "exit",
@@ -161,7 +169,8 @@ class DockerEnvironment:
         """Stop and remove the Docker container."""
         if self._owns_container and getattr(self, "container_id", None) is not None:
             cmd = f"(timeout 60 {self.config.executable} stop {self.container_id} || {self.config.executable} rm -f {self.container_id}) >/dev/null 2>&1 &"
-            subprocess.Popen(cmd, shell=True)
+            if getattr(subprocess, "Popen", None) is not None:
+                subprocess.Popen(cmd, shell=True)
 
     def __del__(self):
         """Cleanup container when object is destroyed."""

@@ -4,6 +4,7 @@
 # Read this first: https://mini-swe-agent.com/latest/usage/swebench/  (usage docs)
 
 import concurrent.futures
+import contextlib
 import json
 import random
 import re
@@ -12,9 +13,12 @@ import time
 import traceback
 from pathlib import Path
 
+import docker
 import typer
 from jinja2 import StrictUndefined, Template
 from rich.live import Live
+from swebench.harness.docker_build import build_env_images, build_instance_image
+from swebench.harness.test_spec.test_spec import make_test_spec
 
 from swe_agent import Environment
 from swe_agent.agents.default import DefaultAgent
@@ -63,6 +67,11 @@ DATASET_MAPPING = {
 
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
 _OUTPUT_FILE_LOCK = threading.Lock()
+_PREPARED_IMAGE_LOCK = threading.Lock()
+_PREPARED_IMAGES: set[str] = set()
+_IMAGE_RESOLUTION_LOCK = threading.Lock()
+_IMAGE_RESOLUTION_CACHE: dict[str, tuple[str, str | None]] = {}
+OFFICIAL_IMAGE_NAMESPACE = "swebench"
 
 
 class ProgressTrackingAgent(DefaultAgent):
@@ -81,13 +90,79 @@ class ProgressTrackingAgent(DefaultAgent):
 
 def get_swebench_docker_image_name(instance: dict) -> str:
     """Get the image name for a SWEBench instance."""
-    image_name = instance.get("image_name", None) or instance.get("docker_image", None)
-    if image_name is None:
-        # Docker doesn't allow double underscore, so we replace them with a magic token
-        iid = instance["instance_id"]
-        id_docker_compatible = iid.replace("__", "_1776_")
-        image_name = f"docker.io/swebench/sweb.eval.x86_64.{id_docker_compatible}:latest".lower()
-    return image_name
+    return resolve_swebench_image(instance)[0]
+
+
+def get_swebench_harness_namespace(instance: dict) -> str | None:
+    """Get the harness namespace that matches the resolved SWE-bench image."""
+    return resolve_swebench_image(instance)[1]
+
+
+def resolve_swebench_image(instance: dict) -> tuple[str, str | None]:
+    """Resolve a SWE-bench instance image, preferring official published images."""
+    instance_id = instance["instance_id"]
+    with _IMAGE_RESOLUTION_LOCK:
+        cached = _IMAGE_RESOLUTION_CACHE.get(instance_id)
+    if cached is not None:
+        return cached
+
+    image_name = instance.get("image_name") or instance.get("docker_image")
+    if image_name:
+        resolved = (image_name, _infer_harness_namespace(image_name, instance))
+    else:
+        resolved = _resolve_generated_swebench_image(instance)
+
+    with _IMAGE_RESOLUTION_LOCK:
+        _IMAGE_RESOLUTION_CACHE[instance_id] = resolved
+    return resolved
+
+
+def _resolve_generated_swebench_image(instance: dict) -> tuple[str, str | None]:
+    official_spec = make_test_spec(instance, namespace=OFFICIAL_IMAGE_NAMESPACE)
+    if _registry_image_exists(official_spec.instance_image_key):
+        return official_spec.instance_image_key, OFFICIAL_IMAGE_NAMESPACE
+
+    local_spec = make_test_spec(instance)
+    image_name = local_spec.instance_image_key
+    with _PREPARED_IMAGE_LOCK:
+        if image_name not in _PREPARED_IMAGES:
+            client = docker.from_env()
+            try:
+                build_env_images(
+                    client,
+                    [instance],
+                    force_rebuild=False,
+                    max_workers=1,
+                    namespace=local_spec.namespace,
+                    instance_image_tag=local_spec.instance_image_tag,
+                    env_image_tag=local_spec.env_image_tag,
+                )
+                build_instance_image(local_spec, client, logger, nocache=False)
+            finally:
+                client.close()
+            _PREPARED_IMAGES.add(image_name)
+    return image_name, None
+
+
+def _registry_image_exists(image_name: str) -> bool:
+    client = docker.from_env()
+    try:
+        client.images.get_registry_data(image_name)
+        return True
+    except docker.errors.NotFound:
+        return False
+    except docker.errors.APIError:
+        logger.warning("Failed to query remote image %s; falling back to local build.", image_name)
+        return False
+    finally:
+        client.close()
+
+
+def _infer_harness_namespace(image_name: str, instance: dict) -> str | None:
+    official_image = make_test_spec(instance, namespace=OFFICIAL_IMAGE_NAMESPACE).instance_image_key
+    if image_name == official_image:
+        return OFFICIAL_IMAGE_NAMESPACE
+    return None
 
 
 def get_sb_environment(config: dict, instance: dict) -> Environment:
@@ -152,6 +227,7 @@ def process_instance(
     progress_manager.update_instance_status(instance_id, "Pulling/starting environment")
 
     agent = None
+    env = None
     exit_status = None
     result = None
     extra_info = {}
@@ -187,6 +263,8 @@ def process_instance(
                 },
             )
             logger.info(f"Saved trajectory to '{traj_path}'")
+        if env is not None and hasattr(env, "cleanup"):
+            env.cleanup()
         update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
         progress_manager.on_instance_end(instance_id, exit_status)
 
@@ -211,6 +289,92 @@ def filter_instances(
     return instances
 
 
+def load_swebench_instances(subset: str, split: str) -> list[dict]:
+    from datasets import load_dataset
+
+    dataset_path = DATASET_MAPPING.get(subset, subset)
+    logger.info(f"Loading dataset {dataset_path}, split {split}...")
+    return list(load_dataset(dataset_path, split=split))
+
+
+def build_swebench_config(
+    *,
+    config_spec: list[str],
+    model: str | None = None,
+    model_class: str | None = None,
+    environment_class: str | None = None,
+    extra_overrides: dict | None = None,
+) -> dict:
+    logger.info(f"Building agent config from specs: {config_spec}")
+    configs = [get_config_from_spec(spec) for spec in config_spec]
+    merged_overrides = {
+        "environment": {"environment_class": environment_class or UNSET},
+        "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
+    }
+    if extra_overrides:
+        merged_overrides = recursive_merge(merged_overrides, extra_overrides)
+    configs.append(merged_overrides)
+    return recursive_merge(*configs)
+
+
+def run_swebench_instances(
+    *,
+    instances: list[dict],
+    output_path: Path,
+    config: dict,
+    workers: int = 1,
+    redo_existing: bool = False,
+    show_live_progress: bool = True,
+) -> list[dict]:
+    output_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Results will be saved to {output_path}")
+    add_file_handler(output_path / "swe_agent.log")
+
+    runnable_instances = instances
+    if not redo_existing and (output_path / "preds.json").exists():
+        existing_instances = list(json.loads((output_path / "preds.json").read_text()).keys())
+        logger.info(f"Skipping {len(existing_instances)} existing instances")
+        runnable_instances = [
+            instance for instance in runnable_instances if instance["instance_id"] not in existing_instances
+        ]
+    logger.info(f"Running on {len(runnable_instances)} instances...")
+
+    progress_manager = RunBatchProgressManager(
+        len(runnable_instances), output_path / f"exit_statuses_{time.time()}.yaml"
+    )
+
+    def process_futures(futures: dict[concurrent.futures.Future, str]) -> None:
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception as e:
+                instance_id = futures[future]
+                logger.error(f"Error in future for instance {instance_id}: {e}", exc_info=True)
+                progress_manager.on_uncaught_exception(instance_id, e)
+
+    progress_context = Live(progress_manager.render_group, refresh_per_second=4) if show_live_progress else contextlib.nullcontext()
+    with progress_context:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(process_instance, instance, output_path, config, progress_manager): instance[
+                    "instance_id"
+                ]
+                for instance in runnable_instances
+            }
+            try:
+                process_futures(futures)
+            except KeyboardInterrupt:
+                logger.info("Cancelling all pending jobs. Press ^C again to exit immediately.")
+                for future in futures:
+                    if not future.running() and not future.done():
+                        future.cancel()
+                process_futures(futures)
+
+    return runnable_instances
+
+
 # fmt: off
 @app.command(help=_HELP_TEXT)
 def main(
@@ -229,60 +393,21 @@ def main(
 ) -> None:
     # fmt: on
     output_path = Path(output)
-    output_path.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Results will be saved to {output_path}")
-    add_file_handler(output_path / "swe_agent.log")
-
-    from datasets import load_dataset
-
-    dataset_path = DATASET_MAPPING.get(subset, subset)
-    logger.info(f"Loading dataset {dataset_path}, split {split}...")
-    instances = list(load_dataset(dataset_path, split=split))
-
+    instances = load_swebench_instances(subset, split)
     instances = filter_instances(instances, filter_spec=filter_spec, slice_spec=slice_spec, shuffle=shuffle)
-    if not redo_existing and (output_path / "preds.json").exists():
-        existing_instances = list(json.loads((output_path / "preds.json").read_text()).keys())
-        logger.info(f"Skipping {len(existing_instances)} existing instances")
-        instances = [instance for instance in instances if instance["instance_id"] not in existing_instances]
-    logger.info(f"Running on {len(instances)} instances...")
-
-    logger.info(f"Building agent config from specs: {config_spec}")
-    configs = [get_config_from_spec(spec) for spec in config_spec]
-    configs.append({
-        "environment": {"environment_class": environment_class or UNSET},
-        "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
-    })
-    config = recursive_merge(*configs)
-
-    progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
-
-    def process_futures(futures: dict[concurrent.futures.Future, str]):
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except concurrent.futures.CancelledError:
-                pass
-            except Exception as e:
-                instance_id = futures[future]
-                logger.error(f"Error in future for instance {instance_id}: {e}", exc_info=True)
-                progress_manager.on_uncaught_exception(instance_id, e)
-
-    with Live(progress_manager.render_group, refresh_per_second=4):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(process_instance, instance, output_path, config, progress_manager): instance[
-                    "instance_id"
-                ]
-                for instance in instances
-            }
-            try:
-                process_futures(futures)
-            except KeyboardInterrupt:
-                logger.info("Cancelling all pending jobs. Press ^C again to exit immediately.")
-                for future in futures:
-                    if not future.running() and not future.done():
-                        future.cancel()
-                process_futures(futures)
+    config = build_swebench_config(
+        config_spec=config_spec,
+        model=model,
+        model_class=model_class,
+        environment_class=environment_class,
+    )
+    run_swebench_instances(
+        instances=instances,
+        output_path=output_path,
+        config=config,
+        workers=workers,
+        redo_existing=redo_existing,
+    )
 
 
 if __name__ == "__main__":

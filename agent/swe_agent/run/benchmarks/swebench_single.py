@@ -3,18 +3,19 @@
 from pathlib import Path
 
 import typer
-from datasets import load_dataset
 
 from swe_agent import global_config_dir
 from swe_agent.agents import get_agent
-from swe_agent.config import builtin_config_dir, get_config_from_spec
+from swe_agent.config import builtin_config_dir
 from swe_agent.models import get_model
 from swe_agent.run.benchmarks.swebench import (
     DATASET_MAPPING,
+    build_swebench_config,
     get_sb_environment,
+    load_swebench_instances,
 )
 from swe_agent.utils.log import logger
-from swe_agent.utils.serialize import UNSET, recursive_merge
+from swe_agent.utils.serialize import UNSET
 
 DEFAULT_OUTPUT_FILE = global_config_dir / "last_swebench_single_run.traj.json"
 DEFAULT_CONFIG_FILE = builtin_config_dir / "benchmarks" / "swebench.yaml"
@@ -56,19 +57,21 @@ def main(
 ) -> None:
     # fmt: on
     """Run on a single SWE-Bench instance."""
-    dataset_path = DATASET_MAPPING.get(subset, subset)
-    logger.info(f"Loading dataset from {dataset_path}, split {split}...")
+    logger.info(f"Loading dataset from {DATASET_MAPPING.get(subset, subset)}, split {split}...")
     instances = {
         inst["instance_id"]: inst  # type: ignore
-        for inst in load_dataset(dataset_path, split=split)
+        for inst in load_swebench_instances(subset, split)
     }
     if instance_spec.isnumeric():
         instance_spec = sorted(instances.keys())[int(instance_spec)]
     instance: dict = instances[instance_spec]  # type: ignore
 
-    logger.info(f"Building agent config from specs: {config_spec}")
-    configs = [get_config_from_spec(spec) for spec in config_spec]
-    configs.append({
+    config = build_swebench_config(
+        config_spec=config_spec,
+        model=model_name,
+        model_class=model_class,
+        environment_class=environment_class,
+        extra_overrides={
         "agent": {
             "agent_class": agent_class or UNSET,
             "mode": "yolo" if yolo else UNSET,
@@ -76,15 +79,8 @@ def main(
             "confirm_exit": False if exit_immediately else UNSET,
             "output_path": output or UNSET,
         },
-        "model": {
-            "model_class": model_class or UNSET,
-            "model_name": model_name or UNSET,
-        },
-        "environment": {
-            "environment_class": environment_class or UNSET,
-        },
-    })
-    config = recursive_merge(*configs)
+    },
+    )
 
     env = get_sb_environment(config, instance)
     agent = get_agent(
