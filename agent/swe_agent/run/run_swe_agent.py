@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -14,12 +15,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence, TextIO
 from swebench.harness import reporting as swebench_reporting
 from swebench.harness import run_evaluation as swebench_run_evaluation
 from swebench.harness.constants import LOG_REPORT
+from swebench.harness.docker_build import build_instance_image
 
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 
@@ -535,6 +538,82 @@ def run_harness_evaluation(
             swebench_run_evaluation.RUN_EVALUATION_LOG_DIR = previous_eval_root
             swebench_reporting.RUN_EVALUATION_LOG_DIR = previous_report_root
     return [updated_results[result.instance_id] for result in results]
+
+
+def evaluate_swebench_instance_patches(
+    *,
+    instance: dict[str, Any],
+    patches_by_key: dict[str, str],
+    model_name: str,
+    max_workers: int,
+    namespace: str | None,
+    work_dir: Path,
+) -> dict[str, float]:
+    rewards: dict[str, float] = {}
+    unique_patches: dict[str, dict[str, Any]] = {}
+    for key, patch in patches_by_key.items():
+        patch_text = patch or ""
+        if not patch_text.strip():
+            rewards[key] = 0.0
+            continue
+        patch_hash = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
+        entry = unique_patches.setdefault(patch_hash, {"patch": patch_text, "keys": []})
+        entry["keys"].append(key)
+    if not unique_patches:
+        return rewards
+
+    temp_parent = Path(work_dir).resolve()
+    previous_eval_root = swebench_run_evaluation.RUN_EVALUATION_LOG_DIR
+    with tempfile.TemporaryDirectory(prefix=".node-eval-", dir=temp_parent) as tmp_dir:
+        temp_root = Path(tmp_dir)
+        eval_log_root = temp_root / "logs" / "run_evaluation"
+        swebench_run_evaluation.RUN_EVALUATION_LOG_DIR = eval_log_root
+        try:
+            client = swebench_run_evaluation.docker.from_env()
+            test_spec = swebench_run_evaluation.make_test_spec(instance, namespace=namespace)
+            if namespace is None:
+                swebench_run_evaluation.build_env_images(client, [instance], False, 1)
+                build_instance_image(test_spec, client, logger=None, nocache=False)
+
+            payloads = []
+            run_entries = []
+            for index, entry in enumerate(unique_patches.values()):
+                run_id = f"node-eval-{int(time.time())}-{index}-{uuid.uuid4().hex[:6]}"
+                prediction = {
+                    "model_name_or_path": model_name,
+                    "instance_id": instance["instance_id"],
+                    "model_patch": entry["patch"],
+                }
+                payloads.append((test_spec, prediction, False, False, client, run_id, None, False))
+                run_entries.append((entry["keys"], run_id, prediction["model_name_or_path"]))
+
+            swebench_run_evaluation.run_threadpool(
+                swebench_run_evaluation.run_instance,
+                payloads,
+                max(1, min(max_workers, len(payloads))),
+            )
+
+            for keys, run_id, prediction_model_name in run_entries:
+                report_path = (
+                    eval_log_root
+                    / run_id
+                    / prediction_model_name.replace("/", "__")
+                    / test_spec.instance_id
+                    / LOG_REPORT
+                )
+                resolved = False
+                if report_path.exists():
+                    try:
+                        report = json.loads(report_path.read_text())
+                        resolved = bool(report[test_spec.instance_id]["resolved"])
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        resolved = False
+                score = 1.0 if resolved else 0.0
+                for key in keys:
+                    rewards[key] = score
+        finally:
+            swebench_run_evaluation.RUN_EVALUATION_LOG_DIR = previous_eval_root
+    return rewards
 
 
 def build_failed_result(

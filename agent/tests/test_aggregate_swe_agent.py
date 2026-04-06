@@ -3,7 +3,9 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from swe_agent.run.aggregate_swe_agent import AggregateTrajectoryRunner
+import pytest
+
+from swe_agent.run.aggregate_swe_agent import AggregateTrajectoryRunner, _summarize_aggregate_trajectory
 from swe_agent.trajectory_search import RubricRecord, SearchConfig
 
 
@@ -120,10 +122,14 @@ def test_aggregate_runner_selects_highest_scoring_candidate_and_writes_outputs(t
 
     async def fake_summarize_aggregate_trajectory(**kwargs):
         return {
-            "critical_context": [kwargs["step_cards"][0]["commands"][0]],
-            "relevant_files": [],
-            "milestones": [f"steps-{kwargs['trajectory_metadata']['step_count']}"],
-            "freeform_summary": "",
+            "current_state": "Submitted a focused patch after targeted validation.",
+            "task_specification": "Fix the failing test for the selected candidate.",
+            "files_and_functions": "- `pkg/core.py`: candidate-specific target file",
+            "errors_and_corrections": "",
+            "codebase_and_system_documentation": "",
+            "learnings": "",
+            "key_results": kwargs["step_cards"][0]["commands"][0],
+            "worklog": f"- steps-{kwargs['trajectory_metadata']['step_count']}",
         }
 
     async def fake_generate_aggregate_rubrics(**kwargs):
@@ -189,7 +195,7 @@ def test_aggregate_runner_selects_highest_scoring_candidate_and_writes_outputs(t
 
     assert manifest["selected_candidate_id"] == "candidate-01"
     assert patch_payload["demo__demo"]["model_patch"] == "patch-1"
-    assert candidate_view["trajectory"]["compressed_trajectory"]["critical_context"] == ["pytest tests/test_alpha.py -q"]
+    assert candidate_view["trajectory"]["compressed_trajectory"]["key_results"] == "pytest tests/test_alpha.py -q"
     assert Path(result.raw_trajectory_path).exists()
     assert Path(result.slim_trajectory_path).exists()
     assert Path(result.patch_path).exists()
@@ -224,10 +230,14 @@ def test_aggregate_runner_summarizes_step_cards_into_view(tmp_path: Path, monkey
         captured["step_indexes"] = [card["step_index"] for card in kwargs["step_cards"]]
         captured["metadata"] = copy.deepcopy(kwargs["trajectory_metadata"])
         return {
-            "critical_context": [],
-            "relevant_files": [],
-            "milestones": ["summary-ready"],
-            "freeform_summary": "",
+            "current_state": "Summary-ready and awaiting rubric scoring.",
+            "task_specification": "",
+            "files_and_functions": "",
+            "errors_and_corrections": "",
+            "codebase_and_system_documentation": "",
+            "learnings": "",
+            "key_results": "",
+            "worklog": "- summary-ready",
         }
 
     async def fake_generate_aggregate_rubrics(**kwargs):
@@ -290,4 +300,34 @@ def test_aggregate_runner_summarizes_step_cards_into_view(tmp_path: Path, monkey
     assert captured["step_indexes"] == [0, 1, 2, 3, 4]
     assert captured["metadata"]["step_count"] == 5
     assert "step_cards" not in json.dumps(view)
-    assert view["trajectory"]["compressed_trajectory"]["milestones"] == ["summary-ready"]
+    assert view["trajectory"]["compressed_trajectory"]["worklog"] == "- summary-ready"
+
+
+@pytest.mark.asyncio
+async def test_summarize_aggregate_trajectory_normalizes_new_state_sections(monkeypatch: pytest.MonkeyPatch):
+    async def fake_chat(route_name, model_name, user_prompt=None, system_prompt=None, **kwargs):
+        return json.dumps(
+            {
+                "current_state": "Submitted a patch and stopped after a passing targeted check.",
+                "files_and_functions": "- `astropy/utils/misc.py`: contains `InheritDocstrings`.",
+                "key_results": "Patch updates the property branch of `InheritDocstrings`.",
+                "worklog": "- Reproduced the issue\n- Patched the metaclass\n- Ran focused validation",
+            }
+        )
+
+    monkeypatch.setattr("swe_agent.run.aggregate_swe_agent.run_chat_with_route_async", fake_chat)
+
+    summary = await _summarize_aggregate_trajectory(
+        question={"system_prompt": "You are SWE-agent.", "user_prompt": "Fix the bug."},
+        step_cards=[{"step_index": 0, "assistant_message": "inspect", "commands": ["pytest -q"], "observation": "ok"}],
+        trajectory_metadata={"candidate_index": 0, "step_count": 1},
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=256,
+    )
+
+    assert summary["current_state"] == "Submitted a patch and stopped after a passing targeted check."
+    assert summary["files_and_functions"] == "- `astropy/utils/misc.py`: contains `InheritDocstrings`."
+    assert summary["key_results"] == "Patch updates the property branch of `InheritDocstrings`."
+    assert summary["task_specification"] == ""

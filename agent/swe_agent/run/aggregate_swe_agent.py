@@ -69,6 +69,7 @@ from swe_agent.run.run_swe_agent import (
 )
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
 from swe_agent.trajectory_search import (
+    EMPTY_PERSISTENT_STATE,
     EVALUATOR_MAX_RETRIES,
     RubricRecord,
     SearchConfig,
@@ -91,26 +92,38 @@ You are an expert evaluator compressing a complete software-debugging trajectory
 ## Task
 Summarize the full agent trajectory from start to finish so another evaluator can compare complete trajectories without reading the raw transcript.
 
-## Output Components
-- **critical_context**: Durable concrete findings, validation outcomes, and causal conclusions supported by the trajectory
-- **relevant_files**: Important changed or inspected files using objects with `path` and short `reason`
-- **milestones**: Short timeline items capturing key diagnostic, edit, and validation steps
-- **freeform_summary**: Any other high-signal context that helps compare overall trajectory quality, including completion behavior or unresolved risks
+## Required Sections
+Return exactly these 8 top-level string fields:
+- **current_state**: Where the trajectory currently ended, what remained pending, and the immediate next step implied by the trajectory. Always keep this section up to date with the latest point reached.
+- **task_specification**: What the user asked the agent to build or fix, plus important constraints and design context.
+- **files_and_functions**: Important files, functions, classes, modules, and why they matter. Include concrete paths and identifiers.
+- **errors_and_corrections**: Errors encountered, failed attempts, rejected hypotheses, and how they were corrected.
+- **codebase_and_system_documentation**: Important system components, architecture, interfaces, workflows, and how they fit together.
+- **learnings**: Actionable lessons about what worked, what did not, and what to avoid. Do not repeat material already captured elsewhere.
+- **key_results**: Exact or near-exact outputs worth preserving, such as the final patch direction, test results, or the final answer.
+- **worklog**: Very terse step-by-step record of what the trajectory attempted and completed.
 
 ## Core Guidelines
-- Use only evidence visible in the provided trajectory
-- Keep concrete commands, outcomes, and decisions; avoid generic paraphrase
-- Prefer compression over copying long logs verbatim
-- Preserve whether the agent validated the fix, changed code, submitted a patch, or stopped early
-- Empty lists and empty strings are allowed
+- Use only evidence visible in the provided trajectory and metadata.
+- Be specific and information-dense. Include concrete commands, file paths, function names, test names, errors, validation outcomes, and technical conclusions when useful.
+- Focus on actionable context that would help someone understand or compare the trajectory.
+- It is OK to leave a section blank if there is no substantial information for it. Do not add filler such as "No info yet".
+- Keep each section under 400 words. If a section becomes too long, remove less important details while preserving the most critical information.
+- Prefer compression over copying long logs verbatim.
+- Preserve whether the agent validated the fix, changed code, submitted a patch, or stopped early.
+- Do not hallucinate. Prefer omission to speculation.
 
 ## Output Format
 ```json
 {
-  "critical_context": [],
-  "relevant_files": [],
-  "milestones": [],
-  "freeform_summary": ""
+  "current_state": "",
+  "task_specification": "",
+  "files_and_functions": "",
+  "errors_and_corrections": "",
+  "codebase_and_system_documentation": "",
+  "learnings": "",
+  "key_results": "",
+  "worklog": ""
 }
 ```
 
@@ -230,7 +243,7 @@ Evaluate the provided trajectory summary using only the provided criterion and q
 ## Core Guidelines
 - Judge only the specified criterion
 - Score the trajectory summary itself, not the bug in the abstract
-- Use the rubric scale exactly as written. For negative rubrics, do not invert the scale
+- Use the rubric's scale exactly as being required. For negative rubrics, the scale is inverted (e.g. worst case should receive 5 while best case should receive 1)
 - Use only visible evidence from the question and trajectory summary
 - Brief grounded reasoning is allowed
 
@@ -292,26 +305,12 @@ async def _summarize_aggregate_trajectory(
         if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
             parsed = extract_json_from_response(parsed["content"]) or parsed
         if isinstance(parsed, dict):
-            return {
-                "critical_context": copy.deepcopy(parsed.get("critical_context"))
-                if isinstance(parsed.get("critical_context"), list)
-                else [],
-                "relevant_files": copy.deepcopy(parsed.get("relevant_files"))
-                if isinstance(parsed.get("relevant_files"), list)
-                else [],
-                "milestones": copy.deepcopy(parsed.get("milestones"))
-                if isinstance(parsed.get("milestones"), list)
-                else [],
-                "freeform_summary": parsed.get("freeform_summary", "")
-                if isinstance(parsed.get("freeform_summary"), str)
-                else "",
-            }
-    return {
-        "critical_context": [],
-        "relevant_files": [],
-        "milestones": [],
-        "freeform_summary": "",
-    }
+            summary = copy.deepcopy(EMPTY_PERSISTENT_STATE)
+            for key in summary:
+                if isinstance(parsed.get(key), str):
+                    summary[key] = parsed[key]
+            return summary
+    return copy.deepcopy(EMPTY_PERSISTENT_STATE)
 
 
 async def _generate_aggregate_rubrics(

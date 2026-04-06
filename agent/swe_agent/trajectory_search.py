@@ -25,7 +25,7 @@ from open_instruct.search_rewards.utils.run_utils import extract_json_from_respo
 from swe_agent import __version__
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
 from swe_agent.rl_backend import SWEAgentRolloutBackend
-from swe_agent.run.run_swe_agent import build_slim_trajectory
+from swe_agent.run.run_swe_agent import build_slim_trajectory, evaluate_swebench_instance_patches
 
 
 SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT = """
@@ -83,10 +83,12 @@ Never create positive/negative versions of same criterion:
 2. Find factors separating higher/lower clusters
 3. Check if factors covered by existing rubrics
 4. Select criteria with highest discriminative value
+5. Brief reasoning is allowed and should stay concrete
 
 ## Output Format
 ```json
 {
+  "reasoning": "<brief grounded analysis>",
   "positive_rubrics": [
     {
       "description": "<detailed excellence description>",
@@ -131,7 +133,7 @@ Never create positive/negative versions of same criterion:
 - Quality over quantity: 2 excellent rubrics > 5 mediocre ones
 - The shared context is common to all continuations. Focus the rubric on differences between the continuations themselves
 - Do not return empty lists when there are visible differences in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
-- Do not copy the full question or trajectory text into the output JSON. Return rubric objects only
+- Output in the requried format. Do not restate the question, previous state, agent tracjectories, or existing rubrics in the response.
 
 Generate only the most impactful, non-redundant rubrics revealing meaningful quality differences.
 """
@@ -144,12 +146,12 @@ Evaluate the provided continuation trajectory using the provided criterion and t
 
 ## Core Guidelines
 - Judge only the specified criterion, not general quality
-- Use the rubric's scale exactly as written. For negative rubrics, do not invert the scale
+- Use the rubric's scale exactly as being required. For negative rubrics, the scale is inverted (e.g. worst case should receive 5 while best case should receive 1)
 - Score the continuation trajectory itself, not the underlying task or bug in the abstract
-- Use only evidence visible in the shared context and continuation trajectory. Do not hallucinate or infer unstated facts
+- Use only evidence visible in the continuation trajectory. Do not hallucinate or infer unstated facts
 - Use the previous persistent state and latest agent trajectory only when it is needed to interpret the continuation
 - Brief reasoning is allowed and should stay concrete
-- Output in the requried format. Do not restate the question, criterion, shared context, or response
+- Output in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response
 
 ## Output Format
 ```json
@@ -169,40 +171,85 @@ Evaluate the provided continuation trajectory using the provided criterion and t
 Return only the JSON object.
 """
 
-PERSISTENT_STATE_UPDATE_PROMPT = """
-You are an expert evaluator maintaining adaptive memory for long model responses.
+SWE_TRAJECTORY_RUBRIC_JUDGE_PARENT_PROMPT = """
+You are an expert evaluator scoring one agent trajectory against one rubric.
 
 ## Task
-Update a persistent state so that older shared trajectory segments can be compressed without losing important information needed for future evaluation.
-
-## Output Components
-- **critical_context**: Durable concrete facts worth carrying forward, such as command running or validation results, and confirmed findings/rejected hypotheses
-- **relevant_files**: Files that change/add/delete or are important for judging future continuations. Use objects with `path` and a short `reason`
-- **milestones**: Short high-signal timeline items or decision changes
-- **freeform_summary**: Any other compressed context that does not fit above, including but not limited to unresolved risks validation history, etc.
+Evaluate the provided agent trajectory using the provided criterion and the shared context.
 
 ## Core Guidelines
-- Keep only facts supported by the previous state, the evicted segment, or current workspace metadata
-- Prefer omission to speculation. Empty lists and empty strings are allowed
-- Preserve early facts that still matter for judging future continuations
-- Merge redundant details and avoid copying long observations verbatim
-- If a previous belief is revised, mention that revision in **milestones** or **freeform_summary** instead of silently deleting it
-- Do not invent facts just to fill every field. Do not hallucinate
+- Judge only the specified criterion, not general quality
+- Use the rubric's scale exactly as written. For negative rubrics, do not invert the scale
+- Score the agent trajectory itself, not the underlying task or bug in the abstract
+- Use only evidence visible in the trajectory. Do not hallucinate or infer unstated facts
+- Use the previous persistent state only when it is needed to interpret the tracjectory
+- Brief reasoning is allowed and should stay concrete
+- Output in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response
+
 
 ## Output Format
 ```json
 {
-  "critical_context": [],
-  "relevant_files": [],
-  "milestones": [],
-  "freeform_summary": ""
+  "reasoning": "<brief grounded explanation>",
+  "score": <a score on a scale of 1 to 5 indicating how appropriate the continuation is based on the scale of the given criterion>
 }
 ```
 
 ## Inputs
 1. **Question**: Original system and user prompt containing code problem statement
+2. **Previous Persistent State**: Current memory state with summary of past findings and milestones
+3. **Agent Trajectory**: The most recent agent trajectory
+5. **Criterion**: The specific aspect to evaluate
+
+Return only the JSON object.
+"""
+
+PERSISTENT_STATE_UPDATE_PROMPT = """
+You are maintaining a compact, durable working memory for a long-running software-debugging trajectory.
+
+## Goal
+Update the persistent state after older trajectory segments are evicted. Preserve the most important actionable context needed for later judging, and continuation of the work.
+
+## Required Sections
+Return exactly these 8 top-level string fields:
+- **current_state**: What is actively being worked on right now, pending tasks, and immediate next steps. Always refresh this section so it reflects the latest work.
+- **task_specification**: What the user asked for, important constraints, acceptance criteria, design decisions, and explanatory context.
+- **files_and_functions**: Important files, functions, classes, modules, and why they matter. Include concrete file paths and identifiers.
+- **errors_and_corrections**: Errors encountered, failed attempts, rejected hypotheses, and how they were corrected. Record approaches that should not be retried.
+- **codebase_and_system_documentation**: Important components, interfaces, workflows, or architectural relationships and how they fit together.
+- **learnings**: Actionable lessons about what worked well, what did not, and what to avoid. Do not duplicate material already captured in other sections.
+- **key_results**: Exact or near-exact outputs that should be preserved, such as a patch idea, a concrete answer, a command result, or another critical artifact.
+- **worklog**: Very terse step-by-step record of what was attempted or completed.
+
+## Writing Guidelines
+- Keep only information supported by the previous state, the evicted trajectory, or the workspace metadata.
+- Be detailed and information-dense. Include concrete file paths, function names, commands, test names, error messages, patch details, and technical observations when useful.
+- Focus on actionable, specific context that would help someone understand, judge, or recreate the work.
+- It is OK to leave a section unchanged or blank if there are no substantial new insights. Do not add filler such as "No info yet".
+- Keep each section under 400 words. If a section gets too long, remove lower-value details while preserving the most decision-relevant information.
+- Preserve older facts that still matter.
+- Merge redundant details instead of repeating them.
+- If an earlier belief was revised, record that correction explicitly in the appropriate section.
+- Do not hallucinate. Prefer omission to speculation.
+
+## Output Format
+```json
+{
+  "current_state": "",
+  "task_specification": "",
+  "files_and_functions": "",
+  "errors_and_corrections": "",
+  "codebase_and_system_documentation": "",
+  "learnings": "",
+  "key_results": "",
+  "worklog": ""
+}
+```
+
+## Inputs
+1. **Question**: Original system and user prompt containing the coding task
 2. **Previous Persistent State**: Previous memory state
-3. **Evicted Older Trajectory**: The trajectories after the previous persistent state that must now be compressed
+3. **Evicted Older Trajectory**: Older trajectory segments that must now be compressed
 4. **Workspace Metadata**: Compact git-based metadata at the current step
 
 Return only the updated JSON object.
@@ -218,10 +265,14 @@ MIN_OBSERVATION_SECTION_CHARS = 256
 EVALUATOR_MAX_RETRIES = 4
 
 EMPTY_PERSISTENT_STATE = {
-    "critical_context": [],
-    "relevant_files": [],
-    "milestones": [],
-    "freeform_summary": "",
+    "current_state": "",
+    "task_specification": "",
+    "files_and_functions": "",
+    "errors_and_corrections": "",
+    "codebase_and_system_documentation": "",
+    "learnings": "",
+    "key_results": "",
+    "worklog": "",
 }
 
 EMPTY_WORKSPACE_META = {
@@ -253,6 +304,8 @@ class SearchConfig:
     judge_top_p: float = 1.0
     judge_max_tokens: int = 1024
     regression_margin: float = 0.0
+    calculate_gt_reward: bool = False
+    gt_reward_workers: int = 1
 
 
 @dataclass
@@ -591,11 +644,10 @@ async def _update_persistent_state(
         )
         parsed = extract_json_from_response(response)
         if isinstance(parsed, dict):
-            state = copy.deepcopy(EMPTY_PERSISTENT_STATE)
-            state["critical_context"] = copy.deepcopy(parsed.get("critical_context")) if isinstance(parsed.get("critical_context"), list) else copy.deepcopy(previous_state.get("critical_context", []))
-            state["milestones"] = copy.deepcopy(parsed.get("milestones")) if isinstance(parsed.get("milestones"), list) else copy.deepcopy(previous_state.get("milestones", []))
-            state["relevant_files"] = copy.deepcopy(parsed.get("relevant_files")) if isinstance(parsed.get("relevant_files"), list) else copy.deepcopy(previous_state.get("relevant_files", []))
-            state["freeform_summary"] = parsed.get("freeform_summary") if isinstance(parsed.get("freeform_summary"), str) else copy.deepcopy(previous_state.get("freeform_summary", ""))
+            state = copy.deepcopy(previous_state)
+            for key in state:
+                if isinstance(parsed.get(key), str):
+                    state[key] = parsed[key]
             return state
     return copy.deepcopy(previous_state)
 
@@ -672,6 +724,17 @@ def _build_initial_rubric_bank(task: str) -> list[RubricRecord]:
                     "3": "Noticeable overclaiming or weakly justified completion",
                     "4": "Serious premature resolution behavior",
                     "5": "Severe premature resolution dominating the continuation",
+                },
+            },
+            {
+                "title": "Invalid Patch Format",
+                "description": "Produces a final patch that is not a valid, directly applicable code patch, such as emitting prose, raw source code, or malformed diff content instead of a legitimate patch.",
+                "scale": {
+                    "1": "Final patch is a valid, directly applicable patch",
+                    "2": "Minor patch-format issues but still mostly usable",
+                    "3": "Noticeable patch-format problems creating ambiguity or manual cleanup",
+                    "4": "Patch is largely malformed or not directly applicable",
+                    "5": "Patch is not a legitimate patch at all",
                 },
             }
         ],
@@ -891,6 +954,104 @@ async def _score_round(
     return per_view_scores, variances, view_errors
 
 
+async def _score_parent_round(
+    *,
+    question: dict[str, str],
+    shared_context: dict[str, Any],
+    rubrics: list[RubricRecord],
+    model_name: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    model_kwargs: dict[str, Any] | None = None,
+) -> tuple[list[list[dict[str, Any]]], dict[str, float], dict[int, str]]:
+    if not rubrics:
+        return [[]], {}, {}
+    calls = []
+    mapping: list[RubricRecord] = []
+    question_text = f"System Prompt:\n{question.get('system_prompt', '')}\n\nUser Prompt:\n{question.get('user_prompt', '')}"
+    for rubric in rubrics:
+        criterion = "\n".join(
+            [
+                f"Title: {rubric.title}",
+                f"Type: {rubric.direction}",
+                f"Description: {rubric.description}",
+                "Scale:",
+                *[f"{score}: {rubric.scale[str(score)]}" for score in range(1, 6)],
+            ]
+        )
+
+        async def _judge_single(
+            *,
+            criterion: str = criterion,
+        ) -> tuple[str, int]:
+            for _ in range(EVALUATOR_MAX_RETRIES):
+                response = await run_chat_with_route_async(
+                    "rubric_judge",
+                    model_name=model_name,
+                    user_prompt=
+                        SWE_TRAJECTORY_RUBRIC_JUDGE_PARENT_PROMPT.strip() + (
+                        f"\n\n## Question:\n{question_text}\n"
+                        f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
+                        f"## Agent Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
+                        f"## Criterion:\n{criterion}"
+                    ),
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                    **(model_kwargs or {}),
+                )
+                score_raw = _parse_judge_score(response)
+                if score_raw is not None:
+                    return response, score_raw
+            return (
+                json.dumps(
+                    {
+                        "reasoning": "Fallback to minimum score after repeated judge failures.",
+                        "score": 1,
+                    },
+                    ensure_ascii=False,
+                ),
+                1,
+            )
+
+        calls.append(
+            _judge_single()
+        )
+        mapping.append(rubric)
+    responses = await asyncio.gather(*calls, return_exceptions=True)
+    per_view_scores: list[list[dict[str, Any]]] = [[]]
+    rubric_values: dict[str, list[float]] = {}
+    view_errors: dict[int, str] = {}
+    for rubric, response in zip(mapping, responses):
+        if isinstance(response, Exception):
+            view_errors.setdefault(0, f"{type(response).__name__}: {response}")
+            continue
+        judge_response, score_raw = response
+        normalized = max(0.0, min(1.0, (score_raw - 1.0) / 4.0))
+        record = {
+            "rubric_id": rubric.rubric_id,
+            "rubric": {
+                "rubric_id": rubric.rubric_id,
+                "title": rubric.title,
+                "direction": rubric.direction,
+                "description": rubric.description,
+                "scale": copy.deepcopy(rubric.scale),
+                "weight": rubric.weight,
+                "source_round": rubric.source_round,
+            },
+            "score_raw": score_raw,
+            "score_normalized": normalized,
+            "weighted_score": float(rubric.weight) * normalized,
+            "judge_response": judge_response,
+        }
+        per_view_scores[0].append(record)
+        rubric_values.setdefault(rubric.rubric_id, []).append(normalized)
+    variances = {rubric_id: (0.0 if len(values) <= 1 else float(pvariance(values))) for rubric_id, values in rubric_values.items()}
+    return per_view_scores, variances, view_errors
+
+
 def _compute_weighted_reward(score_records: list[dict[str, Any]]) -> float:
     numerator = 0.0
     positive_weight = 0.0
@@ -910,13 +1071,20 @@ def _update_rubric_bank(
     variances: dict[str, float],
     max_active_rubrics: int,
 ) -> tuple[list[RubricRecord], list[RubricRecord], list[RubricRecord]]:
-    ranked = []
-    for rubric in {rubric.rubric_id: rubric for rubric in active_bank + inactive_bank + generated}.values():
-        ranked.append(RubricRecord(**{**asdict(rubric), "variance": variances.get(rubric.rubric_id, 0.0)}))
+    deduped_by_title: dict[str, RubricRecord] = {}
+    for rubric in active_bank + generated:
+        candidate = RubricRecord(**{**asdict(rubric), "variance": variances.get(rubric.rubric_id, 0.0)})
+        title_key = candidate.title.strip().casefold()
+        existing = deduped_by_title.get(title_key)
+        if existing is None or (candidate.variance or 0.0) > (existing.variance or 0.0) or (
+            (candidate.variance or 0.0) == (existing.variance or 0.0) and candidate.source_round > existing.source_round
+        ):
+            deduped_by_title[title_key] = candidate
+    ranked = list(deduped_by_title.values())
     ranked.sort(key=lambda rubric: (rubric.variance or 0.0), reverse=True)
     active = [rubric for rubric in ranked][:max_active_rubrics]
     active_ids = {rubric.rubric_id for rubric in active}
-    inactive = [rubric for rubric in ranked if rubric.rubric_id not in active_ids]
+    inactive = [rubric for rubric in ranked + inactive_bank if rubric.rubric_id not in active_ids]
     return active, inactive, ranked
 
 
@@ -944,6 +1112,7 @@ class TrajectorySearchRunner:
         judge_model_name: str | None = None,
         rubric_model_kwargs: dict[str, Any] | None = None,
         judge_model_kwargs: dict[str, Any] | None = None,
+        harness_namespace: str | None = None,
         resume: bool = False,
     ) -> None:
         self.instance = copy.deepcopy(instance)
@@ -957,6 +1126,7 @@ class TrajectorySearchRunner:
         self.search_config = search_config or SearchConfig()
         self.rubric_model_kwargs = copy.deepcopy(rubric_model_kwargs or {})
         self.judge_model_kwargs = copy.deepcopy(judge_model_kwargs or {})
+        self.harness_namespace = harness_namespace
         self.resume = resume
         self.task = instance["problem_statement"]
         self.task_id = instance["instance_id"]
@@ -989,8 +1159,7 @@ class TrajectorySearchRunner:
             if self.resume and self.manifest_path.exists():
                 self._load_manifest()
             else:
-                self._initialize_root()
-            self._sweep_checkpoint_images()
+                self._initialize_root()            
             while self.current_round < self.search_config.max_rounds:
                 if self.frontier_ids and self.nodes[self.frontier_ids[0]].status == "finished":
                     break
@@ -999,6 +1168,8 @@ class TrajectorySearchRunner:
                 self.current_round += 1
                 self._run_round(self.frontier_ids[0], self.current_round)
                 self._save_manifest()
+            if self.search_config.calculate_gt_reward:
+                self._evaluate_ground_truth_rewards()
             result = self._finalize_outputs()
             self._sweep_checkpoint_images()
             return result
@@ -1316,24 +1487,9 @@ class TrajectorySearchRunner:
             child_scores[branch_index] = scored_continuations[local_index]
         parent_score_records = None
         if compare_parent and scoring_rubrics:
-            baseline_scores, _, baseline_errors = await _score_round(
+            baseline_scores, _, baseline_errors = await _score_parent_round(
                 question=question,
                 shared_context=shared_context,
-                continuations=[
-                    {
-                        "summary": {
-                            "step_count": 0,
-                            "changed_files": copy.deepcopy(parent_judge["workspace_meta"].get("changed_files", [])),
-                            "untracked_files": copy.deepcopy(parent_judge["workspace_meta"].get("untracked_files", [])),
-                            "diff_stat": parent_judge["workspace_meta"].get("diff_stat", ""),
-                            "current_patch_chars": int(parent_judge["workspace_meta"].get("current_patch_chars", 0) or 0),
-                            "result_status": "running",
-                            "exit_status": "",
-                            "submission_chars": 0,
-                        },
-                        "note": "No continuation beyond the shared trajectory.",
-                    }
-                ],
                 rubrics=scoring_rubrics,
                 model_name=self.judge_model_name,
                 temperature=self.search_config.judge_temperature,
@@ -1376,7 +1532,7 @@ class TrajectorySearchRunner:
         previous_frontier = list(self.frontier_ids)
         branch_records: list[dict[str, Any]] = []
 
-        for sample_index in range(self.search_config.m):
+        for sample_index in range(self.search_config.m + 2 if parent_id == "root" else self.search_config.m):
             node_id = f"node-r{round_index:03d}-s{sample_index:02d}-{uuid.uuid4().hex[:6]}"
             session = None
             try:
@@ -1470,7 +1626,8 @@ class TrajectorySearchRunner:
                         "baseline_parent_score": None,
                         "regressed_vs_parent": False,
                         "error": str(exc),
-                    },
+                    }
+                    | ({"ground_truth_reward": None} if self.search_config.calculate_gt_reward else {}),
                     snapshot=None,
                 )
 
@@ -1529,7 +1686,8 @@ class TrajectorySearchRunner:
                         "baseline_parent_score": None,
                         "regressed_vs_parent": False,
                         "error": str(exc),
-                    },
+                    }
+                    | ({"ground_truth_reward": None} if self.search_config.calculate_gt_reward else {}),
                     snapshot=None,
                 )
                 self._dispose_session(branch["session"])
@@ -1645,7 +1803,8 @@ class TrajectorySearchRunner:
                     "baseline_parent_score": parent_baseline_score,
                     "regressed_vs_parent": node.regressed_vs_parent,
                     "error": branch["judge_error"],
-                },
+                }
+                | ({"ground_truth_reward": None} if self.search_config.calculate_gt_reward else {}),
                 snapshot=(
                     {
                         **copy.deepcopy(branch["snapshot_after"]),
@@ -1667,6 +1826,38 @@ class TrajectorySearchRunner:
                     else None
                 ),
             )
+            if self.search_config.calculate_gt_reward:
+                node_dir = Path(node.raw_traj_path).parent
+                terminal_result = branch["result"]
+                terminal_snapshot = branch["snapshot_after"]
+                if branch["result"]["status"] != "finished":
+                    model_config = getattr(getattr(branch["session"].agent, "model", None), "config", None)
+                    model_kwargs = getattr(model_config, "model_kwargs", None)
+                    if isinstance(model_kwargs, dict):
+                        model_kwargs["temperature"] = 0.0
+                        model_kwargs["top_p"] = 1.0
+                    terminal_result = branch["session"].run_until_pause(max_steps=None).model_dump(mode="json")
+                    terminal_snapshot = branch["session"].snapshot().model_dump(mode="json")
+                terminal_raw = _make_raw_trajectory(
+                    snapshot=terminal_snapshot,
+                    result=terminal_result,
+                    info_extra={"terminal_rollout_from_node_id": node.node_id},
+                )
+                _atomic_write_json(node_dir / "terminal_raw_traj.json", terminal_raw)
+                _atomic_write_json(
+                    node_dir / "terminal_messages.json",
+                    build_slim_trajectory(terminal_raw, model_name=self.policy_model_name),
+                )
+                _atomic_write_json(
+                    node_dir / "terminal_patch.json",
+                    {
+                        self.task_id: {
+                            "model_name_or_path": self.policy_model_name,
+                            "instance_id": self.task_id,
+                            "model_patch": terminal_result.get("submission", "") or "",
+                        }
+                    },
+                )
             if node.status == "finished":
                 self.finished_node_ids.append(node.node_id)
             self._dispose_session(branch["session"])
@@ -1686,6 +1877,42 @@ class TrajectorySearchRunner:
         if self.frontier_ids:
             self.best_node_id = self.frontier_ids[0]
         self._sweep_checkpoint_images()
+
+    def _evaluate_ground_truth_rewards(self) -> None:
+        patches_by_node_id: dict[str, str] = {}
+        judge_payloads: dict[str, dict[str, Any]] = {}
+        judge_paths: dict[str, Path] = {}
+        for node_id, node in self.nodes.items():
+            if node_id == "root":
+                continue
+            judge_path = Path(node.judge_path)
+            if not judge_path.exists():
+                continue
+            judge_payload = json.loads(judge_path.read_text(encoding="utf-8"))
+            judge_payload["ground_truth_reward"] = None
+            judge_payloads[node_id] = judge_payload
+            judge_paths[node_id] = judge_path
+            terminal_patch_path = Path(node.raw_traj_path).parent / "terminal_patch.json"
+            if not terminal_patch_path.exists():
+                continue
+            try:
+                patch_payload = json.loads(terminal_patch_path.read_text(encoding="utf-8"))
+                patches_by_node_id[node_id] = patch_payload[self.task_id]["model_patch"] or ""
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+
+        rewards_by_node_id = evaluate_swebench_instance_patches(
+            instance=self.instance,
+            patches_by_key=patches_by_node_id,
+            model_name=self.policy_model_name,
+            max_workers=self.search_config.gt_reward_workers,
+            namespace=self.harness_namespace,
+            work_dir=self.run_dir,
+        )
+        for node_id, judge_payload in judge_payloads.items():
+            if node_id in rewards_by_node_id:
+                judge_payload["ground_truth_reward"] = rewards_by_node_id[node_id]
+            _atomic_write_json(judge_paths[node_id], judge_payload)
 
     def _finalize_outputs(self) -> TrajectorySearchResult:
         if self.finished_node_ids:
@@ -1736,7 +1963,6 @@ class TrajectorySearchRunner:
         self.best_node_id = final_node_id
         if final_node.status == "finished":
             self.frontier_ids = [final_node_id]
-        self._sweep_checkpoint_images()
         self._save_manifest()
         return TrajectorySearchResult(
             run_dir=str(self.run_dir),

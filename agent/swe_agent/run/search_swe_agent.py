@@ -101,6 +101,7 @@ def _run_single_instance(
         judge_model_name=judge_model_name,
         rubric_model_kwargs=rubric_model_kwargs,
         judge_model_kwargs=judge_model_kwargs,
+        harness_namespace=get_swebench_harness_namespace(instance),
         resume=resume,
     )
     result = runner.run()
@@ -216,6 +217,8 @@ def run_search(
             judge_top_p=args.judge_top_p,
             judge_max_tokens=args.judge_max_tokens,
             regression_margin=args.regression_margin,
+            calculate_gt_reward=args.calculate_gt_reward,
+            gt_reward_workers=args.workers,
         )
         rubric_model_name = args.rubric_model or model_name
         judge_model_name = args.judge_model or model_name
@@ -301,17 +304,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p", type=int, default=2)
     parser.add_argument("--max-rounds", type=int, default=25)
     parser.add_argument("--max-active-rubrics", type=int, default=6)
-    parser.add_argument("--policy-temperature", type=float, default=1.0)
-    parser.add_argument("--policy-top-p", type=float, default=0.95)
-    parser.add_argument("--rubric-temperature", type=float, default=0.0)
-    parser.add_argument("--rubric-top-p", type=float, default=1.0)
-    parser.add_argument("--rubric-max-tokens", type=int, default=1024)
+    parser.add_argument("--policy-temperature", type=float, default=0.1)
+    parser.add_argument("--policy-top-p", type=float, default=0.9)
+    parser.add_argument("--rubric-temperature", type=float, default=0.1)
+    parser.add_argument("--rubric-top-p", type=float, default=0.9)
+    parser.add_argument("--rubric-max-tokens", type=int, default=4096)
     parser.add_argument("--judge-temperature", type=float, default=0.1)
-    parser.add_argument("--judge-top-p", type=float, default=0.95)
-    parser.add_argument("--judge-max-tokens", type=int, default=1024)
+    parser.add_argument("--judge-top-p", type=float, default=0.9)
+    parser.add_argument("--judge-max-tokens", type=int, default=4096)
     parser.add_argument("--regression-margin", type=float, default=0.0)
     parser.add_argument("--rubric-model", default=None)
     parser.add_argument("--judge-model", default=None)
+    parser.add_argument("--calculate-gt-reward", default=True)
     return parser
 
 

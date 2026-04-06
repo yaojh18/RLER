@@ -40,6 +40,7 @@ from swe_agent.run.run_swe_agent import (
     build_arg_parser,
     build_slim_trajectory,
     choose_gpus,
+    evaluate_swebench_instance_patches,
     find_repo_root,
     parse_nvidia_smi_csv,
     run_harness_evaluation,
@@ -576,6 +577,71 @@ def test_run_harness_evaluations_writes_error_report_when_harness_fails(
     evaluation = json.loads((run_dir / "evaluation.json").read_text())
     assert evaluation["error_ids"] == ["astropy__astropy-12907"]
     assert updated[0].error == "boom"
+
+
+def test_evaluate_swebench_instance_patches_deduplicates_patches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    calls = {"build_env_images": 0, "build_instance_image": 0, "run_instance": []}
+
+    monkeypatch.setattr("swe_agent.run.run_swe_agent.swebench_run_evaluation.docker.from_env", lambda: object())
+    monkeypatch.setattr(
+        "swe_agent.run.run_swe_agent.swebench_run_evaluation.make_test_spec",
+        lambda instance, namespace=None: SimpleNamespace(instance_id=instance["instance_id"]),
+    )
+    monkeypatch.setattr(
+        "swe_agent.run.run_swe_agent.swebench_run_evaluation.build_env_images",
+        lambda client, instances, force_rebuild, max_workers: calls.__setitem__("build_env_images", calls["build_env_images"] + 1),
+    )
+    monkeypatch.setattr(
+        "swe_agent.run.run_swe_agent.build_instance_image",
+        lambda test_spec, client, logger=None, nocache=False: calls.__setitem__("build_instance_image", calls["build_instance_image"] + 1),
+    )
+
+    def fake_run_instance(test_spec, pred, rm_image, force_rebuild, client, run_id, timeout, rewrite_reports):
+        calls["run_instance"].append(pred["model_patch"])
+        report_path = (
+            Path(run_module.swebench_run_evaluation.RUN_EVALUATION_LOG_DIR)
+            / run_id
+            / pred["model_name_or_path"].replace("/", "__")
+            / test_spec.instance_id
+            / "report.json"
+        )
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps({test_spec.instance_id: {"resolved": pred["model_patch"] == "patch-a"}}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr("swe_agent.run.run_swe_agent.swebench_run_evaluation.run_instance", fake_run_instance)
+    monkeypatch.setattr(
+        "swe_agent.run.run_swe_agent.swebench_run_evaluation.run_threadpool",
+        lambda func, payloads, max_workers: [func(*payload) for payload in payloads],
+    )
+
+    from swe_agent.run import run_swe_agent as run_module
+
+    rewards = evaluate_swebench_instance_patches(
+        instance={"instance_id": "demo__demo"},
+        patches_by_key={
+            "node-a": "patch-a",
+            "node-b": "patch-a",
+            "node-c": "patch-c",
+            "node-empty": "",
+        },
+        model_name="openai/fake",
+        max_workers=4,
+        namespace=None,
+        work_dir=tmp_path,
+    )
+
+    assert rewards == {
+        "node-a": 1.0,
+        "node-b": 1.0,
+        "node-c": 0.0,
+        "node-empty": 0.0,
+    }
+    assert calls["build_env_images"] == 1
+    assert calls["build_instance_image"] == 1
+    assert calls["run_instance"] == ["patch-a", "patch-c"]
 
 
 def test_docker_environment_rejects_empty_submission():
