@@ -16,11 +16,7 @@ from pathlib import Path
 from statistics import pvariance
 from typing import Any, Literal
 
-repo_root = Path(__file__).resolve().parents[2]
-candidate = repo_root / "rl" / "open-instruct"
-if str(candidate) not in sys.path and candidate.exists():
-    sys.path.append(str(candidate))
-from open_instruct.search_rewards.utils.run_utils import extract_json_from_response, run_chat_with_route_async
+from agent_rl.run_utils import extract_json_from_response, run_chat_with_route_async
 
 from swe_agent import __version__
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
@@ -260,7 +256,7 @@ EXCEPTION_RE = re.compile(r"<exception>(.*?)</exception>", re.DOTALL)
 OUTPUT_RE = re.compile(r"<output>\s*(.*?)</output>", re.DOTALL)
 PR_DESCRIPTION_RE = re.compile(r"<pr_description>\s*(.*?)\s*</pr_description>", re.DOTALL)
 OBSERVATION_TRUNCATION_MARKER = "\n[... Observation truncated due to length ...]\n"
-MAX_OBSERVATION_CHARS = 2048
+MAX_OBSERVATION_CHARS = 1024
 MIN_OBSERVATION_SECTION_CHARS = 256
 EVALUATOR_MAX_RETRIES = 4
 
@@ -285,6 +281,73 @@ EMPTY_WORKSPACE_META = {
     "diff_stat": "",
     "current_patch_chars": 0,
     "workspace_fingerprint": None,
+}
+
+RUBRIC_SCALE_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {str(score): {"type": "string"} for score in range(1, 6)},
+    "required": [str(score) for score in range(1, 6)],
+}
+
+RUBRIC_ITEM_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "scale": RUBRIC_SCALE_JSON_SCHEMA,
+    },
+    "required": ["title", "description", "scale"],
+}
+
+PERSISTENT_STATE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "persistent_state_update",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {key: {"type": "string"} for key in EMPTY_PERSISTENT_STATE},
+            "required": list(EMPTY_PERSISTENT_STATE),
+        },
+    },
+}
+
+RUBRIC_GENERATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "adaptive_rubric_generation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "reasoning": {"type": "string"},
+                "positive_rubrics": {"type": "array", "items": RUBRIC_ITEM_JSON_SCHEMA},
+                "negative_rubrics": {"type": "array", "items": RUBRIC_ITEM_JSON_SCHEMA},
+            },
+            "required": ["reasoning", "positive_rubrics", "negative_rubrics"],
+        },
+    },
+}
+
+JUDGE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "rubric_judge",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "reasoning": {"type": "string"},
+                "score": {"type": "integer", "minimum": 1, "maximum": 5},
+            },
+            "required": ["reasoning", "score"],
+        },
+    },
 }
 
 
@@ -639,7 +702,8 @@ async def _update_persistent_state(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"},
+            response_format=copy.deepcopy(PERSISTENT_STATE_RESPONSE_FORMAT),
+            enable_json_schema_validation=True,
             **(model_kwargs or {}),
         )
         parsed = extract_json_from_response(response)
@@ -831,7 +895,8 @@ async def _generate_round_rubrics(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"},
+            response_format=copy.deepcopy(RUBRIC_GENERATION_RESPONSE_FORMAT),
+            enable_json_schema_validation=True,
             **(model_kwargs or {}),
         )
         parsed = extract_json_from_response(response)
@@ -901,7 +966,8 @@ async def _score_round(
                         temperature=temperature,
                         top_p=top_p,
                         max_tokens=max_tokens,
-                        response_format={"type": "json_object"},
+                        response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
+                        enable_json_schema_validation=True,
                         **(model_kwargs or {}),
                     )
                     score_raw = _parse_judge_score(response)
@@ -999,7 +1065,8 @@ async def _score_parent_round(
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
-                    response_format={"type": "json_object"},
+                    response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
+                    enable_json_schema_validation=True,
                     **(model_kwargs or {}),
                 )
                 score_raw = _parse_judge_score(response)

@@ -19,13 +19,7 @@ from typing import Any, Sequence
 
 from agent_rl import RolloutSessionSpec
 from dr_agent.utils import launch_vllm_server_handle
-
-repo_root = Path(__file__).resolve().parents[3]
-candidate = repo_root / "rl" / "open-instruct"
-if str(candidate) not in sys.path and candidate.exists():
-    sys.path.append(str(candidate))
-
-from open_instruct.search_rewards.utils.run_utils import (
+from agent_rl.run_utils import (
     ModelRouteConfig,
     clear_model_routes,
     configure_model_route,
@@ -71,7 +65,10 @@ from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
 from swe_agent.trajectory_search import (
     EMPTY_PERSISTENT_STATE,
     EVALUATOR_MAX_RETRIES,
+    JUDGE_RESPONSE_FORMAT,
+    PERSISTENT_STATE_RESPONSE_FORMAT,
     RubricRecord,
+    RUBRIC_GENERATION_RESPONSE_FORMAT,
     SearchConfig,
     _build_initial_rubric_bank,
     _build_step_cards,
@@ -189,6 +186,7 @@ Never create positive/negative versions of same criterion:
 ## Output Format
 ```json
 {
+  "reasoning": "<brief grounded analysis>",
   "positive_rubrics": [
     {
       "description": "<detailed excellence description>",
@@ -298,12 +296,11 @@ async def _summarize_aggregate_trajectory(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"},
+            response_format=copy.deepcopy(PERSISTENT_STATE_RESPONSE_FORMAT),
+            enable_json_schema_validation=True,
             **(model_kwargs or {}),
         )
         parsed = extract_json_from_response(response)
-        if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
-            parsed = extract_json_from_response(parsed["content"]) or parsed
         if isinstance(parsed, dict):
             summary = copy.deepcopy(EMPTY_PERSISTENT_STATE)
             for key in summary:
@@ -374,15 +371,14 @@ async def _generate_aggregate_rubrics(
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"},
+            response_format=copy.deepcopy(RUBRIC_GENERATION_RESPONSE_FORMAT),
+            enable_json_schema_validation=True,
             **(model_kwargs or {}),
         )
         if os.getenv("AGGREGATE_DEBUG_RUBRICS"):
             print("\n===== AGGREGATE RUBRIC RESPONSE =====\n")
             print(response)
         parsed = extract_json_from_response(response)
-        if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
-            parsed = extract_json_from_response(parsed["content"]) or parsed
         if not isinstance(parsed, dict):
             continue
         rubrics = _convert_generated_rubrics(task_text, parsed, round_index)
@@ -446,7 +442,8 @@ async def _score_aggregate_summaries(
                         temperature=temperature,
                         top_p=top_p,
                         max_tokens=max_tokens,
-                        response_format={"type": "json_object"},
+                        response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
+                        enable_json_schema_validation=True,
                         **(model_kwargs or {}),
                     )
                     score_raw = _parse_judge_score(response)

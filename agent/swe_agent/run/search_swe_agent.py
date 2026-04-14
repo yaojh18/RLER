@@ -13,11 +13,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from dr_agent.utils import launch_vllm_server_handle
-repo_root = Path(__file__).resolve().parents[3]
-candidate = repo_root / "rl" / "open-instruct"
-if str(candidate) not in sys.path and candidate.exists():
-    sys.path.append(str(candidate))
-from open_instruct.search_rewards.utils.run_utils import ModelRouteConfig, clear_model_routes, configure_model_route
+from agent_rl.run_utils import ModelRouteConfig, clear_model_routes, configure_model_route
 from swe_agent.rl_backend import SWEAgentRolloutBackend
 from swe_agent.run.benchmarks.swebench import (
     DATASET_MAPPING,

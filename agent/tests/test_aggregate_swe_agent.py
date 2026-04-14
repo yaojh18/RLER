@@ -5,8 +5,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from swe_agent.run.aggregate_swe_agent import AggregateTrajectoryRunner, _summarize_aggregate_trajectory
-from swe_agent.trajectory_search import RubricRecord, SearchConfig
+from swe_agent.run.aggregate_swe_agent import (
+    AggregateTrajectoryRunner,
+    _generate_aggregate_rubrics,
+    _score_aggregate_summaries,
+    _summarize_aggregate_trajectory,
+)
+from swe_agent.trajectory_search import (
+    JUDGE_RESPONSE_FORMAT,
+    PERSISTENT_STATE_RESPONSE_FORMAT,
+    RUBRIC_GENERATION_RESPONSE_FORMAT,
+    RubricRecord,
+    SearchConfig,
+)
 
 
 class _Payload:
@@ -331,3 +342,85 @@ async def test_summarize_aggregate_trajectory_normalizes_new_state_sections(monk
     assert summary["files_and_functions"] == "- `astropy/utils/misc.py`: contains `InheritDocstrings`."
     assert summary["key_results"] == "Patch updates the property branch of `InheritDocstrings`."
     assert summary["task_specification"] == ""
+
+
+@pytest.mark.asyncio
+async def test_aggregate_evaluator_calls_use_exact_json_schema(monkeypatch: pytest.MonkeyPatch):
+    calls = {"summary": None, "rubric": None, "judge": None}
+
+    async def fake_chat(route_name, model_name, user_prompt=None, system_prompt=None, **kwargs):
+        if "## Full Agent Trajectory:" in (user_prompt or ""):
+            calls["summary"] = kwargs
+            return json.dumps(
+                {
+                    "current_state": "Submitted a patch and stopped after a focused check.",
+                    "task_specification": "Fix the failing test.",
+                    "files_and_functions": "- `pkg/core.py`: active target.",
+                    "errors_and_corrections": "Avoid unrelated edits.",
+                    "codebase_and_system_documentation": "`pkg/core.py` contains the failing logic.",
+                    "learnings": "Focused validation is the best signal.",
+                    "key_results": "Prepared the final patch.",
+                    "worklog": "- Reproduced\n- Patched\n- Validated",
+                }
+            )
+        if "## Trajectory Summaries:" in (user_prompt or ""):
+            calls["rubric"] = kwargs
+            return json.dumps(
+                {
+                    "reasoning": "Validation quality differentiates the summaries.",
+                    "positive_rubrics": [
+                        {
+                            "title": "Validation",
+                            "description": "Runs targeted validation relevant to the fix.",
+                            "scale": {
+                                "1": "No validation",
+                                "2": "Weak validation",
+                                "3": "Some validation",
+                                "4": "Targeted validation",
+                                "5": "Targeted validation with follow-through",
+                            },
+                        }
+                    ],
+                    "negative_rubrics": [],
+                }
+            )
+        calls["judge"] = kwargs
+        return json.dumps({"reasoning": "Strong match.", "score": 4})
+
+    monkeypatch.setattr("swe_agent.run.aggregate_swe_agent.run_chat_with_route_async", fake_chat)
+
+    summary = await _summarize_aggregate_trajectory(
+        question={"system_prompt": "sys", "user_prompt": "user"},
+        step_cards=[{"step_index": 0, "assistant_message": "inspect", "commands": ["pytest -q"], "observation": "ok"}],
+        trajectory_metadata={"candidate_index": 0, "step_count": 1},
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=128,
+    )
+    rubrics = await _generate_aggregate_rubrics(
+        question={"system_prompt": "sys", "user_prompt": "user"},
+        trajectories_summaries=[summary],
+        active_bank=[],
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=128,
+        round_index=1,
+    )
+    await _score_aggregate_summaries(
+        question={"system_prompt": "sys", "user_prompt": "user"},
+        trajectories_summaries=[summary],
+        rubrics=rubrics,
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=64,
+    )
+
+    assert calls["summary"]["enable_json_schema_validation"] is True
+    assert calls["summary"]["response_format"] == PERSISTENT_STATE_RESPONSE_FORMAT
+    assert calls["rubric"]["enable_json_schema_validation"] is True
+    assert calls["rubric"]["response_format"] == RUBRIC_GENERATION_RESPONSE_FORMAT
+    assert calls["judge"]["enable_json_schema_validation"] is True
+    assert calls["judge"]["response_format"] == JUDGE_RESPONSE_FORMAT

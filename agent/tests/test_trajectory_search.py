@@ -9,9 +9,12 @@ import pytest
 from swe_agent.trajectory_search import (
     EMPTY_PERSISTENT_STATE,
     EMPTY_WORKSPACE_META,
+    JUDGE_RESPONSE_FORMAT,
     MAX_OBSERVATION_CHARS,
     OBSERVATION_TRUNCATION_MARKER,
     PERSISTENT_STATE_UPDATE_PROMPT,
+    PERSISTENT_STATE_RESPONSE_FORMAT,
+    RUBRIC_GENERATION_RESPONSE_FORMAT,
     SearchNode,
     SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
     SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
@@ -180,6 +183,7 @@ def _make_fake_chat():
             return json.dumps(
                 {
                     "question": "Fix the failing test.",
+                    "reasoning": "Validation quality and drift separate the continuations.",
                     "positive_rubrics": [
                         {
                             "title": "Validation",
@@ -608,6 +612,7 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
             calls["rubric"].append({"prompt": user_prompt, "kwargs": kwargs})
             return json.dumps(
                 {
+                    "reasoning": "Validation distinguishes these continuations.",
                     "positive_rubrics": [
                         {
                             "title": "Validation",
@@ -625,7 +630,7 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
                 }
             )
         calls["judge"].append({"prompt": user_prompt, "kwargs": kwargs, "system_prompt": system_prompt})
-        return json.dumps({"score": 4})
+        return json.dumps({"reasoning": "Grounded scoring.", "score": 4})
 
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
 
@@ -696,6 +701,93 @@ async def test_update_persistent_state_preserves_existing_sections_when_model_sk
 
 
 @pytest.mark.asyncio
+async def test_trajectory_evaluator_calls_use_exact_json_schema(monkeypatch: pytest.MonkeyPatch):
+    calls = {"persistent": None, "rubric": None, "judge": None}
+
+    async def fake_chat(route_name, model_name, user_prompt=None, system_prompt=None, **kwargs):
+        if user_prompt and PERSISTENT_STATE_UPDATE_PROMPT.strip() in user_prompt:
+            calls["persistent"] = kwargs
+            return json.dumps(
+                {
+                    "current_state": "Editing `pkg/core.py`.",
+                    "task_specification": "Fix the failing test.",
+                    "files_and_functions": "- `pkg/core.py`: active target.",
+                    "errors_and_corrections": "Avoid unrelated edits.",
+                    "codebase_and_system_documentation": "`pkg/core.py` contains the target logic.",
+                    "learnings": "Focused validation is the best signal.",
+                    "key_results": "Prepared focused pytest evidence.",
+                    "worklog": "- Read the target file",
+                }
+            )
+        if route_name == "rubric_generation":
+            calls["rubric"] = kwargs
+            return json.dumps(
+                {
+                    "reasoning": "Validation differences are visible.",
+                    "positive_rubrics": [
+                        {
+                            "title": "Validation",
+                            "description": "Runs targeted validation relevant to the fix.",
+                            "scale": {
+                                "1": "No validation",
+                                "2": "Weak validation",
+                                "3": "Some validation",
+                                "4": "Targeted validation",
+                                "5": "Targeted validation with follow-through",
+                            },
+                        }
+                    ],
+                    "negative_rubrics": [],
+                }
+            )
+        calls["judge"] = kwargs
+        return json.dumps({"reasoning": "Strong match.", "score": 5})
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
+
+    await _update_persistent_state(
+        system_prompt="sys",
+        user_prompt="user",
+        previous_state=copy.deepcopy(EMPTY_PERSISTENT_STATE),
+        evicted_step_cards=[{"step_index": 0, "assistant_message": "inspect"}],
+        workspace_meta=copy.deepcopy(EMPTY_WORKSPACE_META),
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=64,
+    )
+    rubrics = await _generate_round_rubrics(
+        question={"system_prompt": "sys", "user_prompt": "user"},
+        previous_state=copy.deepcopy(EMPTY_PERSISTENT_STATE),
+        latest_shared_segment=None,
+        continuations=[{"summary": {"step_count": 1}, "trajectory_continuation": {"step_cards": [{"commands": ["pytest -q"]}]}}],
+        active_bank=[],
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=64,
+        round_index=1,
+    )
+    await _score_round(
+        question={"system_prompt": "sys", "user_prompt": "user"},
+        shared_context={"previous_persistent_state": copy.deepcopy(EMPTY_PERSISTENT_STATE), "latest_agent_trajectory": None},
+        continuations=[{"summary": {"step_count": 1}, "trajectory_continuation": {"step_cards": [{"commands": ["pytest -q"]}]}}],
+        rubrics=rubrics,
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=32,
+    )
+
+    assert calls["persistent"]["enable_json_schema_validation"] is True
+    assert calls["persistent"]["response_format"] == PERSISTENT_STATE_RESPONSE_FORMAT
+    assert calls["rubric"]["enable_json_schema_validation"] is True
+    assert calls["rubric"]["response_format"] == RUBRIC_GENERATION_RESPONSE_FORMAT
+    assert calls["judge"]["enable_json_schema_validation"] is True
+    assert calls["judge"]["response_format"] == JUDGE_RESPONSE_FORMAT
+
+
+@pytest.mark.asyncio
 async def test_rubric_and_judge_retry_up_to_four_times(monkeypatch: pytest.MonkeyPatch):
     rubric_attempts = {"count": 0}
     judge_attempts = {"count": 0}
@@ -707,6 +799,7 @@ async def test_rubric_and_judge_retry_up_to_four_times(monkeypatch: pytest.Monke
                 return "not valid json"
             return json.dumps(
                 {
+                    "reasoning": "Validation remains the key differentiator.",
                     "positive_rubrics": [
                         {
                             "title": "Validation",
@@ -726,7 +819,7 @@ async def test_rubric_and_judge_retry_up_to_four_times(monkeypatch: pytest.Monke
         judge_attempts["count"] += 1
         if judge_attempts["count"] < 4:
             return '{"score": "bad"}'
-        return json.dumps({"score": 5})
+        return json.dumps({"reasoning": "Strong match.", "score": 5})
 
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
 
@@ -776,7 +869,7 @@ async def test_score_parent_round_scores_latest_trajectory_without_continuation(
 
     async def fake_chat(route_name, model_name, user_prompt=None, system_prompt=None, **kwargs):
         prompts.append(user_prompt)
-        return json.dumps({"score": 3})
+        return json.dumps({"reasoning": "Moderate alignment.", "score": 3})
 
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
 
@@ -875,6 +968,7 @@ async def test_prepare_round_judging_keeps_only_active_rubric_scores(tmp_path: P
         if route_name == "rubric_generation":
             return json.dumps(
                 {
+                    "reasoning": "Validation and grounding separate the branches.",
                     "positive_rubrics": [
                         {
                             "title": "Validation",
@@ -903,8 +997,8 @@ async def test_prepare_round_judging_keeps_only_active_rubric_scores(tmp_path: P
                 }
             )
         if "Title: Validation" in user_prompt:
-            return json.dumps({"score": 5 if "pytest -q" in user_prompt else 1})
-        return json.dumps({"score": 3})
+            return json.dumps({"reasoning": "Validation observed." if "pytest -q" in user_prompt else "Validation missing.", "score": 5 if "pytest -q" in user_prompt else 1})
+        return json.dumps({"reasoning": "Neutral grounding.", "score": 3})
 
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
 
@@ -1113,7 +1207,7 @@ def test_new_frontier_children_are_prepended_before_existing_frontier(tmp_path: 
             if user_prompt and SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT.strip() in user_prompt:
                 return json.dumps(
                     {
-                        "question": "Fix the failing test.",
+                        "reasoning": "Validation separates the sibling branches.",
                         "positive_rubrics": [
                             {
                                 "title": "Validation",
@@ -1133,16 +1227,16 @@ def test_new_frontier_children_are_prepended_before_existing_frontier(tmp_path: 
             is_positive = "Type: positive" in judge_prompt
             is_baseline = "No continuation beyond the shared trajectory." in judge_prompt
             if not is_positive:
-                return json.dumps({"score": 1})
+                return json.dumps({"reasoning": "No drift found.", "score": 1})
             if "pytest tests/test_beta.py -q" in judge_prompt:
-                return json.dumps({"score": 5})
+                return json.dumps({"reasoning": "Strong targeted validation.", "score": 5})
             if "pytest tests/test_alpha.py -q" in judge_prompt:
-                return json.dumps({"score": 4 if is_baseline else 5})
+                return json.dumps({"reasoning": "Focused validation.", "score": 4 if is_baseline else 5})
             if "sed -n '1,80p' pkg/core.py" in judge_prompt:
-                return json.dumps({"score": 3})
+                return json.dumps({"reasoning": "Grounded but light validation.", "score": 3})
             if "sed -n '1,20p' README.md" in judge_prompt:
-                return json.dumps({"score": 1})
-            return json.dumps({"score": 3})
+                return json.dumps({"reasoning": "Unfocused.", "score": 1})
+            return json.dumps({"reasoning": "Neutral.", "score": 3})
 
         return fake_chat
 
@@ -1453,7 +1547,7 @@ def test_trajectory_search_runner_failed_parent_expansion_drops_parent_from_fron
             if user_prompt and SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT.strip() in user_prompt:
                 return json.dumps(
                     {
-                        "question": "Fix the failing test.",
+                        "reasoning": "Validation and drift separate the continuations.",
                         "positive_rubrics": [
                             {
                                 "title": "Validation",
@@ -1489,15 +1583,15 @@ def test_trajectory_search_runner_failed_parent_expansion_drops_parent_from_fron
             is_positive = "Type: positive" in judge_prompt
             if is_positive:
                 if latest_bad:
-                    return json.dumps({"score": 1})
+                    return json.dumps({"reasoning": "Validation absent.", "score": 1})
                 if latest_test:
-                    return json.dumps({"score": 5})
+                    return json.dumps({"reasoning": "Strong validation.", "score": 5})
                 if latest_read:
-                    return json.dumps({"score": 4})
-                return json.dumps({"score": 1 if is_baseline else 3})
+                    return json.dumps({"reasoning": "Grounded inspection.", "score": 4})
+                return json.dumps({"reasoning": "Baseline only.", "score": 1 if is_baseline else 3})
             if latest_bad:
-                return json.dumps({"score": 5})
-            return json.dumps({"score": 1})
+                return json.dumps({"reasoning": "Severe drift.", "score": 5})
+            return json.dumps({"reasoning": "No drift.", "score": 1})
 
         return fake_chat
 
