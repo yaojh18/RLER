@@ -238,6 +238,7 @@ def launch_vllm_server_handle(
     gpu_id: int = 0,
     logger: Optional[logging.Logger] = None,
     *,
+    served_model_name: Optional[str] = None,
     gpu_ids: Optional[list[int]] = None,
     max_model_len: int = DEFAULT_VLLM_MAX_MODEL_LEN,
     gpu_memory_utilization: float = 0.9,
@@ -271,6 +272,8 @@ def launch_vllm_server_handle(
         "--gpu-memory-utilization",
         str(gpu_memory_utilization),
     ]
+    if served_model_name:
+        cmd.extend(["--served-model-name", served_model_name])
     if len(selected_gpu_ids) > 1:
         cmd.extend(["--tensor-parallel-size", str(len(selected_gpu_ids))])
 
@@ -316,11 +319,12 @@ def launch_vllm_server_handle(
     while time.time() - start_time < startup_timeout_seconds:
         if check_port(port):
             base_url = f"http://127.0.0.1:{port}/v1"
+            warmup_model_name = served_model_name or model_name
             request = urllib.request.Request(
                 f"{base_url}/chat/completions",
                 data=json.dumps(
                     {
-                        "model": model_name,
+                        "model": warmup_model_name,
                         "messages": [{"role": "user", "content": "ping"}],
                         "max_tokens": 1,
                         "temperature": 0.0,
@@ -341,7 +345,7 @@ def launch_vllm_server_handle(
                         log_file=log_file,
                         port=port,
                         base_url=base_url,
-                        model_name=model_name,
+                        model_name=warmup_model_name,
                         max_model_len=max_model_len,
                         gpu_id=selected_gpu_ids[0] if selected_gpu_ids else None,
                         gpu_ids=selected_gpu_ids,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -27,6 +28,12 @@ from swebench.harness.docker_build import build_instance_image
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 
 from dr_agent.utils import launch_vllm_server_handle
+from swe_agent.run.benchmarks.rebench_eval import (
+    evaluate_rebench_instances as evaluate_rebench_instance_patches_backend,
+    evaluate_rebench_instance as evaluate_rebench_prediction,
+    is_rebench_dataset_name,
+    is_rebench_instance,
+)
 from swe_agent.run.benchmarks.swebench import (
     DATASET_MAPPING,
     build_swebench_config,
@@ -50,10 +57,9 @@ DEFAULT_SUBSET = "verified"
 DEFAULT_SPLIT = "test"
 DEFAULT_OUTPUT_ROOT = AGENT_ROOT / "outputs"
 DEFAULT_LOG_ROOT = AGENT_ROOT / "logs"
-DEFAULT_VLLM_SERVE_MODEL = "Qwen/Qwen3-8B"
-DEFAULT_VLLM_CLIENT_MODEL = "openai/Qwen/Qwen3-8B"
+DEFAULT_SERVE_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_OPENAI_MODEL = "gemini/gemini-3-pro-preview"
-DEFAULT_MODEL_CLASS = "litellm_textbased"
+DEFAULT_MODEL_CLASS = "route_textbased"
 DEFAULT_VLLM_PORT = 8011
 DEFAULT_MAX_MODEL_LEN = 80960
 DEFAULT_STEP_LIMIT = 100
@@ -388,16 +394,161 @@ def extract_backend_result(
     )
 
 
-def run_harness_evaluation(
+def _build_evaluation_payload(
+    *,
+    instance_id: str,
+    completed: bool,
+    resolved: bool,
+    empty_patch: bool,
+    error: bool,
+) -> dict[str, Any]:
+    return {
+        "completed_ids": [instance_id] if completed else [],
+        "incomplete_ids": [],
+        "empty_patch_ids": [instance_id] if empty_patch else [],
+        "submitted_ids": [instance_id],
+        "resolved_ids": [instance_id] if resolved else [],
+        "unresolved_ids": [instance_id] if completed and not resolved else [],
+        "error_ids": [instance_id] if error else [],
+        "schema_version": 2,
+    }
+
+
+def _run_rebench_harness_evaluation(
+    *,
+    results: list[BackendResult],
+    dataset_name: str,
+    timeout: int,
+    max_workers: int,
+    instances_by_id: dict[str, dict[str, Any]] | None,
+) -> list[BackendResult]:
+    if instances_by_id is None:
+        subset = next(key for key, value in DATASET_MAPPING.items() if value == dataset_name)
+        instances_by_id = {
+            instance["instance_id"]: instance
+            for instance in load_swebench_instances(subset, results[0].split)
+        }
+    updated_results: dict[str, BackendResult] = {}
+    log_path = Path(results[0].log_path) if results[0].log_path else None
+    evaluation_log_context = tee_console(log_path) if log_path else contextlib.nullcontext()
+    with evaluation_log_context:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(results)))) as executor:
+            futures: dict[concurrent.futures.Future, BackendResult] = {}
+            for result in results:
+                evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
+                evaluation_command = ["python_api", "rebench_eval", dataset_name, result.split, result.instance_id]
+                if result.prediction_chars == 0:
+                    evaluation_result_path.write_text(
+                        json.dumps(
+                            _build_evaluation_payload(
+                                instance_id=result.instance_id,
+                                completed=False,
+                                resolved=False,
+                                empty_patch=True,
+                                error=False,
+                            ),
+                            indent=2,
+                        )
+                    )
+                    updated_results[result.instance_id] = BackendResult(
+                        **{
+                            **asdict(result),
+                            "evaluation_result_path": str(evaluation_result_path),
+                            "evaluation_completed": True,
+                            "resolved": False,
+                            "error": None,
+                            "run_id": f"verify-{result.backend}-rebench",
+                            "evaluation_command": evaluation_command,
+                        }
+                    )
+                    continue
+                if result.instance_id not in instances_by_id:
+                    evaluation_result_path.write_text(
+                        json.dumps(
+                            _build_evaluation_payload(
+                                instance_id=result.instance_id,
+                                completed=False,
+                                resolved=False,
+                                empty_patch=False,
+                                error=True,
+                            ),
+                            indent=2,
+                        )
+                    )
+                    updated_results[result.instance_id] = BackendResult(
+                        **{
+                            **asdict(result),
+                            "evaluation_result_path": str(evaluation_result_path),
+                            "evaluation_completed": True,
+                            "resolved": False,
+                            "error": f"Instance not found in {dataset_name}/{result.split}: {result.instance_id}",
+                            "run_id": f"verify-{result.backend}-rebench",
+                            "evaluation_command": evaluation_command,
+                        }
+                    )
+                    continue
+                patch_text = json.loads(Path(result.patch_path).resolve().read_text())[result.instance_id]["model_patch"]
+                futures[
+                    executor.submit(
+                        evaluate_rebench_prediction,
+                        instance=instances_by_id[result.instance_id],
+                        patch_text=patch_text,
+                        timeout=timeout,
+                        work_dir=Path(result.run_dir).resolve(),
+                    )
+                ] = result
+
+            for future in concurrent.futures.as_completed(futures):
+                result = futures[future]
+                evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
+                evaluation_command = ["python_api", "rebench_eval", dataset_name, result.split, result.instance_id]
+                try:
+                    payload = future.result()
+                    resolved = bool(payload["resolved"])
+                    completed = True
+                    error = False
+                    extra_error = None
+                    (Path(result.run_dir).resolve() / "rebench_evaluation.json").write_text(
+                        json.dumps(payload, indent=2)
+                    )
+                except Exception as exc:
+                    resolved = False
+                    completed = False
+                    error = True
+                    extra_error = str(exc)
+                evaluation_result_path.write_text(
+                    json.dumps(
+                        _build_evaluation_payload(
+                            instance_id=result.instance_id,
+                            completed=completed,
+                            resolved=resolved,
+                            empty_patch=result.prediction_chars == 0,
+                            error=error,
+                        ),
+                        indent=2,
+                    )
+                )
+                updated_results[result.instance_id] = BackendResult(
+                    **{
+                        **asdict(result),
+                        "evaluation_result_path": str(evaluation_result_path),
+                        "evaluation_completed": True,
+                        "resolved": resolved,
+                        "error": extra_error,
+                        "run_id": f"verify-{result.backend}-rebench",
+                        "evaluation_command": evaluation_command,
+                    }
+                )
+    return [updated_results[result.instance_id] for result in results]
+
+
+def _run_swebench_harness_evaluation(
     *,
     results: list[BackendResult],
     dataset_name: str,
     timeout: int,
     max_workers: int,
 ) -> list[BackendResult]:
-    if not results:
-        return []
-
     updated_results = {result.instance_id: result for result in results}
     grouped_results: dict[str | None, list[BackendResult]] = {}
     for result in results:
@@ -471,16 +622,13 @@ def run_harness_evaluation(
                             evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
                             evaluation_result_path.write_text(
                                 json.dumps(
-                                    {
-                                        "completed_ids": [],
-                                        "incomplete_ids": [],
-                                        "empty_patch_ids": [result.instance_id] if result.prediction_chars == 0 else [],
-                                        "submitted_ids": [result.instance_id],
-                                        "resolved_ids": [],
-                                        "unresolved_ids": [],
-                                        "error_ids": [result.instance_id],
-                                        "schema_version": 2,
-                                    },
+                                    _build_evaluation_payload(
+                                        instance_id=result.instance_id,
+                                        completed=False,
+                                        resolved=False,
+                                        empty_patch=result.prediction_chars == 0,
+                                        error=True,
+                                    ),
                                     indent=2,
                                 )
                             )
@@ -512,18 +660,19 @@ def run_harness_evaluation(
                         elif not empty_patch:
                             error = True
 
-                        evaluation = {
-                            "completed_ids": [result.instance_id] if completed else [],
-                            "incomplete_ids": [],
-                            "empty_patch_ids": [result.instance_id] if empty_patch else [],
-                            "submitted_ids": [result.instance_id],
-                            "resolved_ids": [result.instance_id] if resolved else [],
-                            "unresolved_ids": [result.instance_id] if completed and not resolved else [],
-                            "error_ids": [result.instance_id] if error else [],
-                            "schema_version": 2,
-                        }
                         evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
-                        evaluation_result_path.write_text(json.dumps(evaluation, indent=2))
+                        evaluation_result_path.write_text(
+                            json.dumps(
+                                _build_evaluation_payload(
+                                    instance_id=result.instance_id,
+                                    completed=completed,
+                                    resolved=resolved,
+                                    empty_patch=empty_patch,
+                                    error=error,
+                                ),
+                                indent=2,
+                            )
+                        )
                         updated_results[result.instance_id] = BackendResult(
                             **{
                                 **asdict(result),
@@ -540,6 +689,32 @@ def run_harness_evaluation(
     return [updated_results[result.instance_id] for result in results]
 
 
+def run_harness_evaluation(
+    *,
+    results: list[BackendResult],
+    dataset_name: str,
+    timeout: int,
+    max_workers: int,
+    instances_by_id: dict[str, dict[str, Any]] | None = None,
+) -> list[BackendResult]:
+    if not results:
+        return []
+    if is_rebench_dataset_name(dataset_name):
+        return _run_rebench_harness_evaluation(
+            results=results,
+            dataset_name=dataset_name,
+            timeout=timeout,
+            max_workers=max_workers,
+            instances_by_id=instances_by_id,
+        )
+    return _run_swebench_harness_evaluation(
+        results=results,
+        dataset_name=dataset_name,
+        timeout=timeout,
+        max_workers=max_workers,
+    )
+
+
 def evaluate_swebench_instance_patches(
     *,
     instance: dict[str, Any],
@@ -549,6 +724,15 @@ def evaluate_swebench_instance_patches(
     namespace: str | None,
     work_dir: Path,
 ) -> dict[str, float]:
+    if is_rebench_instance(instance):
+        return evaluate_rebench_instance_patches_backend(
+            instance=instance,
+            patches_by_key=patches_by_key,
+            max_workers=max_workers,
+            timeout=DEFAULT_EVAL_TIMEOUT,
+            work_dir=work_dir,
+        )
+
     rewards: dict[str, float] = {}
     unique_patches: dict[str, dict[str, Any]] = {}
     for key, patch in patches_by_key.items():
@@ -751,6 +935,7 @@ def run_swe_instance_multi(
                 dataset_name=DATASET_MAPPING.get(benchmark_name, benchmark_name),
                 timeout=eval_timeout,
                 max_workers=workers,
+                instances_by_id={instance["instance_id"]: instance for instance in instances},
             )
         except Exception as exc:
             if effective_run_log_path:
@@ -791,7 +976,7 @@ def run_swe_agent_backend(
     backend_name: str,
     instance_ids: Sequence[str] | None,
 ) -> list[BackendResult]:
-    model_name = args.vllm_client_model if backend_name == "vllm" else args.openai_model
+    model_name = args.vllm_model if backend_name == "vllm" else args.openai_model
     if args._evaluation_only:
         available_instances = load_swebench_instances(args.subset, args.split)
         by_id = {instance["instance_id"]: instance for instance in available_instances}
@@ -858,6 +1043,7 @@ def run_swe_agent_backend(
             dataset_name=DATASET_MAPPING.get(args.subset, args.subset),
             timeout=args.eval_timeout,
             max_workers=args.workers,
+            instances_by_id=by_id,
         )
 
     gpu_id: int | None = None
@@ -869,7 +1055,7 @@ def run_swe_agent_backend(
         if gpu_id is None:
             raise RuntimeError("vLLM backend requires a GPU; got gpu_id=none")
         vllm_handle = launch_vllm_server_handle(
-            model_name=args.vllm_serve_model,
+            model_name=args.vllm_model,
             port=find_free_port(args.vllm_port),
             gpu_id=gpu_id,
             gpu_ids=gpu_ids,
@@ -953,8 +1139,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--allow-long-max-model-len", action="store_true")
-    parser.add_argument("--vllm-serve-model", default=DEFAULT_VLLM_SERVE_MODEL)
-    parser.add_argument("--vllm-client-model", default=DEFAULT_VLLM_CLIENT_MODEL)
+    parser.add_argument("--vllm-model", default=DEFAULT_SERVE_MODEL)
     parser.add_argument("--openai-model", default=DEFAULT_OPENAI_MODEL)
     parser.add_argument("--model-retry-attempts", type=int, default=2)
     parser.add_argument("--completion-max-tokens", type=int, default=DEFAULT_COMPLETION_MAX_TOKENS)
@@ -973,7 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
     backend_names = ["vllm", "openai"] if args.backend == "both" else [args.backend]
     results: list[BackendResult] = []
     for backend_name in backend_names:
-        prepared_model_name = args.vllm_client_model if backend_name == "vllm" else args.openai_model
+        prepared_model_name = args.vllm_model if backend_name == "vllm" else args.openai_model
         target_label = "__all__" if instance_ids is None else "__".join(instance_ids)
         fallback_run_dir = (
             args.output_root

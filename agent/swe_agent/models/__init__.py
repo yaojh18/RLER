@@ -86,6 +86,7 @@ _MODEL_CLASS_MAPPING = {
     "portkey_response": "swe_agent.models.portkey_response_model.PortkeyResponseAPIModel",
     "requesty": "swe_agent.models.requesty_model.RequestyModel",
     "model_service_textbased": "swe_agent.models.model_service_textbased_model.ModelServiceTextbasedModel",
+    "route_textbased": "swe_agent.models.route_textbased_model.RouteTextbasedModel",
     "deterministic": "swe_agent.models.test_models.DeterministicModel",
 }
 

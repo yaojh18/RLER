@@ -696,7 +696,7 @@ async def _update_persistent_state(
     )
     for _ in range(EVALUATOR_MAX_RETRIES):
         response = await run_chat_with_route_async(
-            "rubric_generation",
+            "rubric_judge",
             model_name=model_name,
             user_prompt=prompt,
             temperature=temperature,

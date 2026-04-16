@@ -8,6 +8,8 @@ import contextlib
 import json
 import random
 import re
+import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -63,6 +65,7 @@ DATASET_MAPPING = {
     "smith": "SWE-bench/SWE-smith",
     "_test": "klieret/swe-bench-dummy-test-dataset",
     "rebench": "nebius/SWE-rebench",
+    "rebench_v2": "nebius/SWE-rebench-V2",
 }
 
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
@@ -72,6 +75,7 @@ _PREPARED_IMAGES: set[str] = set()
 _IMAGE_RESOLUTION_LOCK = threading.Lock()
 _IMAGE_RESOLUTION_CACHE: dict[str, tuple[str, str | None]] = {}
 OFFICIAL_IMAGE_NAMESPACE = "swebench"
+REBENCH_VENDOR_ROOT = Path(__file__).resolve().parent / "SWE-rebench-V2"
 
 
 class ProgressTrackingAgent(DefaultAgent):
@@ -106,11 +110,14 @@ def resolve_swebench_image(instance: dict) -> tuple[str, str | None]:
     if cached is not None:
         return cached
 
-    image_name = instance.get("image_name") or instance.get("docker_image")
-    if image_name:
-        resolved = (image_name, _infer_harness_namespace(image_name, instance))
+    if _is_rebench_instance(instance):
+        resolved = _resolve_rebench_image(instance)
     else:
-        resolved = _resolve_generated_swebench_image(instance)
+        image_name = instance.get("image_name") or instance.get("docker_image")
+        if image_name:
+            resolved = (image_name, _infer_harness_namespace(image_name, instance))
+        else:
+            resolved = _resolve_generated_swebench_image(instance)
 
     with _IMAGE_RESOLUTION_LOCK:
         _IMAGE_RESOLUTION_CACHE[instance_id] = resolved
@@ -144,6 +151,109 @@ def _resolve_generated_swebench_image(instance: dict) -> tuple[str, str | None]:
     return image_name, None
 
 
+def _is_rebench_instance(instance: dict) -> bool:
+    return bool(instance.get("image_name")) and isinstance(instance.get("install_config"), dict)
+
+
+def _local_image_exists(image_name: str) -> bool:
+    image_not_found = getattr(docker.errors, "ImageNotFound", docker.errors.NotFound)
+    client = docker.from_env()
+    try:
+        client.images.get(image_name)
+        return True
+    except (image_not_found, docker.errors.NotFound):
+        return False
+    finally:
+        client.close()
+
+
+def _resolve_rebench_image(instance: dict) -> tuple[str, str | None]:
+    image_name = instance["image_name"]
+    if _local_image_exists(image_name):
+        return image_name, None
+    if _registry_image_exists(image_name):
+        return image_name, None
+    _build_rebench_instance_image(instance)
+    return image_name, None
+
+
+def _build_rebench_instance_image(instance: dict) -> None:
+    image_name = instance["image_name"]
+    with _PREPARED_IMAGE_LOCK:
+        if image_name in _PREPARED_IMAGES or _local_image_exists(image_name):
+            _PREPARED_IMAGES.add(image_name)
+            return
+        install_config = instance.get("install_config") or {}
+        base_image_name = install_config.get("image_name") or install_config.get("base_image_name")
+        if not isinstance(base_image_name, str) or not base_image_name.strip():
+            raise RuntimeError(f"Instance {instance['instance_id']} is missing install_config.base_image_name")
+        _build_rebench_base_image(base_image_name)
+        repo = instance["repo"]
+        project_dir = f"/{repo.split('/', 1)[1]}"
+        install_commands = [command for command in install_config.get("install", []) if isinstance(command, str) and command.strip()]
+        dockerfile_lines = [
+            f"FROM --platform=linux/amd64 {base_image_name} AS base",
+            f"FROM --platform=linux/amd64 base AS {instance['instance_id']}",
+            "RUN <<'DOCKER_RUN_EOF'",
+            "set -eux",
+            f"git clone -o origin https://github.com/{repo} {project_dir}",
+            f"chmod -R 777 {project_dir}",
+            f"cd {project_dir}",
+            f"git reset --hard {instance['base_commit']}",
+            "git remote remove origin || true",
+        ]
+        dockerfile_lines.extend(f"( {command} ) || true" for command in install_commands)
+        dockerfile_lines.extend(["DOCKER_RUN_EOF", "", f"WORKDIR {project_dir}", ""])
+        with tempfile.TemporaryDirectory(prefix="rebench-build-") as temp_dir:
+            dockerfile_path = Path(temp_dir) / "Dockerfile"
+            dockerfile_path.write_text("\n".join(dockerfile_lines), encoding="utf-8")
+            subprocess.run(
+                ["docker", "build", "--platform", "linux/amd64", "-f", str(dockerfile_path), "-t", image_name, temp_dir],
+                check=True,
+            )
+        _PREPARED_IMAGES.add(image_name)
+
+
+def _build_rebench_base_image(base_image_name: str) -> None:
+    if _local_image_exists(base_image_name):
+        return
+    dockerfile = _resolve_rebench_base_dockerfile(base_image_name)
+    subprocess.run(
+        [
+            "docker",
+            "build",
+            "--platform",
+            "linux/amd64",
+            "-f",
+            str(dockerfile),
+            "-t",
+            base_image_name,
+            str(dockerfile.parent),
+        ],
+        check=True,
+    )
+
+
+def _resolve_rebench_base_dockerfile(base_image_name: str) -> Path:
+    dockerfiles_dir = REBENCH_VENDOR_ROOT / "base_dockerfiles"
+    image_stub = base_image_name.rsplit("/", 1)[-1].split(":", 1)[0]
+    candidates = [f"Dockerfile_{image_stub}"]
+    if image_stub.startswith("python_base_"):
+        suffix = image_stub.removeprefix("python_base_")
+        if suffix.isdigit() and len(suffix) in {2, 3}:
+            candidates.append(f"Dockerfile_python_{suffix[0]}.{suffix[1:]}")
+        candidates.append(f"Dockerfile_python_{suffix}")
+    else:
+        match = re.match(r"(?P<lang>[a-z]+)_base_(?P<version>.+)", image_stub)
+        if match:
+            candidates.append(f"Dockerfile_{match.group('lang')}_{match.group('version')}")
+    for candidate in candidates:
+        path = dockerfiles_dir / candidate
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"Could not map Rebench base image {base_image_name} to a Dockerfile in {dockerfiles_dir}")
+
+
 def _registry_image_exists(image_name: str) -> bool:
     client = docker.from_env()
     try:
@@ -159,7 +269,10 @@ def _registry_image_exists(image_name: str) -> bool:
 
 
 def _infer_harness_namespace(image_name: str, instance: dict) -> str | None:
-    official_image = make_test_spec(instance, namespace=OFFICIAL_IMAGE_NAMESPACE).instance_image_key
+    try:
+        official_image = make_test_spec(instance, namespace=OFFICIAL_IMAGE_NAMESPACE).instance_image_key
+    except Exception:
+        return None
     if image_name == official_image:
         return OFFICIAL_IMAGE_NAMESPACE
     return None

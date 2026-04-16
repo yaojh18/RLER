@@ -112,6 +112,129 @@ def test_find_repo_root_points_at_current_repo():
     assert AGENT_ROOT == expected_root / "agent"
 
 
+def test_load_rebench_v2_alias(monkeypatch: pytest.MonkeyPatch):
+    calls = {}
+
+    def fake_load_dataset(path, split):
+        calls["path"] = path
+        calls["split"] = split
+        return [{"instance_id": "demo__demo"}]
+
+    monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=fake_load_dataset))
+
+    records = swebench_run.load_swebench_instances("rebench_v2", "train")
+
+    assert calls == {"path": "nebius/SWE-rebench-V2", "split": "train"}
+    assert records == [{"instance_id": "demo__demo"}]
+
+
+def test_run_harness_evaluation_uses_rebench_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    patch_path = run_dir / "model_patch.json"
+    patch_path.write_text(
+        json.dumps(
+            {
+                "demo__demo-1": {
+                    "model_name_or_path": "Qwen/Qwen3.5-9B",
+                    "instance_id": "demo__demo-1",
+                    "model_patch": "diff --git a/a b/a\n",
+                }
+            }
+        )
+    )
+    log_path = tmp_path / "driver.log"
+    log_path.write_text("")
+    result = BackendResult(
+        benchmark_name="rebench_v2",
+        split="train",
+        backend="vllm",
+        model_name="Qwen/Qwen3.5-9B",
+        instance_id="demo__demo-1",
+        run_dir=str(run_dir),
+        raw_trajectory_path=None,
+        slim_trajectory_path=None,
+        patch_path=str(patch_path),
+        log_path=str(log_path),
+        evaluation_result_path=None,
+        exit_status="submitted",
+        submission_chars=12,
+        prediction_chars=18,
+        evaluation_completed=False,
+        resolved=None,
+        run_id=None,
+        error=None,
+        harness_namespace=None,
+        swebench_command=None,
+        evaluation_command=None,
+        vllm_command=None,
+        vllm_log_path=None,
+        gpu_id=None,
+    )
+
+    monkeypatch.setattr(
+        "swe_agent.run.run_swe_agent.evaluate_rebench_prediction",
+        lambda **kwargs: {
+            "instance_id": kwargs["instance"]["instance_id"],
+            "resolved": True,
+            "passed_actual": ["tests::ok"],
+            "failed_actual": [],
+            "passed_expected": ["tests::ok"],
+            "log_path": str(run_dir / "rebench_eval" / "demo__demo-1.log"),
+        },
+    )
+
+    updated = run_harness_evaluation(
+        results=[result],
+        dataset_name="nebius/SWE-rebench-V2",
+        timeout=60,
+        max_workers=1,
+        instances_by_id={
+            "demo__demo-1": {
+                "instance_id": "demo__demo-1",
+                "repo": "demo/demo",
+                "image_name": "docker.io/swerebenchv2/demo-demo:1",
+                "install_config": {"test_cmd": ["pytest"], "log_parser": "parse_log_pytest"},
+                "PASS_TO_PASS": [],
+                "FAIL_TO_PASS": [],
+                "test_patch": "diff --git a/tests b/tests\n",
+            }
+        },
+    )
+
+    assert updated[0].resolved is True
+    assert updated[0].evaluation_completed is True
+    assert Path(updated[0].evaluation_result_path).exists()
+    assert (run_dir / "rebench_evaluation.json").exists()
+
+
+def test_evaluate_swebench_instance_patches_dispatches_rebench_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    captured = {}
+
+    def fake_eval_backend(**kwargs):
+        captured.update(kwargs)
+        return {"node-1": 1.0}
+
+    monkeypatch.setattr("swe_agent.run.run_swe_agent.evaluate_rebench_instance_patches_backend", fake_eval_backend)
+
+    rewards = evaluate_swebench_instance_patches(
+        instance={
+            "instance_id": "demo__demo-1",
+            "image_name": "docker.io/swerebenchv2/demo-demo:1",
+            "install_config": {"test_cmd": ["pytest"], "log_parser": "parse_log_pytest"},
+        },
+        patches_by_key={"node-1": "diff --git a/a b/a\n"},
+        model_name="Qwen/Qwen3.5-9B",
+        max_workers=2,
+        namespace=None,
+        work_dir=tmp_path,
+    )
+
+    assert rewards == {"node-1": 1.0}
+    assert captured["max_workers"] == 2
+    assert captured["timeout"] == 900
+
+
 def test_resolve_vllm_serve_command_prefers_interpreter_adjacent_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     real_python_dir = tmp_path / "real"
     real_python_dir.mkdir()
@@ -256,6 +379,54 @@ def test_launch_vllm_server_handle_supports_tensor_parallel(monkeypatch: pytest.
     assert envs[0]["CUDA_VISIBLE_DEVICES"] == "0,1"
 
 
+def test_launch_vllm_server_handle_supports_served_model_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    commands: list[list[str]] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"pong"}}]}'
+
+    class FakeProcess:
+        pid = 789
+
+        @staticmethod
+        def poll():
+            return None
+
+    vllm_bin = tmp_path / "bin"
+    vllm_bin.mkdir(parents=True)
+    vllm_path = vllm_bin / "vllm"
+    vllm_path.write_text("")
+
+    monkeypatch.setattr(dr_utils, "_resolve_vllm_base_command", lambda: [str(vllm_path), "serve"])
+    monkeypatch.setattr(dr_utils, "check_port", lambda port: True)
+    monkeypatch.setattr(dr_utils, "time", types.SimpleNamespace(time=lambda: 0, sleep=lambda _: None))
+    monkeypatch.setattr(dr_utils.urllib.request, "urlopen", lambda *args, **kwargs: FakeResponse())
+
+    def fake_popen(cmd, **kwargs):
+        commands.append(cmd)
+        return FakeProcess()
+
+    monkeypatch.setattr(dr_utils.subprocess, "Popen", fake_popen)
+
+    handle = dr_utils.launch_vllm_server_handle(
+        "/models/Qwen3.5-9B",
+        8013,
+        gpu_id=0,
+        served_model_name="Qwen/Qwen3.5-9B",
+    )
+
+    assert "--served-model-name" in commands[0]
+    assert "Qwen/Qwen3.5-9B" in commands[0]
+    assert handle.model_name == "Qwen/Qwen3.5-9B"
+
+
 def test_resolve_swebench_image_prefers_official_registry(monkeypatch: pytest.MonkeyPatch):
     swebench_run._IMAGE_RESOLUTION_CACHE.clear()
     swebench_run._PREPARED_IMAGES.clear()
@@ -321,6 +492,62 @@ def test_resolve_swebench_image_builds_local_when_registry_missing(monkeypatch: 
     assert image_name == "sweb.eval.x86_64.missing__instance:latest"
     assert namespace is None
     assert build_calls == ["env", "instance"]
+
+
+def test_resolve_swebench_image_with_dataset_image_and_missing_version_skips_namespace_inference(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    swebench_run._IMAGE_RESOLUTION_CACHE.clear()
+    instance = {
+        "instance_id": "axios__axios-5831",
+        "repo": "axios/axios",
+        "version": None,
+        "image_name": "docker.io/swerebenchv2/axios-axios:5831-3f53eb6",
+    }
+
+    def fake_make_test_spec(*args, **kwargs):
+        raise KeyError(None)
+
+    monkeypatch.setattr(swebench_run, "make_test_spec", fake_make_test_spec)
+
+    image_name, namespace = swebench_run.resolve_swebench_image(instance)
+
+    assert image_name == "docker.io/swerebenchv2/axios-axios:5831-3f53eb6"
+    assert namespace is None
+
+
+def test_resolve_swebench_image_builds_rebench_image_when_registry_missing(monkeypatch: pytest.MonkeyPatch):
+    swebench_run._IMAGE_RESOLUTION_CACHE.clear()
+    swebench_run._PREPARED_IMAGES.clear()
+    build_calls: list[str] = []
+    instance = {
+        "instance_id": "pvlib__pvlib-python-278",
+        "repo": "pvlib/pvlib-python",
+        "base_commit": "abc123",
+        "image_name": "docker.io/swerebenchv2/pvlib-pvlib-python:278-6a41299",
+        "install_config": {
+            "base_image_name": "python_base_37",
+            "install": ["pip install -e ."],
+        },
+    }
+
+    monkeypatch.setattr(swebench_run, "_local_image_exists", lambda image_name: False)
+    monkeypatch.setattr(swebench_run, "_registry_image_exists", lambda image_name: False)
+    monkeypatch.setattr(swebench_run, "_build_rebench_base_image", lambda image_name: build_calls.append(f"base:{image_name}"))
+    monkeypatch.setattr(swebench_run.subprocess, "run", lambda command, check=True: build_calls.append(f"instance:{command[-2]}"))
+
+    image_name, namespace = swebench_run.resolve_swebench_image(instance)
+
+    assert image_name == instance["image_name"]
+    assert namespace is None
+    assert build_calls[0] == "base:python_base_37"
+    assert build_calls[1].startswith("instance:docker.io/swerebenchv2/pvlib-pvlib-python:278-6a41299")
+
+
+def test_resolve_rebench_base_dockerfile_maps_python_alias():
+    dockerfile = swebench_run._resolve_rebench_base_dockerfile("python_base_37")
+
+    assert dockerfile.name == "Dockerfile_python_3.7"
 
 
 def test_process_instance_cleans_up_environment_after_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -692,11 +919,12 @@ def test_run_swe_agent_backend_evaluation_only_uses_existing_outputs(tmp_path: P
     monkeypatch.setattr(run_module, "load_swebench_instances", lambda subset, split: [{"instance_id": instance_id}])
     monkeypatch.setattr(run_module, "get_swebench_harness_namespace", lambda instance: "swebench")
 
-    def fake_run_harness_evaluation(*, results, dataset_name, timeout, max_workers):
+    def fake_run_harness_evaluation(*, results, dataset_name, timeout, max_workers, instances_by_id=None):
         captured["results"] = results
         captured["dataset_name"] = dataset_name
         captured["timeout"] = timeout
         captured["max_workers"] = max_workers
+        captured["instances_by_id"] = instances_by_id
         return results
 
     monkeypatch.setattr(run_module, "run_harness_evaluation", fake_run_harness_evaluation)
@@ -708,7 +936,7 @@ def test_run_swe_agent_backend_evaluation_only_uses_existing_outputs(tmp_path: P
         workers=2,
         eval_timeout=900,
         openai_model="gemini/gemini-3.1-pro-preview",
-        vllm_client_model="openai/Qwen/Qwen3-8B",
+        vllm_model="Qwen/Qwen3-8B",
         _evaluation_only=timestamp,
         _run_log_path=tmp_path / "logs" / f"{timestamp}.log",
     )
@@ -720,4 +948,5 @@ def test_run_swe_agent_backend_evaluation_only_uses_existing_outputs(tmp_path: P
     assert captured["dataset_name"] == "princeton-nlp/SWE-Bench_Verified"
     assert captured["timeout"] == 900
     assert captured["max_workers"] == 2
+    assert captured["instances_by_id"] == {instance_id: {"instance_id": instance_id}}
     assert captured["results"][0].instance_id == instance_id
