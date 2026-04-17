@@ -15,7 +15,11 @@ from pathlib import Path
 from statistics import pvariance
 from typing import Any, Literal
 
-from agent_rl.run_utils import extract_json_from_response, run_chat_with_route_async
+from agent_rl.run_utils import (
+    extract_json_from_response,
+    run_chat_with_route_async,
+    run_chat_with_route_completion_async,
+)
 
 from swe_agent import __version__
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
@@ -25,19 +29,24 @@ from swe_agent.run.run_swe_agent import build_slim_trajectory, evaluate_swebench
 
 
 SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT = """
-You are an expert evaluator generating adaptive rubrics to assess model responses.
+You are an expert evaluator generating adaptive rubrics to assess agent trajectory continuations.
 
 ## Task
-Identify the most discriminative criteria that distinguish high-quality from low-quality agent trajectory continuations. Capture subtle quality differences that existing rubrics miss.
+Identify the single most discriminative criterion that distinguishes high-quality from low-quality agent trajectory continuations and is not already covered by the existing rubrics. Capture subtle quality differences that existing rubrics miss.
+This is a multi-turn rubric generation setting. At each turn, generate at most one new rubric. The user may ask to continue in later turns. Existing Rubrics contains previously generated rubrics and should be used to understand the current evaluation gap and avoid redundancy.
+If no additional high-impact, non-redundant rubric remains, return an empty JSON object: {}.
 
 ## Output Components
 - **Description**: Detailed, specific description of what makes a continuation excellent/problematic
 - **Title**: Concise abstract label (general, not task-specific)
 - **Scale**: A five-point scale from 1 to 5 with concrete anchors for this rubric
+- **Polarity**: Either `"positive"` or `"negative"`
 
 ## Categories
+A rubric may be either:
 1. **Positive Rubrics**: Excellence indicators distinguishing superior continuations
 2. **Negative Rubrics**: Critical flaws definitively degrading quality
+Represent this choice using the `polarity` field in the rubric object.
 
 ## Core Guidelines
 
@@ -45,7 +54,6 @@ Identify the most discriminative criteria that distinguish high-quality from low
 - Focus ONLY on criteria meaningfully separating quality levels
 - Each rubric must distinguish between otherwise similar continuations from the same shared prefix
 - Exclude generic criteria applying equally to all continuations
-- If the continuations are still in the exploration stage, prefer rubrics about exploration quality, reproduction quality, repository grounding, file targeting, and follow-through rather than returning empty lists
 
 ### 2. Novelty & Non-Redundancy
 With existing rubrics:
@@ -64,54 +72,50 @@ Never create positive/negative versions of same criterion:
 - Response penalized if it exhibits ANY negative rubric behavior
 - Focus on active mistakes vs missing features
 
+### 5. Prefer the strongest available evidence form
+Choose the rubric form that can be judged most concretely at the current agent stage:
+- When the agent is still gathering evidence, prefer action-based rubrics. Evaluate whether the agent actually did the exact key work, such as reproducing the exact issue, inspecting the right files, grounding claims in problem statement. These rubrics should be checkable from concrete actions in the trajectory.
+- When a continuation has proposed or made a fix, prefer test-based rubrics. Define targeted test cases or executable checks, then judge whether the current patch would pass or fail them without execution. Favor rubrics that make concrete pass/fail predictions over general judgments about patch quality.
+- Always prefer the most falsifiable rubric available. Strong rubrics point to specific files, commands, edits, tests, expected outputs, or pass/fail predictions. Avoid vague rubrics based mainly on impressions such as "thoughtful", "careful", or "correct".
+
 ## Selection Strategy
 
-### Quantity: 1-5 total rubrics (fewer high-quality > many generic)
+### Quantity: 0-1 rubric total per turn, and 0-6 total rubrics in total (fewer high-quality > many generic)
+- Generate exactly one rubric only if it adds meaningful new discriminative value
+- Otherwise return an empty object: {}
 
-### Distribution Based on Response Patterns:
-- **More positive**: Continuations lack sophistication but avoid major errors
-- **More negative**: Systematic failure patterns present
-- **Balanced**: Both excellence gaps and failure modes exist
-- **Empty lists**: Existing rubrics already comprehensive
+### Polarity Selection Based on Response Patterns:
+- **More positive**: When continuations lack sophistication but avoid major errors
+- **More negative**: When systematic failure patterns are present
+- **Balanced across turns**: When both excellence gaps and failure modes exist
+- **Empty object**: When existing rubrics are already comprehensive
 
 ## Analysis Process
 1. Group continuations by quality level
 2. Find factors separating higher/lower clusters
 3. Check if factors covered by existing rubrics
-4. Select criteria with highest discriminative value
-5. Brief reasoning is allowed and should stay concrete
+4. Select the single criterion with the highest discriminative value
 
 ## Output Format
 ```json
 {
-  "reasoning": "<brief grounded analysis>",
-  "positive_rubrics": [
-    {
-      "description": "<detailed excellence description>",
-      "title": "<abstract label>",
-      "scale": {
-        "1": "<worst case for this positive rubric>",
-        "2": "<weak>",
-        "3": "<partial>",
-        "4": "<strong>",
-        "5": "<best case>"
-      }
+  "rubric": {
+    "polarity": "<positive|negative>",
+    "description": "<detailed excellence/failure description>",
+    "title": "<abstract label>",
+    "scale": {
+      "1": "<worst case anchor>",
+      "2": "<weak/minor issue anchor>",
+      "3": "<partial/moderate anchor>",
+      "4": "<strong/serious issue anchor>",
+      "5": "<best case/severe issue anchor>"
     }
-  ],
-  "negative_rubrics": [
-    {
-      "description": "<detailed failure description>",
-      "title": "<abstract label>",
-      "scale": {
-        "1": "<no issue>",
-        "2": "<minor issue>",
-        "3": "<moderate issue>",
-        "4": "<serious issue>",
-        "5": "<severe issue>"
-      }
-    }
-  ]
+  }
 }
+```
+If no new high-impact, non-redundant rubric should be added, output:
+```json
+{}
 ```
 
 ## Inputs
@@ -126,13 +130,15 @@ Never create positive/negative versions of same criterion:
 - Exclude rubrics applying equally to all continuations
 - Prefer empty lists over redundancy when existing rubrics are comprehensive
 - Focus on observable, objective, actionable criteria
-- Quality over quantity: 2 excellent rubrics > 5 mediocre ones
+- Quality over quantity: 1 excellent rubric > multiple mediocre ones
 - The shared context is common to all continuations. Focus the rubric on differences between the continuations themselves
 - Do not return empty lists when there are visible differences in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
 - Output in the requried format. Do not restate the question, previous state, agent tracjectories, or existing rubrics in the response.
 
 Generate only the most impactful, non-redundant rubrics revealing meaningful quality differences.
 """
+
+RUBRIC_GENERATION_CONTINUE_PROMPT = "Generate the next best rubric or return an empty object."
 
 SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT = """
 You are an expert evaluator scoring one agent trajectory continuation against one rubric.
@@ -146,13 +152,11 @@ Evaluate the provided continuation trajectory using the provided criterion and t
 - Score the continuation trajectory itself, not the underlying task or bug in the abstract
 - Use only evidence visible in the continuation trajectory. Do not hallucinate or infer unstated facts
 - Use the previous persistent state and latest agent trajectory only when it is needed to interpret the continuation
-- Brief reasoning is allowed and should stay concrete
-- Output in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response
+- Output only score in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response
 
 ## Output Format
 ```json
 {
-  "reasoning": "<brief grounded explanation>",
   "score": <a score on a scale of 1 to 5 indicating how appropriate the continuation is based on the scale of the given criterion>
 }
 ```
@@ -179,14 +183,12 @@ Evaluate the provided agent trajectory using the provided criterion and the shar
 - Score the agent trajectory itself, not the underlying task or bug in the abstract
 - Use only evidence visible in the trajectory. Do not hallucinate or infer unstated facts
 - Use the previous persistent state only when it is needed to interpret the tracjectory
-- Brief reasoning is allowed and should stay concrete
-- Output in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response
+Output only score in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response
 
 
 ## Output Format
 ```json
 {
-  "reasoning": "<brief grounded explanation>",
   "score": <a score on a scale of 1 to 5 indicating how appropriate the continuation is based on the scale of the given criterion>
 }
 ```
@@ -324,19 +326,18 @@ RUBRIC_GENERATION_RESPONSE_FORMAT = {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "reasoning": {"type": "string"},
-                "positive_rubrics": {
-                    "type": "array",
-                    "items": RUBRIC_ITEM_JSON_SCHEMA,
-                    "maxItems": 4,
-                },
-                "negative_rubrics": {
-                    "type": "array",
-                    "items": RUBRIC_ITEM_JSON_SCHEMA,
-                    "maxItems": 4,
+                "rubric": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "polarity": {"type": "string", "enum": ["positive", "negative"]},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "scale": RUBRIC_SCALE_JSON_SCHEMA,
+                    },
+                    "required": ["polarity", "title", "description", "scale"],
                 },
             },
-            "required": ["reasoning", "positive_rubrics", "negative_rubrics"],
         },
     },
 }
@@ -350,10 +351,9 @@ JUDGE_RESPONSE_FORMAT = {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "reasoning": {"type": "string"},
                 "score": {"type": "integer", "minimum": 1, "maximum": 5},
             },
-            "required": ["reasoning", "score"],
+            "required": ["score"],
         },
     },
 }
@@ -709,94 +709,82 @@ async def _update_persistent_state(
     return copy.deepcopy(previous_state)
 
 
-def _convert_generated_rubrics(task: str, payload: dict[str, Any], round_index: int) -> list[RubricRecord]:
-    rubrics: list[RubricRecord] = []
-    for direction, weight, key in [("positive", 1, "positive_rubrics"), ("negative", -1, "negative_rubrics")]:
-        for item in payload.get(key, []) or []:
-            title = str(item.get("title", "")).strip()
-            description = str(item.get("description", "")).strip()
-            scale = {str(score): str(text) for score, text in (item.get("scale") or {}).items()}
-            if not title or not description or set(scale) != {"1", "2", "3", "4", "5"}:
-                continue
-            rubric_id = hashlib.md5(
-                json.dumps(
-                    {
-                        "task": task,
-                        "direction": direction,
-                        "title": title,
-                        "description": description,
-                        "scale": scale,
-                    },
-                    sort_keys=True,
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            ).hexdigest()[:12]
-            rubrics.append(
-                RubricRecord(
-                    rubric_id=rubric_id,
-                    title=title,
-                    direction=direction,
-                    description=description,
-                    scale=scale,
-                    weight=weight,
-                    source_round=round_index,
-                )
-            )
-    return list({rubric.rubric_id: rubric for rubric in rubrics}.values())
+def _convert_generated_rubric(task: str, payload: dict[str, Any], round_index: int) -> RubricRecord | None:
+    item = payload.get("rubric")
+    if not isinstance(item, dict):
+        return None
+    direction = str(item.get("polarity", "")).strip().lower()
+    if direction not in {"positive", "negative"}:
+        return None
+    title = str(item.get("title", "")).strip()
+    description = str(item.get("description", "")).strip()
+    scale = {str(score): str(text) for score, text in (item.get("scale") or {}).items()}
+    if not title or not description or set(scale) != {"1", "2", "3", "4", "5"}:
+        return None
+    rubric_id = hashlib.md5(
+        json.dumps(
+            {
+                "task": task,
+                "direction": direction,
+                "title": title,
+                "description": description,
+                "scale": scale,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+    return RubricRecord(
+        rubric_id=rubric_id,
+        title=title,
+        direction=direction,
+        description=description,
+        scale=scale,
+        weight=1 if direction == "positive" else -1,
+        source_round=round_index,
+    )
 
 
 def _build_initial_rubric_bank(task: str) -> list[RubricRecord]:
-    payload = {
-        "positive_rubrics": [
+    bank = [
+        _convert_generated_rubric(
+            task,
             {
-                "title": "Validation Follow-Through",
-                "description": "Runs focused reproduction or validation commands and uses the results to refine the next step instead of treating validation as a box-checking exercise.",
-                "scale": {
-                    "1": "No meaningful validation or reproduction attempt",
-                    "2": "Weak or poorly targeted validation",
-                    "3": "Relevant validation with limited follow-through",
-                    "4": "Focused validation that materially informs the next step",
-                    "5": "Focused validation with strong interpretation and follow-through",
-                },
+                "rubric": {
+                    "polarity": "positive",
+                    "title": "Evidence-to-Decision Traceability",
+                    "description": "Ties major next steps or fix proposals to concrete evidence already surfaced in the trajectory—such as an observed failure, command/check output, file or function inspection, a named code location, or a test result—and makes clear how that evidence changes the plan.",
+                    "scale": {
+                        "1": "Major decisions are not tied to any concrete evidence already surfaced in the trajectory",
+                        "2": "Mentions concrete evidence, but the link from evidence to the chosen next step is mostly implicit or weak",
+                        "3": "At least one important next step is explicitly justified by concrete evidence, but other key decisions remain weakly supported",
+                        "4": "Most important next steps or fix proposals are explicitly tied to concrete evidence and the effect on the plan is clear",
+                        "5": "Nearly every important pivot, hypothesis update, or fix proposal is explicitly anchored to concrete evidence, with a clear explanation of how that evidence drives the next move",
+                    },
+                }
             },
+            0,
+        ),
+        _convert_generated_rubric(
+            task,
             {
-                "title": "Change Precision",
-                "description": "Keeps edits narrowly scoped to the implicated logic and avoids unnecessary churn, speculative rewrites, or unrelated modifications.",
-                "scale": {
-                    "1": "No clear edit strategy or broadly unfocused changes",
-                    "2": "Mostly unfocused or weakly scoped changes",
-                    "3": "Partially focused but with some unnecessary churn",
-                    "4": "Mostly precise, relevant changes",
-                    "5": "Highly precise and well-targeted changes only where needed",
-                },
-            }
-        ],
-        "negative_rubrics": [
-            {
-                "title": "Premature Resolution",
-                "description": "Acts as if the issue is solved, or submits a patch, without enough evidence, validation, or a coherent causal link from the observed problem to the proposed fix.",
-                "scale": {
-                    "1": "No premature resolution behavior",
-                    "2": "Minor overclaiming",
-                    "3": "Noticeable overclaiming or weakly justified completion",
-                    "4": "Serious premature resolution behavior",
-                    "5": "Severe premature resolution dominating the continuation",
-                },
+                "rubric": {
+                    "polarity": "negative",
+                    "title": "Closure Without a Decisive Check",
+                    "description": "Claims or strongly implies that the issue is fixed, understood, or ready to close without naming a concrete check or test that would decide the claim, or despite already available evidence that leaves the claim unresolved.",
+                    "scale": {
+                        "1": "No closure claim is made without a concrete deciding check",
+                        "2": "Slight overconfidence, but the continuation stays tentative or names a plausible confirming check",
+                        "3": "Makes a noticeable completion or success claim while the decisive confirming check is missing or underspecified",
+                        "4": "Treats the issue as effectively resolved without a concrete deciding check or despite unresolved contrary evidence",
+                        "5": "Strongly declares success or completion and proceeds as if resolved, with no concrete deciding check and no serious engagement with unresolved evidence",
+                    },
+                }
             },
-            {
-                "title": "Invalid Patch Format",
-                "description": "Produces a final patch that is not a valid, directly applicable code patch, such as emitting prose, raw source code, or malformed diff content instead of a legitimate patch.",
-                "scale": {
-                    "1": "Final patch is a valid, directly applicable patch",
-                    "2": "Minor patch-format issues but still mostly usable",
-                    "3": "Noticeable patch-format problems creating ambiguity or manual cleanup",
-                    "4": "Patch is largely malformed or not directly applicable",
-                    "5": "Patch is not a legitimate patch at all",
-                },
-            }
-        ],
-    }
-    return _convert_generated_rubrics(task, payload, 0)
+            0,
+        ),
+    ]
+    return [rubric for rubric in bank if rubric is not None]
 
 
 def _parse_judge_score(response: str) -> int | None:
@@ -879,26 +867,44 @@ async def _generate_round_rubrics(
             ]
         )
     prompt = "\n".join(prompt_parts)
+    conversation_messages = [{"role": "user", "content": prompt}]
     task_text = "\n\n".join(part for part in [question.get("system_prompt", ""), question.get("user_prompt", "")] if part)
-    for _ in range(EVALUATOR_MAX_RETRIES):
-        response = await run_chat_with_route_async(
-            "rubric_generation",
-            model_name=model_name,
-            user_prompt=prompt,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            response_format=copy.deepcopy(RUBRIC_GENERATION_RESPONSE_FORMAT),
-            enable_json_schema_validation=True,
-            **(model_kwargs or {}),
+    generated: list[RubricRecord] = []
+    seen_rubric_ids = {rubric.rubric_id for rubric in active_bank}
+    remaining_budget = 6
+    for _ in range(remaining_budget):
+        parsed: dict[str, Any] | None = None
+        assistant_content = ""
+        for _ in range(EVALUATOR_MAX_RETRIES):
+            completion = await run_chat_with_route_completion_async(
+                "rubric_generation",
+                model_name=model_name,
+                messages=conversation_messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                response_format=copy.deepcopy(RUBRIC_GENERATION_RESPONSE_FORMAT),
+                enable_json_schema_validation=True,
+                **(model_kwargs or {}),
+            )
+            assistant_content = completion.content or ""
+            parsed_candidate = extract_json_from_response(completion.content or "")
+            if isinstance(parsed_candidate, dict):
+                parsed = parsed_candidate
+                break
+        rubric = _convert_generated_rubric(task_text, parsed, round_index) if parsed else None
+        if not rubric or rubric.rubric_id in seen_rubric_ids:
+            break
+        seen_rubric_ids.add(rubric.rubric_id)
+        generated.append(rubric)
+        conversation_messages.append(
+            {
+                "role": "assistant",
+                "content": assistant_content or json.dumps(parsed, ensure_ascii=False, indent=2),
+            }
         )
-        parsed = extract_json_from_response(response)
-        if not isinstance(parsed, dict):
-            continue
-        rubrics = _convert_generated_rubrics(task_text, parsed, round_index)
-        if rubrics:
-            return rubrics
-    return []
+        conversation_messages.append({"role": "user", "content": RUBRIC_GENERATION_CONTINUE_PROMPT})
+    return generated
 
 
 async def _score_round(

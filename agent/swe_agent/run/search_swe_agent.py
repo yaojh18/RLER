@@ -58,7 +58,6 @@ SLIME_API_BASE = os.environ.get("SEARCH_SWE_SLIME_API_BASE", "http://127.0.0.1:8
 SLIME_API_KEY = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
 
 
-
 def _make_run_root(output_root: Path, subset: str, split: str, model_name: str) -> Path:
     return output_root / (
         f"{re.sub(r'[^A-Za-z0-9._-]+', '_', subset.replace('/', '__'))}_"
@@ -358,7 +357,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regression-margin", type=float, default=0.0)
     parser.add_argument("--rubric-model", default=None)
     parser.add_argument("--judge-model", default=None)
-    parser.add_argument("--calculate-gt-reward", type=bool, default=True)
+    parser.add_argument("--calculate-gt-reward", action="store_true")
     return parser
 
 

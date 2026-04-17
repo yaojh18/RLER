@@ -295,16 +295,16 @@ def _patch_docker_subprocess(monkeypatch: pytest.MonkeyPatch, *, initial_images:
     return state
 
 
-def test_initial_rubric_bank_includes_invalid_patch_negative_rubric():
+def test_initial_rubric_bank_includes_closure_without_decisive_check_negative_rubric():
     rubrics = _build_initial_rubric_bank("Fix the failing test.")
 
-    invalid_patch = next((rubric for rubric in rubrics if rubric.title == "Invalid Patch Format"), None)
-    assert invalid_patch is not None
-    assert invalid_patch.direction == "negative"
-    assert "valid" in invalid_patch.description.lower()
-    assert "patch" in invalid_patch.description.lower()
-    assert invalid_patch.scale["1"] == "Final patch is a valid, directly applicable patch"
-    assert invalid_patch.scale["5"] == "Patch is not a legitimate patch at all"
+    closure = next((rubric for rubric in rubrics if rubric.title == "Closure Without a Decisive Check"), None)
+    assert closure is not None
+    assert closure.direction == "negative"
+    assert "resolved" in closure.description.lower() or "solved" in closure.description.lower()
+    assert "check" in closure.description.lower()
+    assert "deciding check" in closure.scale["1"].lower()
+    assert "no concrete deciding check" in closure.scale["5"].lower()
 
 
 def test_weighted_reward_and_rubric_bank_update():
@@ -647,31 +647,35 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
                     "worklog": "- Moved older segment into persistent memory\n- Preserved shared branch context",
                 }
             )
-        if route_name == "rubric_generation":
-            calls["rubric"].append({"prompt": user_prompt, "kwargs": kwargs})
-            return json.dumps(
-                {
-                    "reasoning": "Validation distinguishes these continuations.",
-                    "positive_rubrics": [
-                        {
-                            "title": "Validation",
-                            "description": "Runs targeted validation relevant to the fix.",
-                            "scale": {
-                                "1": "No validation",
-                                "2": "Weak validation",
-                                "3": "Some validation",
-                                "4": "Targeted validation",
-                                "5": "Targeted validation with follow-through",
-                            },
-                        }
-                    ],
-                    "negative_rubrics": [],
-                }
-            )
         calls["judge"].append({"prompt": user_prompt, "kwargs": kwargs, "system_prompt": system_prompt})
         return json.dumps({"reasoning": "Grounded scoring.", "score": 4})
 
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
+    rubric_turns = {"count": 0}
+
+    async def fake_completion(route_name, model_name, user_prompt=None, system_prompt=None, messages=None, **kwargs):
+        calls["rubric"].append({"messages": copy.deepcopy(messages), "kwargs": kwargs})
+        rubric_turns["count"] += 1
+        if rubric_turns["count"] == 1:
+            payload = {
+                "rubric": {
+                    "polarity": "positive",
+                    "title": "Validation",
+                    "description": "Runs targeted validation relevant to the fix.",
+                    "scale": {
+                        "1": "No validation",
+                        "2": "Weak validation",
+                        "3": "Some validation",
+                        "4": "Targeted validation",
+                        "5": "Targeted validation with follow-through",
+                    },
+                }
+            }
+            rendered = json.dumps(payload)
+            return SimpleNamespace(content=rendered, metadata={"content_no_thinking": rendered})
+        return SimpleNamespace(content="{}", metadata={"content_no_thinking": "{}"})
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", fake_completion)
 
     judged = await runner._prepare_round_judging(
         parent_node=parent_node,
@@ -685,7 +689,7 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
     assert '"segment_step_range"' not in calls["persistent"][0]["prompt"]
     assert "pkg/from-grandparent.py" in calls["persistent"][0]["prompt"]
     assert "pkg/from-parent.py" not in calls["persistent"][0]["prompt"]
-    assert "compressed-once" in calls["rubric"][0]["prompt"]
+    assert "compressed-once" in calls["rubric"][0]["messages"][0]["content"]
     assert calls["rubric"][0]["kwargs"]["temperature"] == 0.0
     assert calls["rubric"][0]["kwargs"]["top_p"] == 1.0
     assert calls["rubric"][0]["kwargs"]["max_tokens"] == 111
@@ -758,31 +762,31 @@ async def test_trajectory_evaluator_calls_use_exact_json_schema(monkeypatch: pyt
                     "worklog": "- Read the target file",
                 }
             )
-        if route_name == "rubric_generation":
-            calls["rubric"] = kwargs
-            return json.dumps(
-                {
-                    "reasoning": "Validation differences are visible.",
-                    "positive_rubrics": [
-                        {
-                            "title": "Validation",
-                            "description": "Runs targeted validation relevant to the fix.",
-                            "scale": {
-                                "1": "No validation",
-                                "2": "Weak validation",
-                                "3": "Some validation",
-                                "4": "Targeted validation",
-                                "5": "Targeted validation with follow-through",
-                            },
-                        }
-                    ],
-                    "negative_rubrics": [],
-                }
-            )
         calls["judge"] = kwargs
         return json.dumps({"reasoning": "Strong match.", "score": 5})
 
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
+
+    async def fake_completion(route_name, model_name, user_prompt=None, system_prompt=None, messages=None, **kwargs):
+        calls["rubric"] = kwargs
+        payload = {
+            "rubric": {
+                "polarity": "positive",
+                "title": "Validation",
+                "description": "Runs targeted validation relevant to the fix.",
+                "scale": {
+                    "1": "No validation",
+                    "2": "Weak validation",
+                    "3": "Some validation",
+                    "4": "Targeted validation",
+                    "5": "Targeted validation with follow-through",
+                },
+            }
+        }
+        rendered = json.dumps(payload)
+        return SimpleNamespace(content=rendered, metadata={"content_no_thinking": rendered})
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", fake_completion)
 
     await _update_persistent_state(
         system_prompt="sys",
@@ -828,8 +832,60 @@ async def test_trajectory_evaluator_calls_use_exact_json_schema(monkeypatch: pyt
 
 def test_rubric_generation_schema_bounds_rubric_count():
     properties = RUBRIC_GENERATION_RESPONSE_FORMAT["json_schema"]["schema"]["properties"]
-    assert properties["positive_rubrics"]["maxItems"] == 4
-    assert properties["negative_rubrics"]["maxItems"] == 4
+    assert sorted(properties["rubric"]["properties"]) == ["description", "polarity", "scale", "title"]
+    assert properties["rubric"]["properties"]["polarity"]["enum"] == ["positive", "negative"]
+
+
+@pytest.mark.asyncio
+async def test_generate_round_rubrics_uses_multiturn_generation_and_stops_on_empty_object(monkeypatch: pytest.MonkeyPatch):
+    calls = []
+    responses = [
+        SimpleNamespace(
+            content='<think>pick validation</think>\n{"rubric":{"polarity":"positive","title":"Validation","description":"Runs targeted validation.","scale":{"1":"none","2":"weak","3":"some","4":"good","5":"strong"}}}',
+            metadata={
+                "content_no_thinking": '{"rubric":{"polarity":"positive","title":"Validation","description":"Runs targeted validation.","scale":{"1":"none","2":"weak","3":"some","4":"good","5":"strong"}}}'
+            },
+        ),
+        SimpleNamespace(
+            content="<think>done</think>\n{}",
+            metadata={"content_no_thinking": "{}"},
+        ),
+    ]
+
+    async def fake_completion(route_name, model_name, user_prompt=None, system_prompt=None, messages=None, **kwargs):
+        calls.append(
+            {
+                "route_name": route_name,
+                "messages": copy.deepcopy(messages),
+                "response_format": kwargs["response_format"],
+            }
+        )
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", fake_completion)
+
+    rubrics = await _generate_round_rubrics(
+        question={"system_prompt": "sys", "user_prompt": "user"},
+        previous_state=copy.deepcopy(EMPTY_PERSISTENT_STATE),
+        latest_shared_segment=None,
+        continuations=[{"summary": {"step_count": 1}, "trajectory_continuation": {"step_cards": [{"commands": ["pytest -q"]}]}}],
+        active_bank=[],
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=256,
+        round_index=1,
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["messages"][0]["role"] == "user"
+    assert "## Agent Trajectory Continuations:" in calls[0]["messages"][0]["content"]
+    assert "Generate the next best rubric or return an empty object." in calls[0]["messages"][0]["content"]
+    assert calls[1]["messages"][-2]["role"] == "assistant"
+    assert "<think>pick validation</think>" in calls[1]["messages"][-2]["content"]
+    assert calls[1]["messages"][-1] == {"role": "user", "content": "Generate the next best rubric or return an empty object."}
+    assert calls[0]["response_format"] == RUBRIC_GENERATION_RESPONSE_FORMAT
+    assert [rubric.title for rubric in rubrics] == ["Validation"]
 
 
 @pytest.mark.asyncio
@@ -837,35 +893,34 @@ async def test_rubric_and_judge_retry_up_to_four_times(monkeypatch: pytest.Monke
     rubric_attempts = {"count": 0}
     judge_attempts = {"count": 0}
 
+    async def fake_completion(route_name, model_name, user_prompt=None, system_prompt=None, messages=None, **kwargs):
+        rubric_attempts["count"] += 1
+        if rubric_attempts["count"] < 4:
+            return SimpleNamespace(content="not valid json", metadata={"content_no_thinking": "not valid json"})
+        payload = {
+            "rubric": {
+                "polarity": "positive",
+                "title": "Validation",
+                "description": "Runs targeted validation relevant to the fix.",
+                "scale": {
+                    "1": "No validation",
+                    "2": "Weak validation",
+                    "3": "Some validation",
+                    "4": "Targeted validation",
+                    "5": "Targeted validation with follow-through",
+                },
+            }
+        }
+        rendered = json.dumps(payload)
+        return SimpleNamespace(content=rendered, metadata={"content_no_thinking": rendered})
+
     async def fake_chat(route_name, model_name, user_prompt=None, system_prompt=None, **kwargs):
-        if route_name == "rubric_generation":
-            rubric_attempts["count"] += 1
-            if rubric_attempts["count"] < 4:
-                return "not valid json"
-            return json.dumps(
-                {
-                    "reasoning": "Validation remains the key differentiator.",
-                    "positive_rubrics": [
-                        {
-                            "title": "Validation",
-                            "description": "Runs targeted validation relevant to the fix.",
-                            "scale": {
-                                "1": "No validation",
-                                "2": "Weak validation",
-                                "3": "Some validation",
-                                "4": "Targeted validation",
-                                "5": "Targeted validation with follow-through",
-                            },
-                        }
-                    ],
-                    "negative_rubrics": [],
-                }
-            )
         judge_attempts["count"] += 1
         if judge_attempts["count"] < 4:
             return '{"score": "bad"}'
-        return json.dumps({"reasoning": "Strong match.", "score": 5})
+        return json.dumps({"score": 5})
 
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", fake_completion)
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
 
     rubrics = await _generate_round_rubrics(
@@ -901,7 +956,7 @@ async def test_rubric_and_judge_retry_up_to_four_times(monkeypatch: pytest.Monke
         max_tokens=33,
     )
 
-    assert rubric_attempts["count"] == 4
+    assert rubric_attempts["count"] == 5
     assert judge_attempts["count"] == 4
     assert len(rubrics) == 1
     assert errors == {}
@@ -1009,42 +1064,50 @@ async def test_prepare_round_judging_keeps_only_active_rubric_scores(tmp_path: P
         },
     ]
 
-    async def fake_chat(route_name, model_name, user_prompt=None, system_prompt=None, **kwargs):
-        if route_name == "rubric_generation":
-            return json.dumps(
-                {
-                    "reasoning": "Validation and grounding separate the branches.",
-                    "positive_rubrics": [
-                        {
-                            "title": "Validation",
-                            "description": "Runs targeted validation relevant to the fix.",
-                            "scale": {
-                                "1": "No validation",
-                                "2": "Weak validation",
-                                "3": "Some validation",
-                                "4": "Targeted validation",
-                                "5": "Targeted validation with follow-through",
-                            },
-                        },
-                        {
-                            "title": "Grounding",
-                            "description": "Stays grounded in the relevant files.",
-                            "scale": {
-                                "1": "Ungrounded",
-                                "2": "Weak grounding",
-                                "3": "Some grounding",
-                                "4": "Good grounding",
-                                "5": "Excellent grounding",
-                            },
-                        },
-                    ],
-                    "negative_rubrics": [],
+    async def fake_completion(route_name, model_name, user_prompt=None, system_prompt=None, messages=None, **kwargs):
+        turn_index = sum(1 for message in messages if message["role"] == "assistant")
+        payload = (
+            {
+                "rubric": {
+                    "polarity": "positive",
+                    "title": "Validation",
+                    "description": "Runs targeted validation relevant to the fix.",
+                    "scale": {
+                        "1": "No validation",
+                        "2": "Weak validation",
+                        "3": "Some validation",
+                        "4": "Targeted validation",
+                        "5": "Targeted validation with follow-through",
+                    },
                 }
-            )
-        if "Title: Validation" in user_prompt:
-            return json.dumps({"reasoning": "Validation observed." if "pytest -q" in user_prompt else "Validation missing.", "score": 5 if "pytest -q" in user_prompt else 1})
-        return json.dumps({"reasoning": "Neutral grounding.", "score": 3})
+            }
+            if turn_index == 0
+            else {
+                "rubric": {
+                    "polarity": "positive",
+                    "title": "Grounding",
+                    "description": "Stays grounded in the relevant files.",
+                    "scale": {
+                        "1": "Ungrounded",
+                        "2": "Weak grounding",
+                        "3": "Some grounding",
+                        "4": "Good grounding",
+                        "5": "Excellent grounding",
+                    },
+                }
+            }
+            if turn_index == 1
+            else {}
+        )
+        rendered = json.dumps(payload)
+        return SimpleNamespace(content=rendered, metadata={"content_no_thinking": rendered})
 
+    async def fake_chat(route_name, model_name, user_prompt=None, system_prompt=None, **kwargs):
+        if "Title: Validation" in user_prompt:
+            return json.dumps({"score": 5 if "pytest -q" in user_prompt else 1})
+        return json.dumps({"score": 3})
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", fake_completion)
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
 
     judged = await runner._prepare_round_judging(

@@ -24,11 +24,18 @@ logger = logging.getLogger("litellm_model")
 
 
 def _message_contents(message: Any) -> tuple[str, str]:
-    content = message.get("content", "")
-    reasoning_content = message.get("reasoning_content", None)
-    if reasoning_content is None:
-        reasoning_content = message.get("reasoning", None)
-    provider_specific_fields = message.get("provider_specific_fields", None)
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        reasoning_content = message.get("reasoning_content", None)
+        if reasoning_content is None:
+            reasoning_content = message.get("reasoning", None)
+        provider_specific_fields = message.get("provider_specific_fields", None)
+    else:
+        content = getattr(message, "content", "")
+        reasoning_content = getattr(message, "reasoning_content", None)
+        if reasoning_content is None:
+            reasoning_content = getattr(message, "reasoning", None)
+        provider_specific_fields = getattr(message, "provider_specific_fields", None)
     if reasoning_content is None and isinstance(provider_specific_fields, dict):
         reasoning_content = provider_specific_fields.get("reasoning_content")
     if reasoning_content:
