@@ -162,6 +162,9 @@ def run_search(
     gpu_ids: list[int] = []
     vllm_handle = None
     service_name: str | None = None
+    shared_model_kwargs: dict[str, Any] = {}
+    if "qwen" in model_name.lower():
+        shared_model_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
     if args.backend == "vllm":
         gpu_ids = choose_gpus(args.gpu_id)
         gpu_id = gpu_ids[0] if gpu_ids else None
@@ -186,12 +189,10 @@ def run_search(
                 default_model_name=args.vllm_model,
             ),
         )
-        shared_model_kwargs = {}
     elif args.backend == "openai":
         required_env = infer_litellm_api_env(args.openai_model)
         if required_env and not os.getenv(required_env):
             raise RuntimeError(f"{required_env} is not set for model {args.openai_model}")
-        shared_model_kwargs = {}
     else:
         service_name = SLIME_SERVICE_NAME
         register_model_service(
@@ -202,7 +203,6 @@ def run_search(
                 default_model_name=args.slime_model,
             ),
         )
-        shared_model_kwargs = {}
 
     if args.backend == "vllm":
         configure_model_route("policy", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.vllm_model))
@@ -358,7 +358,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regression-margin", type=float, default=0.0)
     parser.add_argument("--rubric-model", default=None)
     parser.add_argument("--judge-model", default=None)
-    parser.add_argument("--calculate-gt-reward", default=True)
+    parser.add_argument("--calculate-gt-reward", type=bool, default=True)
     return parser
 
 

@@ -8,7 +8,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -21,6 +20,7 @@ from agent_rl.run_utils import extract_json_from_response, run_chat_with_route_a
 from swe_agent import __version__
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
 from swe_agent.rl_backend import SWEAgentRolloutBackend
+from swe_agent.parallel_utils import ArtifactWriter, NodeArtifactBundle, PatchEvalManager, _atomic_write_json
 from swe_agent.run.run_swe_agent import build_slim_trajectory, evaluate_swebench_instance_patches
 
 
@@ -325,8 +325,16 @@ RUBRIC_GENERATION_RESPONSE_FORMAT = {
             "additionalProperties": False,
             "properties": {
                 "reasoning": {"type": "string"},
-                "positive_rubrics": {"type": "array", "items": RUBRIC_ITEM_JSON_SCHEMA},
-                "negative_rubrics": {"type": "array", "items": RUBRIC_ITEM_JSON_SCHEMA},
+                "positive_rubrics": {
+                    "type": "array",
+                    "items": RUBRIC_ITEM_JSON_SCHEMA,
+                    "maxItems": 4,
+                },
+                "negative_rubrics": {
+                    "type": "array",
+                    "items": RUBRIC_ITEM_JSON_SCHEMA,
+                    "maxItems": 4,
+                },
             },
             "required": ["reasoning", "positive_rubrics", "negative_rubrics"],
         },
@@ -417,22 +425,6 @@ class TrajectorySearchResult:
     exit_status: str
     submission_chars: int
     finished: bool
-
-
-def _atomic_write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(suffix=".tmp", prefix=f"{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=False, default=str)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    except Exception:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise
-
 
 def _make_raw_trajectory(
     *,
@@ -569,9 +561,10 @@ def _build_step_cards(segment_events: list[dict[str, Any]]) -> list[dict[str, An
             },
         )
         if event.get("kind") == "model_response":
-            assistant_message = event.get("payload", {}).get("message", {}).get("content", "")
+            message = event.get("payload", {}).get("message", {})
+            assistant_message = message.get("content_no_thinking", message.get("content", ""))
             if assistant_message:
-                card["assistant_message"] = assistant_message
+                card["assistant_message"] = _truncate_middle(assistant_message, MAX_OBSERVATION_CHARS)
             continue
         if event.get("kind") == "environment_action":
             commands = [action.get("command", "") for action in (event.get("payload") or {}).get("actions", [])]
@@ -1219,6 +1212,20 @@ class TrajectorySearchRunner:
         self.best_node_id: str | None = None
         self.finished_node_ids: list[str] = []
         self.image_repository = f"rler-search/{self.task_id.replace('__', '-').lower()}"
+        self.artifact_writer = ArtifactWriter()
+        self.patch_eval_manager = (
+            PatchEvalManager(
+                instance=self.instance,
+                task_id=self.task_id,
+                model_name=self.policy_model_name,
+                namespace=self.harness_namespace,
+                work_dir=self.run_dir,
+                evaluate_patches_fn=evaluate_swebench_instance_patches,
+                max_workers=max(1, self.search_config.gt_reward_workers),
+            )
+            if self.search_config.calculate_gt_reward
+            else None
+        )
 
     def run(self) -> TrajectorySearchResult:
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -1235,12 +1242,18 @@ class TrajectorySearchRunner:
                 self.current_round += 1
                 self._run_round(self.frontier_ids[0], self.current_round)
                 self._save_manifest()
+            self.artifact_writer.wait()
+            if self.patch_eval_manager is not None:
+                self.patch_eval_manager.wait()
             if self.search_config.calculate_gt_reward:
                 self._evaluate_ground_truth_rewards()
             result = self._finalize_outputs()
             self._sweep_checkpoint_images()
             return result
         finally:
+            if self.patch_eval_manager is not None:
+                self.patch_eval_manager.close()
+            self.artifact_writer.close()
             self._sweep_checkpoint_images()
             if self.nodes:
                 self._save_manifest()
@@ -1611,9 +1624,7 @@ class TrajectorySearchRunner:
                     event["event_id"] = f"{resumed_snapshot['session_id']}:{index}"
                 for turn in resumed_snapshot.get("metadata", {}).get("model_turns", []):
                     turn["session_id"] = resumed_snapshot["session_id"]
-                session = self.backend.resume_session(
-                    RolloutSnapshot(**resumed_snapshot)
-                )
+                session = self.backend.resume_session(RolloutSnapshot(**resumed_snapshot))
                 result = session.run_until_pause(max_steps=self.search_config.k).model_dump(mode="json")
                 snapshot_after = session.snapshot().model_dump(mode="json")
                 workspace_meta = _collect_workspace_meta(session.agent.env)
@@ -1818,30 +1829,36 @@ class TrajectorySearchRunner:
         self.inactive_bank = judged["inactive_after"]
 
         for branch in branch_records:
-            keep_snapshot = branch["node_id"] in kept_child_ids
-            image_tag = None
-            image_id = None
-            if keep_snapshot:
-                image_tag = f"{self.image_repository}:round-{round_index:03d}-{branch['node_id'][-6:]}"
-                image_tag, image_id = _docker_commit(
-                    self.docker_executable,
-                    getattr(branch["session"].agent.env, "container_id", None),
-                    image_tag,
-                )
+            branch["keep_snapshot"] = branch["node_id"] in kept_child_ids
+            branch["image_tag"] = None
+            branch["image_id"] = None
+            if not branch["keep_snapshot"]:
+                continue
+            image_tag = f"{self.image_repository}:round-{round_index:03d}-{branch['node_id'][-6:]}"
+            image_tag, image_id = _docker_commit(
+                self.docker_executable,
+                getattr(branch["session"].agent.env, "container_id", None),
+                image_tag,
+            )
+            branch["image_tag"] = image_tag
+            branch["image_id"] = image_id
+
+        artifact_bundles: list[NodeArtifactBundle] = []
+        for branch in branch_records:
             node = SearchNode(
                 node_id=branch["node_id"],
                 parent_id=parent_id,
                 round_index=round_index,
                 depth=parent_node.depth + 1,
                 session_id=branch["snapshot_after"]["session_id"],
-                status="finished" if branch["result"]["status"] == "finished" and keep_snapshot else ("frontier" if keep_snapshot else "dropped"),
-                checkpoint_image_tag=image_tag,
-                checkpoint_image_id=image_id,
+                status="finished" if branch["result"]["status"] == "finished" and branch["keep_snapshot"] else ("frontier" if branch["keep_snapshot"] else "dropped"),
+                checkpoint_image_tag=branch["image_tag"],
+                checkpoint_image_id=branch["image_id"],
                 workspace_fingerprint=branch["workspace_meta"].get("workspace_fingerprint"),
                 raw_traj_path=str(self.nodes_dir / branch["node_id"] / "raw_traj.json"),
                 messages_path=str(self.nodes_dir / branch["node_id"] / "messages.json"),
                 judge_path=str(self.nodes_dir / branch["node_id"] / "judge.json"),
-                snapshot_path=str(self.nodes_dir / branch["node_id"] / "snapshot.json") if keep_snapshot else None,
+                snapshot_path=str(self.nodes_dir / branch["node_id"] / "snapshot.json") if branch["keep_snapshot"] else None,
                 rubric_ref=str(round_rubric_path),
                 score=branch["reward"],
                 step_start=branch["step_start"],
@@ -1850,51 +1867,30 @@ class TrajectorySearchRunner:
                 exit_status=branch["result"].get("exit_status", ""),
                 regressed_vs_parent=regressed and bool(valid_branches) and branch["node_id"] == valid_branches[0]["node_id"],
             )
-            self._write_node(
-                node,
-                raw_traj=branch["segment_raw"],
-                messages=branch["segment_messages"],
-                judge={
-                    "persistent_state": branch.get("persistent_state", copy.deepcopy(parent_judge.get("persistent_state", EMPTY_PERSISTENT_STATE))),
-                    "recent_segments": branch["recent_segments"],
-                    "workspace_meta": branch["workspace_meta"],
-                    "rubric_round": {
-                        "generated": [asdict(rubric) for rubric in judged["generated"]],
-                        "active_bank_before": round_payload["active_bank_before"],
-                        "active_bank_after": [asdict(rubric) for rubric in judged["active_after"]],
-                        "inactive_bank_after": [asdict(rubric) for rubric in judged["inactive_after"]],
-                        "variance_by_rubric": judged["variances"],
-                    },
-                    "scores": branch["score_records"],
-                    "overall_reward": branch["reward"],
-                    "baseline_parent_score": parent_baseline_score,
-                    "regressed_vs_parent": node.regressed_vs_parent,
-                    "error": branch["judge_error"],
-                }
-                | ({"ground_truth_reward": None} if self.search_config.calculate_gt_reward else {}),
-                snapshot=(
-                    {
-                        **copy.deepcopy(branch["snapshot_after"]),
-                        "environment": {
-                            **copy.deepcopy(branch["snapshot_after"]["environment"]),
-                            "config": {
-                                **copy.deepcopy(branch["snapshot_after"]["environment"]["config"]),
-                                "image": image_tag,
-                            },
-                            "state": {"owns_container": True},
-                        },
-                        "metadata": {
-                            **copy.deepcopy(branch["snapshot_after"].get("metadata", {})),
-                            "checkpoint_image_id": image_id,
-                            "checkpoint_image_tag": image_tag,
-                        },
-                    }
-                    if keep_snapshot
-                    else None
-                ),
-            )
+            judge_payload = {
+                "persistent_state": branch.get("persistent_state", copy.deepcopy(parent_judge.get("persistent_state", EMPTY_PERSISTENT_STATE))),
+                "recent_segments": branch["recent_segments"],
+                "workspace_meta": branch["workspace_meta"],
+                "rubric_round": {
+                    "generated": [asdict(rubric) for rubric in judged["generated"]],
+                    "active_bank_before": round_payload["active_bank_before"],
+                    "active_bank_after": [asdict(rubric) for rubric in judged["active_after"]],
+                    "inactive_bank_after": [asdict(rubric) for rubric in judged["inactive_after"]],
+                    "variance_by_rubric": judged["variances"],
+                },
+                "scores": branch["score_records"],
+                "overall_reward": branch["reward"],
+                "baseline_parent_score": parent_baseline_score,
+                "regressed_vs_parent": node.regressed_vs_parent,
+                "error": branch["judge_error"],
+            }
             if self.search_config.calculate_gt_reward:
-                node_dir = Path(node.raw_traj_path).parent
+                judge_payload["ground_truth_reward"] = None
+
+            terminal_raw = None
+            terminal_messages = None
+            terminal_patch = None
+            if self.search_config.calculate_gt_reward:
                 terminal_result = branch["result"]
                 terminal_snapshot = branch["snapshot_after"]
                 if branch["result"]["status"] != "finished":
@@ -1910,24 +1906,59 @@ class TrajectorySearchRunner:
                     result=terminal_result,
                     info_extra={"terminal_rollout_from_node_id": node.node_id},
                 )
-                _atomic_write_json(node_dir / "terminal_raw_traj.json", terminal_raw)
-                _atomic_write_json(
-                    node_dir / "terminal_messages.json",
-                    build_slim_trajectory(terminal_raw, model_name=self.policy_model_name),
-                )
-                _atomic_write_json(
-                    node_dir / "terminal_patch.json",
-                    {
-                        self.task_id: {
-                            "model_name_or_path": self.policy_model_name,
-                            "instance_id": self.task_id,
-                            "model_patch": terminal_result.get("submission", "") or "",
+                terminal_messages = build_slim_trajectory(terminal_raw, model_name=self.policy_model_name)
+                terminal_patch = {
+                    self.task_id: {
+                        "model_name_or_path": self.policy_model_name,
+                        "instance_id": self.task_id,
+                        "model_patch": terminal_result.get("submission", "") or "",
+                    }
+                }
+
+            self.nodes[node.node_id] = node
+            artifact_bundles.append(
+                NodeArtifactBundle(
+                    node_id=node.node_id,
+                    node_dir=Path(node.raw_traj_path).parent,
+                    node_payload=asdict(node),
+                    raw_traj_payload=branch["segment_raw"],
+                    messages_payload=branch["segment_messages"],
+                    judge_payload=judge_payload,
+                    snapshot_payload=(
+                        {
+                            **copy.deepcopy(branch["snapshot_after"]),
+                            "environment": {
+                                **copy.deepcopy(branch["snapshot_after"]["environment"]),
+                                "config": {
+                                    **copy.deepcopy(branch["snapshot_after"]["environment"]["config"]),
+                                    "image": branch["image_tag"],
+                                },
+                                "state": {"owns_container": True},
+                            },
+                            "metadata": {
+                                **copy.deepcopy(branch["snapshot_after"].get("metadata", {})),
+                                "checkpoint_image_id": branch["image_id"],
+                                "checkpoint_image_tag": branch["image_tag"],
+                            },
                         }
-                    },
+                        if branch["keep_snapshot"]
+                        else None
+                    ),
+                    terminal_raw_traj_payload=terminal_raw,
+                    terminal_messages_payload=terminal_messages,
+                    terminal_patch_payload=terminal_patch,
                 )
+            )
             if node.status == "finished":
                 self.finished_node_ids.append(node.node_id)
+
+        for branch in branch_records:
             self._dispose_session(branch["session"])
+
+        write_future = self.artifact_writer.submit_round(artifact_bundles)
+        if self.patch_eval_manager is not None:
+            self.patch_eval_manager.submit_round(artifact_bundles, write_future)
+        write_future.result()
 
         self.finished_node_ids = sorted(set(self.finished_node_ids))
         self.frontier_ids = [
@@ -1956,6 +1987,8 @@ class TrajectorySearchRunner:
             if not judge_path.exists():
                 continue
             judge_payload = json.loads(judge_path.read_text(encoding="utf-8"))
+            if judge_payload.get("ground_truth_reward") is not None:
+                continue
             judge_payload["ground_truth_reward"] = None
             judge_payloads[node_id] = judge_payload
             judge_paths[node_id] = judge_path

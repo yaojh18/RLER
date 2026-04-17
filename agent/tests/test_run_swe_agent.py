@@ -33,6 +33,7 @@ from dr_agent.utils import _resolve_vllm_base_command
 from swe_agent.environments.docker import DockerEnvironment
 from swe_agent.exceptions import Submitted
 from swe_agent.models.litellm_model import LitellmModel
+from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel
 from swe_agent.run.run_swe_agent import (
     AGENT_ROOT,
     BackendResult,
@@ -93,6 +94,132 @@ def test_litellm_bad_request_errors_abort_without_retry(monkeypatch: pytest.Monk
         model.query([{"role": "user", "content": "hello"}])
 
     assert calls["count"] == 1
+
+
+def test_litellm_query_prepends_reasoning_to_message_content(monkeypatch: pytest.MonkeyPatch):
+    class _FakeMessage:
+        def __init__(self, content: str, reasoning_content: str):
+            self.content = content
+            self.reasoning_content = reasoning_content
+            self.provider_specific_fields = {}
+
+        def model_dump(self):
+            return {"role": "assistant", "content": self.content, "reasoning_content": self.reasoning_content}
+
+    class _FakeResponse:
+        def __init__(self):
+            self.choices = [SimpleNamespace(message=_FakeMessage("done", "inspect files first"))]
+
+        def model_dump(self):
+            return {"choices": [{"message": {"content": "done", "reasoning_content": "inspect files first"}}]}
+
+    model = LitellmModel(model_name="openai/test-model")
+    monkeypatch.setattr(model, "_query", lambda *args, **kwargs: _FakeResponse())
+    monkeypatch.setattr(model, "_calculate_cost", lambda response: {"cost": 0.0})
+    monkeypatch.setattr(model, "_parse_actions", lambda response: [])
+
+    response = model.query([{"role": "user", "content": "hello"}])
+
+    assert response["content"] == "<think>inspect files first</think>\ndone"
+    assert response["content_no_thinking"] == "done"
+
+
+def test_litellm_query_strips_prefixed_inline_thinking_from_content(monkeypatch: pytest.MonkeyPatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.content = "<think>inspect files first</think>\ndone"
+            self.reasoning_content = None
+            self.provider_specific_fields = {}
+
+        def model_dump(self):
+            return {"role": "assistant", "content": self.content}
+
+    class _FakeResponse:
+        def __init__(self):
+            self.choices = [SimpleNamespace(message=_FakeMessage())]
+
+        def model_dump(self):
+            return {"choices": [{"message": {"content": "<think>inspect files first</think>\\ndone"}}]}
+
+    model = LitellmModel(model_name="openai/test-model")
+    monkeypatch.setattr(model, "_query", lambda *args, **kwargs: _FakeResponse())
+    monkeypatch.setattr(model, "_calculate_cost", lambda response: {"cost": 0.0})
+    monkeypatch.setattr(model, "_parse_actions", lambda response: [])
+
+    response = model.query([{"role": "user", "content": "hello"}])
+
+    assert response["content"] == "<think>inspect files first</think>\ndone"
+    assert response["content_no_thinking"] == "done"
+
+
+def test_litellm_query_reads_vllm_reasoning_field(monkeypatch: pytest.MonkeyPatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.content = "done"
+            self.reasoning = "inspect files first"
+            self.reasoning_content = None
+            self.provider_specific_fields = {}
+
+        def model_dump(self):
+            return {"role": "assistant", "content": self.content, "reasoning": self.reasoning}
+
+    class _FakeResponse:
+        def __init__(self):
+            self.choices = [SimpleNamespace(message=_FakeMessage())]
+
+        def model_dump(self):
+            return {"choices": [{"message": {"content": "done", "reasoning": "inspect files first"}}]}
+
+    model = LitellmModel(model_name="openai/test-model")
+    monkeypatch.setattr(model, "_query", lambda *args, **kwargs: _FakeResponse())
+    monkeypatch.setattr(model, "_calculate_cost", lambda response: {"cost": 0.0})
+    monkeypatch.setattr(model, "_parse_actions", lambda response: [])
+
+    response = model.query([{"role": "user", "content": "hello"}])
+
+    assert response["content"] == "<think>inspect files first</think>\ndone"
+    assert response["content_no_thinking"] == "done"
+
+
+def test_litellm_textbased_model_parses_actions_with_reasoning_content(monkeypatch: pytest.MonkeyPatch):
+    class _FakeMessage:
+        def __init__(self):
+            self.content = "```mswea_bash_command\necho hi\n```"
+            self.reasoning_content = "inspect files first"
+            self.provider_specific_fields = {}
+
+        def model_dump(self):
+            return {
+                "role": "assistant",
+                "content": self.content,
+                "reasoning_content": self.reasoning_content,
+            }
+
+    class _FakeResponse:
+        def __init__(self):
+            self.choices = [SimpleNamespace(message=_FakeMessage())]
+
+        def model_dump(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "```mswea_bash_command\necho hi\n```",
+                            "reasoning_content": "inspect files first",
+                        }
+                    }
+                ]
+            }
+
+    model = LitellmTextbasedModel(model_name="openai/test-model")
+    monkeypatch.setattr(model, "_query", lambda *args, **kwargs: _FakeResponse())
+    monkeypatch.setattr(model, "_calculate_cost", lambda response: {"cost": 0.0})
+
+    response = model.query([{"role": "user", "content": "hello"}])
+
+    assert response["content"] == "<think>inspect files first</think>\n```mswea_bash_command\necho hi\n```"
+    assert response["content_no_thinking"] == "```mswea_bash_command\necho hi\n```"
+    assert response["extra"]["actions"] == [{"command": "echo hi"}]
 
 
 def test_tee_stream_strips_control_sequences_from_log_copy():
@@ -424,6 +551,8 @@ def test_launch_vllm_server_handle_supports_served_model_name(monkeypatch: pytes
 
     assert "--served-model-name" in commands[0]
     assert "Qwen/Qwen3.5-9B" in commands[0]
+    assert "--reasoning-parser" in commands[0]
+    assert "qwen3" in commands[0]
     assert handle.model_name == "Qwen/Qwen3.5-9B"
 
 

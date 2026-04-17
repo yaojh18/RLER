@@ -23,6 +23,25 @@ from swe_agent.models.utils.retry import retry
 logger = logging.getLogger("litellm_model")
 
 
+def _message_contents(message: Any) -> tuple[str, str]:
+    content = message.get("content", "")
+    reasoning_content = message.get("reasoning_content", None)
+    if reasoning_content is None:
+        reasoning_content = message.get("reasoning", None)
+    provider_specific_fields = message.get("provider_specific_fields", None)
+    if reasoning_content is None and isinstance(provider_specific_fields, dict):
+        reasoning_content = provider_specific_fields.get("reasoning_content")
+    if reasoning_content:
+        full_content = f"<think>{reasoning_content}</think>\n{content}" if content else f"<think>{reasoning_content}</think>"
+        return full_content, content
+    if isinstance(content, str) and content.startswith("<think>"):
+        closing_tag = "</think>"
+        closing_index = content.find(closing_tag)
+        if closing_index >= 0:
+            return content, content[closing_index + len(closing_tag) :].lstrip("\r\n")
+    return content, content
+
+
 class LitellmModelConfig(BaseModel):
     model_name: str
     """Model name. Highly recommended to include the provider in the model name, e.g., `anthropic/claude-sonnet-4-5-20250929`."""
@@ -74,7 +93,7 @@ class LitellmModel:
             raise e
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
-        prepared = [{k: v for k, v in msg.items() if k != "extra"} for msg in messages]
+        prepared = [{k: v for k, v in msg.items() if k not in {"extra", "content_no_thinking"}} for msg in messages]
         prepared = _reorder_anthropic_thinking_blocks(prepared)
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
@@ -85,6 +104,9 @@ class LitellmModel:
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
         message = response.choices[0].message.model_dump()
+        full_content, content_no_thinking = _message_contents(response.choices[0].message)
+        message["content"] = full_content
+        message["content_no_thinking"] = content_no_thinking
         message["extra"] = {
             "actions": self._parse_actions(response),
             "response": response.model_dump(),

@@ -87,7 +87,10 @@ def _build_messages(
 
 def _build_service_sampling(chat_kwargs: Dict[str, Any]) -> ChatSamplingParams:
     kwargs = dict(chat_kwargs)
-    json_mode = kwargs.pop("response_format", None) == {"type": "json_object"}
+    response_format = kwargs.pop("response_format", None)
+    json_mode = response_format == {"type": "json_object"}
+    if response_format is not None and not json_mode:
+        kwargs["response_format"] = response_format
     return ChatSamplingParams(
         temperature=kwargs.pop("temperature", 0),
         top_p=kwargs.pop("top_p", 1.0),
@@ -96,6 +99,17 @@ def _build_service_sampling(chat_kwargs: Dict[str, Any]) -> ChatSamplingParams:
         json_mode=json_mode,
         extra=kwargs,
     )
+
+
+def _split_inline_thinking_content(content: str) -> tuple[str, str]:
+    if not isinstance(content, str) or not content.startswith("<think>"):
+        return content, content
+    closing_tag = "</think>"
+    closing_index = content.find(closing_tag)
+    if closing_index < 0:
+        return content, content
+    content_no_thinking = content[closing_index + len(closing_tag) :].lstrip("\r\n")
+    return content, content_no_thinking
 
 
 def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
@@ -160,17 +174,33 @@ async def run_litellm_completion_async(
         print(f"Error in run_litellm_completion_async: {exc}")
         return ChatCompletion(content="", model_name=model_name, metadata={"timestamp": time.time()})
     choice = response.choices[0]
+    message = choice.message
+    inline_content = message.content or ""
+    reasoning_content = getattr(message, "reasoning_content", None)
+    if reasoning_content is None:
+        reasoning_content = getattr(message, "reasoning", None)
+    if reasoning_content is None:
+        provider_specific_fields = getattr(message, "provider_specific_fields", None)
+        if isinstance(provider_specific_fields, dict):
+            reasoning_content = provider_specific_fields.get("reasoning_content")
+    if reasoning_content:
+        content_no_thinking = inline_content
+    else:
+        _, content_no_thinking = _split_inline_thinking_content(inline_content)
+    content = inline_content
+    if reasoning_content:
+        content = f"<think>{reasoning_content}</think>\n{content_no_thinking}" if content_no_thinking else f"<think>{reasoning_content}</think>"
     usage = {}
     if getattr(response, "usage", None) is not None:
         usage = response.usage.model_dump() if hasattr(response.usage, "model_dump") else dict(response.usage)
     return ChatCompletion(
-        content=choice.message.content or "",
+        content=content,
         finish_reason=choice.finish_reason or "stop",
         model_name=model_name,
         cost=0.0,
         usage=usage,
         raw_response=response.model_dump() if hasattr(response, "model_dump") else {},
-        metadata={"timestamp": time.time()},
+        metadata={"timestamp": time.time(), "content_no_thinking": content_no_thinking},
     )
 
 

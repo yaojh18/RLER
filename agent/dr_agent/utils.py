@@ -272,6 +272,9 @@ def launch_vllm_server_handle(
         "--gpu-memory-utilization",
         str(gpu_memory_utilization),
     ]
+    normalized_qwen_name = (served_model_name or model_name).lower()
+    if "qwen3" in normalized_qwen_name:
+        cmd.extend(["--reasoning-parser", "qwen3"])
     if served_model_name:
         cmd.extend(["--served-model-name", served_model_name])
     if len(selected_gpu_ids) > 1:

@@ -1,11 +1,13 @@
 import copy
 import json
 import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from swe_agent.parallel_utils import ArtifactWriter, NodeArtifactBundle, PatchEvalManager
 from swe_agent.trajectory_search import (
     EMPTY_PERSISTENT_STATE,
     EMPTY_WORKSPACE_META,
@@ -87,6 +89,40 @@ class _SequentialSession:
         self._current_snapshot = copy.deepcopy(self._snapshots[self._index])
         if self._index < len(self._results) - 1:
             self._index += 1
+        return _Payload(payload)
+
+
+class _SlowSequentialSession:
+    def __init__(self, snapshots, results, *, sample_delay: float, terminal_delay: float, timings: dict[str, list[float]], container_id="cid"):
+        self._snapshots = [copy.deepcopy(snapshot) for snapshot in snapshots]
+        self._results = [copy.deepcopy(result) for result in results]
+        self._index = 0
+        self._current_snapshot = copy.deepcopy(self._snapshots[0])
+        self._sample_delay = sample_delay
+        self._terminal_delay = terminal_delay
+        self._timings = timings
+        self.agent = SimpleNamespace(
+            env=SimpleNamespace(container_id=container_id, config=SimpleNamespace(cwd="/repo")),
+            model=SimpleNamespace(config=SimpleNamespace(model_kwargs={"temperature": 1.0, "top_p": 0.95})),
+        )
+
+    def snapshot(self):
+        return _Payload(self._current_snapshot)
+
+    def run_until_pause(self, max_steps=None):
+        if max_steps is None:
+            self._timings["terminal_start"].append(time.perf_counter())
+            time.sleep(self._terminal_delay)
+            payload = copy.deepcopy(self._results[-1])
+            self._current_snapshot = copy.deepcopy(self._snapshots[-1])
+            self._timings["terminal_end"].append(time.perf_counter())
+            return _Payload(payload)
+
+        self._timings["sample_start"].append(time.perf_counter())
+        time.sleep(self._sample_delay)
+        payload = copy.deepcopy(self._results[0])
+        self._current_snapshot = copy.deepcopy(self._snapshots[0])
+        self._timings["sample_end"].append(time.perf_counter())
         return _Payload(payload)
 
 
@@ -352,8 +388,9 @@ def test_update_rubric_bank_deduplicates_by_title():
     assert inactive == []
 
 
-def test_build_step_cards_keeps_assistant_message_and_truncates_large_sections():
-    assistant_text = "<think>diagnose issue</think>\nTHOUGHT: run reproduction first"
+def test_build_step_cards_strips_thinking_from_assistant_message_and_truncates_large_sections():
+    assistant_plain = "THOUGHT: " + ("run reproduction first. " * 120)
+    assistant_text = f"<think>diagnose issue</think>\n{assistant_plain}"
     long_exception = "E" * 6000
     long_output = "O" * 1200
     cards = _build_step_cards(
@@ -361,7 +398,7 @@ def test_build_step_cards_keeps_assistant_message_and_truncates_large_sections()
             {
                 "step_index": 3,
                 "kind": "model_response",
-                "payload": {"message": {"content": assistant_text}},
+                "payload": {"message": {"content": assistant_text, "content_no_thinking": assistant_plain}},
             },
             {
                 "step_index": 3,
@@ -387,7 +424,9 @@ def test_build_step_cards_keeps_assistant_message_and_truncates_large_sections()
     )
 
     assert len(cards) == 1
-    assert cards[0]["assistant_message"] == assistant_text
+    assert OBSERVATION_TRUNCATION_MARKER in cards[0]["assistant_message"]
+    assert "<think>" not in cards[0]["assistant_message"]
+    assert len(cards[0]["assistant_message"]) <= MAX_OBSERVATION_CHARS
     assert cards[0]["commands"] == ["python repro.py"]
     assert "signal" not in cards[0]
     assert OBSERVATION_TRUNCATION_MARKER in cards[0]["observation"]
@@ -785,6 +824,12 @@ async def test_trajectory_evaluator_calls_use_exact_json_schema(monkeypatch: pyt
     assert calls["rubric"]["response_format"] == RUBRIC_GENERATION_RESPONSE_FORMAT
     assert calls["judge"]["enable_json_schema_validation"] is True
     assert calls["judge"]["response_format"] == JUDGE_RESPONSE_FORMAT
+
+
+def test_rubric_generation_schema_bounds_rubric_count():
+    properties = RUBRIC_GENERATION_RESPONSE_FORMAT["json_schema"]["schema"]["properties"]
+    assert properties["positive_rubrics"]["maxItems"] == 4
+    assert properties["negative_rubrics"]["maxItems"] == 4
 
 
 @pytest.mark.asyncio
@@ -1242,7 +1287,7 @@ def test_new_frontier_children_are_prepended_before_existing_frontier(tmp_path: 
 
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_prepend_chat())
     monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
-    _patch_docker_subprocess(monkeypatch)
+    docker_state = _patch_docker_subprocess(monkeypatch)
 
     runner = TrajectorySearchRunner(
         instance={"instance_id": "demo__prepend-order", "problem_statement": "Fix the failing test."},
@@ -1335,6 +1380,93 @@ def test_trajectory_search_runner_writes_expected_artifacts(tmp_path: Path, monk
     assert len(docker_state["images"]) == 1
 
 
+def test_run_round_waits_for_terminal_cleanup_in_serial_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _root_snapshot()
+    timings = {"sample_start": [], "sample_end": [], "terminal_start": [], "terminal_end": []}
+    child_snapshots = [
+        _branch_snapshot(
+            root,
+            session_id=f"child-{index}",
+            step_index=0,
+            assistant_text=f"Run sample {index}.",
+            command=f"pytest tests/test_alpha.py::{index} -q",
+            observation="<returncode>0</returncode>\n<output>\n1 passed\n</output>",
+        )
+        for index in range(3)
+    ]
+    final_snapshots = [
+        _branch_snapshot(
+            child_snapshot,
+            session_id=f"{child_snapshot['session_id']}-final",
+            step_index=1,
+            assistant_text=f"Submit sample {index}.",
+            command=f"printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\npatch-{index}\\n'",
+            observation="<returncode>0</returncode>\n<output>\nsubmitted\n</output>",
+        )
+        for index, child_snapshot in enumerate(child_snapshots)
+    ]
+    backend = _FakeBackend(
+        root,
+        [
+            _SlowSequentialSession(
+                [child_snapshot, final_snapshot],
+                [_branch_result(child_snapshot), _branch_result(final_snapshot, status="finished", submission=f"patch-{index}")],
+                sample_delay=0.25,
+                terminal_delay=0.25,
+                timings=timings,
+                container_id=f"child-{index}-container",
+            )
+            for index, (child_snapshot, final_snapshot) in enumerate(zip(child_snapshots, final_snapshots))
+        ],
+    )
+    workspace_meta = {
+        "root-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "root"},
+        **{
+            f"child-{index}-container": {
+                "changed_files": ["pkg/core.py"],
+                "untracked_files": [],
+                "diff_stat": " pkg/core.py | 2 +-",
+                "current_patch_chars": 120 + index,
+                "workspace_fingerprint": f"child-{index}",
+            }
+            for index in range(3)
+        },
+    }
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
+    monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
+    monkeypatch.setattr(
+        "swe_agent.trajectory_search.evaluate_swebench_instance_patches",
+        lambda **kwargs: {node_id: 1.0 for node_id in kwargs["patches_by_key"]},
+    )
+    docker_state = _patch_docker_subprocess(monkeypatch)
+
+    runner = TrajectorySearchRunner(
+        instance={"instance_id": "demo__parallel-round", "problem_statement": "Fix the failing test."},
+        backend=backend,
+        run_dir=tmp_path / "run",
+        policy_model_name="openai/fake",
+        harness_namespace="test-namespace",
+        search_config=SearchConfig(m=1, k=1, p=1, max_rounds=1, max_active_rubrics=2, calculate_gt_reward=True),
+    )
+    runner._initialize_root()
+
+    started_at = time.perf_counter()
+    runner._run_round("root", 1)
+    elapsed = time.perf_counter() - started_at
+
+    assert len(timings["sample_start"]) == 3
+    assert len(timings["terminal_end"]) == 3
+    assert elapsed > 1.45
+    assert timings["sample_start"][1] - timings["sample_start"][0] >= 0.20
+    assert timings["sample_start"][2] - timings["sample_start"][1] >= 0.20
+    assert timings["terminal_start"][1] - timings["terminal_start"][0] >= 0.20
+    assert timings["terminal_start"][2] - timings["terminal_start"][1] >= 0.20
+    assert set(docker_state["removed_containers"]) == {"root-container", "child-0-container", "child-1-container", "child-2-container"}
+    assert runner.frontier_ids and all(node_id.startswith("node-r001") for node_id in runner.frontier_ids)
+    assert len([node_id for node_id in runner.nodes if node_id.startswith("node-r001")]) == 3
+
+
 def test_trajectory_search_runner_calculates_gt_reward_and_writes_terminal_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     root = _root_snapshot()
     child_a = _branch_snapshot(
@@ -1399,7 +1531,7 @@ def test_trajectory_search_runner_calculates_gt_reward_and_writes_terminal_artif
             for node_id, patch in kwargs["patches_by_key"].items()
         },
     )
-    _patch_docker_subprocess(monkeypatch)
+    docker_state = _patch_docker_subprocess(monkeypatch)
 
     runner = TrajectorySearchRunner(
         instance={"instance_id": "demo__gt-reward", "problem_statement": "Fix the failing test."},
@@ -1426,6 +1558,55 @@ def test_trajectory_search_runner_calculates_gt_reward_and_writes_terminal_artif
     }
     assert 0.0 in rewards.values()
     assert 1.0 in rewards.values()
+    assert set(docker_state["removed_containers"]) == {"root-container", "child-a-container", "child-b-container"}
+
+
+def test_patch_eval_manager_backfills_ground_truth_reward(tmp_path: Path):
+    writer = ArtifactWriter()
+    try:
+        bundles = []
+        for node_id, patch in [("node-a", "patch-a"), ("node-b", "patch-b")]:
+            node_dir = tmp_path / node_id
+            bundles.append(
+                NodeArtifactBundle(
+                    node_id=node_id,
+                    node_dir=node_dir,
+                    node_payload={"node_id": node_id},
+                    raw_traj_payload={"messages": []},
+                    messages_payload={"messages": []},
+                    judge_payload={"ground_truth_reward": None, "scores": []},
+                    terminal_patch_payload={
+                        "demo__patch-eval": {
+                            "model_name_or_path": "openai/fake",
+                            "instance_id": "demo__patch-eval",
+                            "model_patch": patch,
+                        }
+                    },
+                )
+            )
+
+        write_future = writer.submit_round(bundles)
+        manager = PatchEvalManager(
+            instance={"instance_id": "demo__patch-eval", "problem_statement": "Fix the failing test."},
+            task_id="demo__patch-eval",
+            model_name="openai/fake",
+            namespace="test-namespace",
+            work_dir=tmp_path,
+            evaluate_patches_fn=lambda **kwargs: {
+                node_id: (1.0 if patch == "patch-a" else 0.0)
+                for node_id, patch in kwargs["patches_by_key"].items()
+            },
+        )
+        try:
+            manager.submit_round(bundles, write_future)
+            manager.wait()
+        finally:
+            manager.close()
+
+        assert json.loads((tmp_path / "node-a" / "judge.json").read_text())["ground_truth_reward"] == 1.0
+        assert json.loads((tmp_path / "node-b" / "judge.json").read_text())["ground_truth_reward"] == 0.0
+    finally:
+        writer.close()
 
 
 def test_trajectory_search_runner_root_expansion_keeps_top_valid_children(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

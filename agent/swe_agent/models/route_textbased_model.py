@@ -57,6 +57,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         return {
             "role": "assistant",
             "content": content,
+            "content_no_thinking": completion.metadata.get("content_no_thinking", content),
             "extra": {
                 "actions": actions,
                 "response": completion.raw_response,

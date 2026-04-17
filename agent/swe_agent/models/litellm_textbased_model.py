@@ -1,6 +1,6 @@
 import litellm
 
-from swe_agent.models.litellm_model import LitellmModel, LitellmModelConfig
+from swe_agent.models.litellm_model import LitellmModel, LitellmModelConfig, _message_contents
 from swe_agent.models.utils.actions_text import format_observation_messages, parse_regex_actions
 
 
@@ -28,7 +28,7 @@ class LitellmTextbasedModel(LitellmModel):
 
     def _parse_actions(self, response: dict) -> list[dict]:
         """Parse actions from the model response. Raises FormatError if not exactly one action."""
-        content = response.choices[0].message.content or ""
+        content, _ = _message_contents(response.choices[0].message)
         return parse_regex_actions(
             content, action_regex=self.config.action_regex, format_error_template=self.config.format_error_template
         )

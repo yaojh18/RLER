@@ -27,7 +27,7 @@ def test_policy_route_uses_run_chat_with_route_async(monkeypatch):
             finish_reason="length",
             cost=1.25,
             raw_response={"choices": [{"message": {"content": "```mswea_bash_command\necho hi\n```"}}]},
-            metadata={"timestamp": 123.0},
+            metadata={"timestamp": 123.0, "content_no_thinking": "```mswea_bash_command\necho hi\n```"},
         )
 
     monkeypatch.setattr(
@@ -55,6 +55,7 @@ def test_policy_route_uses_run_chat_with_route_async(monkeypatch):
     assert response["extra"]["actions"] == [{"command": "echo hi"}]
     assert response["extra"]["finish_reason"] == "length"
     assert response["extra"]["cost"] == 1.25
+    assert response["content_no_thinking"] == "```mswea_bash_command\necho hi\n```"
     assert response["extra"]["response"]["choices"][0]["message"]["content"] == "```mswea_bash_command\necho hi\n```"
     assert captured["route_name"] == "policy"
     assert captured["model_name"] == "openai/test-model"
