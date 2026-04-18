@@ -82,6 +82,7 @@ def _run_single_instance(
     run_dir: Path,
     config: dict[str, Any],
     policy_model_name: str,
+    student_policy_model_name: str | None,
     rubric_model_name: str,
     judge_model_name: str,
     rubric_model_kwargs: dict[str, Any],
@@ -98,6 +99,7 @@ def _run_single_instance(
         backend=_make_backend(instance_config),
         run_dir=run_dir,
         policy_model_name=policy_model_name,
+        student_policy_model_name=student_policy_model_name,
         search_config=search_config,
         rubric_model_name=rubric_model_name,
         judge_model_name=judge_model_name,
@@ -139,6 +141,7 @@ def run_search(
     args: argparse.Namespace,
     instance_ids: Sequence[str] | None,
 ) -> list[BackendResult]:
+    student_model_name = getattr(args, "student_model", None)
     if args.backend == "vllm":
         model_name = args.vllm_model
     elif args.backend == "slime":
@@ -202,6 +205,20 @@ def run_search(
                 default_model_name=args.slime_model,
             ),
         )
+    student_backend = getattr(args, "student_backend", "slime")
+    if student_model_name and student_backend == "slime":
+        if service_name != SLIME_SERVICE_NAME:
+            register_model_service(
+                SLIME_SERVICE_NAME,
+                SGLangChatService(
+                    base_url=SLIME_API_BASE,
+                    api_key=SLIME_API_KEY,
+                    default_model_name=student_model_name,
+                ),
+            )
+        configure_model_route("policy_student", ModelRouteConfig(backend="service", service_name=SLIME_SERVICE_NAME, model_name=args.student_model))
+    else:
+        raise RuntimeError(f"student_backend={student_backend} is not supported for search mixed mode")
 
     if args.backend == "vllm":
         configure_model_route("policy", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.vllm_model))
@@ -274,6 +291,7 @@ def run_search(
                             run_dir=run_dir,
                             config=config,
                             policy_model_name=model_name,
+                            student_policy_model_name=student_model_name,
                             rubric_model_name=rubric_model_name,
                             judge_model_name=judge_model_name,
                             rubric_model_kwargs=rubric_model_kwargs,
@@ -357,7 +375,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regression-margin", type=float, default=0.0)
     parser.add_argument("--rubric-model", default=None)
     parser.add_argument("--judge-model", default=None)
-    parser.add_argument("--calculate-gt-reward", action="store_true")
+    parser.add_argument("--calculate-gt-reward", action="store_true", default=True)
+    parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
+    parser.add_argument("--student-model", default=None)
     return parser
 
 

@@ -413,6 +413,8 @@ class SearchNode:
     submission: str = ""
     exit_status: str = ""
     regressed_vs_parent: bool = False
+    policy_source: Literal["teacher", "student"] = "teacher"
+    policy_model_name: str = ""
 
 
 @dataclass
@@ -1173,6 +1175,7 @@ class TrajectorySearchRunner:
         backend: SWEAgentRolloutBackend,
         run_dir: Path,
         policy_model_name: str,
+        student_policy_model_name: str | None = None,
         search_config: SearchConfig | None = None,
         rubric_model_name: str | None = None,
         judge_model_name: str | None = None,
@@ -1187,6 +1190,7 @@ class TrajectorySearchRunner:
         self.nodes_dir = self.run_dir / "nodes"
         self.rubrics_dir = self.run_dir / "rubrics"
         self.policy_model_name = policy_model_name
+        self.student_policy_model_name = student_policy_model_name
         self.rubric_model_name = rubric_model_name or policy_model_name
         self.judge_model_name = judge_model_name or policy_model_name
         self.search_config = search_config or SearchConfig()
@@ -1274,6 +1278,7 @@ class TrajectorySearchRunner:
                 "base_image": self.base_image,
                 "base_image_id": self.base_image_id,
                 "policy_model_name": self.policy_model_name,
+                "student_policy_model_name": self.student_policy_model_name,
                 "rubric_model_name": self.rubric_model_name,
                 "judge_model_name": self.judge_model_name,
                 "frontier_ids": self.frontier_ids,
@@ -1409,6 +1414,8 @@ class TrajectorySearchRunner:
             score=0.0,
             step_start=0,
             step_end=-1,
+            policy_source="teacher",
+            policy_model_name=self.policy_model_name,
         )
         raw_traj = _make_raw_trajectory(snapshot=snapshot, info_extra={"segment_step_range": [-1, -1]})
         raw_traj["messages"] = []
@@ -1617,14 +1624,27 @@ class TrajectorySearchRunner:
         parent_judge = json.loads(Path(parent_node.judge_path).read_text(encoding="utf-8"))
         previous_frontier = list(self.frontier_ids)
         branch_records: list[dict[str, Any]] = []
+        sample_plan: list[tuple[str, str]] = []
+        sample_count = self.search_config.m + 2 if parent_id == "root" else self.search_config.m
+        if self.student_policy_model_name:
+            teacher_count = (sample_count + 1) // 2
+            student_count = sample_count // 2
+            sample_plan = [("teacher", self.policy_model_name)] * teacher_count + [("student", self.student_policy_model_name)] * student_count
+        else:
+            sample_plan = [("teacher", self.policy_model_name)] * sample_count
 
-        for sample_index in range(self.search_config.m + 2 if parent_id == "root" else self.search_config.m):
+        for sample_index, (policy_source, policy_model_name) in enumerate(sample_plan):
             node_id = f"node-r{round_index:03d}-s{sample_index:02d}-{uuid.uuid4().hex[:6]}"
             session = None
             try:
                 resumed_snapshot = copy.deepcopy(parent_snapshot)
                 resumed_snapshot["session_id"] = f"{node_id}-session"
                 resumed_snapshot["spec"]["session_id"] = resumed_snapshot["session_id"]
+                resumed_snapshot["spec"]["policy_ref"] = policy_model_name
+                
+                resumed_snapshot["spec"]["policy_version"] = policy_model_name
+                resumed_snapshot["model"]["config"]["model_name"] = policy_model_name
+                resumed_snapshot["model"]["config"]["route_name"] = "policy_student" if policy_source == "student" else "policy"
                 for index, event in enumerate(resumed_snapshot.get("metadata", {}).get("events", [])):
                     event["session_id"] = resumed_snapshot["session_id"]
                     event["event_id"] = f"{resumed_snapshot['session_id']}:{index}"
@@ -1659,9 +1679,11 @@ class TrajectorySearchRunner:
                         "session": session,
                         "result": result,
                         "snapshot_after": snapshot_after,
+                        "policy_source": policy_source,
+                        "policy_model_name": policy_model_name,
                         "workspace_meta": workspace_meta,
                         "segment_raw": segment_raw,
-                        "segment_messages": build_slim_trajectory(segment_raw, model_name=self.policy_model_name),
+                        "segment_messages": build_slim_trajectory(segment_raw, model_name=policy_model_name),
                         "step_start": step_start,
                         "step_end": step_end,
                         "recent_segments": recent_segments,
@@ -1689,6 +1711,8 @@ class TrajectorySearchRunner:
                     step_start=parent_node.step_end + 1,
                     step_end=parent_node.step_end,
                     exit_status=type(exc).__name__,
+                    policy_source=policy_source,
+                    policy_model_name=policy_model_name,
                 )
                 self._write_node(
                     node,
@@ -1872,6 +1896,8 @@ class TrajectorySearchRunner:
                 submission=branch["result"].get("submission", ""),
                 exit_status=branch["result"].get("exit_status", ""),
                 regressed_vs_parent=regressed and bool(valid_branches) and branch["node_id"] == valid_branches[0]["node_id"],
+                policy_source=branch["policy_source"],
+                policy_model_name=branch["policy_model_name"],
             )
             judge_payload = {
                 "persistent_state": branch.get("persistent_state", copy.deepcopy(parent_judge.get("persistent_state", EMPTY_PERSISTENT_STATE))),
@@ -1912,10 +1938,10 @@ class TrajectorySearchRunner:
                     result=terminal_result,
                     info_extra={"terminal_rollout_from_node_id": node.node_id},
                 )
-                terminal_messages = build_slim_trajectory(terminal_raw, model_name=self.policy_model_name)
+                terminal_messages = build_slim_trajectory(terminal_raw, model_name=branch["policy_model_name"])
                 terminal_patch = {
                     self.task_id: {
-                        "model_name_or_path": self.policy_model_name,
+                        "model_name_or_path": branch["policy_model_name"],
                         "instance_id": self.task_id,
                         "model_patch": terminal_result.get("submission", "") or "",
                     }
@@ -2055,12 +2081,13 @@ class TrajectorySearchRunner:
         messages_path = self.run_dir / "messages.json"
         patch_path = self.run_dir / "model_patch.json"
         _atomic_write_json(raw_traj_path, raw_traj)
-        _atomic_write_json(messages_path, build_slim_trajectory(raw_traj, model_name=self.policy_model_name))
+        final_policy_model_name = final_node.policy_model_name or self.policy_model_name
+        _atomic_write_json(messages_path, build_slim_trajectory(raw_traj, model_name=final_policy_model_name))
         _atomic_write_json(
             patch_path,
             {
                 self.task_id: {
-                    "model_name_or_path": self.policy_model_name,
+                    "model_name_or_path": final_policy_model_name,
                     "instance_id": self.task_id,
                     "model_patch": final_node.submission,
                 }

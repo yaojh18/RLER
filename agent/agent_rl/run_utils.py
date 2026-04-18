@@ -171,6 +171,16 @@ async def run_litellm_completion_async(
         async with _get_litellm_semaphore():
             response = await asyncio.to_thread(litellm.completion, messages=msgs, model=model_name, **chat_kwargs)
     except Exception as exc:
+        if isinstance(exc, litellm.JSONSchemaValidationError):
+            raw_content = exc.raw_response if isinstance(exc.raw_response, str) else str(exc.raw_response)
+            return ChatCompletion(
+                content=raw_content,
+                finish_reason="stop",
+                model_name=model_name,
+                cost=0.0,
+                raw_response={"validation_error": str(exc)},
+                metadata={"timestamp": time.time(), "content_no_thinking": raw_content},
+            )
         print(f"Error in run_litellm_completion_async: {exc}")
         return ChatCompletion(content="", model_name=model_name, metadata={"timestamp": time.time()})
     choice = response.choices[0]
@@ -215,6 +225,7 @@ async def run_chat_with_route_completion_async(
     route = get_model_route(route_name)
     routed_kwargs = dict(chat_kwargs)
     policy_version = routed_kwargs.pop("policy_version", None)
+    # LOGGER.debug(f"Running route backend: {route.backend}")
     if route is None or route.backend == "litellm":
         routed_model_name = route.model_name if route and route.model_name else model_name
         return await run_litellm_completion_async(
