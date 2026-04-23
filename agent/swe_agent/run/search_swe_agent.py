@@ -253,6 +253,7 @@ def run_search(
             n=args.n,
             k=args.k,
             p=args.p,
+            step_limit=args.step_limit,
             max_rounds=args.max_rounds,
             max_active_rubrics=args.max_active_rubrics,
             policy_temperature=args.policy_temperature,

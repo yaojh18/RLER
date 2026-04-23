@@ -25,7 +25,6 @@ from swe_agent.trajectory_search import (
     _build_initial_rubric_bank,
     _build_step_cards,
     _collect_workspace_meta,
-    _compute_weighted_reward,
     _generate_round_rubrics,
     _score_parent_round,
     _score_round,
@@ -125,6 +124,16 @@ class _SlowSequentialSession:
         self._current_snapshot = copy.deepcopy(self._snapshots[0])
         self._timings["sample_end"].append(time.perf_counter())
         return _Payload(payload)
+
+
+class _RecordingSequentialSession(_SequentialSession):
+    def __init__(self, snapshots, results, container_id="cid"):
+        super().__init__(snapshots, results, container_id=container_id)
+        self.max_steps_calls: list[int | None] = []
+
+    def run_until_pause(self, max_steps=None):
+        self.max_steps_calls.append(max_steps)
+        return super().run_until_pause(max_steps=max_steps)
 
 
 class _FakeBackend:
@@ -351,7 +360,7 @@ def test_initial_rubric_bank_includes_closure_without_decisive_check_negative_ru
     assert "no concrete deciding check" in closure.scale["5"].lower()
 
 
-def test_weighted_reward_and_rubric_bank_update():
+def test_rubric_bank_update():
     positive = RubricRecord(
         rubric_id="pos",
         title="Validation",
@@ -370,14 +379,6 @@ def test_weighted_reward_and_rubric_bank_update():
         weight=-1,
         source_round=1,
     )
-    score = _compute_weighted_reward(
-        [
-            {"rubric": {"weight": 1}, "score_normalized": 1.0},
-            {"rubric": {"weight": -1}, "score_normalized": 0.25},
-        ]
-    )
-    assert score == pytest.approx(0.75)
-
     active, inactive, combined = _update_rubric_bank(
         active_bank=[],
         inactive_bank=[],
@@ -1707,7 +1708,7 @@ def test_trajectory_search_runner_calculates_gt_reward_and_writes_terminal_artif
     assert 1.0 in rewards.values()
     round_payload = json.loads((tmp_path / "run" / "rubrics" / "round_001.json").read_text())
     selected_rubric = next(sample for sample in round_payload["rubric_samples"] if sample.get("selected"))
-    rubric_payload = json.loads((Path(selected_rubric["artifact_dir"]) / "rubric.json").read_text())
+    rubric_payload = json.loads((tmp_path / "run" / "rubrics" / selected_rubric["rubric_list_id"] / "rubric.json").read_text())
     ordered_node_ids = sorted(node_id for node_id in rubric_payload["child_rewards"] if node_id in rewards)
     sibling_scores = [float(rubric_payload["child_rewards"][node_id]) for node_id in ordered_node_ids]
     sibling_gt = [float(rewards[node_id]) for node_id in ordered_node_ids]
@@ -1722,7 +1723,147 @@ def test_trajectory_search_runner_calculates_gt_reward_and_writes_terminal_artif
     assert rubric_payload["gt_reward_parent"] == 0.0
     assert round_payload["gt_reward_parent"] == 0.0
     assert rubric_payload["gt_by_rubric"]
+    assert round_payload["selected_rubric_list_id"] == selected_rubric["rubric_list_id"]
+    assert round_payload["parent_reward"] == pytest.approx(rubric_payload["parent_reward"])
+    assert round_payload["child_rewards"] == pytest.approx(rubric_payload["child_rewards"])
+    assert round_payload["parent_score_by_rubric"] == rubric_payload["parent_score_by_rubric"]
+    assert round_payload["child_score_by_rubric"] == rubric_payload["child_score_by_rubric"]
     assert set(docker_state["removed_containers"]) == {"root-container", "child-a-container", "child-b-container"}
+
+
+def test_round_summary_copies_selected_rubric_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _root_snapshot()
+    child_a = _branch_snapshot(
+        root,
+        session_id="child-a",
+        step_index=0,
+        assistant_text="Run the failing test.",
+        command="pytest tests/test_alpha.py -q",
+        observation="<returncode>0</returncode>\n<output>\n1 passed\n</output>",
+    )
+    child_b = _branch_snapshot(
+        root,
+        session_id="child-b",
+        step_index=0,
+        assistant_text="Inspect the file only.",
+        command="sed -n '1,40p' pkg/core.py",
+        observation="<returncode>0</returncode>\n<output>\nclass Core: ...\n</output>",
+    )
+    backend = _FakeBackend(
+        root,
+        [
+            _FakeSession(child_a, _branch_result(child_a), container_id="child-a-container"),
+            _FakeSession(child_b, _branch_result(child_b), container_id="child-b-container"),
+        ],
+    )
+    workspace_meta = {
+        "root-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "root"},
+        "child-a-container": {"changed_files": ["pkg/core.py"], "untracked_files": [], "diff_stat": " pkg/core.py | 2 +-", "current_patch_chars": 120, "workspace_fingerprint": "a"},
+        "child-b-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "b"},
+    }
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
+    monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
+    _patch_docker_subprocess(monkeypatch)
+
+    runner = TrajectorySearchRunner(
+        instance={"instance_id": "demo__round-summary", "problem_statement": "Fix the failing test."},
+        backend=backend,
+        run_dir=tmp_path / "run",
+        policy_model_name="openai/fake",
+        search_config=SearchConfig(m=1, k=1, p=1, max_rounds=1, max_active_rubrics=2),
+    )
+    runner.run()
+
+    round_payload = json.loads((tmp_path / "run" / "rubrics" / "round_001.json").read_text())
+    rubric_payload = json.loads(
+        (tmp_path / "run" / "rubrics" / round_payload["selected_rubric_list_id"] / "rubric.json").read_text()
+    )
+    assert round_payload["selected_rubric_list_id"] == rubric_payload["rubric_list_id"]
+    assert round_payload["parent_reward"] == pytest.approx(rubric_payload["parent_reward"])
+    assert round_payload["child_rewards"] == pytest.approx(rubric_payload["child_rewards"])
+    assert round_payload["parent_score_by_rubric"] == rubric_payload["parent_score_by_rubric"]
+    assert round_payload["child_score_by_rubric"] == rubric_payload["child_score_by_rubric"]
+
+
+def test_terminal_rollout_uses_remaining_step_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _root_snapshot()
+    child_a = _branch_snapshot(
+        root,
+        session_id="child-a",
+        step_index=19,
+        assistant_text="Run the failing test.",
+        command="pytest tests/test_alpha.py -q",
+        observation="<returncode>0</returncode>\n<output>\n1 passed\n</output>",
+    )
+    child_b = _branch_snapshot(
+        root,
+        session_id="child-b",
+        step_index=19,
+        assistant_text="Inspect unrelated file.",
+        command="sed -n '1,20p' README.md",
+        observation="<returncode>0</returncode>\n<output>\nREADME\n</output>",
+    )
+    child_a_final = _branch_snapshot(
+        child_a,
+        session_id="child-a-final",
+        step_index=20,
+        assistant_text="Submit the patch.",
+        command="printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\npatch-a\\n'",
+        observation="<returncode>0</returncode>\n<output>\nsubmitted\n</output>",
+    )
+    child_b_final = _branch_snapshot(
+        child_b,
+        session_id="child-b-final",
+        step_index=20,
+        assistant_text="Submit the weak patch.",
+        command="printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\npatch-b\\n'",
+        observation="<returncode>0</returncode>\n<output>\nsubmitted\n</output>",
+    )
+    chosen_session = _RecordingSequentialSession(
+        [child_a, child_a_final],
+        [_branch_result(child_a), _branch_result(child_a_final, status="finished", submission="patch-a")],
+        container_id="child-a-container",
+    )
+    backend = _FakeBackend(
+        root,
+        [
+            chosen_session,
+            _SequentialSession(
+                [child_b, child_b_final],
+                [_branch_result(child_b), _branch_result(child_b_final, status="finished", submission="patch-b")],
+                container_id="child-b-container",
+            ),
+        ],
+    )
+    backend.agent_config["step_limit"] = 25
+    workspace_meta = {
+        "root-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "root"},
+        "child-a-container": {"changed_files": ["pkg/core.py"], "untracked_files": [], "diff_stat": " pkg/core.py | 2 +-", "current_patch_chars": 120, "workspace_fingerprint": "a"},
+        "child-b-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "b"},
+    }
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
+    monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
+    monkeypatch.setattr(
+        "swe_agent.trajectory_search.evaluate_swebench_instance_patches",
+        lambda **kwargs: {node_id: 1.0 for node_id in kwargs["patches_by_key"]},
+    )
+    _patch_docker_subprocess(monkeypatch)
+
+    runner = TrajectorySearchRunner(
+        instance={"instance_id": "demo__remaining-steps", "problem_statement": "Fix the failing test."},
+        backend=backend,
+        run_dir=tmp_path / "run",
+        policy_model_name="openai/fake",
+        harness_namespace="test-namespace",
+        search_config=SearchConfig(m=0, k=20, p=1, max_rounds=1, max_active_rubrics=2, calculate_gt_reward=True),
+    )
+    runner.run()
+
+    assert chosen_session.max_steps_calls == [20, 5]
 
 
 def test_trajectory_search_runner_skips_artifacts_for_failed_policy_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -2101,6 +2242,195 @@ def test_trajectory_search_runner_equal_parent_score_keeps_frontier_progress(tmp
     assert manifest["frontier_ids"][1].startswith("node-r001-s02")
     round_two = json.loads((tmp_path / "run" / "rubrics" / "round_002.json").read_text())
     assert round_two["regressed"] is False
+
+
+def test_trajectory_search_runner_regression_uses_parent_as_final_best_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _root_snapshot()
+    child_a = _branch_snapshot(
+        root,
+        session_id="child-a",
+        step_index=0,
+        assistant_text="Run the failing test.",
+        command="pytest tests/test_alpha.py -q",
+        observation="<returncode>0</returncode>\n<output>\n1 passed\n</output>",
+    )
+    child_b = _branch_snapshot(
+        root,
+        session_id="child-b",
+        step_index=0,
+        assistant_text="Inspect unrelated file.",
+        command="sed -n '1,20p' README.md",
+        observation="<returncode>0</returncode>\n<output>\nREADME\n</output>",
+    )
+    child_c = _branch_snapshot(
+        root,
+        session_id="child-c",
+        step_index=0,
+        assistant_text="Make an unfocused edit.",
+        command="echo 'noise' >> notes.txt",
+        observation="<returncode>0</returncode>\n<output>\n</output>",
+    )
+    child_a_final = _branch_snapshot(
+        child_a,
+        session_id="child-a-final",
+        step_index=1,
+        assistant_text="Submit the parent patch.",
+        command="printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\npatch-parent\\n'",
+        observation="<returncode>0</returncode>\n<output>\nsubmitted\n</output>",
+    )
+    child_b_final = _branch_snapshot(
+        child_b,
+        session_id="child-b-final",
+        step_index=1,
+        assistant_text="Submit weak patch b.",
+        command="printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\npatch-b\\n'",
+        observation="<returncode>0</returncode>\n<output>\nsubmitted\n</output>",
+    )
+    child_c_final = _branch_snapshot(
+        child_c,
+        session_id="child-c-final",
+        step_index=1,
+        assistant_text="Submit weak patch c.",
+        command="printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\npatch-c\\n'",
+        observation="<returncode>0</returncode>\n<output>\nsubmitted\n</output>",
+    )
+    grandchild_bad = _branch_snapshot(
+        child_a,
+        session_id="grandchild-bad",
+        step_index=1,
+        assistant_text="Inspect unrelated file.",
+        command="sed -n '1,20p' README.md",
+        observation="<returncode>0</returncode>\n<output>\nREADME\n</output>",
+    )
+    grandchild_bad_final = _branch_snapshot(
+        grandchild_bad,
+        session_id="grandchild-bad-final",
+        step_index=2,
+        assistant_text="Submit the regressed patch.",
+        command="printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\npatch-grandchild\\n'",
+        observation="<returncode>0</returncode>\n<output>\nsubmitted\n</output>",
+    )
+    backend = _FakeBackend(
+        root,
+        [
+            _SequentialSession(
+                [child_a, child_a_final],
+                [_branch_result(child_a), _branch_result(child_a_final, status="finished", submission="patch-parent")],
+                container_id="child-a-container",
+            ),
+            _SequentialSession(
+                [child_b, child_b_final],
+                [_branch_result(child_b), _branch_result(child_b_final, status="finished", submission="patch-b")],
+                container_id="child-b-container",
+            ),
+            _SequentialSession(
+                [child_c, child_c_final],
+                [_branch_result(child_c), _branch_result(child_c_final, status="finished", submission="patch-c")],
+                container_id="child-c-container",
+            ),
+            _SequentialSession(
+                [grandchild_bad, grandchild_bad_final],
+                [_branch_result(grandchild_bad), _branch_result(grandchild_bad_final, status="finished", submission="patch-grandchild")],
+                container_id="grandchild-bad-container",
+            ),
+        ],
+    )
+    workspace_meta = {
+        "root-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "root"},
+        "child-a-container": {"changed_files": ["pkg/core.py"], "untracked_files": [], "diff_stat": " pkg/core.py | 2 +-", "current_patch_chars": 120, "workspace_fingerprint": "a"},
+        "child-b-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "b"},
+        "child-c-container": {"changed_files": ["notes.txt"], "untracked_files": ["notes.txt"], "diff_stat": " notes.txt | 1 +", "current_patch_chars": 30, "workspace_fingerprint": "c"},
+        "grandchild-bad-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "gb"},
+    }
+
+    async def fake_regression_chat(route_name, model_name, user_prompt=None, system_prompt=None, **kwargs):
+        judge_prompt = "\n".join(part for part in [system_prompt, user_prompt] if part)
+        if user_prompt and PERSISTENT_STATE_UPDATE_PROMPT.strip() in user_prompt:
+            return json.dumps(
+                {
+                    "current_state": "Continue focused debugging on `pkg/core.py`.",
+                    "task_specification": "Fix the failing test without unrelated edits.",
+                    "files_and_functions": "- `pkg/core.py`: active target file",
+                    "errors_and_corrections": "Discard unrelated exploration.",
+                    "codebase_and_system_documentation": "`pkg/core.py` contains the failing logic.",
+                    "learnings": "Targeted validation is the strongest signal.",
+                    "key_results": "Preserved the validated branch.",
+                    "worklog": "- Compressed the earlier shared segment",
+                }
+            )
+        if user_prompt and SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT.strip() in user_prompt:
+            return json.dumps(
+                {
+                    "question": "Fix the failing test.",
+                    "reasoning": "Validation and drift separate the continuations.",
+                    "positive_rubrics": [
+                        {
+                            "title": "Validation",
+                            "description": "The trajectory runs targeted validation relevant to the fix.",
+                            "scale": {
+                                "1": "No validation",
+                                "2": "Incidental validation",
+                                "3": "Some relevant validation",
+                                "4": "Targeted validation",
+                                "5": "Targeted validation plus edge coverage",
+                            },
+                        }
+                    ],
+                    "negative_rubrics": [
+                        {
+                            "title": "Drift",
+                            "description": "The trajectory makes unfocused changes without evidence.",
+                            "scale": {
+                                "1": "No drift",
+                                "2": "Minor drift",
+                                "3": "Noticeable drift",
+                                "4": "Serious drift",
+                                "5": "Severe drift",
+                            },
+                        }
+                    ],
+                }
+            )
+
+        is_parent = "## Agent Trajectory:" in judge_prompt and "## Continuation Trajectory:" not in judge_prompt
+        latest_bad = "sed -n '1,20p' README.md" in judge_prompt or "echo 'noise' >> notes.txt" in judge_prompt
+        latest_test = "pytest tests/test_alpha.py -q" in judge_prompt
+        is_positive = "Type: positive" in judge_prompt
+        if is_parent:
+            return json.dumps({"score": 5 if is_positive else 1})
+        if is_positive:
+            return json.dumps({"score": 1 if latest_bad else (5 if latest_test else 3)})
+        return json.dumps({"score": 5 if latest_bad else 1})
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_regression_chat)
+    monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
+    monkeypatch.setattr(
+        "swe_agent.trajectory_search.evaluate_swebench_instance_patches",
+        lambda **kwargs: {
+            node_id: (1.0 if patch == "patch-parent" else 0.0)
+            for node_id, patch in kwargs["patches_by_key"].items()
+        },
+    )
+    _patch_docker_subprocess(monkeypatch)
+
+    runner = TrajectorySearchRunner(
+        instance={"instance_id": "demo__regress-final", "problem_statement": "Fix the failing test."},
+        backend=backend,
+        run_dir=tmp_path / "run",
+        policy_model_name="openai/fake",
+        harness_namespace="test-namespace",
+        search_config=SearchConfig(m=1, k=1, p=1, max_rounds=2, max_active_rubrics=2, calculate_gt_reward=True),
+    )
+    result = runner.run()
+
+    manifest = json.loads((tmp_path / "run" / "run_manifest.json").read_text())
+    patch_payload = json.loads(Path(result.patch_path).read_text())
+    parent_id = manifest["best_node_id"]
+    assert parent_id and parent_id.startswith("node-r001")
+    assert manifest["frontier_ids"] == []
+    assert (patch_payload["demo__regress-final"]["model_patch"]) == "patch-parent"
+    assert json.loads((tmp_path / "run" / "nodes" / parent_id / "node.json").read_text())["status"] == "archived"
 
 
 def test_trajectory_search_final_cleanup_keeps_only_best_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

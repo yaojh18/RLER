@@ -1,6 +1,0 @@
-{
-  "trajectory_format": "mini-swe-agent-1.1",
-  "parser": "parse_mini_swe_message",
-  "model_name": "Qwen/Qwen3.5-9B",
-  "messages": []
-}

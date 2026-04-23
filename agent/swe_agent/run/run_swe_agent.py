@@ -340,7 +340,6 @@ def extract_backend_result(
     patch_path.write_text(json.dumps({instance_id: patch_record}, indent=2))
 
     info = raw_traj.get("info", {})
-    submission = info.get("submission", "") or ""
     return BackendResult(
         benchmark_name=benchmark_name,
         split=split,

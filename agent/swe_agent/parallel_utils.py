@@ -1,6 +1,3 @@
-# TODO: rewrite this file, current codes are too messy. Make them as precise as possible.
-
-
 from __future__ import annotations
 
 import json
@@ -10,6 +7,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+import numpy as np
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -51,33 +49,27 @@ class RubricArtifactBundle:
     selected_for_round_summary: bool = False
 
 
-def _write_round_artifacts(
+def _write_base_artifacts(
     bundles: list[NodeArtifactBundle],
     rubric_bundles: list[RubricArtifactBundle] | None = None,
     extra_json_writes: list[tuple[Path, Any]] | None = None,
-    *,
-    write_gt_files: bool = True,
 ) -> None:
     for bundle in bundles:
         bundle.node_dir.mkdir(parents=True, exist_ok=True)
         if bundle.raw_traj_payload is not None:
             _atomic_write_json(bundle.node_dir / "raw_traj.json", bundle.raw_traj_payload)
         _atomic_write_json(bundle.node_dir / "messages.json", bundle.messages_payload)
-        if write_gt_files:
-            _atomic_write_json(bundle.node_dir / "judge.json", bundle.judge_payload)
         if bundle.snapshot_payload is not None:
             _atomic_write_json(bundle.node_dir / "snapshot.json", bundle.snapshot_payload)
+        _atomic_write_json(bundle.node_dir / "node.json", bundle.node_payload)
         if bundle.terminal_raw_traj_payload is not None:
             _atomic_write_json(bundle.node_dir / "terminal_raw_traj.json", bundle.terminal_raw_traj_payload)
         if bundle.terminal_messages_payload is not None:
             _atomic_write_json(bundle.node_dir / "terminal_messages.json", bundle.terminal_messages_payload)
         if bundle.terminal_patch_payload is not None:
             _atomic_write_json(bundle.node_dir / "terminal_patch.json", bundle.terminal_patch_payload)
-        _atomic_write_json(bundle.node_dir / "node.json", bundle.node_payload)
     for bundle in rubric_bundles or []:
         bundle.rubric_dir.mkdir(parents=True, exist_ok=True)
-        if write_gt_files:
-            _atomic_write_json(bundle.rubric_dir / "rubric.json", bundle.rubric_payload)
         _atomic_write_json(bundle.rubric_dir / "messages.json", bundle.messages_payload)
         if bundle.raw_traj_payload is not None:
             _atomic_write_json(bundle.rubric_dir / "raw_traj.json", bundle.raw_traj_payload)
@@ -100,6 +92,15 @@ def _write_gt_artifacts(
         _atomic_write_json(path, payload)
 
 
+def _pearson(scores: list[float], gt_scores: list[float]) -> float:
+    if len(scores) < 2 or len(gt_scores) < 2 or len(scores) != len(gt_scores):
+        return 0.0
+    if np.allclose(scores, scores[0]) and np.allclose(gt_scores, gt_scores[0]):
+        return 1.0
+    r = np.corrcoef(scores, gt_scores)[0, 1]
+    return float(r) if np.isfinite(r) else 0.0
+
+
 class ArtifactWriter:
     def __init__(self, max_workers: int = 1) -> None:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="search-artifacts")
@@ -110,10 +111,9 @@ class ArtifactWriter:
         bundles: list[NodeArtifactBundle],
         rubric_bundles: list[RubricArtifactBundle] | None = None,
         extra_json_writes: list[tuple[Path, Any]] | None = None,
-        *,
-        write_gt_files: bool = True,
     ) -> None:
-        _write_round_artifacts(bundles, rubric_bundles, extra_json_writes, write_gt_files=write_gt_files)
+        _write_base_artifacts(bundles, rubric_bundles, extra_json_writes)
+        _write_gt_artifacts(bundles, rubric_bundles, None)
 
     def submit_round(
         self,
@@ -123,13 +123,10 @@ class ArtifactWriter:
         *,
         write_gt_files: bool = True,
     ) -> Future:
-        future = self._executor.submit(
-            self.write_round,
-            bundles,
-            rubric_bundles,
-            extra_json_writes,
-            write_gt_files=write_gt_files,
-        )
+        if write_gt_files:
+            future = self._executor.submit(self.write_round, bundles, rubric_bundles, extra_json_writes)
+        else:
+            future = self._executor.submit(_write_base_artifacts, bundles, rubric_bundles, extra_json_writes)
         self._futures.append(future)
         return future
 
@@ -192,61 +189,63 @@ class PatchEvalManager:
         for bundle in bundles:
             if bundle.node_id in rewards:
                 bundle.judge_payload["ground_truth_reward"] = rewards[bundle.node_id]
-        gt_by_node_id = dict(rewards)
+
+        round_payload_by_path = {
+            path: payload for path, payload in (extra_json_writes or []) if isinstance(payload, dict)
+        }
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
-            parent_node_id = payload.get("parent_node_id")
+            rubric_list_id = str(payload.get("rubric_list_id") or "")
+            if not rubric_list_id:
+                continue
+
+            parent_node_id = str(payload.get("parent_node_id") or "")
             parent_gt = None
             if parent_node_id:
-                parent_judge_path = self.work_dir / "nodes" / str(parent_node_id) / "judge.json"
+                parent_judge_path = self.work_dir / "nodes" / parent_node_id / "judge.json"
                 if parent_judge_path.exists():
                     parent_gt = json.loads(parent_judge_path.read_text(encoding="utf-8")).get("ground_truth_reward")
-            ordered_node_ids = sorted(str(node_id) for node_id in payload.get("child_rewards", {}))
-            sibling_scores = [float(payload["child_rewards"][node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
-            sibling_gt = [float(gt_by_node_id[node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
-            gt_reward_siblings = 0.0
-            if len(sibling_scores) >= 2:
-                mean_score = sum(sibling_scores) / len(sibling_scores)
-                mean_gt = sum(sibling_gt) / len(sibling_gt)
-                cov = sum((score - mean_score) * (gt - mean_gt) for score, gt in zip(sibling_scores, sibling_gt))
-                var_score = sum((score - mean_score) ** 2 for score in sibling_scores)
-                var_gt = sum((gt - mean_gt) ** 2 for gt in sibling_gt)
-                if var_score > 0 and var_gt > 0:
-                    gt_reward_siblings = cov / (var_score * var_gt) ** 0.5
-            gt_reward_parent = 0.0
-            parent_reward = payload.get("parent_reward")
-            if parent_gt is not None and parent_reward is not None:
-                agreements = [
-                    float((float(payload["child_rewards"][node_id]) >= float(parent_reward)) == (float(gt_by_node_id[node_id]) >= float(parent_gt)))
-                    for node_id in ordered_node_ids
-                    if node_id in gt_by_node_id
-                ]
-                if agreements:
-                    gt_reward_parent = sum(agreements) / len(agreements)
-            payload["gt_reward_siblings"] = float(gt_reward_siblings)
-            payload["gt_reward_parent"] = float(gt_reward_parent)
-            payload["gt_by_rubric"] = {
-                rubric_id: {
-                    "parent_score": payload.get("parent_score_by_rubric", {}).get(rubric_id),
-                    "child_scores": payload.get("child_score_by_rubric", {}).get(rubric_id, {}),
-                    "ground_truth_by_node": (
-                        ({str(parent_node_id): parent_gt} if parent_node_id is not None else {})
-                        | {node_id: gt_by_node_id[node_id] for node_id in ordered_node_ids if node_id in gt_by_node_id}
-                    ),
+
+            ordered_child_ids = sorted(str(node_id) for node_id in payload.get("child_rewards", {}))
+            gt_entries: dict[str, dict[str, Any]] = {}
+            if parent_node_id and parent_gt is not None and payload.get("parent_reward") is not None:
+                gt_entries[parent_node_id] = {
+                    "score": float(payload["parent_reward"]),
+                    "gt_score": float(parent_gt),
+                    "is_parent": True,
                 }
-                for rubric_id in sorted(
-                    set(payload.get("parent_score_by_rubric", {}))
-                    | set(payload.get("child_score_by_rubric", {}))
-                )
-            }
+            for node_id in ordered_child_ids:
+                if node_id not in rewards:
+                    continue
+                gt_entries[node_id] = {
+                    "score": float(payload["child_rewards"][node_id]),
+                    "gt_score": float(rewards[node_id]),
+                    "is_parent": False,
+                }
+
+            sibling_scores = [entry["score"] for entry in gt_entries.values() if not entry["is_parent"]]
+            sibling_gt = [entry["gt_score"] for entry in gt_entries.values() if not entry["is_parent"]]
+            parent_entry = next((entry for entry in gt_entries.values() if entry["is_parent"]), None)
+            gt_reward_parent = 0.0
+            if parent_entry is not None:
+                agreements = [
+                    float((entry["score"] >= parent_entry["score"]) == (entry["gt_score"] >= parent_entry["gt_score"]))
+                    for entry in gt_entries.values()
+                    if not entry["is_parent"]
+                ]
+                gt_reward_parent = sum(agreements) / len(agreements)
+
+            payload["gt_by_rubric"] = {rubric_list_id: gt_entries}
+            payload["gt_reward_siblings"] = float(_pearson(sibling_scores, sibling_gt))
+            payload["gt_reward_parent"] = float(gt_reward_parent)
+
             if bundle.selected_for_round_summary and bundle.round_summary_path is not None:
-                for path, round_payload in extra_json_writes or []:
-                    if path != bundle.round_summary_path or not isinstance(round_payload, dict):
-                        continue
+                round_payload = round_payload_by_path.get(bundle.round_summary_path)
+                if round_payload is not None:
                     round_payload["gt_by_rubric"] = payload["gt_by_rubric"]
                     round_payload["gt_reward_siblings"] = payload["gt_reward_siblings"]
                     round_payload["gt_reward_parent"] = payload["gt_reward_parent"]
-                    break
+
         _write_gt_artifacts(bundles, rubric_bundles, extra_json_writes)
         return rewards
 
