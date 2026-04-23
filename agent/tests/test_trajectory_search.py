@@ -32,6 +32,7 @@ from swe_agent.trajectory_search import (
     _truncate_structured_observation,
     _update_persistent_state,
     _update_rubric_bank,
+    RubricGenerationSample,
     RubricRecord,
 )
 
@@ -258,6 +259,49 @@ def _make_fake_chat():
     return fake_chat
 
 
+def _make_fake_rubric_completion():
+    async def fake_completion(route_name, model_name, user_prompt=None, system_prompt=None, messages=None, **kwargs):
+        assistant_turns = sum(1 for message in (messages or []) if message.get("role") == "assistant")
+        if assistant_turns == 0:
+            rendered = json.dumps(
+                {
+                    "question": "Fix the failing test.",
+                    "reasoning": "Validation quality and drift separate the continuations.",
+                    "positive_rubrics": [
+                        {
+                            "title": "Validation",
+                            "description": "The trajectory runs targeted validation relevant to the fix.",
+                            "scale": {
+                                "1": "No validation",
+                                "2": "Incidental validation",
+                                "3": "Some relevant validation",
+                                "4": "Targeted validation",
+                                "5": "Targeted validation plus edge coverage",
+                            },
+                        }
+                    ],
+                    "negative_rubrics": [
+                        {
+                            "title": "Drift",
+                            "description": "The trajectory makes unfocused changes without evidence.",
+                            "scale": {
+                                "1": "No drift",
+                                "2": "Minor drift",
+                                "3": "Noticeable drift",
+                                "4": "Serious drift",
+                                "5": "Severe drift",
+                            },
+                        }
+                    ],
+                }
+            )
+        else:
+            rendered = "{}"
+        return SimpleNamespace(content=rendered, metadata={"content_no_thinking": rendered}, finish_reason="stop")
+
+    return fake_completion
+
+
 def _patch_docker_subprocess(monkeypatch: pytest.MonkeyPatch, *, initial_images: list[str] | None = None):
     state = {"images": set(initial_images or []), "removed_images": [], "removed_containers": []}
 
@@ -338,7 +382,7 @@ def test_weighted_reward_and_rubric_bank_update():
         active_bank=[],
         inactive_bank=[],
         generated=[positive, negative],
-        variances={"pos": 0.2, "neg": 0.0},
+        rewards={"pos": 0.2, "neg": 0.0},
         max_active_rubrics=2,
     )
     assert [rubric.rubric_id for rubric in active] == ["pos", "neg"]
@@ -379,7 +423,7 @@ def test_update_rubric_bank_deduplicates_by_title():
         active_bank=[original],
         inactive_bank=[],
         generated=[duplicate, negative],
-        variances={"old": 0.1, "new": 0.3, "neg": 0.2},
+        rewards={"old": 0.1, "new": 0.3, "neg": 0.2},
         max_active_rubrics=2,
     )
 
@@ -513,14 +557,6 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
             depth=1,
             session_id="grandparent-session",
             status="frontier",
-            checkpoint_image_tag=None,
-            checkpoint_image_id=None,
-            workspace_fingerprint="grandparent",
-            raw_traj_path=str(grandparent_dir / "raw_traj.json"),
-            messages_path=str(grandparent_dir / "messages.json"),
-            judge_path=str(grandparent_judge_path),
-            snapshot_path=None,
-            rubric_ref=None,
         )
     }
     parent_node = SearchNode(
@@ -530,14 +566,6 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
         depth=2,
         session_id="parent-session",
         status="frontier",
-        checkpoint_image_tag=None,
-        checkpoint_image_id=None,
-        workspace_fingerprint="parent",
-        raw_traj_path=str(tmp_path / "run" / "nodes" / "parent" / "raw_traj.json"),
-        messages_path=str(tmp_path / "run" / "nodes" / "parent" / "messages.json"),
-        judge_path=str(tmp_path / "run" / "nodes" / "parent" / "judge.json"),
-        snapshot_path=None,
-        rubric_ref=None,
     )
     runner.nodes["parent"] = parent_node
 
@@ -581,6 +609,7 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
     }
     branch_records = [
         {
+            "node_id": "branch-1",
             "recent_segments": [
                 copy.deepcopy(parent_judge["recent_segments"][1]),
                 {
@@ -605,6 +634,7 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
             "result": {"status": "paused", "exit_status": "", "submission": ""},
         },
         {
+            "node_id": "branch-2",
             "recent_segments": [
                 copy.deepcopy(parent_judge["recent_segments"][1]),
                 {
@@ -700,7 +730,7 @@ async def test_prepare_round_judging_updates_shared_context_once(tmp_path: Path,
     assert all(call["kwargs"]["max_tokens"] == 37 for call in calls["judge"])
     assert all(branch["persistent_state"]["current_state"] == "Continue from the shared pytest context and compare branch-specific validation." for branch in branch_records)
     assert all(branch["persistent_state"]["key_results"] == "- compressed-once" for branch in branch_records)
-    assert judged["generated"]
+    assert judged["selected_sample"]["generated"]
 
 
 @pytest.mark.asyncio
@@ -799,7 +829,7 @@ async def test_trajectory_evaluator_calls_use_exact_json_schema(monkeypatch: pyt
         top_p=1.0,
         max_tokens=64,
     )
-    rubrics = await _generate_round_rubrics(
+    rubric_sample = await _generate_round_rubrics(
         question={"system_prompt": "sys", "user_prompt": "user"},
         previous_state=copy.deepcopy(EMPTY_PERSISTENT_STATE),
         latest_shared_segment=None,
@@ -815,7 +845,7 @@ async def test_trajectory_evaluator_calls_use_exact_json_schema(monkeypatch: pyt
         question={"system_prompt": "sys", "user_prompt": "user"},
         shared_context={"previous_persistent_state": copy.deepcopy(EMPTY_PERSISTENT_STATE), "latest_agent_trajectory": None},
         continuations=[{"summary": {"step_count": 1}, "trajectory_continuation": {"step_cards": [{"commands": ["pytest -q"]}]}}],
-        rubrics=rubrics,
+        rubrics=rubric_sample.generated,
         model_name="openai/fake",
         temperature=0.0,
         top_p=1.0,
@@ -864,7 +894,7 @@ async def test_generate_round_rubrics_uses_multiturn_generation_and_stops_on_emp
 
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", fake_completion)
 
-    rubrics = await _generate_round_rubrics(
+    rubric_sample = await _generate_round_rubrics(
         question={"system_prompt": "sys", "user_prompt": "user"},
         previous_state=copy.deepcopy(EMPTY_PERSISTENT_STATE),
         latest_shared_segment=None,
@@ -880,12 +910,15 @@ async def test_generate_round_rubrics_uses_multiturn_generation_and_stops_on_emp
     assert len(calls) == 2
     assert calls[0]["messages"][0]["role"] == "user"
     assert "## Agent Trajectory Continuations:" in calls[0]["messages"][0]["content"]
-    assert "Generate the next best rubric or return an empty object." in calls[0]["messages"][0]["content"]
+    assert "Generate the next best rubric or return an empty object." not in calls[0]["messages"][0]["content"]
     assert calls[1]["messages"][-2]["role"] == "assistant"
     assert "<think>pick validation</think>" in calls[1]["messages"][-2]["content"]
     assert calls[1]["messages"][-1] == {"role": "user", "content": "Generate the next best rubric or return an empty object."}
     assert calls[0]["response_format"] == RUBRIC_GENERATION_RESPONSE_FORMAT
-    assert [rubric.title for rubric in rubrics] == ["Validation"]
+    assert [rubric.title for rubric in rubric_sample.generated] == ["Validation"]
+    assert rubric_sample.raw_traj["trajectory_format"] == "mini-swe-agent-1.1"
+    assert rubric_sample.raw_traj["info"]["sample_index"] == 0
+    assert rubric_sample.raw_traj["info"]["generated"][0]["title"] == "Validation"
 
 
 @pytest.mark.asyncio
@@ -923,7 +956,7 @@ async def test_rubric_and_judge_retry_up_to_four_times(monkeypatch: pytest.Monke
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", fake_completion)
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", fake_chat)
 
-    rubrics = await _generate_round_rubrics(
+    rubric_sample = await _generate_round_rubrics(
         question={"system_prompt": "sys", "user_prompt": "user"},
         previous_state={},
         latest_shared_segment=None,
@@ -949,7 +982,7 @@ async def test_rubric_and_judge_retry_up_to_four_times(monkeypatch: pytest.Monke
                 "trajectory_continuation": {"step_cards": [{"commands": ["pytest -q"]}]},
             }
         ],
-        rubrics=rubrics,
+        rubrics=rubric_sample.generated,
         model_name="openai/fake",
         temperature=0.0,
         top_p=1.0,
@@ -958,9 +991,42 @@ async def test_rubric_and_judge_retry_up_to_four_times(monkeypatch: pytest.Monke
 
     assert rubric_attempts["count"] == 5
     assert judge_attempts["count"] == 4
-    assert len(rubrics) == 1
+    assert len(rubric_sample.generated) == 1
     assert errors == {}
     assert scores[0][0]["score_raw"] == 5
+
+
+@pytest.mark.asyncio
+async def test_generate_round_rubrics_preserves_invalid_response_as_format_error(monkeypatch: pytest.MonkeyPatch):
+    async def fake_completion(route_name, model_name, user_prompt=None, system_prompt=None, messages=None, **kwargs):
+        return SimpleNamespace(content="not valid json", metadata={"content_no_thinking": "not valid json"})
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", fake_completion)
+
+    rubric_sample = await _generate_round_rubrics(
+        question={"system_prompt": "sys", "user_prompt": "user", "instance_id": "demo"},
+        previous_state=copy.deepcopy(EMPTY_PERSISTENT_STATE),
+        latest_shared_segment=None,
+        continuations=[{"summary": {"step_count": 1}, "trajectory_continuation": {"step_cards": [{"commands": ["pytest -q"]}]}}],
+        active_bank=[],
+        model_name="openai/fake",
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=256,
+        round_index=1,
+    )
+
+    assert rubric_sample.generated == []
+    assert rubric_sample.messages[-1]["role"] == "assistant"
+    assert rubric_sample.messages[-1]["content"] == "not valid json"
+    assert rubric_sample.format_errors == [
+        {
+            "turn_index": 1,
+            "error_type": "invalid_rubric_generation_response",
+            "response_content": "not valid json",
+        }
+    ]
+    assert rubric_sample.raw_traj["info"]["format_errors"] == rubric_sample.format_errors
 
 
 @pytest.mark.asyncio
@@ -1026,14 +1092,6 @@ async def test_prepare_round_judging_keeps_only_active_rubric_scores(tmp_path: P
         depth=1,
         session_id="parent-session",
         status="frontier",
-        checkpoint_image_tag=None,
-        checkpoint_image_id=None,
-        workspace_fingerprint="parent",
-        raw_traj_path=str(tmp_path / "run" / "nodes" / "parent" / "raw_traj.json"),
-        messages_path=str(tmp_path / "run" / "nodes" / "parent" / "messages.json"),
-        judge_path=str(tmp_path / "run" / "nodes" / "parent" / "judge.json"),
-        snapshot_path=None,
-        rubric_ref=None,
     )
     runner.nodes["parent"] = parent_node
     parent_judge = {
@@ -1043,6 +1101,7 @@ async def test_prepare_round_judging_keeps_only_active_rubric_scores(tmp_path: P
     }
     branch_records = [
         {
+            "node_id": "branch-a",
             "recent_segments": [
                 {
                     "step_cards": [{"step_index": 0, "assistant_message": "a", "commands": ["pytest -q"], "observation": "ok"}],
@@ -1053,6 +1112,7 @@ async def test_prepare_round_judging_keeps_only_active_rubric_scores(tmp_path: P
             "result": {"status": "paused", "exit_status": "", "submission": ""},
         },
         {
+            "node_id": "branch-b",
             "recent_segments": [
                 {
                     "step_cards": [{"step_index": 0, "assistant_message": "b", "commands": ["sed -n '1,20p' x"], "observation": "ok"}],
@@ -1144,6 +1204,7 @@ async def test_score_round_uses_error_handling_after_retry_exhaustion(monkeypatc
         shared_context={"previous_persistent_state": {}, "latest_agent_trajectory": None},
         continuations=[
             {
+                "node_id": "branch-0",
                 "summary": {"step_count": 1},
                 "trajectory_continuation": {"step_cards": [{"commands": ["pytest -q"]}]},
             }
@@ -1155,7 +1216,16 @@ async def test_score_round_uses_error_handling_after_retry_exhaustion(monkeypatc
         max_tokens=33,
     )
 
-    assert errors == {}
+    assert errors == {
+        0: [
+            {
+                "rubric_id": "validation",
+                "node_id": "branch-0",
+                "continuation_index": 0,
+                "error": "InvalidJudgeResponse",
+            }
+        ]
+    }
     assert variances == {"validation": 0.0}
     assert len(scores[0]) == 1
     assert scores[0][0]["score_raw"] == 1
@@ -1196,6 +1266,7 @@ async def test_score_round_preserves_other_scores_when_one_rubric_fails(monkeypa
         shared_context={"previous_persistent_state": {}, "latest_agent_trajectory": None},
         continuations=[
             {
+                "node_id": "branch-0",
                 "summary": {"step_count": 1},
                 "trajectory_continuation": {"step_cards": [{"commands": ["pytest -q"]}]},
             }
@@ -1207,7 +1278,16 @@ async def test_score_round_preserves_other_scores_when_one_rubric_fails(monkeypa
         max_tokens=33,
     )
 
-    assert errors == {}
+    assert errors == {
+        0: [
+            {
+                "rubric_id": "precision",
+                "node_id": "branch-0",
+                "continuation_index": 0,
+                "error": "InvalidJudgeResponse",
+            }
+        ]
+    }
     assert {record["rubric_id"] for record in scores[0]} == {"validation", "precision"}
     assert {record["rubric_id"]: record["score_raw"] for record in scores[0]} == {"validation": 5, "precision": 1}
     assert variances == {"validation": 0.0, "precision": 0.0}
@@ -1348,6 +1428,7 @@ def test_new_frontier_children_are_prepended_before_existing_frontier(tmp_path: 
 
         return fake_chat
 
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_prepend_chat())
     monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
     docker_state = _patch_docker_subprocess(monkeypatch)
@@ -1398,6 +1479,7 @@ def test_trajectory_search_runner_writes_expected_artifacts(tmp_path: Path, monk
         "child-b-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "b"},
     }
 
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
     monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
     docker_state = _patch_docker_subprocess(monkeypatch)
@@ -1496,6 +1578,7 @@ def test_run_round_waits_for_terminal_cleanup_in_serial_order(tmp_path: Path, mo
         },
     }
 
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
     monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
     monkeypatch.setattr(
@@ -1585,6 +1668,7 @@ def test_trajectory_search_runner_calculates_gt_reward_and_writes_terminal_artif
         "child-b-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "b"},
     }
 
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
     monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
     monkeypatch.setattr(
@@ -1621,7 +1705,165 @@ def test_trajectory_search_runner_calculates_gt_reward_and_writes_terminal_artif
     }
     assert 0.0 in rewards.values()
     assert 1.0 in rewards.values()
+    round_payload = json.loads((tmp_path / "run" / "rubrics" / "round_001.json").read_text())
+    selected_rubric = next(sample for sample in round_payload["rubric_samples"] if sample.get("selected"))
+    rubric_payload = json.loads((Path(selected_rubric["artifact_dir"]) / "rubric.json").read_text())
+    ordered_node_ids = sorted(node_id for node_id in rubric_payload["child_rewards"] if node_id in rewards)
+    sibling_scores = [float(rubric_payload["child_rewards"][node_id]) for node_id in ordered_node_ids]
+    sibling_gt = [float(rewards[node_id]) for node_id in ordered_node_ids]
+    mean_score = sum(sibling_scores) / len(sibling_scores)
+    mean_gt = sum(sibling_gt) / len(sibling_gt)
+    cov = sum((score - mean_score) * (gt - mean_gt) for score, gt in zip(sibling_scores, sibling_gt))
+    var_score = sum((score - mean_score) ** 2 for score in sibling_scores)
+    var_gt = sum((gt - mean_gt) ** 2 for gt in sibling_gt)
+    expected_siblings = cov / (var_score * var_gt) ** 0.5
+    assert rubric_payload["gt_reward_siblings"] == pytest.approx(expected_siblings)
+    assert round_payload["gt_reward_siblings"] == pytest.approx(expected_siblings)
+    assert rubric_payload["gt_reward_parent"] == 0.0
+    assert round_payload["gt_reward_parent"] == 0.0
+    assert rubric_payload["gt_by_rubric"]
     assert set(docker_state["removed_containers"]) == {"root-container", "child-a-container", "child-b-container"}
+
+
+def test_trajectory_search_runner_skips_artifacts_for_failed_policy_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _root_snapshot()
+    child_a = _branch_snapshot(
+        root,
+        session_id="child-a",
+        step_index=0,
+        assistant_text="Run the failing test.",
+        command="pytest tests/test_alpha.py -q",
+        observation="<returncode>0</returncode>\n<output>\n1 passed\n</output>",
+    )
+    child_b = _branch_snapshot(
+        root,
+        session_id="child-b",
+        step_index=0,
+        assistant_text="Inspect the file only.",
+        command="sed -n '1,40p' pkg/core.py",
+        observation="<returncode>0</returncode>\n<output>\nclass Core: ...\n</output>",
+    )
+    backend = _FakeBackend(
+        root,
+        [
+            _FakeSession(child_a, _branch_result(child_a), container_id="child-a-container"),
+            _FakeSession(child_b, _branch_result(child_b), container_id="child-b-container"),
+        ],
+    )
+    original_resume_session = backend.resume_session
+    call_count = {"value": 0}
+
+    def flaky_resume(snapshot):
+        if call_count["value"] == 0:
+            call_count["value"] += 1
+            raise RuntimeError("policy boom")
+        call_count["value"] += 1
+        return original_resume_session(snapshot)
+
+    monkeypatch.setattr(backend, "resume_session", flaky_resume)
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
+    monkeypatch.setattr(
+        "swe_agent.trajectory_search._collect_workspace_meta",
+        lambda env: {
+            "root-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "root"},
+            "child-a-container": {"changed_files": ["pkg/core.py"], "untracked_files": [], "diff_stat": " pkg/core.py | 2 +-", "current_patch_chars": 120, "workspace_fingerprint": "a"},
+            "child-b-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "b"},
+        }[env.container_id],
+    )
+    _patch_docker_subprocess(monkeypatch)
+
+    runner = TrajectorySearchRunner(
+        instance={"instance_id": "demo__policy-failure", "problem_statement": "Fix the failing test."},
+        backend=backend,
+        run_dir=tmp_path / "run",
+        policy_model_name="openai/fake",
+        search_config=SearchConfig(m=1, k=1, p=1, max_rounds=1, max_active_rubrics=2),
+    )
+    runner.run()
+
+    manifest = json.loads((tmp_path / "run" / "run_manifest.json").read_text())
+    round_payload = json.loads((tmp_path / "run" / "rubrics" / "round_001.json").read_text())
+    assert len(round_payload["policy_generation_errors"]) == 1
+    failed_node_id = round_payload["policy_generation_errors"][0]["node_id"]
+    assert failed_node_id not in manifest["node_ids"]
+    assert not (tmp_path / "run" / "nodes" / failed_node_id).exists()
+
+
+def test_trajectory_search_runner_skips_artifacts_for_failed_rubric_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _root_snapshot()
+    child_a = _branch_snapshot(
+        root,
+        session_id="child-a",
+        step_index=0,
+        assistant_text="Run the failing test.",
+        command="pytest tests/test_alpha.py -q",
+        observation="<returncode>0</returncode>\n<output>\n1 passed\n</output>",
+    )
+    child_b = _branch_snapshot(
+        root,
+        session_id="child-b",
+        step_index=0,
+        assistant_text="Inspect the file only.",
+        command="sed -n '1,40p' pkg/core.py",
+        observation="<returncode>0</returncode>\n<output>\nclass Core: ...\n</output>",
+    )
+    backend = _FakeBackend(
+        root,
+        [
+            _FakeSession(child_a, _branch_result(child_a), container_id="child-a-container"),
+            _FakeSession(child_b, _branch_result(child_b), container_id="child-b-container"),
+            _FakeSession(child_a, _branch_result(child_a), container_id="child-c-container"),
+        ],
+    )
+    workspace_meta = {
+        "root-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "root"},
+        "child-a-container": {"changed_files": ["pkg/core.py"], "untracked_files": [], "diff_stat": " pkg/core.py | 2 +-", "current_patch_chars": 120, "workspace_fingerprint": "a"},
+        "child-b-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "b"},
+        "child-c-container": {"changed_files": ["pkg/core.py"], "untracked_files": [], "diff_stat": " pkg/core.py | 2 +-", "current_patch_chars": 121, "workspace_fingerprint": "c"},
+    }
+
+    async def fake_generate_round_rubrics(**kwargs):
+        sample_index = kwargs["sample_index"]
+        artifact_tag = f"rubric-r{kwargs['round_index']:03d}-s{sample_index:02d}"
+        if sample_index == 0:
+            raise RuntimeError("rubric boom")
+        rubric = RubricRecord(
+            rubric_id=f"rubric-{sample_index}",
+            title="Validation",
+            direction="positive",
+            description="Runs targeted validation relevant to the fix.",
+            scale={"1": "No validation", "2": "Weak validation", "3": "Some validation", "4": "Targeted validation", "5": "Strong validation"},
+            weight=1,
+            source_round=kwargs["round_index"],
+        )
+        return RubricGenerationSample(
+            sample_index=sample_index,
+            artifact_tag=artifact_tag,
+            generated=[rubric],
+            messages=[{"role": "user", "content": "prompt"}, {"role": "assistant", "content": "{}"}],
+            raw_traj={"messages": [], "artifact_tag": artifact_tag},
+        )
+
+    monkeypatch.setattr("swe_agent.trajectory_search._generate_round_rubrics", fake_generate_round_rubrics)
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
+    monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
+    _patch_docker_subprocess(monkeypatch)
+
+    runner = TrajectorySearchRunner(
+        instance={"instance_id": "demo__rubric-failure", "problem_statement": "Fix the failing test."},
+        backend=backend,
+        run_dir=tmp_path / "run",
+        policy_model_name="openai/fake",
+        search_config=SearchConfig(m=1, n=2, k=1, p=1, max_rounds=1, max_active_rubrics=2),
+    )
+    runner.run()
+
+    round_payload = json.loads((tmp_path / "run" / "rubrics" / "round_001.json").read_text())
+    assert len(round_payload["rubric_generation_errors"]) == 1
+    failed_tag = round_payload["rubric_generation_errors"][0]["artifact_tag"]
+    assert not (tmp_path / "run" / "rubrics" / failed_tag).exists()
 
 
 def test_patch_eval_manager_backfills_ground_truth_reward(tmp_path: Path):
@@ -1721,7 +1963,7 @@ def test_trajectory_search_runner_root_expansion_keeps_top_valid_children(tmp_pa
     assert all(node_id.startswith("node-r001") for node_id in manifest["frontier_ids"])
 
 
-def test_trajectory_search_runner_failed_parent_expansion_drops_parent_from_frontier(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_trajectory_search_runner_equal_parent_score_keeps_frontier_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     root = _root_snapshot()
     child_a = _branch_snapshot(
         root,
@@ -1839,6 +2081,7 @@ def test_trajectory_search_runner_failed_parent_expansion_drops_parent_from_fron
 
         return fake_chat
 
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_regression_chat())
     monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
     _patch_docker_subprocess(monkeypatch)
@@ -1853,10 +2096,11 @@ def test_trajectory_search_runner_failed_parent_expansion_drops_parent_from_fron
     runner.run()
 
     manifest = json.loads((tmp_path / "run" / "run_manifest.json").read_text())
-    assert len(manifest["frontier_ids"]) == 1
-    assert manifest["frontier_ids"][0].startswith("node-r001-s01")
+    assert len(manifest["frontier_ids"]) == 2
+    assert manifest["frontier_ids"][0].startswith("node-r002-s00")
+    assert manifest["frontier_ids"][1].startswith("node-r001-s02")
     round_two = json.loads((tmp_path / "run" / "rubrics" / "round_002.json").read_text())
-    assert round_two["regressed"] is True
+    assert round_two["regressed"] is False
 
 
 def test_trajectory_search_final_cleanup_keeps_only_best_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1890,6 +2134,7 @@ def test_trajectory_search_final_cleanup_keeps_only_best_checkpoint(tmp_path: Pa
         "child-b-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "b"},
     }
 
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
     monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
     monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
     docker_state = _patch_docker_subprocess(monkeypatch)
@@ -1899,18 +2144,53 @@ def test_trajectory_search_final_cleanup_keeps_only_best_checkpoint(tmp_path: Pa
         backend=backend,
         run_dir=tmp_path / "run",
         policy_model_name="openai/fake",
-        search_config=SearchConfig(m=1, k=1, p=2, max_rounds=1, max_active_rubrics=2),
+        search_config=SearchConfig(m=1, k=1, p=2, max_rounds=1, max_active_rubrics=2, write_raw_traj=True),
     )
     result = runner.run()
 
     manifest = json.loads((tmp_path / "run" / "run_manifest.json").read_text())
+    final_raw_traj = json.loads(Path(result.raw_trajectory_path).read_text())
     assert manifest["best_node_id"] == result.best_node_id
     assert manifest["frontier_ids"] == [result.best_node_id]
-    loser_nodes = [node_id for node_id in manifest["node_ids"] if node_id not in {"root", result.best_node_id}]
-    assert loser_nodes
-    for node_id in loser_nodes:
-        loser_node = json.loads((tmp_path / "run" / "nodes" / node_id / "node.json").read_text())
-        assert loser_node["snapshot_path"] is None
-        assert loser_node["checkpoint_image_tag"] is None
-        assert not (tmp_path / "run" / "nodes" / node_id / "snapshot.json").exists()
+    assert [message["role"] for message in final_raw_traj["messages"]] == ["system", "user", "assistant", "user"]
+    assert final_raw_traj["messages"][2]["extra"]["actions"][0]["command"] == "pytest tests/test_alpha.py -q"
     assert len(docker_state["images"]) == 1
+
+
+def test_trajectory_search_finalize_outputs_falls_back_without_raw_segments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = _root_snapshot()
+    child = _branch_snapshot(
+        root,
+        session_id="child-a",
+        step_index=0,
+        assistant_text="Run the failing test.",
+        command="pytest tests/test_alpha.py -q",
+        observation="<returncode>0</returncode>\n<output>\n1 passed\n</output>",
+    )
+    backend = _FakeBackend(
+        root,
+        [
+            _FakeSession(child, _branch_result(child, status="finished", submission="patch-a"), container_id="child-a-container"),
+        ],
+    )
+    workspace_meta = {
+        "root-container": {"changed_files": [], "untracked_files": [], "diff_stat": "", "current_patch_chars": 0, "workspace_fingerprint": "root"},
+        "child-a-container": {"changed_files": ["pkg/core.py"], "untracked_files": [], "diff_stat": " pkg/core.py | 2 +-", "current_patch_chars": 120, "workspace_fingerprint": "a"},
+    }
+
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_completion_async", _make_fake_rubric_completion())
+    monkeypatch.setattr("swe_agent.trajectory_search.run_chat_with_route_async", _make_fake_chat())
+    monkeypatch.setattr("swe_agent.trajectory_search._collect_workspace_meta", lambda env: workspace_meta[env.container_id])
+    _patch_docker_subprocess(monkeypatch)
+
+    runner = TrajectorySearchRunner(
+        instance={"instance_id": "demo__finalize-fallback", "problem_statement": "Fix the failing test."},
+        backend=backend,
+        run_dir=tmp_path / "run",
+        policy_model_name="openai/fake",
+        search_config=SearchConfig(m=1, k=1, p=1, max_rounds=1, max_active_rubrics=2, write_raw_traj=False),
+    )
+    result = runner.run()
+
+    final_raw_traj = json.loads(Path(result.raw_trajectory_path).read_text())
+    assert [message["role"] for message in final_raw_traj["messages"]] == ["system", "user", "assistant", "user"]

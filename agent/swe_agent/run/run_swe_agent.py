@@ -71,17 +71,6 @@ DEFAULT_COMPLETION_MAX_TOKENS = 4096
 SWE_AGENT_TEXTBASED_CONFIG = AGENT_ROOT / "swe_agent" / "config" / "benchmarks" / "swebench_backticks.yaml"
 
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-logging.getLogger("litellm").setLevel(logging.WARNING)
-try:
-    import litellm
-
-    litellm.turn_off_message_logging = True
-    if hasattr(litellm, "suppress_debug_info"):
-        litellm.suppress_debug_info = True
-    if hasattr(litellm, "_logging") and hasattr(litellm._logging, "_disable_debugging"):
-        litellm._logging._disable_debugging()
-except Exception:
-    pass
 
 
 @dataclass
@@ -98,18 +87,9 @@ class BackendResult:
     log_path: str | None
     evaluation_result_path: str | None
     exit_status: str
-    submission_chars: int
     prediction_chars: int
-    evaluation_completed: bool
     resolved: bool | None
-    run_id: str | None
     error: str | None
-    harness_namespace: str | None
-    swebench_command: list[str] | None
-    evaluation_command: list[str] | None
-    vllm_command: list[str] | None
-    vllm_log_path: str | None
-    gpu_id: int | None
 
 
 class TeeStream:
@@ -329,11 +309,6 @@ def extract_backend_result(
     run_dir: Path,
     temp_output_dir: Path,
     run_log_path: Path,
-    swebench_command: list[str] | None,
-    harness_namespace: str | None = None,
-    vllm_command: list[str] | None = None,
-    vllm_log_path: Path | None = None,
-    gpu_id: int | None = None,
 ) -> BackendResult:
     run_dir.mkdir(parents=True, exist_ok=True)
     raw_traj_temp = temp_output_dir / instance_id / f"{instance_id}.traj.json"
@@ -379,18 +354,9 @@ def extract_backend_result(
         log_path=str(run_log_path),
         evaluation_result_path=None,
         exit_status=info.get("exit_status", ""),
-        submission_chars=len(submission),
         prediction_chars=len(patch_record["model_patch"]),
-        evaluation_completed=False,
         resolved=None,
-        run_id=None,
         error=None,
-        harness_namespace=harness_namespace,
-        swebench_command=swebench_command,
-        evaluation_command=None,
-        vllm_command=vllm_command,
-        vllm_log_path=str(vllm_log_path) if vllm_log_path else None,
-        gpu_id=gpu_id,
     )
 
 
@@ -436,7 +402,6 @@ def _run_rebench_harness_evaluation(
             futures: dict[concurrent.futures.Future, BackendResult] = {}
             for result in results:
                 evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
-                evaluation_command = ["python_api", "rebench_eval", dataset_name, result.split, result.instance_id]
                 if result.prediction_chars == 0:
                     evaluation_result_path.write_text(
                         json.dumps(
@@ -454,11 +419,8 @@ def _run_rebench_harness_evaluation(
                         **{
                             **asdict(result),
                             "evaluation_result_path": str(evaluation_result_path),
-                            "evaluation_completed": True,
                             "resolved": False,
                             "error": None,
-                            "run_id": f"verify-{result.backend}-rebench",
-                            "evaluation_command": evaluation_command,
                         }
                     )
                     continue
@@ -479,11 +441,8 @@ def _run_rebench_harness_evaluation(
                         **{
                             **asdict(result),
                             "evaluation_result_path": str(evaluation_result_path),
-                            "evaluation_completed": True,
                             "resolved": False,
                             "error": f"Instance not found in {dataset_name}/{result.split}: {result.instance_id}",
-                            "run_id": f"verify-{result.backend}-rebench",
-                            "evaluation_command": evaluation_command,
                         }
                     )
                     continue
@@ -501,7 +460,6 @@ def _run_rebench_harness_evaluation(
             for future in concurrent.futures.as_completed(futures):
                 result = futures[future]
                 evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
-                evaluation_command = ["python_api", "rebench_eval", dataset_name, result.split, result.instance_id]
                 try:
                     payload = future.result()
                     resolved = bool(payload["resolved"])
@@ -532,11 +490,8 @@ def _run_rebench_harness_evaluation(
                     **{
                         **asdict(result),
                         "evaluation_result_path": str(evaluation_result_path),
-                        "evaluation_completed": True,
                         "resolved": resolved,
                         "error": extra_error,
-                        "run_id": f"verify-{result.backend}-rebench",
-                        "evaluation_command": evaluation_command,
                     }
                 )
     return [updated_results[result.instance_id] for result in results]
@@ -548,11 +503,19 @@ def _run_swebench_harness_evaluation(
     dataset_name: str,
     timeout: int,
     max_workers: int,
+    instances_by_id: dict[str, dict[str, Any]] | None,
 ) -> list[BackendResult]:
     updated_results = {result.instance_id: result for result in results}
+    if instances_by_id is None:
+        subset = next(key for key, value in DATASET_MAPPING.items() if value == dataset_name)
+        instances_by_id = {
+            instance["instance_id"]: instance
+            for instance in load_swebench_instances(subset, results[0].split)
+        }
     grouped_results: dict[str | None, list[BackendResult]] = {}
     for result in results:
-        grouped_results.setdefault(result.harness_namespace, []).append(result)
+        instance = instances_by_id.get(result.instance_id)
+        grouped_results.setdefault(get_swebench_harness_namespace(instance) if instance else None, []).append(result)
 
     temp_parent = Path(results[0].run_dir).resolve().parents[2]
     log_path = Path(results[0].log_path) if results[0].log_path else None
@@ -579,16 +542,6 @@ def _run_swebench_harness_evaluation(
             with evaluation_log_context:
                 for group_index, (namespace, group) in enumerate(grouped_results.items()):
                     run_id = f"verify-{group[0].backend}-{int(time.time())}-{group_index}"
-                    evaluation_command = [
-                        "python_api",
-                        "swebench.harness.run_evaluation.main",
-                        dataset_name,
-                        group[0].split,
-                        ",".join(result.instance_id for result in group),
-                        str(predictions_path),
-                        namespace or "none",
-                        run_id,
-                    ]
                     try:
                         with pushd(temp_root):
                             summary_report = swebench_run_evaluation.main(
@@ -637,8 +590,6 @@ def _run_swebench_harness_evaluation(
                                     **asdict(result),
                                     "evaluation_result_path": str(evaluation_result_path),
                                     "error": str(exc),
-                                    "run_id": run_id,
-                                    "evaluation_command": evaluation_command,
                                 }
                             )
                         continue
@@ -677,10 +628,7 @@ def _run_swebench_harness_evaluation(
                             **{
                                 **asdict(result),
                                 "evaluation_result_path": str(evaluation_result_path),
-                                "evaluation_completed": True,
                                 "resolved": resolved,
-                                "run_id": run_id,
-                                "evaluation_command": evaluation_command,
                             }
                         )
         finally:
@@ -712,6 +660,7 @@ def run_harness_evaluation(
         dataset_name=dataset_name,
         timeout=timeout,
         max_workers=max_workers,
+        instances_by_id=instances_by_id,
     )
 
 
@@ -810,11 +759,6 @@ def build_failed_result(
     run_dir: Path,
     error: Exception,
     log_path: Path | None = None,
-    swebench_command: list[str] | None = None,
-    evaluation_command: list[str] | None = None,
-    vllm_command: list[str] | None = None,
-    vllm_log_path: Path | None = None,
-    gpu_id: int | None = None,
 ) -> BackendResult:
     run_dir.mkdir(parents=True, exist_ok=True)
     target_log_path = log_path or (run_dir / "run.log")
@@ -836,18 +780,9 @@ def build_failed_result(
         log_path=str(target_log_path),
         evaluation_result_path=None,
         exit_status="error",
-        submission_chars=0,
         prediction_chars=0,
-        evaluation_completed=False,
         resolved=None,
-        run_id=None,
         error=str(error),
-        harness_namespace=None,
-        swebench_command=swebench_command,
-        evaluation_command=evaluation_command,
-        vllm_command=vllm_command,
-        vllm_log_path=str(vllm_log_path) if vllm_log_path else None,
-        gpu_id=gpu_id,
     )
 
 
@@ -863,9 +798,6 @@ def run_swe_instance_multi(
     eval_timeout: int,
     workers: int = 1,
     redo_existing: bool = True,
-    gpu_id: int | None = None,
-    vllm_command: list[str] | None = None,
-    vllm_log_path: Path | None = None,
     timestamp: str | None = None,
     run_log_path: Path | None = None,
 ) -> list[BackendResult]:
@@ -887,14 +819,6 @@ def run_swe_instance_multi(
         f"{re.sub(r'[^A-Za-z0-9._-]+', '_', split.replace('/', '__'))}_"
         f"{re.sub(r'[^A-Za-z0-9._-]+', '_', model_name.replace('/', '__'))}"
     )
-    invocation = [
-        "python_api",
-        "run_swe_instance_multi",
-        benchmark_name,
-        split,
-        ",".join(instance["instance_id"] for instance in instances),
-    ]
-
     with tempfile.TemporaryDirectory(prefix=".run-", dir=output_root) as tmp_dir:
         temp_root = Path(tmp_dir)
         temp_output_dir = temp_root / "batch_outputs"
@@ -922,11 +846,6 @@ def run_swe_instance_multi(
                 run_dir=run_dir,
                 temp_output_dir=temp_output_dir,
                 run_log_path=effective_run_log_path,
-                swebench_command=invocation,
-                harness_namespace=get_swebench_harness_namespace(instance),
-                vllm_command=vllm_command,
-                vllm_log_path=vllm_log_path,
-                gpu_id=gpu_id,
             )
             results.append(result)
         try:
@@ -1009,7 +928,6 @@ def run_swe_agent_backend(
                     json.dumps(build_slim_trajectory(raw_traj, model_name=model_name), indent=2)
                 )
             patch_record = json.loads(patch_path.read_text())[instance_id]
-            submission = raw_traj.get("info", {}).get("submission", "") or ""
             results.append(
                 BackendResult(
                     benchmark_name=args.subset,
@@ -1024,18 +942,9 @@ def run_swe_agent_backend(
                     log_path=str(args._run_log_path),
                     evaluation_result_path=str(run_dir / "evaluation.json") if (run_dir / "evaluation.json").exists() else None,
                     exit_status=raw_traj.get("info", {}).get("exit_status", ""),
-                    submission_chars=len(submission),
                     prediction_chars=len(patch_record.get("model_patch", "") or ""),
-                    evaluation_completed=False,
                     resolved=None,
-                    run_id=None,
                     error=None,
-                    harness_namespace=get_swebench_harness_namespace(by_id[instance_id]),
-                    swebench_command=None,
-                    evaluation_command=None,
-                    vllm_command=None,
-                    vllm_log_path=None,
-                    gpu_id=None,
                 )
             )
         return run_harness_evaluation(
@@ -1111,9 +1020,6 @@ def run_swe_agent_backend(
                 eval_timeout=args.eval_timeout,
                 workers=args.workers,
                 redo_existing=True,
-                gpu_id=gpu_id,
-                vllm_command=vllm_handle.command if vllm_handle else None,
-                vllm_log_path=vllm_handle.log_file if vllm_handle else None,
                 timestamp=args._run_timestamp,
                 run_log_path=args._run_log_path,
             )

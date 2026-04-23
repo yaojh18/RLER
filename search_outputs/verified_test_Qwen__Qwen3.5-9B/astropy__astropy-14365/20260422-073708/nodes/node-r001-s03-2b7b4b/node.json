@@ -1,0 +1,14 @@
+{
+  "node_id": "node-r001-s03-2b7b4b",
+  "parent_id": "root",
+  "round_index": 1,
+  "depth": 1,
+  "session_id": "node-r001-s03-2b7b4b-session",
+  "status": "dropped",
+  "step_start": 0,
+  "step_end": 19,
+  "submission": "",
+  "exit_status": "",
+  "policy_source": "teacher",
+  "policy_model_name": "Qwen/Qwen3.5-9B"
+}

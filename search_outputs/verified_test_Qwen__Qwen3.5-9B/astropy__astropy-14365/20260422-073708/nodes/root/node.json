@@ -1,0 +1,14 @@
+{
+  "node_id": "root",
+  "parent_id": null,
+  "round_index": 0,
+  "depth": 0,
+  "session_id": "root-3e828ff55d8a4a938c1679094e2d645b",
+  "status": "archived",
+  "step_start": 0,
+  "step_end": -1,
+  "submission": "",
+  "exit_status": "",
+  "policy_source": "teacher",
+  "policy_model_name": "Qwen/Qwen3.5-9B"
+}

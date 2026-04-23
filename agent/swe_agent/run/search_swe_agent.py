@@ -8,7 +8,6 @@ import json
 import os
 import re
 import time
-import sys
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -122,18 +121,9 @@ def _run_single_instance(
         log_path=None,
         evaluation_result_path=None,
         exit_status=result.exit_status,
-        submission_chars=result.submission_chars,
         prediction_chars=len(json.loads(Path(result.patch_path).read_text())[instance["instance_id"]]["model_patch"]) if result.patch_path else 0,
-        evaluation_completed=False,
         resolved=None,
-        run_id=None,
         error=None,
-        harness_namespace=get_swebench_harness_namespace(instance),
-        swebench_command=None,
-        evaluation_command=None,
-        vllm_command=None,
-        vllm_log_path=None,
-        gpu_id=None,
     )
 
 
@@ -217,7 +207,7 @@ def run_search(
                 ),
             )
         configure_model_route("policy_student", ModelRouteConfig(backend="service", service_name=SLIME_SERVICE_NAME, model_name=args.student_model))
-    else:
+    elif student_model_name:
         raise RuntimeError(f"student_backend={student_backend} is not supported for search mixed mode")
 
     if args.backend == "vllm":
@@ -260,6 +250,7 @@ def run_search(
         )
         search_config = SearchConfig(
             m=args.m,
+            n=args.n,
             k=args.k,
             p=args.p,
             max_rounds=args.max_rounds,
@@ -275,6 +266,8 @@ def run_search(
             regression_margin=args.regression_margin,
             calculate_gt_reward=args.calculate_gt_reward,
             gt_reward_workers=args.workers,
+            write_raw_traj=getattr(args, "write_raw_traj", False),
+            strategy=getattr(args, "strategy", "best"),
         )
         rubric_model_name = args.rubric_model or model_name
         judge_model_name = args.judge_model or model_name
@@ -300,12 +293,9 @@ def run_search(
                             resume=bool(args.resume_run_dir),
                         )
                         result.backend = args.backend
-                        result.log_path = run_log_path
-                        result.gpu_id = gpu_id
-                        result.vllm_command = vllm_handle.command if vllm_handle else None
-                        result.vllm_log_path = str(vllm_handle.log_file) if vllm_handle else None
                         result.benchmark_name = args.subset
                         result.split = args.split
+                        result.log_path = str(run_log_path)
                         results.append(result)
                     except Exception as exc:
                         results.append(
@@ -318,9 +308,6 @@ def run_search(
                                 run_dir=run_dir,
                                 error=exc,
                                 log_path=run_log_path,
-                                vllm_command=vllm_handle.command if vllm_handle else None,
-                                vllm_log_path=vllm_handle.log_file if vllm_handle else None,
-                                gpu_id=gpu_id,
                             )
                         )
         return run_harness_evaluation(
@@ -360,13 +347,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-retry-attempts", type=int, default=2)
     parser.add_argument("--completion-max-tokens", type=int, default=DEFAULT_COMPLETION_MAX_TOKENS)
     parser.add_argument("--m", type=int, default=4)
+    parser.add_argument("--n", type=int, default=1)
     parser.add_argument("--k", type=int, default=20)
     parser.add_argument("--p", type=int, default=2)
     parser.add_argument("--max-rounds", type=int, default=25)
     parser.add_argument("--max-active-rubrics", type=int, default=6)
-    parser.add_argument("--policy-temperature", type=float, default=0.1)
+    parser.add_argument("--policy-temperature", type=float, default=0.5)
     parser.add_argument("--policy-top-p", type=float, default=0.9)
-    parser.add_argument("--rubric-temperature", type=float, default=0.1)
+    parser.add_argument("--rubric-temperature", type=float, default=0.5)
     parser.add_argument("--rubric-top-p", type=float, default=0.9)
     parser.add_argument("--rubric-max-tokens", type=int, default=4096)
     parser.add_argument("--judge-temperature", type=float, default=0.1)
@@ -376,6 +364,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rubric-model", default=None)
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--calculate-gt-reward", action="store_true", default=True)
+    parser.add_argument("--write-raw-traj", action="store_true", default=False)
+    parser.add_argument("--strategy", choices=["best", "probability", "random"], default="best")
     parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
     parser.add_argument("--student-model", default=None)
     return parser

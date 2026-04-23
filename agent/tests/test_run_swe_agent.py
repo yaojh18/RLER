@@ -285,18 +285,9 @@ def test_run_harness_evaluation_uses_rebench_backend(monkeypatch: pytest.MonkeyP
         log_path=str(log_path),
         evaluation_result_path=None,
         exit_status="submitted",
-        submission_chars=12,
         prediction_chars=18,
-        evaluation_completed=False,
         resolved=None,
-        run_id=None,
         error=None,
-        harness_namespace=None,
-        swebench_command=None,
-        evaluation_command=None,
-        vllm_command=None,
-        vllm_log_path=None,
-        gpu_id=None,
     )
 
     monkeypatch.setattr(
@@ -330,7 +321,6 @@ def test_run_harness_evaluation_uses_rebench_backend(monkeypatch: pytest.MonkeyP
     )
 
     assert updated[0].resolved is True
-    assert updated[0].evaluation_completed is True
     assert Path(updated[0].evaluation_result_path).exists()
     assert (run_dir / "rebench_evaluation.json").exists()
 
@@ -784,18 +774,9 @@ def test_run_harness_evaluations_batches_instances_by_namespace(tmp_path: Path, 
                 log_path=str(log_path),
                 evaluation_result_path=None,
                 exit_status="Submitted",
-                submission_chars=10,
                 prediction_chars=10,
-                evaluation_completed=False,
                 resolved=None,
-                run_id=None,
                 error=None,
-                harness_namespace="swebench",
-                swebench_command=None,
-                evaluation_command=None,
-                vllm_command=None,
-                vllm_log_path=None,
-                gpu_id=None,
             )
         )
 
@@ -851,12 +832,17 @@ def test_run_harness_evaluations_batches_instances_by_namespace(tmp_path: Path, 
     monkeypatch.setattr(swebench_run_evaluation, "main", fake_main)
     monkeypatch.setattr(swebench_run_evaluation, "RUN_EVALUATION_LOG_DIR", tmp_path / "unused_eval_root")
     monkeypatch.setattr(swebench_reporting, "RUN_EVALUATION_LOG_DIR", tmp_path / "unused_report_root")
+    monkeypatch.setattr("swe_agent.run.run_swe_agent.get_swebench_harness_namespace", lambda instance: "swebench")
 
     updated = run_harness_evaluation(
         results=results,
         dataset_name="princeton-nlp/SWE-Bench_Verified",
         timeout=900,
         max_workers=2,
+        instances_by_id={
+            "astropy__astropy-12907": {"instance_id": "astropy__astropy-12907"},
+            "django__django-10097": {"instance_id": "django__django-10097"},
+        },
     )
 
     assert calls == [(["astropy__astropy-12907", "django__django-10097"], 2, "swebench")]
@@ -895,6 +881,7 @@ def test_run_harness_evaluations_writes_error_report_when_harness_fails(
     monkeypatch.setattr(swebench_run_evaluation, "RUN_EVALUATION_LOG_DIR", tmp_path / "eval_root")
     monkeypatch.setattr(swebench_reporting, "RUN_EVALUATION_LOG_DIR", tmp_path / "report_root")
     monkeypatch.setattr(swebench_run_evaluation, "main", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr("swe_agent.run.run_swe_agent.get_swebench_harness_namespace", lambda instance: "swebench")
 
     updated = run_harness_evaluation(
         results=[
@@ -911,23 +898,15 @@ def test_run_harness_evaluations_writes_error_report_when_harness_fails(
                 log_path=str(log_path),
                 evaluation_result_path=None,
                 exit_status="Submitted",
-                submission_chars=10,
                 prediction_chars=10,
-                evaluation_completed=False,
                 resolved=None,
-                run_id=None,
                 error=None,
-                harness_namespace="swebench",
-                swebench_command=None,
-                evaluation_command=None,
-                vllm_command=None,
-                vllm_log_path=None,
-                gpu_id=None,
             )
         ],
         dataset_name="princeton-nlp/SWE-Bench_Verified",
         timeout=900,
         max_workers=1,
+        instances_by_id={"astropy__astropy-12907": {"instance_id": "astropy__astropy-12907"}},
     )
 
     evaluation = json.loads((run_dir / "evaluation.json").read_text())

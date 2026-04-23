@@ -32,7 +32,6 @@ from swe_agent.run.benchmarks.swebench import (
     DATASET_MAPPING,
     build_swebench_config,
     get_swebench_docker_image_name,
-    get_swebench_harness_namespace,
     load_swebench_instances,
 )
 from swe_agent.run.run_swe_agent import (
@@ -43,12 +42,11 @@ from swe_agent.run.run_swe_agent import (
     DEFAULT_MAX_MODEL_LEN,
     DEFAULT_MODEL_CLASS,
     DEFAULT_PULL_TIMEOUT,
+    DEFAULT_SERVE_MODEL,
     DEFAULT_SPLIT,
     DEFAULT_STEP_LIMIT,
     DEFAULT_SUBSET,
-    DEFAULT_VLLM_CLIENT_MODEL,
     DEFAULT_VLLM_PORT,
-    DEFAULT_VLLM_SERVE_MODEL,
     BackendResult,
     ParseInstanceIds,
     build_failed_result,
@@ -76,7 +74,7 @@ from swe_agent.trajectory_search import (
     _compute_weighted_reward,
     _make_raw_trajectory,
     _parse_judge_score,
-    _convert_generated_rubrics,
+    _convert_generated_rubric,
     _update_rubric_bank,
 )
 
@@ -381,9 +379,9 @@ async def _generate_aggregate_rubrics(
         parsed = extract_json_from_response(response)
         if not isinstance(parsed, dict):
             continue
-        rubrics = _convert_generated_rubrics(task_text, parsed, round_index)
-        if rubrics:
-            return rubrics
+        rubric = _convert_generated_rubric(task_text, parsed, round_index)
+        if rubric is not None:
+            return [rubric]
     return []
 
 
@@ -600,7 +598,6 @@ class AggregateTrajectoryRunner:
                     "step_count": len(candidate["step_cards"]),
                     "result_status": candidate["result"].get("status", ""),
                     "exit_status": candidate["result"].get("exit_status", ""),
-                    "submission_chars": len(candidate["result"].get("submission", "") or ""),
                     "model_stats": candidate["raw_traj"].get("info", {}).get("model_stats", {}),
                 },
                 model_name=self.rubric_model_name,
@@ -614,7 +611,6 @@ class AggregateTrajectoryRunner:
                     "step_count": int(candidate["result"].get("metadata", {}).get("n_calls", 0) or 0),
                     "result_status": candidate["result"].get("status", ""),
                     "exit_status": candidate["result"].get("exit_status", ""),
-                    "submission_chars": len(candidate["result"].get("submission", "") or ""),
                 },
                 "trajectory": {
                     "compressed_trajectory": state,
@@ -658,7 +654,7 @@ class AggregateTrajectoryRunner:
             active_bank=[],
             inactive_bank=[],
             generated=scoring_rubrics,
-            variances=variances,
+            rewards=variances,
             max_active_rubrics=self.search_config.max_active_rubrics,
         )
         active_ids = {rubric.rubric_id for rubric in active_after}
@@ -807,18 +803,9 @@ class AggregateTrajectoryRunner:
             log_path=None,
             evaluation_result_path=None,
             exit_status=best_candidate["result"].get("exit_status", ""),
-            submission_chars=len(best_candidate["result"].get("submission", "") or ""),
             prediction_chars=len(selected_patch),
-            evaluation_completed=False,
             resolved=None,
-            run_id=None,
             error=None,
-            harness_namespace=get_swebench_harness_namespace(self.instance),
-            swebench_command=None,
-            evaluation_command=None,
-            vllm_command=None,
-            vllm_log_path=None,
-            gpu_id=None,
         )
 
 
@@ -940,12 +927,9 @@ def run_aggregate(
                             judge_model_kwargs=judge_model_kwargs,
                         )
                         result = runner.run()
-                        result.log_path = str(run_log_path)
-                        result.gpu_id = gpu_id
-                        result.vllm_command = vllm_handle.command if vllm_handle else None
-                        result.vllm_log_path = str(vllm_handle.log_file) if vllm_handle else None
                         result.benchmark_name = args.subset
                         result.split = args.split
+                        result.log_path = str(run_log_path)
                         results.append(result)
                     except Exception as exc:
                         results.append(
@@ -958,9 +942,6 @@ def run_aggregate(
                                 run_dir=run_dir,
                                 error=exc,
                                 log_path=run_log_path,
-                                vllm_command=vllm_handle.command if vllm_handle else None,
-                                vllm_log_path=vllm_handle.log_file if vllm_handle else None,
-                                gpu_id=gpu_id,
                             )
                         )
         return run_harness_evaluation(
@@ -991,9 +972,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--allow-long-max-model-len", action="store_true")
-    parser.add_argument("--vllm-serve-model", default=DEFAULT_VLLM_SERVE_MODEL)
-    parser.add_argument("--vllm-client-model", default=DEFAULT_VLLM_CLIENT_MODEL)
-    parser.add_argument("--openai-model", default=DEFAULT_VLLM_CLIENT_MODEL)
+    parser.add_argument("--vllm-serve-model", default=DEFAULT_SERVE_MODEL)
+    parser.add_argument("--vllm-client-model", default=DEFAULT_SERVE_MODEL)
+    parser.add_argument("--openai-model", default=DEFAULT_SERVE_MODEL)
     parser.add_argument("--model-retry-attempts", type=int, default=2)
     parser.add_argument("--completion-max-tokens", type=int, default=DEFAULT_COMPLETION_MAX_TOKENS)
     parser.add_argument("--num-trajectories", type=int, default=4)
