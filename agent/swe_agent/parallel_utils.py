@@ -1,3 +1,6 @@
+# TODO: rewrite this file, current codes are too messy. Make them as precise as possible.
+
+
 from __future__ import annotations
 
 import json
@@ -48,36 +51,85 @@ class RubricArtifactBundle:
     selected_for_round_summary: bool = False
 
 
+def _write_round_artifacts(
+    bundles: list[NodeArtifactBundle],
+    rubric_bundles: list[RubricArtifactBundle] | None = None,
+    extra_json_writes: list[tuple[Path, Any]] | None = None,
+    *,
+    write_gt_files: bool = True,
+) -> None:
+    for bundle in bundles:
+        bundle.node_dir.mkdir(parents=True, exist_ok=True)
+        if bundle.raw_traj_payload is not None:
+            _atomic_write_json(bundle.node_dir / "raw_traj.json", bundle.raw_traj_payload)
+        _atomic_write_json(bundle.node_dir / "messages.json", bundle.messages_payload)
+        if write_gt_files:
+            _atomic_write_json(bundle.node_dir / "judge.json", bundle.judge_payload)
+        if bundle.snapshot_payload is not None:
+            _atomic_write_json(bundle.node_dir / "snapshot.json", bundle.snapshot_payload)
+        if bundle.terminal_raw_traj_payload is not None:
+            _atomic_write_json(bundle.node_dir / "terminal_raw_traj.json", bundle.terminal_raw_traj_payload)
+        if bundle.terminal_messages_payload is not None:
+            _atomic_write_json(bundle.node_dir / "terminal_messages.json", bundle.terminal_messages_payload)
+        if bundle.terminal_patch_payload is not None:
+            _atomic_write_json(bundle.node_dir / "terminal_patch.json", bundle.terminal_patch_payload)
+        _atomic_write_json(bundle.node_dir / "node.json", bundle.node_payload)
+    for bundle in rubric_bundles or []:
+        bundle.rubric_dir.mkdir(parents=True, exist_ok=True)
+        if write_gt_files:
+            _atomic_write_json(bundle.rubric_dir / "rubric.json", bundle.rubric_payload)
+        _atomic_write_json(bundle.rubric_dir / "messages.json", bundle.messages_payload)
+        if bundle.raw_traj_payload is not None:
+            _atomic_write_json(bundle.rubric_dir / "raw_traj.json", bundle.raw_traj_payload)
+    for path, payload in extra_json_writes or []:
+        _atomic_write_json(path, payload)
+
+
+def _write_gt_artifacts(
+    bundles: list[NodeArtifactBundle],
+    rubric_bundles: list[RubricArtifactBundle] | None = None,
+    extra_json_writes: list[tuple[Path, Any]] | None = None,
+) -> None:
+    for bundle in bundles:
+        bundle.node_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(bundle.node_dir / "judge.json", bundle.judge_payload)
+    for bundle in rubric_bundles or []:
+        bundle.rubric_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(bundle.rubric_dir / "rubric.json", bundle.rubric_payload)
+    for path, payload in extra_json_writes or []:
+        _atomic_write_json(path, payload)
+
+
 class ArtifactWriter:
     def __init__(self, max_workers: int = 1) -> None:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="search-artifacts")
         self._futures: list[Future] = []
 
-    def write_round(self, bundles: list[NodeArtifactBundle], rubric_bundles: list[RubricArtifactBundle] | None = None) -> None:
-        for bundle in bundles:
-            bundle.node_dir.mkdir(parents=True, exist_ok=True)
-            if bundle.raw_traj_payload is not None:
-                _atomic_write_json(bundle.node_dir / "raw_traj.json", bundle.raw_traj_payload)
-            _atomic_write_json(bundle.node_dir / "messages.json", bundle.messages_payload)
-            _atomic_write_json(bundle.node_dir / "judge.json", bundle.judge_payload)
-            if bundle.snapshot_payload is not None:
-                _atomic_write_json(bundle.node_dir / "snapshot.json", bundle.snapshot_payload)
-            if bundle.terminal_raw_traj_payload is not None:
-                _atomic_write_json(bundle.node_dir / "terminal_raw_traj.json", bundle.terminal_raw_traj_payload)
-            if bundle.terminal_messages_payload is not None:
-                _atomic_write_json(bundle.node_dir / "terminal_messages.json", bundle.terminal_messages_payload)
-            if bundle.terminal_patch_payload is not None:
-                _atomic_write_json(bundle.node_dir / "terminal_patch.json", bundle.terminal_patch_payload)
-            _atomic_write_json(bundle.node_dir / "node.json", bundle.node_payload)
-        for bundle in rubric_bundles or []:
-            bundle.rubric_dir.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(bundle.rubric_dir / "rubric.json", bundle.rubric_payload)
-            _atomic_write_json(bundle.rubric_dir / "messages.json", bundle.messages_payload)
-            if bundle.raw_traj_payload is not None:
-                _atomic_write_json(bundle.rubric_dir / "raw_traj.json", bundle.raw_traj_payload)
+    def write_round(
+        self,
+        bundles: list[NodeArtifactBundle],
+        rubric_bundles: list[RubricArtifactBundle] | None = None,
+        extra_json_writes: list[tuple[Path, Any]] | None = None,
+        *,
+        write_gt_files: bool = True,
+    ) -> None:
+        _write_round_artifacts(bundles, rubric_bundles, extra_json_writes, write_gt_files=write_gt_files)
 
-    def submit_round(self, bundles: list[NodeArtifactBundle], rubric_bundles: list[RubricArtifactBundle] | None = None) -> Future:
-        future = self._executor.submit(self.write_round, bundles, rubric_bundles)
+    def submit_round(
+        self,
+        bundles: list[NodeArtifactBundle],
+        rubric_bundles: list[RubricArtifactBundle] | None = None,
+        extra_json_writes: list[tuple[Path, Any]] | None = None,
+        *,
+        write_gt_files: bool = True,
+    ) -> Future:
+        future = self._executor.submit(
+            self.write_round,
+            bundles,
+            rubric_bundles,
+            extra_json_writes,
+            write_gt_files=write_gt_files,
+        )
         self._futures.append(future)
         return future
 
@@ -114,13 +166,11 @@ class PatchEvalManager:
         self,
         bundles: list[NodeArtifactBundle],
         rubric_bundles: list[RubricArtifactBundle] | None,
-        write_future: Future | None,
+        extra_json_writes: list[tuple[Path, Any]] | None,
         previous_future: Future | None,
     ) -> dict[str, float]:
         if previous_future is not None:
             previous_future.result()
-        if write_future is not None:
-            write_future.result()
 
         patches_by_node_id: dict[str, str] = {}
         for bundle in bundles:
@@ -129,22 +179,19 @@ class PatchEvalManager:
             patch = bundle.terminal_patch_payload.get(self.task_id, {}).get("model_patch") or ""
             patches_by_node_id[bundle.node_id] = patch
 
-        if not patches_by_node_id:
-            return {}
-
-        rewards = self.evaluate_patches_fn(
-            instance=self.instance,
-            patches_by_key=patches_by_node_id,
-            model_name=self.model_name,
-            max_workers=1,
-            namespace=self.namespace,
-            work_dir=self.work_dir,
-        )
+        rewards: dict[str, float] = {}
+        if patches_by_node_id:
+            rewards = self.evaluate_patches_fn(
+                instance=self.instance,
+                patches_by_key=patches_by_node_id,
+                model_name=self.model_name,
+                max_workers=1,
+                namespace=self.namespace,
+                work_dir=self.work_dir,
+            )
         for bundle in bundles:
-            if bundle.node_id not in rewards:
-                continue
-            bundle.judge_payload["ground_truth_reward"] = rewards[bundle.node_id]
-            _atomic_write_json(bundle.node_dir / "judge.json", bundle.judge_payload)
+            if bundle.node_id in rewards:
+                bundle.judge_payload["ground_truth_reward"] = rewards[bundle.node_id]
         gt_by_node_id = dict(rewards)
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
@@ -192,29 +239,25 @@ class PatchEvalManager:
                     | set(payload.get("child_score_by_rubric", {}))
                 )
             }
-            _atomic_write_json(bundle.rubric_dir / "rubric.json", payload)
-            if bundle.selected_for_round_summary and bundle.round_summary_path is not None and bundle.round_summary_path.exists():
-                round_payload = json.loads(bundle.round_summary_path.read_text(encoding="utf-8"))
-                round_payload["gt_by_rubric"] = payload["gt_by_rubric"]
-                round_payload["gt_reward_siblings"] = payload["gt_reward_siblings"]
-                round_payload["gt_reward_parent"] = payload["gt_reward_parent"]
-                for sample_payload in round_payload.get("rubric_samples", []):
-                    if sample_payload.get("sample_index") == payload.get("sample_index"):
-                        sample_payload["gt_by_rubric"] = payload["gt_by_rubric"]
-                        sample_payload["gt_reward_siblings"] = payload["gt_reward_siblings"]
-                        sample_payload["gt_reward_parent"] = payload["gt_reward_parent"]
-                        break
-                _atomic_write_json(bundle.round_summary_path, round_payload)
+            if bundle.selected_for_round_summary and bundle.round_summary_path is not None:
+                for path, round_payload in extra_json_writes or []:
+                    if path != bundle.round_summary_path or not isinstance(round_payload, dict):
+                        continue
+                    round_payload["gt_by_rubric"] = payload["gt_by_rubric"]
+                    round_payload["gt_reward_siblings"] = payload["gt_reward_siblings"]
+                    round_payload["gt_reward_parent"] = payload["gt_reward_parent"]
+                    break
+        _write_gt_artifacts(bundles, rubric_bundles, extra_json_writes)
         return rewards
 
     def submit_round(
         self,
         bundles: list[NodeArtifactBundle],
-        write_future: Future | None,
         rubric_bundles: list[RubricArtifactBundle] | None = None,
+        extra_json_writes: list[tuple[Path, Any]] | None = None,
     ) -> Future:
         previous_future = self._futures[-1] if self._futures else None
-        future = self._executor.submit(self._evaluate_round, bundles, rubric_bundles, write_future, previous_future)
+        future = self._executor.submit(self._evaluate_round, bundles, rubric_bundles, extra_json_writes, previous_future)
         self._futures.append(future)
         return future
 
