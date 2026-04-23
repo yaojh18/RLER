@@ -11,6 +11,7 @@ from .data_export import SFTDataExporter
 
 
 DEFAULT_TEACHER_MODEL = "gemini/gemini-3.1-pro-preview"
+os.environ["GEMINI_API_KEY"] = "AQ.Ab8RN6Ij-4PRghnr2J1tu3KSG3Rdzqvdg6B329fvsBt-fJWAHw"
 
 
 def build_search_args(
@@ -22,11 +23,11 @@ def build_search_args(
     output_root: Path,
     model_name: str,
     student_model_name: str | None,
-    m: int,
-    k: int,
-    p: int,
-    max_rounds: int,
-    completion_max_tokens: int = 4096,
+    completion_max_tokens: int | None = None,
+    m: int | None = None,
+    k: int | None = None,
+    p: int | None = None,
+    max_rounds: int | None = None,
 ) -> argparse.Namespace:
     args = build_arg_parser().parse_args([])
     args.backend = backend
@@ -36,12 +37,16 @@ def build_search_args(
     args.output_root = output_root
     args.resume_run_dir = None
     args.workers = 1
-    args.completion_max_tokens = completion_max_tokens
-    args.m = m
-    args.k = k
-    args.p = p
-    args.max_rounds = max_rounds
-    args.calculate_gt_reward = True
+    if completion_max_tokens is not None:
+        args.completion_max_tokens = completion_max_tokens
+    if m is not None:
+        args.m = m
+    if k is not None:
+        args.k = k
+    if p is not None:
+        args.p = p
+    if max_rounds is not None:
+        args.max_rounds = max_rounds
     if backend == "slime":
         args.slime_model = model_name
     elif backend == "openai":
@@ -60,26 +65,30 @@ def collect_teacher_student_export(
     teacher_api_key: str,
     student_model_name: str,
     teacher_model_name: str = DEFAULT_TEACHER_MODEL,
+    student_backend: str = "slime",
+    teacher_backend: str = "openai",
     subset: str = "rebench_v2",
     split: str = "train",
-    m: int = 2,
-    k: int = 20,
-    p: int = 1,
-    max_rounds: int = 5,
-    completion_max_tokens: int = 4096,
+    completion_max_tokens: int | None = None,
+    m: int | None = None,
+    k: int | None = None,
+    p: int | None = None,
+    max_rounds: int | None = None,
 ) -> SFTExportBundle:
     if teacher_model_name.startswith("gemini/"):
         os.environ["GEMINI_API_KEY"] = teacher_api_key
     else:
-        os.environ["OPENAI_API_KEY"] = teacher_api_key
+        raise ValueError(f"Unsupported teacher model: {teacher_model_name}")
+
     args = build_search_args(
-        backend="openai",
+        backend=teacher_backend,
         instance_id=instance_id,
         subset=subset,
         split=split,
-        output_root=output_root / "mixed",
+        output_root=output_root,
         model_name=teacher_model_name,
         student_model_name=student_model_name,
+        student_backend=student_backend,
         m=m,
         k=k,
         p=p,
@@ -91,4 +100,10 @@ def collect_teacher_student_export(
         raise RuntimeError(f"Search run did not return a result for {instance_id}")
     if results[0].error:
         raise RuntimeError(f"Search run failed with error: {results[0].error}")
-    return SFTDataExporter(run_dir=Path(results[0].run_dir)).export_bundle()
+
+    bundle = SFTDataExporter(run_dir=Path(results[0].run_dir)).export_bundle()
+    bundle.metadata.update({
+        "teacher_backend": teacher_backend,
+        "teacher_model_name": teacher_model_name,
+    })
+    return bundle
