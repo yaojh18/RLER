@@ -1,3 +1,6 @@
+# TODO: I notice when you run rebench eval, you left a rebench_eval folder in the output files.
+# TODO: I don't know ehere the cause is, but when evaluating on rebench, the outputs should be the same as swebench verified. Do not add additional files.
+
 from __future__ import annotations
 
 import importlib

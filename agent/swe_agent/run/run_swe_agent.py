@@ -72,7 +72,8 @@ SWE_AGENT_TEXTBASED_CONFIG = AGENT_ROOT / "swe_agent" / "config" / "benchmarks" 
 
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
-
+# TODO: delete BackendResult and all coresponding logic. The return of search_swe_agent should be GRPOExportBundle or not depending on the paremeter in search config (export_boundle).
+# TODO: move all GRPOExportBundle computing logic to tracjectory_search; also add a new parameter (write_artifacts) in search config, default true, write files only when this paramter is true.
 @dataclass
 class BackendResult:
     benchmark_name: str

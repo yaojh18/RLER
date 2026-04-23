@@ -877,7 +877,7 @@ async def _generate_round_rubrics(
     generated: list[RubricRecord] = []
     format_errors: list[dict[str, Any]] = []
     remaining_budget = 6
-    for _ in range(remaining_budget):
+    for idx in range(remaining_budget):
         parsed: dict[str, Any] | None = None
         assistant_content = ""
         assistant_content_no_thinking = ""
@@ -921,7 +921,8 @@ async def _generate_round_rubrics(
                 )
             break
         generated.append(rubric)
-        conversation_messages.append({"role": "user", "content": RUBRIC_GENERATION_CONTINUE_PROMPT})
+        if idx < remaining_budget - 1:
+            conversation_messages.append({"role": "user", "content": RUBRIC_GENERATION_CONTINUE_PROMPT})
     return RubricGenerationSample(
         sample_index=sample_index,
         rubric_list_id=f"rubric-r{round_index:03d}-s{sample_index:02d}",
@@ -2186,6 +2187,8 @@ class TrajectorySearchRunner:
         self._sweep_checkpoint_images()
 
     def _finalize_outputs(self) -> TrajectorySearchResult:
+        # TODO: This step and evaluation the final patch is optional depending on a new paramter in the search config.
+        # TODO: move the final patch evaluation in search swe_agent into this function. This function will only return a float represent patch success or not.
         def _cached_overall_reward(node_id: str) -> float:
             reward = (self._node_judge_cache.get(node_id) or {}).get("overall_reward")
             return float(reward) if reward is not None else float("-inf")
