@@ -22,7 +22,7 @@ if str(AGENT_ROOT) not in sys.path:
 
 from slime.swe_agent.teacher_student import collect_teacher_student_export
 from swe_agent.run.run_swe_agent import choose_gpus
-from swe_agent.run.search_swe_agent import build_arg_parser, run_search
+from swe_agent.run.search_swe_agent import build_arg_parser, get_search_run_dir, run_search
 import swe_agent.run.search_swe_agent as search_module
 
 
@@ -334,14 +334,14 @@ def main() -> int:
                 output_root=args.search_output_root / "teacher_student",
                 teacher_api_key=args.teacher_api_key,
                 student_model_name=args.student_model,
-            teacher_model_name=args.teacher_model,
-            subset=args.subset,
-            split=args.split,
-            m=args.search_m,
-            k=args.search_k,
-            p=args.search_p,
-            max_rounds=args.search_max_rounds,
-        )
+                teacher_model_name=args.teacher_model,
+                subset=args.subset,
+                split=args.split,
+                m=args.search_m,
+                k=args.search_k,
+                p=args.search_p,
+                max_rounds=args.search_max_rounds,
+            )
             teacher_run_dir = Path(teacher_bundle.run_dir)
         teacher_summary = _summarize_run(teacher_run_dir)
         if not teacher_summary["evaluation_exists"] or teacher_summary["rubric_count"] <= 0:
@@ -376,10 +376,8 @@ def main() -> int:
                 p=args.search_p,
                 max_rounds=args.search_max_rounds,
             )
-            student_results = run_search(student_args, [args.instance_id])
-            if not student_results or student_results[0].error:
-                raise RuntimeError(f"student-only search failed: {student_results[0].error if student_results else 'no result'}")
-            student_run_dir = Path(student_results[0].run_dir)
+            student_run_dir = get_search_run_dir(student_args, args.instance_id)
+            run_search(student_args, [args.instance_id])
         student_summary = _summarize_run(student_run_dir)
         if not student_summary["evaluation_exists"] or student_summary["rubric_count"] <= 0:
             raise RuntimeError(f"student-only search did not produce usable artifacts: {student_summary}")

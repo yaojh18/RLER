@@ -47,9 +47,7 @@ from swe_agent.run.run_swe_agent import (
     DEFAULT_STEP_LIMIT,
     DEFAULT_SUBSET,
     DEFAULT_VLLM_PORT,
-    BackendResult,
     ParseInstanceIds,
-    build_failed_result,
     build_slim_trajectory,
     choose_gpus,
     find_free_port,
@@ -58,6 +56,7 @@ from swe_agent.run.run_swe_agent import (
     tee_console,
     temporary_env,
     terminate_process,
+    write_failure_artifacts,
 )
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
 from swe_agent.trajectory_search import (
@@ -689,7 +688,7 @@ class AggregateTrajectoryRunner:
             "judge_errors": judge_errors,
         }
 
-    def run(self) -> BackendResult:
+    def run(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         candidates: list[dict[str, Any]] = []
         for candidate_index in range(self.num_trajectories):
@@ -788,31 +787,10 @@ class AggregateTrajectoryRunner:
             encoding="utf-8",
         )
 
-        patch_payload = json.loads(patch_path.read_text(encoding="utf-8"))
-        selected_patch = patch_payload[self.task_id]["model_patch"]
-        return BackendResult(
-            benchmark_name="aggregate_swe_agent",
-            split="",
-            backend="vllm" if self.policy_model_name.startswith("openai/") else "openai",
-            model_name=self.policy_model_name,
-            instance_id=self.task_id,
-            run_dir=str(self.run_dir),
-            raw_trajectory_path=str(raw_traj_path),
-            slim_trajectory_path=str(slim_traj_path),
-            patch_path=str(patch_path),
-            log_path=None,
-            evaluation_result_path=None,
-            exit_status=best_candidate["result"].get("exit_status", ""),
-            prediction_chars=len(selected_patch),
-            resolved=None,
-            error=None,
-        )
-
-
 def run_aggregate(
     args: argparse.Namespace,
     instance_ids: Sequence[str] | None,
-) -> list[BackendResult]:
+) -> None:
     model_name = args.vllm_client_model if args.backend == "vllm" else args.openai_model
     available_instances = load_swebench_instances(args.subset, args.split)
     by_id = {instance["instance_id"]: instance for instance in available_instances}
@@ -856,7 +834,8 @@ def run_aggregate(
 
     configure_model_route("rubric_generation", ModelRouteConfig(backend="litellm"))
     configure_model_route("rubric_judge", ModelRouteConfig(backend="litellm"))
-    results: list[BackendResult] = []
+    run_dirs: list[Path] = []
+    errors: list[str] = []
     try:
         config = build_swebench_config(
             config_spec=[str(SWE_AGENT_TEXTBASED_CONFIG)],
@@ -926,30 +905,29 @@ def run_aggregate(
                             rubric_model_kwargs=rubric_model_kwargs,
                             judge_model_kwargs=judge_model_kwargs,
                         )
-                        result = runner.run()
-                        result.benchmark_name = args.subset
-                        result.split = args.split
-                        result.log_path = str(run_log_path)
-                        results.append(result)
+                        runner.run()
+                        run_dirs.append(run_dir)
                     except Exception as exc:
-                        results.append(
-                            build_failed_result(
-                                benchmark_name=args.subset,
-                                split=args.split,
-                                backend=args.backend,
-                                model_name=model_name,
-                                instance_id=instance["instance_id"],
-                                run_dir=run_dir,
-                                error=exc,
-                                log_path=run_log_path,
-                            )
+                        errors.append(f"{instance['instance_id']}: {exc}")
+                        write_failure_artifacts(
+                            instance_id=instance["instance_id"],
+                            run_dir=run_dir,
+                            error=exc,
+                            log_path=run_log_path,
                         )
-        return run_harness_evaluation(
-            results=results,
-            dataset_name=DATASET_MAPPING.get(args.subset, args.subset),
-            timeout=args.eval_timeout,
-            max_workers=max(1, min(args.workers, len(results))),
-        )
+        if run_dirs:
+            run_harness_evaluation(
+                run_dirs=run_dirs,
+                split=args.split,
+                model_name=model_name,
+                dataset_name=DATASET_MAPPING.get(args.subset, args.subset),
+                log_path=run_log_path,
+                timeout=args.eval_timeout,
+                max_workers=max(1, min(args.workers, len(run_dirs))),
+                instances_by_id=by_id,
+            )
+        if errors:
+            raise RuntimeError("; ".join(errors))
     finally:
         clear_model_routes()
         terminate_process(vllm_handle.process if vllm_handle else None)
@@ -995,8 +973,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    results = run_aggregate(args, args.instance_id)
-    print(json.dumps([result.__dict__ for result in results], indent=2))
+    run_aggregate(args, args.instance_id)
     return 0
 
 

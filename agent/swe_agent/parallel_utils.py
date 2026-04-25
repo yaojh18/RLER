@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -47,6 +48,38 @@ class RubricArtifactBundle:
     raw_traj_payload: dict[str, Any] | None = None
     round_summary_path: Path | None = None
     selected_for_round_summary: bool = False
+
+
+class GRPOCollector:
+    def __init__(self) -> None:
+        self.node_payloads: dict[str, dict[str, Any]] = {}
+        self.node_messages: dict[str, dict[str, Any]] = {}
+        self.node_judges: dict[str, dict[str, Any]] = {}
+        self.rubric_payloads: dict[str, dict[str, Any]] = {}
+        self.rubric_messages: dict[str, dict[str, Any]] = {}
+        self.round_payloads: dict[str, dict[str, Any]] = {}
+
+    def collect(
+        self,
+        bundles: list[NodeArtifactBundle],
+        rubric_bundles: list[RubricArtifactBundle] | None = None,
+        extra_json_writes: list[tuple[Path, Any]] | None = None,
+    ) -> None:
+        for bundle in bundles:
+            self.node_payloads[bundle.node_id] = copy.deepcopy(bundle.node_payload)
+            self.node_messages[bundle.node_id] = copy.deepcopy(bundle.messages_payload)
+            self.node_judges[bundle.node_id] = copy.deepcopy(bundle.judge_payload)
+        for bundle in rubric_bundles or []:
+            rubric_list_id = str(bundle.rubric_payload.get("rubric_list_id") or bundle.rubric_dir.name)
+            self.rubric_payloads[rubric_list_id] = copy.deepcopy(bundle.rubric_payload)
+            self.rubric_messages[rubric_list_id] = copy.deepcopy(bundle.messages_payload)
+        for path, payload in extra_json_writes or []:
+            if isinstance(payload, dict):
+                self.round_payloads[str(path)] = copy.deepcopy(payload)
+
+    def get_ground_truth_reward(self, node_id: str) -> float | None:
+        reward = (self.node_judges.get(node_id) or {}).get("ground_truth_reward")
+        return None if reward is None else float(reward)
 
 
 def _write_base_artifacts(
@@ -102,9 +135,10 @@ def _pearson(scores: list[float], gt_scores: list[float]) -> float:
 
 
 class ArtifactWriter:
-    def __init__(self, max_workers: int = 1) -> None:
+    def __init__(self, max_workers: int = 1, write_artifacts: bool = True) -> None:
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="search-artifacts")
         self._futures: list[Future] = []
+        self.write_artifacts = write_artifacts
 
     def write_round(
         self,
@@ -148,6 +182,8 @@ class PatchEvalManager:
         namespace: str | None,
         work_dir: Path,
         evaluate_patches_fn: Callable[..., dict[str, float]],
+        collector: GRPOCollector | None = None,
+        write_artifacts: bool = True,
         max_workers: int = 1,
     ) -> None:
         self.instance = instance
@@ -156,6 +192,8 @@ class PatchEvalManager:
         self.namespace = namespace
         self.work_dir = work_dir
         self.evaluate_patches_fn = evaluate_patches_fn
+        self.collector = collector
+        self.write_artifacts = write_artifacts
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="search-gt-eval")
         self._futures: list[Future] = []
 
@@ -202,9 +240,11 @@ class PatchEvalManager:
             parent_node_id = str(payload.get("parent_node_id") or "")
             parent_gt = None
             if parent_node_id:
-                parent_judge_path = self.work_dir / "nodes" / parent_node_id / "judge.json"
-                if parent_judge_path.exists():
-                    parent_gt = json.loads(parent_judge_path.read_text(encoding="utf-8")).get("ground_truth_reward")
+                parent_gt = self.collector.get_ground_truth_reward(parent_node_id) if self.collector is not None else None
+                if parent_gt is None:
+                    parent_judge_path = self.work_dir / "nodes" / parent_node_id / "judge.json"
+                    if parent_judge_path.exists():
+                        parent_gt = json.loads(parent_judge_path.read_text(encoding="utf-8")).get("ground_truth_reward")
 
             ordered_child_ids = sorted(str(node_id) for node_id in payload.get("child_rewards", {}))
             gt_entries: dict[str, dict[str, Any]] = {}
@@ -246,7 +286,10 @@ class PatchEvalManager:
                     round_payload["gt_reward_siblings"] = payload["gt_reward_siblings"]
                     round_payload["gt_reward_parent"] = payload["gt_reward_parent"]
 
-        _write_gt_artifacts(bundles, rubric_bundles, extra_json_writes)
+        if self.collector is not None:
+            self.collector.collect(bundles, rubric_bundles, extra_json_writes)
+        if self.write_artifacts:
+            _write_gt_artifacts(bundles, rubric_bundles, extra_json_writes)
         return rewards
 
     def submit_round(

@@ -1,6 +1,3 @@
-# TODO: I notice when you run rebench eval, you left a rebench_eval folder in the output files.
-# TODO: I don't know ehere the cause is, but when evaluating on rebench, the outputs should be the same as swebench verified. Do not add additional files.
-
 from __future__ import annotations
 
 import importlib
@@ -87,8 +84,6 @@ def evaluate_rebench_instance(
         raise ValueError(f"Unknown log parser: {parser_name}")
 
     resolved_work_dir = work_dir.resolve()
-    eval_dir = resolved_work_dir / "rebench_eval"
-    eval_dir.mkdir(parents=True, exist_ok=True)
     workdir = f"/{repo.split('/')[1]}"
     test_patch = instance.get("test_patch", "")
     if not test_patch:
@@ -140,8 +135,6 @@ def evaluate_rebench_instance(
             exit_code = -1
             output = stdout + stderr + f"\nTimed out after {timeout} seconds while evaluating patch.\n"
 
-    log_path = eval_dir / f"{instance_id}.log"
-    log_path.write_text(output, encoding="utf-8")
     parsed = parser(output)
     parsed = {_normalize_test_name(name): status for name, status in parsed.items()}
     passed = sorted(name for name, status in parsed.items() if status == "PASSED")
@@ -156,7 +149,7 @@ def evaluate_rebench_instance(
         "passed_actual": passed,
         "failed_actual": failed,
         "passed_expected": expected_passed,
-        "log_path": str(log_path),
+        "log_path": None,
         "parser_name": parser_name,
         "image_name": image_name,
     }

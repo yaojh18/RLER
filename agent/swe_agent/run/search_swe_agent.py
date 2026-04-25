@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-import json
 import os
-import re
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -16,7 +14,6 @@ from agent_rl import clear_model_services, register_model_service
 from agent_rl.run_utils import ModelRouteConfig, clear_model_routes, configure_model_route
 from swe_agent.rl_backend import SWEAgentRolloutBackend
 from swe_agent.run.benchmarks.swebench import (
-    DATASET_MAPPING,
     build_swebench_config,
     get_swebench_docker_image_name,
     get_swebench_harness_namespace,
@@ -36,16 +33,15 @@ from swe_agent.run.run_swe_agent import (
     DEFAULT_SPLIT,
     DEFAULT_VLLM_PORT,
     DEFAULT_SERVE_MODEL,
-    BackendResult,
     ParseInstanceIds,
-    build_failed_result,
     choose_gpus,
     find_free_port,
     infer_litellm_api_env,
-    run_harness_evaluation,
+    make_run_root,
     tee_console,
     temporary_env,
     terminate_process,
+    write_failure_artifacts,
 )
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
 from swe_agent.trajectory_search import SearchConfig, TrajectorySearchRunner
@@ -57,22 +53,12 @@ SLIME_API_BASE = os.environ.get("SEARCH_SWE_SLIME_API_BASE", "http://127.0.0.1:8
 SLIME_API_KEY = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
 
 
-def _make_run_root(output_root: Path, subset: str, split: str, model_name: str) -> Path:
-    return output_root / (
-        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', subset.replace('/', '__'))}_"
-        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', split.replace('/', '__'))}_"
-        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', model_name.replace('/', '__'))}"
-    )
-
-
-def _make_backend(config: dict[str, Any]) -> SWEAgentRolloutBackend:
-    return SWEAgentRolloutBackend(
-        model=config.get("model", {}),
-        environment=config.get("environment", {}),
-        agent=config.get("agent", {}),
-        default_agent_type="default",
-        default_environment_type=config.get("environment", {}).get("environment_class", "docker"),
-    )
+def _resolve_model_name(args: argparse.Namespace) -> str:
+    if args.backend == "vllm":
+        return args.vllm_model
+    if args.backend == "slime":
+        return args.slime_model
+    return args.openai_model
 
 
 def _run_single_instance(
@@ -88,14 +74,20 @@ def _run_single_instance(
     judge_model_kwargs: dict[str, Any],
     search_config: SearchConfig,
     resume: bool,
-) -> BackendResult:
+) -> None:
     instance_config = copy.deepcopy(config)
     environment_config = instance_config.setdefault("environment", {})
     if environment_config.get("environment_class", "docker") == "docker":
         environment_config["image"] = get_swebench_docker_image_name(instance)
     runner = TrajectorySearchRunner(
         instance=instance,
-        backend=_make_backend(instance_config),
+        backend=SWEAgentRolloutBackend(
+            model=config.get("model", {}),
+            environment=config.get("environment", {}),
+            agent=config.get("agent", {}),
+            default_agent_type="default",
+            default_environment_type=config.get("environment", {}).get("environment_class", "docker"),
+        ),
         run_dir=run_dir,
         policy_model_name=policy_model_name,
         student_policy_model_name=student_policy_model_name,
@@ -107,37 +99,15 @@ def _run_single_instance(
         harness_namespace=get_swebench_harness_namespace(instance),
         resume=resume,
     )
-    result = runner.run()
-    return BackendResult(
-        benchmark_name="search_swe_agent",
-        split="",
-        backend="vllm" if policy_model_name.startswith("openai/") else "openai",
-        model_name=policy_model_name,
-        instance_id=instance["instance_id"],
-        run_dir=str(run_dir),
-        raw_trajectory_path=result.raw_trajectory_path,
-        slim_trajectory_path=result.slim_trajectory_path,
-        patch_path=result.patch_path,
-        log_path=None,
-        evaluation_result_path=None,
-        exit_status=result.exit_status,
-        prediction_chars=len(json.loads(Path(result.patch_path).read_text())[instance["instance_id"]]["model_patch"]) if result.patch_path else 0,
-        resolved=None,
-        error=None,
-    )
+    runner.run()
 
 
 def run_search(
     args: argparse.Namespace,
     instance_ids: Sequence[str] | None,
-) -> list[BackendResult]:
+) -> None:
     student_model_name = getattr(args, "student_model", None)
-    if args.backend == "vllm":
-        model_name = args.vllm_model
-    elif args.backend == "slime":
-        model_name = args.slime_model
-    else:
-        model_name = args.openai_model
+    model_name = _resolve_model_name(args)
     available_instances = load_swebench_instances(args.subset, args.split)
     by_id = {instance["instance_id"]: instance for instance in available_instances}
     selected_ids = list(instance_ids or by_id)
@@ -145,8 +115,13 @@ def run_search(
     if missing:
         raise RuntimeError(f"Instances not found in {args.subset}/{args.split}: {', '.join(missing)}")
     instances = [by_id[instance_id] for instance_id in selected_ids]
-    timestamp = args.resume_run_dir.name if args.resume_run_dir else time.strftime("%Y%m%d-%H%M%S")
-    run_root = _make_run_root(args.output_root, args.subset, args.split, model_name)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    run_root = make_run_root(
+        output_root=args.output_root,
+        benchmark_name=args.subset,
+        split=args.split,
+        model_name=model_name,
+    )
     run_log_path = DEFAULT_LOG_ROOT / f"search-{timestamp}.log"
     run_log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -222,7 +197,7 @@ def run_search(
         configure_model_route("policy", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
         configure_model_route("rubric_generation", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
         configure_model_route("rubric_judge", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
-    results: list[BackendResult] = []
+    errors: list[str] = []
     try:
         config = build_swebench_config(
             config_spec=[str(SWE_AGENT_TEXTBASED_CONFIG)],
@@ -267,8 +242,11 @@ def run_search(
             regression_margin=args.regression_margin,
             calculate_gt_reward=args.calculate_gt_reward,
             gt_reward_workers=args.workers,
-            write_raw_traj=getattr(args, "write_raw_traj", False),
-            strategy=getattr(args, "strategy", "best"),
+            evaluate_final_patch=args.evaluate_final_patch,
+            export_grpo_bundles=args.export_grpo_bundles,
+            write_artifacts=args.write_artifacts,
+            write_raw_traj=args.write_raw_traj,
+            strategy=args.strategy,
         )
         rubric_model_name = args.rubric_model or model_name
         judge_model_name = args.judge_model or model_name
@@ -280,7 +258,7 @@ def run_search(
                     run_dir = args.resume_run_dir or (run_root / instance["instance_id"] / timestamp)
                     run_dir.mkdir(parents=True, exist_ok=True)
                     try:
-                        result = _run_single_instance(
+                        _run_single_instance(
                             instance=instance,
                             run_dir=run_dir,
                             config=config,
@@ -293,31 +271,16 @@ def run_search(
                             search_config=search_config,
                             resume=bool(args.resume_run_dir),
                         )
-                        result.backend = args.backend
-                        result.benchmark_name = args.subset
-                        result.split = args.split
-                        result.log_path = str(run_log_path)
-                        results.append(result)
                     except Exception as exc:
-                        results.append(
-                            build_failed_result(
-                                benchmark_name=args.subset,
-                                split=args.split,
-                                backend=args.backend,
-                                model_name=model_name,
-                                instance_id=instance["instance_id"],
-                                run_dir=run_dir,
-                                error=exc,
-                                log_path=run_log_path,
-                            )
+                        errors.append(f"{instance['instance_id']}: {exc}")
+                        write_failure_artifacts(
+                            instance_id=instance["instance_id"],
+                            run_dir=run_dir,
+                            error=exc,
+                            log_path=run_log_path,
                         )
-        return run_harness_evaluation(
-            results=results,
-            dataset_name=DATASET_MAPPING.get(args.subset, args.subset),
-            timeout=args.eval_timeout,
-            max_workers=max(1, min(args.workers, len(results))),
-            instances_by_id=by_id,
-        )
+        if errors:
+            raise RuntimeError("; ".join(errors))
     finally:
         clear_model_services()
         clear_model_routes()
@@ -369,13 +332,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategy", choices=["best", "probability", "random"], default="best")
     parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
     parser.add_argument("--student-model", default=None)
+    parser.add_argument("--evaluate-final-patch", action="store_true", default=True)
+    parser.add_argument("--export-grpo-bundles", action="store_true", default=True)
+    parser.add_argument("--write-artifacts", action="store_true", default=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    results = run_search(args, args.instance_id)
-    return 0
+    run_search(args, args.instance_id)
 
 
 if __name__ == "__main__":

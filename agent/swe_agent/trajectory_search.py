@@ -26,7 +26,14 @@ from agent_rl.run_utils import (
 from swe_agent import __version__
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
 from swe_agent.rl_backend import SWEAgentRolloutBackend
-from swe_agent.parallel_utils import ArtifactWriter, NodeArtifactBundle, PatchEvalManager, RubricArtifactBundle, _atomic_write_json
+from swe_agent.parallel_utils import (
+    ArtifactWriter,
+    GRPOCollector,
+    NodeArtifactBundle,
+    PatchEvalManager,
+    RubricArtifactBundle,
+    _atomic_write_json,
+)
 from swe_agent.run.run_swe_agent import build_slim_trajectory, evaluate_swebench_instance_patches
 
 
@@ -381,6 +388,9 @@ class SearchConfig:
     regression_margin: float = 0.0
     calculate_gt_reward: bool = False
     gt_reward_workers: int = 1
+    evaluate_final_patch: bool = True
+    export_grpo_bundles: bool = True
+    write_artifacts: bool = True
     write_raw_traj: bool = False
     strategy: Literal["best", "probability", "random"] = "best"
 
@@ -423,15 +433,24 @@ class SearchNode:
     policy_model_name: str = ""
 
 
-@dataclass
-class TrajectorySearchResult:
-    run_dir: str
-    best_node_id: str | None
-    raw_trajectory_path: str | None
-    slim_trajectory_path: str | None
-    patch_path: str | None
-    exit_status: str
-    finished: bool
+def _build_evaluation_payload(
+    *,
+    instance_id: str,
+    completed: bool,
+    resolved: bool,
+    empty_patch: bool,
+    error: bool,
+) -> dict[str, Any]:
+    return {
+        "completed_ids": [instance_id] if completed else [],
+        "incomplete_ids": [],
+        "empty_patch_ids": [instance_id] if empty_patch else [],
+        "submitted_ids": [instance_id],
+        "resolved_ids": [instance_id] if resolved else [],
+        "unresolved_ids": [instance_id] if completed and not resolved else [],
+        "error_ids": [instance_id] if error else [],
+        "schema_version": 2,
+    }
 
 def _make_raw_trajectory(
     *,
@@ -1311,11 +1330,16 @@ class TrajectorySearchRunner:
         self.best_node_id: str | None = None
         self.finished_node_ids: list[str] = []
         self.image_repository = f"rler-search/{self.task_id.replace('__', '-').lower()}"
-        self.artifact_writer = ArtifactWriter()
+        self.artifact_writer = ArtifactWriter(write_artifacts=self.search_config.write_artifacts)
         self._manifest_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="search-manifest")
         self._manifest_futures: list[Future] = []
         self._node_judge_cache: dict[str, dict[str, Any]] = {}
         self._node_snapshot_cache: dict[str, dict[str, Any]] = {}
+        self.grpo_collector = (
+            GRPOCollector()
+            if self.search_config.export_grpo_bundles or not self.search_config.write_artifacts
+            else None
+        )
         self.patch_eval_manager = (
             PatchEvalManager(
                 instance=self.instance,
@@ -1324,13 +1348,17 @@ class TrajectorySearchRunner:
                 namespace=self.harness_namespace,
                 work_dir=self.run_dir,
                 evaluate_patches_fn=evaluate_swebench_instance_patches,
+                collector=self.grpo_collector,
+                write_artifacts=self.search_config.write_artifacts,
                 max_workers=max(1, self.search_config.gt_reward_workers),
             )
             if self.search_config.calculate_gt_reward
             else None
         )
 
-    def run(self) -> TrajectorySearchResult:
+    def run(self) -> None:
+        if self.resume and not self.search_config.write_artifacts:
+            raise RuntimeError("resume requires write_artifacts=True")
         self.run_dir.mkdir(parents=True, exist_ok=True)
         try:
             if self.resume and self.manifest_path.exists():
@@ -1348,8 +1376,7 @@ class TrajectorySearchRunner:
             self.artifact_writer.wait()
             if self.patch_eval_manager is not None:
                 self.patch_eval_manager.wait()
-            result = self._finalize_outputs()
-            return result
+            self._finalize_outputs()
         finally:
             if self.patch_eval_manager is not None:
                 self.patch_eval_manager.close()
@@ -1362,6 +1389,8 @@ class TrajectorySearchRunner:
             self._manifest_executor.shutdown(wait=True, cancel_futures=False)
 
     def _save_manifest(self) -> None:
+        if not self.search_config.write_artifacts:
+            return
         manifest_payload = {
             "run_id": self.run_id,
             "instance_id": self.task_id,
@@ -2186,9 +2215,7 @@ class TrajectorySearchRunner:
             )
         self._sweep_checkpoint_images()
 
-    def _finalize_outputs(self) -> TrajectorySearchResult:
-        # TODO: This step and evaluation the final patch is optional depending on a new paramter in the search config.
-        # TODO: move the final patch evaluation in search swe_agent into this function. This function will only return a float represent patch success or not.
+    def _finalize_outputs(self) -> None:
         def _cached_overall_reward(node_id: str) -> float:
             reward = (self._node_judge_cache.get(node_id) or {}).get("overall_reward")
             return float(reward) if reward is not None else float("-inf")
@@ -2206,15 +2233,7 @@ class TrajectorySearchRunner:
         elif self.best_node_id is not None:
             final_node_id = self.best_node_id
         else:
-            return TrajectorySearchResult(
-                run_dir=str(self.run_dir),
-                best_node_id=None,
-                raw_trajectory_path=None,
-                slim_trajectory_path=None,
-                patch_path=None,
-                exit_status="",
-                finished=False,
-            )
+            return
 
         final_node = self.nodes[final_node_id]
         if final_node_id not in self._node_snapshot_cache:
@@ -2225,32 +2244,60 @@ class TrajectorySearchRunner:
             result={"exit_status": final_node.exit_status, "submission": final_node.submission, "metadata": {}},
             info_extra={"search": {"best_node_id": final_node_id, "current_round": self.current_round, "frontier_ids": self.frontier_ids}},
         )
-        raw_traj_path = self.run_dir / "raw_traj.json"
-        messages_path = self.run_dir / "messages.json"
-        patch_path = self.run_dir / "model_patch.json"
-        _atomic_write_json(raw_traj_path, raw_traj)
         final_policy_model_name = final_node.policy_model_name or self.policy_model_name
-        _atomic_write_json(messages_path, build_slim_trajectory(raw_traj, model_name=final_policy_model_name))
-        _atomic_write_json(
-            patch_path,
-            {
-                self.task_id: {
-                    "model_name_or_path": final_policy_model_name,
-                    "instance_id": self.task_id,
-                    "model_patch": final_node.submission,
-                }
-            },
-        )
+        if self.search_config.write_artifacts:
+            _atomic_write_json(self.run_dir / "raw_traj.json", raw_traj)
+            _atomic_write_json(self.run_dir / "messages.json", build_slim_trajectory(raw_traj, model_name=final_policy_model_name))
+            _atomic_write_json(
+                self.run_dir / "model_patch.json",
+                {
+                    self.task_id: {
+                        "model_name_or_path": final_policy_model_name,
+                        "instance_id": self.task_id,
+                        "model_patch": final_node.submission,
+                    }
+                },
+            )
+        if self.search_config.evaluate_final_patch:
+            patch_text = final_node.submission or ""
+            if not patch_text.strip():
+                if self.search_config.write_artifacts:
+                    _atomic_write_json(
+                        self.run_dir / "evaluation.json",
+                        _build_evaluation_payload(
+                            instance_id=self.task_id,
+                            completed=False,
+                            resolved=False,
+                            empty_patch=True,
+                            error=False,
+                        ),
+                    )
+            else:
+                try:
+                    reward = evaluate_swebench_instance_patches(
+                        instance=self.instance,
+                        patches_by_key={final_node_id: patch_text},
+                        model_name=final_policy_model_name,
+                        max_workers=1,
+                        namespace=self.harness_namespace,
+                        work_dir=self.run_dir,
+                    ).get(final_node_id)
+                except Exception:
+                    reward = 0.0
+                    error = True
+                reward = float(reward)
+                if self.search_config.write_artifacts:
+                    _atomic_write_json(
+                        self.run_dir / "evaluation.json",
+                        _build_evaluation_payload(
+                            instance_id=self.task_id,
+                            completed=not error,
+                            resolved=reward >= 1.0 and not error,
+                            empty_patch=False,
+                            error=error,
+                        ),
+                    )
         self.best_node_id = final_node_id
         if final_node.status == "finished":
             self.frontier_ids = [final_node_id]
         self._save_manifest()
-        return TrajectorySearchResult(
-            run_dir=str(self.run_dir),
-            best_node_id=final_node_id,
-            raw_trajectory_path=str(raw_traj_path),
-            slim_trajectory_path=str(messages_path),
-            patch_path=str(patch_path),
-            exit_status=final_node.exit_status,
-            finished=final_node.status == "finished",
-        )

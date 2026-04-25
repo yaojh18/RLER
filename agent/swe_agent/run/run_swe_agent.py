@@ -17,7 +17,6 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence, TextIO
 from swebench.harness import reporting as swebench_reporting
@@ -71,26 +70,6 @@ DEFAULT_COMPLETION_MAX_TOKENS = 4096
 SWE_AGENT_TEXTBASED_CONFIG = AGENT_ROOT / "swe_agent" / "config" / "benchmarks" / "swebench_backticks.yaml"
 
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-
-# TODO: delete BackendResult and all coresponding logic. The return of search_swe_agent should be GRPOExportBundle or not depending on the paremeter in search config (export_boundle).
-# TODO: move all GRPOExportBundle computing logic to tracjectory_search; also add a new parameter (write_artifacts) in search config, default true, write files only when this paramter is true.
-@dataclass
-class BackendResult:
-    benchmark_name: str
-    split: str
-    backend: str
-    model_name: str
-    instance_id: str
-    run_dir: str
-    raw_trajectory_path: str | None
-    slim_trajectory_path: str | None
-    patch_path: str | None
-    log_path: str | None
-    evaluation_result_path: str | None
-    exit_status: str
-    prediction_chars: int
-    resolved: bool | None
-    error: str | None
 
 
 class TeeStream:
@@ -300,17 +279,59 @@ def build_slim_trajectory(raw_traj: dict[str, Any], *, model_name: str) -> dict[
     }
 
 
-def extract_backend_result(
+def make_run_root(
     *,
+    output_root: Path,
     benchmark_name: str,
     split: str,
-    backend: str,
+    model_name: str,
+) -> Path:
+    return output_root / (
+        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', benchmark_name.replace('/', '__'))}_"
+        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', split.replace('/', '__'))}_"
+        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', model_name.replace('/', '__'))}"
+    )
+
+
+def _append_error_to_log(log_path: Path | None, error: Exception | str) -> None:
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if not log_path.exists():
+        log_path.write_text("", encoding="utf-8")
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"\n\nERROR: {error}\n")
+
+def _load_patch_record(run_dir: Path, instance_id: str) -> dict[str, Any]:
+    patch_path = run_dir / "model_patch.json"
+    if not patch_path.exists():
+        return {
+            "model_name_or_path": "",
+            "instance_id": instance_id,
+            "model_patch": "",
+        }
+    return json.loads(patch_path.read_text(encoding="utf-8")).get(
+        instance_id,
+        {
+            "model_name_or_path": "",
+            "instance_id": instance_id,
+            "model_patch": "",
+        },
+    )
+
+
+def _prediction_chars(run_dir: Path, instance_id: str) -> int:
+    return len(str(_load_patch_record(run_dir, instance_id).get("model_patch") or ""))
+
+
+def materialize_backend_run(
+    *,
     model_name: str,
     instance_id: str,
     run_dir: Path,
     temp_output_dir: Path,
-    run_log_path: Path,
-) -> BackendResult:
+    run_log_path: Path | None = None,
+) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     raw_traj_temp = temp_output_dir / instance_id / f"{instance_id}.traj.json"
     raw_traj_path = run_dir / "raw_traj.json"
@@ -318,17 +339,20 @@ def extract_backend_result(
     if raw_traj_temp.exists():
         shutil.copy2(raw_traj_temp, raw_traj_path)
     else:
-        raw_traj_path.write_text(json.dumps({}, indent=2))
+        raw_traj_path.write_text(json.dumps({}, indent=2), encoding="utf-8")
     if raw_traj_path.exists():
-        raw_traj = json.loads(raw_traj_path.read_text())
+        raw_traj = json.loads(raw_traj_path.read_text(encoding="utf-8"))
 
     slim_traj_path = run_dir / "messages.json"
-    slim_traj_path.write_text(json.dumps(build_slim_trajectory(raw_traj, model_name=model_name), indent=2))
+    slim_traj_path.write_text(
+        json.dumps(build_slim_trajectory(raw_traj, model_name=model_name), indent=2),
+        encoding="utf-8",
+    )
 
     preds_path = temp_output_dir / "preds.json"
     prediction = {"model_patch": ""}
     if preds_path.exists():
-        predictions = json.loads(preds_path.read_text())
+        predictions = json.loads(preds_path.read_text(encoding="utf-8"))
         if instance_id not in predictions:
             raise RuntimeError(f"Prediction for instance '{instance_id}' not found in {preds_path}")
         prediction = predictions[instance_id]
@@ -338,25 +362,33 @@ def extract_backend_result(
         "model_patch": prediction.get("model_patch", "") or "",
     }
     patch_path = run_dir / "model_patch.json"
-    patch_path.write_text(json.dumps({instance_id: patch_record}, indent=2))
+    patch_path.write_text(json.dumps({instance_id: patch_record}, indent=2), encoding="utf-8")
+    if run_log_path is not None and not run_log_path.exists():
+        run_log_path.parent.mkdir(parents=True, exist_ok=True)
+        run_log_path.write_text("", encoding="utf-8")
 
-    info = raw_traj.get("info", {})
-    return BackendResult(
-        benchmark_name=benchmark_name,
-        split=split,
-        backend=backend,
-        model_name=model_name,
-        instance_id=instance_id,
-        run_dir=str(run_dir),
-        raw_trajectory_path=str(raw_traj_path),
-        slim_trajectory_path=str(slim_traj_path),
-        patch_path=str(patch_path),
-        log_path=str(run_log_path),
-        evaluation_result_path=None,
-        exit_status=info.get("exit_status", ""),
-        prediction_chars=len(patch_record["model_patch"]),
-        resolved=None,
-        error=None,
+
+def write_failure_artifacts(
+    *,
+    instance_id: str,
+    run_dir: Path,
+    error: Exception | str,
+    log_path: Path | None = None,
+) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _append_error_to_log(log_path, error)
+    (run_dir / "evaluation.json").write_text(
+        json.dumps(
+            _build_evaluation_payload(
+                instance_id=instance_id,
+                completed=False,
+                resolved=False,
+                empty_patch=True,
+                error=True,
+            ),
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
 
@@ -382,143 +414,120 @@ def _build_evaluation_payload(
 
 def _run_rebench_harness_evaluation(
     *,
-    results: list[BackendResult],
+    run_dirs: list[Path],
+    split: str,
     dataset_name: str,
+    log_path: Path | None,
     timeout: int,
     max_workers: int,
     instances_by_id: dict[str, dict[str, Any]] | None,
-) -> list[BackendResult]:
+) -> None:
     if instances_by_id is None:
         subset = next(key for key, value in DATASET_MAPPING.items() if value == dataset_name)
         instances_by_id = {
             instance["instance_id"]: instance
-            for instance in load_swebench_instances(subset, results[0].split)
+            for instance in load_swebench_instances(subset, split)
         }
-    updated_results: dict[str, BackendResult] = {}
-    log_path = Path(results[0].log_path) if results[0].log_path else None
     evaluation_log_context = tee_console(log_path) if log_path else contextlib.nullcontext()
     with evaluation_log_context:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(results)))) as executor:
-            futures: dict[concurrent.futures.Future, BackendResult] = {}
-            for result in results:
-                evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
-                if result.prediction_chars == 0:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(run_dirs)))) as executor:
+            futures: dict[concurrent.futures.Future, tuple[str, Path, bool]] = {}
+            for run_dir in run_dirs:
+                instance_id = run_dir.parent.name
+                evaluation_result_path = run_dir.resolve() / "evaluation.json"
+                prediction_chars = _prediction_chars(run_dir, instance_id)
+                if prediction_chars == 0:
                     evaluation_result_path.write_text(
                         json.dumps(
                             _build_evaluation_payload(
-                                instance_id=result.instance_id,
+                                instance_id=instance_id,
                                 completed=False,
                                 resolved=False,
                                 empty_patch=True,
                                 error=False,
                             ),
                             indent=2,
-                        )
-                    )
-                    updated_results[result.instance_id] = BackendResult(
-                        **{
-                            **asdict(result),
-                            "evaluation_result_path": str(evaluation_result_path),
-                            "resolved": False,
-                            "error": None,
-                        }
+                        ),
+                        encoding="utf-8",
                     )
                     continue
-                if result.instance_id not in instances_by_id:
+                if instance_id not in instances_by_id:
                     evaluation_result_path.write_text(
                         json.dumps(
                             _build_evaluation_payload(
-                                instance_id=result.instance_id,
+                                instance_id=instance_id,
                                 completed=False,
                                 resolved=False,
                                 empty_patch=False,
                                 error=True,
                             ),
                             indent=2,
-                        )
-                    )
-                    updated_results[result.instance_id] = BackendResult(
-                        **{
-                            **asdict(result),
-                            "evaluation_result_path": str(evaluation_result_path),
-                            "resolved": False,
-                            "error": f"Instance not found in {dataset_name}/{result.split}: {result.instance_id}",
-                        }
+                        ),
+                        encoding="utf-8",
                     )
                     continue
-                patch_text = json.loads(Path(result.patch_path).resolve().read_text())[result.instance_id]["model_patch"]
                 futures[
                     executor.submit(
                         evaluate_rebench_prediction,
-                        instance=instances_by_id[result.instance_id],
-                        patch_text=patch_text,
+                        instance=instances_by_id[instance_id],
+                        patch_text=str(_load_patch_record(run_dir, instance_id).get("model_patch") or ""),
                         timeout=timeout,
-                        work_dir=Path(result.run_dir).resolve(),
+                        work_dir=run_dir.resolve(),
                     )
-                ] = result
+                ] = (instance_id, run_dir, False)
 
             for future in concurrent.futures.as_completed(futures):
-                result = futures[future]
-                evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
+                instance_id, run_dir, empty_patch = futures[future]
+                evaluation_result_path = run_dir.resolve() / "evaluation.json"
                 try:
                     payload = future.result()
                     resolved = bool(payload["resolved"])
                     completed = True
                     error = False
-                    extra_error = None
-                    (Path(result.run_dir).resolve() / "rebench_evaluation.json").write_text(
-                        json.dumps(payload, indent=2)
-                    )
                 except Exception as exc:
                     resolved = False
                     completed = False
                     error = True
-                    extra_error = str(exc)
+                    _append_error_to_log(log_path, exc)
                 evaluation_result_path.write_text(
                     json.dumps(
                         _build_evaluation_payload(
-                            instance_id=result.instance_id,
+                            instance_id=instance_id,
                             completed=completed,
                             resolved=resolved,
-                            empty_patch=result.prediction_chars == 0,
+                            empty_patch=empty_patch,
                             error=error,
                         ),
                         indent=2,
-                    )
+                    ),
+                    encoding="utf-8",
                 )
-                updated_results[result.instance_id] = BackendResult(
-                    **{
-                        **asdict(result),
-                        "evaluation_result_path": str(evaluation_result_path),
-                        "resolved": resolved,
-                        "error": extra_error,
-                    }
-                )
-    return [updated_results[result.instance_id] for result in results]
 
 
 def _run_swebench_harness_evaluation(
     *,
-    results: list[BackendResult],
+    run_dirs: list[Path],
+    split: str,
+    model_name: str,
     dataset_name: str,
+    log_path: Path | None,
     timeout: int,
     max_workers: int,
     instances_by_id: dict[str, dict[str, Any]] | None,
-) -> list[BackendResult]:
-    updated_results = {result.instance_id: result for result in results}
+) -> None:
     if instances_by_id is None:
         subset = next(key for key, value in DATASET_MAPPING.items() if value == dataset_name)
         instances_by_id = {
             instance["instance_id"]: instance
-            for instance in load_swebench_instances(subset, results[0].split)
+            for instance in load_swebench_instances(subset, split)
         }
-    grouped_results: dict[str | None, list[BackendResult]] = {}
-    for result in results:
-        instance = instances_by_id.get(result.instance_id)
-        grouped_results.setdefault(get_swebench_harness_namespace(instance) if instance else None, []).append(result)
+    grouped_run_dirs: dict[str | None, list[Path]] = {}
+    for run_dir in run_dirs:
+        instance_id = run_dir.parent.name
+        instance = instances_by_id.get(instance_id)
+        grouped_run_dirs.setdefault(get_swebench_harness_namespace(instance) if instance else None, []).append(run_dir)
 
-    temp_parent = Path(results[0].run_dir).resolve().parents[2]
-    log_path = Path(results[0].log_path) if results[0].log_path else None
+    temp_parent = run_dirs[0].resolve().parents[2]
     with tempfile.TemporaryDirectory(prefix=".eval-", dir=temp_parent) as tmp_dir:
         temp_root = Path(tmp_dir)
         eval_log_root = temp_root / "logs" / "run_evaluation"
@@ -526,12 +535,13 @@ def _run_swebench_harness_evaluation(
         predictions_path.write_text(
             json.dumps(
                 {
-                    result.instance_id: json.loads(Path(result.patch_path).resolve().read_text())[result.instance_id]
-                    for result in results
-                    if result.patch_path
+                    run_dir.parent.name: _load_patch_record(run_dir, run_dir.parent.name)
+                    for run_dir in run_dirs
+                    if (run_dir / "model_patch.json").exists()
                 },
                 indent=2,
-            )
+            ),
+            encoding="utf-8",
         )
         previous_eval_root = swebench_run_evaluation.RUN_EVALUATION_LOG_DIR
         previous_report_root = swebench_reporting.RUN_EVALUATION_LOG_DIR
@@ -540,14 +550,14 @@ def _run_swebench_harness_evaluation(
         try:
             evaluation_log_context = tee_console(log_path) if log_path else contextlib.nullcontext()
             with evaluation_log_context:
-                for group_index, (namespace, group) in enumerate(grouped_results.items()):
-                    run_id = f"verify-{group[0].backend}-{int(time.time())}-{group_index}"
+                for group_index, (namespace, group) in enumerate(grouped_run_dirs.items()):
+                    run_id = f"verify-{int(time.time())}-{group_index}"
                     try:
                         with pushd(temp_root):
                             summary_report = swebench_run_evaluation.main(
                                 dataset_name=dataset_name,
-                                split=group[0].split,
-                                instance_ids=[result.instance_id for result in group],
+                                split=split,
+                                instance_ids=[run_dir.parent.name for run_dir in group],
                                 predictions_path=str(predictions_path),
                                 max_workers=max(1, min(max_workers, len(group))),
                                 force_rebuild=False,
@@ -561,7 +571,7 @@ def _run_swebench_harness_evaluation(
                                 modal=False,
                                 report_dir=str(temp_root),
                             )
-                            model_key = group[0].model_name.replace("/", "__")
+                            model_key = model_name.replace("/", "__")
                             for candidate in [
                                 Path(summary_report) if summary_report else None,
                                 temp_root / f"{model_key}.{run_id}.json",
@@ -571,33 +581,30 @@ def _run_swebench_harness_evaluation(
                                 if candidate and candidate.exists():
                                     candidate.unlink()
                     except Exception as exc:
-                        for result in group:
-                            evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
+                        for run_dir in group:
+                            instance_id = run_dir.parent.name
+                            evaluation_result_path = run_dir.resolve() / "evaluation.json"
                             evaluation_result_path.write_text(
                                 json.dumps(
                                     _build_evaluation_payload(
-                                        instance_id=result.instance_id,
+                                        instance_id=instance_id,
                                         completed=False,
                                         resolved=False,
-                                        empty_patch=result.prediction_chars == 0,
+                                        empty_patch=_prediction_chars(run_dir, instance_id) == 0,
                                         error=True,
                                     ),
                                     indent=2,
-                                )
+                                ),
+                                encoding="utf-8",
                             )
-                            updated_results[result.instance_id] = BackendResult(
-                                **{
-                                    **asdict(result),
-                                    "evaluation_result_path": str(evaluation_result_path),
-                                    "error": str(exc),
-                                }
-                            )
+                            _append_error_to_log(log_path, exc)
                         continue
 
-                    for result in group:
-                        model_key = result.model_name.replace("/", "__")
-                        report_path = eval_log_root / run_id / model_key / result.instance_id / LOG_REPORT
-                        empty_patch = result.prediction_chars == 0
+                    for run_dir in group:
+                        instance_id = run_dir.parent.name
+                        model_key = model_name.replace("/", "__")
+                        report_path = eval_log_root / run_id / model_key / instance_id / LOG_REPORT
+                        empty_patch = _prediction_chars(run_dir, instance_id) == 0
                         completed = False
                         resolved = False
                         error = False
@@ -605,59 +612,61 @@ def _run_swebench_harness_evaluation(
                             try:
                                 report = json.loads(report_path.read_text())
                                 completed = True
-                                resolved = bool(report[result.instance_id]["resolved"])
+                                resolved = bool(report[instance_id]["resolved"])
                             except (json.JSONDecodeError, KeyError):
                                 error = True
                         elif not empty_patch:
                             error = True
 
-                        evaluation_result_path = Path(result.run_dir).resolve() / "evaluation.json"
+                        evaluation_result_path = run_dir.resolve() / "evaluation.json"
                         evaluation_result_path.write_text(
                             json.dumps(
                                 _build_evaluation_payload(
-                                    instance_id=result.instance_id,
+                                    instance_id=instance_id,
                                     completed=completed,
                                     resolved=resolved,
                                     empty_patch=empty_patch,
                                     error=error,
                                 ),
                                 indent=2,
-                            )
-                        )
-                        updated_results[result.instance_id] = BackendResult(
-                            **{
-                                **asdict(result),
-                                "evaluation_result_path": str(evaluation_result_path),
-                                "resolved": resolved,
-                            }
+                            ),
+                            encoding="utf-8",
                         )
         finally:
             swebench_run_evaluation.RUN_EVALUATION_LOG_DIR = previous_eval_root
             swebench_reporting.RUN_EVALUATION_LOG_DIR = previous_report_root
-    return [updated_results[result.instance_id] for result in results]
 
 
 def run_harness_evaluation(
     *,
-    results: list[BackendResult],
+    run_dirs: list[Path],
+    split: str,
+    model_name: str,
     dataset_name: str,
+    log_path: Path | None,
     timeout: int,
     max_workers: int,
     instances_by_id: dict[str, dict[str, Any]] | None = None,
-) -> list[BackendResult]:
-    if not results:
-        return []
+) -> None:
+    if not run_dirs:
+        return
     if is_rebench_dataset_name(dataset_name):
-        return _run_rebench_harness_evaluation(
-            results=results,
+        _run_rebench_harness_evaluation(
+            run_dirs=run_dirs,
+            split=split,
             dataset_name=dataset_name,
+            log_path=log_path,
             timeout=timeout,
             max_workers=max_workers,
             instances_by_id=instances_by_id,
         )
-    return _run_swebench_harness_evaluation(
-        results=results,
+        return
+    _run_swebench_harness_evaluation(
+        run_dirs=run_dirs,
+        split=split,
+        model_name=model_name,
         dataset_name=dataset_name,
+        log_path=log_path,
         timeout=timeout,
         max_workers=max_workers,
         instances_by_id=instances_by_id,
@@ -749,43 +758,6 @@ def evaluate_swebench_instance_patches(
     return rewards
 
 
-def build_failed_result(
-    *,
-    benchmark_name: str,
-    split: str,
-    backend: str,
-    model_name: str,
-    instance_id: str,
-    run_dir: Path,
-    error: Exception,
-    log_path: Path | None = None,
-) -> BackendResult:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    target_log_path = log_path or (run_dir / "run.log")
-    target_log_path.parent.mkdir(parents=True, exist_ok=True)
-    if not target_log_path.exists():
-        target_log_path.write_text("")
-    with target_log_path.open("a", encoding="utf-8") as log_file:
-        log_file.write(f"\n\nERROR: {error}\n")
-    return BackendResult(
-        benchmark_name=benchmark_name,
-        split=split,
-        backend=backend,
-        model_name=model_name,
-        instance_id=instance_id,
-        run_dir=str(run_dir),
-        raw_trajectory_path=None,
-        slim_trajectory_path=None,
-        patch_path=None,
-        log_path=str(target_log_path),
-        evaluation_result_path=None,
-        exit_status="error",
-        prediction_chars=0,
-        resolved=None,
-        error=str(error),
-    )
-
-
 def run_swe_instance_multi(
     benchmark_name: str,
     split: str,
@@ -800,7 +772,7 @@ def run_swe_instance_multi(
     redo_existing: bool = True,
     timestamp: str | None = None,
     run_log_path: Path | None = None,
-) -> list[BackendResult]:
+) -> None:
     available_instances = load_swebench_instances(benchmark_name, split)
     if instance_ids is None:
         instances = available_instances
@@ -814,10 +786,11 @@ def run_swe_instance_multi(
     output_root.mkdir(parents=True, exist_ok=True)
     effective_run_log_path = run_log_path or (DEFAULT_LOG_ROOT / f"{timestamp}.log")
     effective_run_log_path.parent.mkdir(parents=True, exist_ok=True)
-    run_root = output_root / (
-        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', benchmark_name.replace('/', '__'))}_"
-        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', split.replace('/', '__'))}_"
-        f"{re.sub(r'[^A-Za-z0-9._-]+', '_', model_name.replace('/', '__'))}"
+    run_root = make_run_root(
+        output_root=output_root,
+        benchmark_name=benchmark_name,
+        split=split,
+        model_name=model_name,
     )
     with tempfile.TemporaryDirectory(prefix=".run-", dir=output_root) as tmp_dir:
         temp_root = Path(tmp_dir)
@@ -834,75 +807,53 @@ def run_swe_instance_multi(
                 show_live_progress=False,
             )
 
-        results: list[BackendResult] = []
+        run_dirs: list[Path] = []
         for instance in instances:
             run_dir = run_root / instance["instance_id"] / timestamp
-            result = extract_backend_result(
-                benchmark_name=benchmark_name,
-                split=split,
-                backend=backend,
+            materialize_backend_run(
                 model_name=model_name,
                 instance_id=instance["instance_id"],
                 run_dir=run_dir,
                 temp_output_dir=temp_output_dir,
                 run_log_path=effective_run_log_path,
             )
-            results.append(result)
+            run_dirs.append(run_dir)
         try:
-            return run_harness_evaluation(
-                results=results,
+            run_harness_evaluation(
+                run_dirs=run_dirs,
+                split=split,
+                model_name=model_name,
                 dataset_name=DATASET_MAPPING.get(benchmark_name, benchmark_name),
+                log_path=effective_run_log_path,
                 timeout=eval_timeout,
                 max_workers=workers,
                 instances_by_id={instance["instance_id"]: instance for instance in instances},
             )
         except Exception as exc:
-            if effective_run_log_path:
-                with effective_run_log_path.open("a", encoding="utf-8") as log_file:
-                    log_file.write(f"\n\nERROR: {exc}\n")
-            failed_results: list[BackendResult] = []
-            for result in results:
-                evaluation_result_path = Path(result.run_dir) / "evaluation.json"
-                evaluation_result_path.write_text(
-                    json.dumps(
-                        {
-                            "completed_ids": [],
-                            "incomplete_ids": [],
-                            "empty_patch_ids": [result.instance_id] if result.prediction_chars == 0 else [],
-                            "submitted_ids": [result.instance_id],
-                            "resolved_ids": [],
-                            "unresolved_ids": [],
-                            "error_ids": [result.instance_id],
-                            "schema_version": 2,
-                        },
-                        indent=2,
-                    )
+            for run_dir in run_dirs:
+                write_failure_artifacts(
+                    instance_id=run_dir.parent.name,
+                    run_dir=run_dir,
+                    error=exc,
+                    log_path=effective_run_log_path,
                 )
-                failed_results.append(
-                    BackendResult(
-                        **{
-                            **asdict(result),
-                            "evaluation_result_path": str(evaluation_result_path),
-                            "error": str(exc),
-                        }
-                    )
-                )
-            return failed_results
+            raise
 
 
 def run_swe_agent_backend(
     args: argparse.Namespace,
     backend_name: str,
     instance_ids: Sequence[str] | None,
-) -> list[BackendResult]:
+) -> None:
     model_name = args.vllm_model if backend_name == "vllm" else args.openai_model
     if args._evaluation_only:
         available_instances = load_swebench_instances(args.subset, args.split)
         by_id = {instance["instance_id"]: instance for instance in available_instances}
-        run_root = args.output_root / (
-            f"{re.sub(r'[^A-Za-z0-9._-]+', '_', args.subset.replace('/', '__'))}_"
-            f"{re.sub(r'[^A-Za-z0-9._-]+', '_', args.split.replace('/', '__'))}_"
-            f"{re.sub(r'[^A-Za-z0-9._-]+', '_', model_name.replace('/', '__'))}"
+        run_root = make_run_root(
+            output_root=args.output_root,
+            benchmark_name=args.subset,
+            split=args.split,
+            model_name=model_name,
         )
         selected_instance_ids = list(instance_ids) if instance_ids is not None else []
         if not selected_instance_ids:
@@ -912,7 +863,7 @@ def run_swe_agent_backend(
         if not selected_instance_ids:
             raise RuntimeError(f"No existing runs found under {run_root} for timestamp {args._evaluation_only}")
 
-        results: list[BackendResult] = []
+        run_dirs: list[Path] = []
         for instance_id in selected_instance_ids:
             if instance_id not in by_id:
                 raise RuntimeError(f"Instance not found in {args.subset}/{args.split}: {instance_id}")
@@ -925,35 +876,21 @@ def run_swe_agent_backend(
             slim_trajectory_path = run_dir / "messages.json"
             if not slim_trajectory_path.exists():
                 slim_trajectory_path.write_text(
-                    json.dumps(build_slim_trajectory(raw_traj, model_name=model_name), indent=2)
+                    json.dumps(build_slim_trajectory(raw_traj, model_name=model_name), indent=2),
+                    encoding="utf-8",
                 )
-            patch_record = json.loads(patch_path.read_text())[instance_id]
-            results.append(
-                BackendResult(
-                    benchmark_name=args.subset,
-                    split=args.split,
-                    backend=backend_name,
-                    model_name=model_name,
-                    instance_id=instance_id,
-                    run_dir=str(run_dir),
-                    raw_trajectory_path=str(raw_trajectory_path),
-                    slim_trajectory_path=str(slim_trajectory_path),
-                    patch_path=str(patch_path),
-                    log_path=str(args._run_log_path),
-                    evaluation_result_path=str(run_dir / "evaluation.json") if (run_dir / "evaluation.json").exists() else None,
-                    exit_status=raw_traj.get("info", {}).get("exit_status", ""),
-                    prediction_chars=len(patch_record.get("model_patch", "") or ""),
-                    resolved=None,
-                    error=None,
-                )
-            )
-        return run_harness_evaluation(
-            results=results,
+            run_dirs.append(run_dir)
+        run_harness_evaluation(
+            run_dirs=run_dirs,
+            split=args.split,
+            model_name=model_name,
             dataset_name=DATASET_MAPPING.get(args.subset, args.subset),
+            log_path=args._run_log_path,
             timeout=args.eval_timeout,
             max_workers=args.workers,
             instances_by_id=by_id,
         )
+        return
 
     gpu_id: int | None = None
     gpu_ids: list[int] = []
@@ -1009,7 +946,7 @@ def run_swe_agent_backend(
                 "LITELLM_LOG": "ERROR",
             }
         ):
-            return run_swe_instance_multi(
+            run_swe_instance_multi(
                 args.subset,
                 args.split,
                 instance_ids,
@@ -1062,37 +999,28 @@ def main(argv: list[str] | None = None) -> int:
     instance_ids = args.instance_id
 
     backend_names = ["vllm", "openai"] if args.backend == "both" else [args.backend]
-    results: list[BackendResult] = []
+    errors: list[str] = []
     for backend_name in backend_names:
         prepared_model_name = args.vllm_model if backend_name == "vllm" else args.openai_model
         target_label = "__all__" if instance_ids is None else "__".join(instance_ids)
-        fallback_run_dir = (
-            args.output_root
-            / (
-                f"{re.sub(r'[^A-Za-z0-9._-]+', '_', args.subset.replace('/', '__'))}_"
-                f"{re.sub(r'[^A-Za-z0-9._-]+', '_', args.split.replace('/', '__'))}_"
-                f"{re.sub(r'[^A-Za-z0-9._-]+', '_', prepared_model_name.replace('/', '__'))}"
-            )
-            / re.sub(r"[^A-Za-z0-9._-]+", "_", target_label)
-            / args._run_timestamp
-        )
+        fallback_run_dir = make_run_root(
+            output_root=args.output_root,
+            benchmark_name=args.subset,
+            split=args.split,
+            model_name=prepared_model_name,
+        ) / re.sub(r"[^A-Za-z0-9._-]+", "_", target_label) / args._run_timestamp
         try:
-            results.extend(run_swe_agent_backend(args, backend_name, instance_ids))
+            run_swe_agent_backend(args, backend_name, instance_ids)
         except Exception as exc:
-            results.append(
-                build_failed_result(
-                    benchmark_name=args.subset,
-                    split=args.split,
-                    backend=backend_name,
-                    model_name=prepared_model_name,
-                    instance_id=target_label,
-                    run_dir=fallback_run_dir,
-                    error=exc,
-                    log_path=args._run_log_path,
-                )
+            errors.append(f"{backend_name}: {exc}")
+            write_failure_artifacts(
+                instance_id=target_label,
+                run_dir=fallback_run_dir,
+                error=exc,
+                log_path=args._run_log_path,
             )
-
-    print(json.dumps([asdict(result) for result in results], indent=2))
+    if errors:
+        raise RuntimeError("; ".join(errors))
     return 0
 
 

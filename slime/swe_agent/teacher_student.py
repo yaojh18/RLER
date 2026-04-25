@@ -4,14 +4,13 @@ import argparse
 import os
 from pathlib import Path
 
-from swe_agent.run.search_swe_agent import build_arg_parser, run_search
+from swe_agent.run.search_swe_agent import build_arg_parser, get_search_run_dir, run_search
 
 from .contracts import SFTExportBundle
 from .data_export import SFTDataExporter
 
 
 DEFAULT_TEACHER_MODEL = "gemini/gemini-3.1-pro-preview"
-os.environ["GEMINI_API_KEY"] = "AQ.Ab8RN6Ij-4PRghnr2J1tu3KSG3Rdzqvdg6B329fvsBt-fJWAHw"
 
 
 def build_search_args(
@@ -23,6 +22,7 @@ def build_search_args(
     output_root: Path,
     model_name: str,
     student_model_name: str | None,
+    student_backend: str = "slime",
     completion_max_tokens: int | None = None,
     m: int | None = None,
     k: int | None = None,
@@ -53,7 +53,7 @@ def build_search_args(
         args.openai_model = model_name
     else:
         args.vllm_model = model_name
-    args.student_backend = "slime"
+    args.student_backend = student_backend
     args.student_model = student_model_name
     return args
 
@@ -95,13 +95,9 @@ def collect_teacher_student_export(
         max_rounds=max_rounds,
         completion_max_tokens=completion_max_tokens,
     )
-    results = run_search(args, [instance_id])
-    if not results:
-        raise RuntimeError(f"Search run did not return a result for {instance_id}")
-    if results[0].error:
-        raise RuntimeError(f"Search run failed with error: {results[0].error}")
-
-    bundle = SFTDataExporter(run_dir=Path(results[0].run_dir)).export_bundle()
+    run_dir = get_search_run_dir(args, instance_id)
+    run_search(args, [instance_id])
+    bundle = SFTDataExporter(run_dir=run_dir).export_bundle()
     bundle.metadata.update({
         "teacher_backend": teacher_backend,
         "teacher_model_name": teacher_model_name,

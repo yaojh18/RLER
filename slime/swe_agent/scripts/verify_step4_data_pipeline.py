@@ -22,7 +22,7 @@ if str(agent_root) not in sys.path:
 
 from slime.swe_agent.data_export import GRPODataExporter
 from slime.swe_agent.teacher_student import collect_teacher_student_export
-from swe_agent.run.search_swe_agent import build_arg_parser, run_search
+from swe_agent.run.search_swe_agent import build_arg_parser, get_search_run_dir, run_search
 from swe_agent.run.run_swe_agent import choose_gpus
 
 DEFAULT_SLIME_IMAGE = "slimerl/slime:qwen35-route-fixed-20260416-v1"
@@ -218,12 +218,11 @@ def _run_sft_verification(args: argparse.Namespace) -> None:
 
 def _run_rl_verification(args: argparse.Namespace) -> None:
     rl_args = _build_rl_args(instance_id=args.instance_id, output_root=args.output_root / "rl_runtime")
-    rl_results = run_search(rl_args, [args.instance_id])
-    if not rl_results or rl_results[0].error:
-        raise RuntimeError(f"rl runtime capture failed: {rl_results[0].error if rl_results else 'no result'}")
-    export_bundle = GRPODataExporter(run_dir=Path(rl_results[0].run_dir)).export_bundle()
+    run_dir = get_search_run_dir(rl_args, args.instance_id)
+    run_search(rl_args, [args.instance_id])
+    export_bundle = GRPODataExporter(run_dir=run_dir).export_bundle()
     rl_summary = {
-        "run_dir": rl_results[0].run_dir,
+        "run_dir": str(run_dir),
         "policy_group_count": len(export_bundle.policy_groups),
         "rubric_group_count": len(export_bundle.rubric_groups),
         "policy_sample_count": sum(len(group.samples) for group in export_bundle.policy_groups),
