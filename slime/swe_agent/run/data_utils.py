@@ -78,7 +78,6 @@ def build_debug_sample(
         reward=float(export_sample.reward or 0.0),
         loss_mask=full_loss_mask[-response_length:],
         status=Sample.Status.COMPLETED,
-        metadata={**export_sample.metadata, "group_id": export_sample.group_id, "raw_reward": export_sample.reward},
     )
 
     if not include_turn_rewards:
@@ -104,8 +103,6 @@ def build_debug_sample(
     sample.train_metadata = {
         "turn_rewards": list(export_sample.metadata.get("turn_rewards", [])),
         "turn_loss_masks": turn_masks,
-        "group_id": export_sample.group_id,
-        "raw_reward": export_sample.reward,
     }
     return sample
 

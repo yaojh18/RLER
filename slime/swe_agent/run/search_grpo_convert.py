@@ -6,7 +6,8 @@ from collections import defaultdict
 def convert_samples_to_train_data(args, samples):
     grouped_indices = defaultdict(list)
     for index, sample in enumerate(samples):
-        grouped_indices[str(sample.metadata.get("group_id") or sample.group_index or index)].append(index)
+        group_key = sample.group_index if sample.group_index is not None else index
+        grouped_indices[str(group_key)].append(index)
 
     raw_rewards = [float(sample.reward or 0.0) for sample in samples]
     normalized_rewards = list(raw_rewards)

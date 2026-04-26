@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import os
 import tempfile
@@ -9,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 import numpy as np
+from slime.swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -51,35 +51,126 @@ class RubricArtifactBundle:
 
 
 class GRPOCollector:
-    def __init__(self) -> None:
-        self.node_payloads: dict[str, dict[str, Any]] = {}
-        self.node_messages: dict[str, dict[str, Any]] = {}
-        self.node_judges: dict[str, dict[str, Any]] = {}
-        self.rubric_payloads: dict[str, dict[str, Any]] = {}
-        self.rubric_messages: dict[str, dict[str, Any]] = {}
-        self.round_payloads: dict[str, dict[str, Any]] = {}
+    def __init__(
+        self,
+        *,
+        instance_id: str,
+        run_dir: Path,
+        alpha: float = 0.5,
+        beta: float = 0.5,
+    ) -> None:
+        self.instance_id = instance_id
+        self.run_dir = run_dir
+        self.alpha = alpha
+        self.beta = beta
+        self.bundle = GRPOExportBundle(
+            instance_id=instance_id,
+            run_dir=str(run_dir),
+            policy_groups=[],
+            rubric_groups=[],
+        )
 
     def collect(
         self,
         bundles: list[NodeArtifactBundle],
-        rubric_bundles: list[RubricArtifactBundle] | None = None,
-        extra_json_writes: list[tuple[Path, Any]] | None = None,
+        rubric_bundles: list[RubricArtifactBundle],
+        group_id: str,
     ) -> None:
-        for bundle in bundles:
-            self.node_payloads[bundle.node_id] = copy.deepcopy(bundle.node_payload)
-            self.node_messages[bundle.node_id] = copy.deepcopy(bundle.messages_payload)
-            self.node_judges[bundle.node_id] = copy.deepcopy(bundle.judge_payload)
-        for bundle in rubric_bundles or []:
-            rubric_list_id = str(bundle.rubric_payload.get("rubric_list_id") or bundle.rubric_dir.name)
-            self.rubric_payloads[rubric_list_id] = copy.deepcopy(bundle.rubric_payload)
-            self.rubric_messages[rubric_list_id] = copy.deepcopy(bundle.messages_payload)
-        for path, payload in extra_json_writes or []:
-            if isinstance(payload, dict):
-                self.round_payloads[str(path)] = copy.deepcopy(payload)
+        policy_samples = self._build_policy_samples(bundles, group_id)
+        rubric_samples = self._build_rubric_samples(rubric_bundles, group_id)
+        if policy_samples:
+            self.bundle.policy_groups.append(
+                ExportGroup(
+                    group_id=group_id,
+                    samples=policy_samples,
+                )
+            )
+        if rubric_samples:
+            self.bundle.rubric_groups.append(
+                ExportGroup(
+                    group_id=group_id,
+                    samples=rubric_samples,
+                )
+            )
 
-    def get_ground_truth_reward(self, node_id: str) -> float | None:
-        reward = (self.node_judges.get(node_id) or {}).get("ground_truth_reward")
-        return None if reward is None else float(reward)
+    @staticmethod
+    def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "role": message["role"],
+            "content": message["message"],
+        }
+
+    @classmethod
+    def _normalize_messages(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        messages = [cls._normalize_message(message) for message in payload.get("messages", [])]
+        if len(messages) > 1 and messages[-1]["role"] == "user":
+            return messages[:-1]
+        return messages
+
+    @classmethod
+    def _normalize_prompt(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        return [cls._normalize_message(message) for message in payload.get("prompt", [])]
+
+    def _build_policy_samples(
+        self,
+        bundles: list[NodeArtifactBundle],
+        group_id: str,
+    ) -> list[ExportSample]:
+        samples: list[ExportSample] = []
+        for bundle in bundles:
+            turns = self._normalize_messages(bundle.messages_payload)
+            reward = bundle.judge_payload.get("overall_reward") # NOTE: if we want to add gt reward: + bundle.judge_payload.get("ground_truth_reward")
+            if not turns or reward is None:
+                continue
+            samples.append(
+                ExportSample(
+                    sample_id=bundle.node_id,
+                    group_id=group_id,
+                    # TODO: the prompt part is wrong. The prompt should be every history message list by far, including system prompt and initial user prompt.
+                    prompt=self._normalize_prompt(bundle.messages_payload),
+                    turns=turns,
+                    reward=float(reward),
+                )
+            )
+        return samples
+
+    def _build_rubric_samples(
+        self,
+        rubric_bundles: list[RubricArtifactBundle],
+        group_id: str,
+    ) -> list[ExportSample]:
+        samples: list[ExportSample] = []
+        for bundle in rubric_bundles:
+            payload = bundle.rubric_payload
+            rubric_list_id = str(payload.get("rubric_list_id") or bundle.rubric_dir.name)
+            conversation = self._normalize_messages(bundle.messages_payload)
+            if not rubric_list_id or not conversation:
+                continue
+            generated = list(payload.get("generated"))
+            variance_by_rubric = payload.get("variance_by_rubric")
+            redundency_by_rubric = payload.get("redundency_by_rubric")
+            turn_rewards = [
+                (1.0 - self.alpha) * float(variance_by_rubric.get(rubric["rubric_id"]))
+                + self.alpha * float(redundency_by_rubric.get(rubric["rubric_id"]))
+                for rubric in generated
+            ]
+            scalar_reward = (
+                (1.0 - self.beta) * float(payload.get("gt_reward_siblings"))
+                + self.beta * float(payload.get("gt_reward_parent"))
+            )
+            samples.append(
+                ExportSample(
+                    sample_id=rubric_list_id,
+                    group_id=group_id,
+                    prompt=conversation[:1],
+                    turns=conversation[1:],
+                    reward=scalar_reward,
+                    metadata={
+                        "turn_rewards": turn_rewards,
+                    },
+                )
+            )
+        return samples
 
 
 def _write_base_artifacts(
@@ -125,13 +216,27 @@ def _write_gt_artifacts(
         _atomic_write_json(path, payload)
 
 
-def _pearson(scores: list[float], gt_scores: list[float]) -> float:
-    if len(scores) < 2 or len(gt_scores) < 2 or len(scores) != len(gt_scores):
+def _pairwise_diff(x):
+    x = np.asarray(x, dtype=float)
+    i, j = np.triu_indices(len(x), 1)
+    return x[i] - x[j]
+
+
+def gap_corr(a, b):
+    da, db = _pairwise_diff(a), _pairwise_diff(b)
+    if len(da) == 0:
         return 0.0
-    if np.allclose(scores, scores[0]) and np.allclose(gt_scores, gt_scores[0]):
-        return 1.0
-    r = np.corrcoef(scores, gt_scores)[0, 1]
-    return float(r) if np.isfinite(r) else 0.0
+    return 1.0 - np.mean(np.abs(da - db))
+
+
+def gap_redundancy(a, b):
+    da, db = _pairwise_diff(a), _pairwise_diff(b)
+    if len(da) == 0:
+        return 0.0
+    return 1.0 - min(
+        np.mean(np.abs(da - db)),
+        np.mean(np.abs(da + db)),
+    )
 
 
 class ArtifactWriter:
@@ -146,8 +251,9 @@ class ArtifactWriter:
         rubric_bundles: list[RubricArtifactBundle] | None = None,
         extra_json_writes: list[tuple[Path, Any]] | None = None,
     ) -> None:
-        _write_base_artifacts(bundles, rubric_bundles, extra_json_writes)
-        _write_gt_artifacts(bundles, rubric_bundles, None)
+        if self.write_artifacts:
+            _write_base_artifacts(bundles, rubric_bundles, extra_json_writes)
+            _write_gt_artifacts(bundles, rubric_bundles, None)
 
     def submit_round(
         self,
@@ -228,66 +334,44 @@ class PatchEvalManager:
             if bundle.node_id in rewards:
                 bundle.judge_payload["ground_truth_reward"] = rewards[bundle.node_id]
 
-        round_payload_by_path = {
-            path: payload for path, payload in (extra_json_writes or []) if isinstance(payload, dict)
-        }
+        gt_by_node_id = dict(rewards)
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
-            rubric_list_id = str(payload.get("rubric_list_id") or "")
-            if not rubric_list_id:
-                continue
-
-            parent_node_id = str(payload.get("parent_node_id") or "")
+            parent_node_id = payload.get("parent_node_id")
             parent_gt = None
             if parent_node_id:
-                parent_gt = self.collector.get_ground_truth_reward(parent_node_id) if self.collector is not None else None
-                if parent_gt is None:
-                    parent_judge_path = self.work_dir / "nodes" / parent_node_id / "judge.json"
-                    if parent_judge_path.exists():
-                        parent_gt = json.loads(parent_judge_path.read_text(encoding="utf-8")).get("ground_truth_reward")
-
-            ordered_child_ids = sorted(str(node_id) for node_id in payload.get("child_rewards", {}))
-            gt_entries: dict[str, dict[str, Any]] = {}
-            if parent_node_id and parent_gt is not None and payload.get("parent_reward") is not None:
-                gt_entries[parent_node_id] = {
-                    "score": float(payload["parent_reward"]),
-                    "gt_score": float(parent_gt),
-                    "is_parent": True,
-                }
-            for node_id in ordered_child_ids:
-                if node_id not in rewards:
-                    continue
-                gt_entries[node_id] = {
-                    "score": float(payload["child_rewards"][node_id]),
-                    "gt_score": float(rewards[node_id]),
-                    "is_parent": False,
-                }
-
-            sibling_scores = [entry["score"] for entry in gt_entries.values() if not entry["is_parent"]]
-            sibling_gt = [entry["gt_score"] for entry in gt_entries.values() if not entry["is_parent"]]
-            parent_entry = next((entry for entry in gt_entries.values() if entry["is_parent"]), None)
-            gt_reward_parent = 0.0
-            if parent_entry is not None:
-                agreements = [
-                    float((entry["score"] >= parent_entry["score"]) == (entry["gt_score"] >= parent_entry["gt_score"]))
-                    for entry in gt_entries.values()
-                    if not entry["is_parent"]
-                ]
-                gt_reward_parent = sum(agreements) / len(agreements)
-
-            payload["gt_by_rubric"] = {rubric_list_id: gt_entries}
-            payload["gt_reward_siblings"] = float(_pearson(sibling_scores, sibling_gt))
+                parent_judge_path = self.work_dir / "nodes" / str(parent_node_id) / "judge.json"
+                if parent_judge_path.exists():
+                    parent_gt = json.loads(parent_judge_path.read_text(encoding="utf-8")).get("ground_truth_reward")
+            ordered_node_ids = sorted(str(node_id) for node_id in payload.get("child_rewards", {}))
+            sibling_scores = [float(payload["child_rewards"][node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
+            sibling_gt = [float(gt_by_node_id[node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
+            gt_reward_siblings = gap_corr(sibling_scores, sibling_gt)
+            parent_reward = payload.get("parent_reward")
+            gt_reward_parent = float(np.mean([
+                1.0 - abs(float(payload["child_rewards"][node_id]) - float(parent_reward) - float(gt_by_node_id[node_id]) + float(parent_gt))
+                for node_id in ordered_node_ids
+            ]))
+            payload["gt_reward_siblings"] = float(gt_reward_siblings)
             payload["gt_reward_parent"] = float(gt_reward_parent)
-
-            if bundle.selected_for_round_summary and bundle.round_summary_path is not None:
-                round_payload = round_payload_by_path.get(bundle.round_summary_path)
-                if round_payload is not None:
-                    round_payload["gt_by_rubric"] = payload["gt_by_rubric"]
-                    round_payload["gt_reward_siblings"] = payload["gt_reward_siblings"]
-                    round_payload["gt_reward_parent"] = payload["gt_reward_parent"]
+            payload["gt_by_rubric"] = {
+                rubric_id: {
+                    "parent_score": payload.get("parent_score_by_rubric", {}).get(rubric_id),
+                    "child_scores": payload.get("child_score_by_rubric", {}).get(rubric_id, {}),
+                    "ground_truth_by_node": (
+                        ({str(parent_node_id): parent_gt} if parent_node_id is not None else {})
+                        | {node_id: gt_by_node_id[node_id] for node_id in ordered_node_ids if node_id in gt_by_node_id}
+                    ),
+                }
+                for rubric_id in sorted(
+                    set(payload.get("parent_score_by_rubric", {}))
+                    | set(payload.get("child_score_by_rubric", {}))
+                )
+            }
 
         if self.collector is not None:
-            self.collector.collect(bundles, rubric_bundles, extra_json_writes)
+            parent_id = bundles[0].node_payload.get("parent_id")
+            self.collector.collect(bundles, rubric_bundles or [], parent_id)
         if self.write_artifacts:
             _write_gt_artifacts(bundles, rubric_bundles, extra_json_writes)
         return rewards
@@ -295,10 +379,14 @@ class PatchEvalManager:
     def submit_round(
         self,
         bundles: list[NodeArtifactBundle],
-        rubric_bundles: list[RubricArtifactBundle] | None = None,
+        rubric_bundles: list[RubricArtifactBundle] | Future | None = None,
         extra_json_writes: list[tuple[Path, Any]] | None = None,
     ) -> Future:
-        previous_future = self._futures[-1] if self._futures else None
+        if isinstance(rubric_bundles, Future):
+            previous_future = rubric_bundles
+            rubric_bundles = None
+        else:
+            previous_future = self._futures[-1] if self._futures else None
         future = self._executor.submit(self._evaluate_round, bundles, rubric_bundles, extra_json_writes, previous_future)
         self._futures.append(future)
         return future

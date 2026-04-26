@@ -33,6 +33,7 @@ from swe_agent.parallel_utils import (
     PatchEvalManager,
     RubricArtifactBundle,
     _atomic_write_json,
+    gap_redundancy
 )
 from swe_agent.run.run_swe_agent import build_slim_trajectory, evaluate_swebench_instance_patches
 
@@ -1192,25 +1193,16 @@ async def _score_parent_round(
     return score_records, errors
 
 
+# NOTE: the correlation score will be unstable when there are very few data points
 def _redundancy_reward(
     candidate_scores: list[float],
     existing_score_vectors: list[list[float]],
 ) -> float:
     if not existing_score_vectors:
         return 1.0
-
     candidate = np.asarray(candidate_scores, dtype=float)
-    max_abs_corr = 0.0
-    for other_scores in existing_score_vectors:
-        other = np.asarray(other_scores, dtype=float)
-        if np.allclose(candidate, candidate[0]) or np.allclose(other, other[0]):
-            corr = 1.0 if np.allclose(candidate, candidate[0]) else 0.0
-        else:
-            corr = float(np.corrcoef(np.stack([candidate, other], axis=0))[0, 1])
-            if not np.isfinite(corr):
-                corr = 0.0
-        max_abs_corr = max(max_abs_corr, abs(corr))
-    return float(1.0 - max_abs_corr)
+    max_redundency = max(gap_redundancy(candidate, other_scores) for other_scores in existing_score_vectors)
+    return float(1.0 - max_redundency)
 
 
 def _sample_by_strategy(
@@ -1336,7 +1328,7 @@ class TrajectorySearchRunner:
         self._node_judge_cache: dict[str, dict[str, Any]] = {}
         self._node_snapshot_cache: dict[str, dict[str, Any]] = {}
         self.grpo_collector = (
-            GRPOCollector()
+            GRPOCollector(instance_id=self.task_id, run_dir=self.run_dir)
             if self.search_config.export_grpo_bundles or not self.search_config.write_artifacts
             else None
         )
@@ -1568,19 +1560,16 @@ class TrajectorySearchRunner:
         self.nodes[root_node.node_id] = root_node
         self._node_judge_cache[root_node.node_id] = copy.deepcopy(root_judge)
         self._node_snapshot_cache[root_node.node_id] = copy.deepcopy(root_snapshot)
-        self.artifact_writer.submit_round(
-            [
-                NodeArtifactBundle(
-                    node_id=root_node.node_id,
-                    node_dir=self.nodes_dir / root_node.node_id,
-                    node_payload=asdict(root_node),
-                    raw_traj_payload=raw_traj if self.search_config.write_raw_traj else None,
-                    messages_payload=build_slim_trajectory(raw_traj, model_name=self.policy_model_name),
-                    judge_payload=root_judge,
-                    snapshot_payload=root_snapshot,
-                )
-            ]
+        root_bundle = NodeArtifactBundle(
+            node_id=root_node.node_id,
+            node_dir=self.nodes_dir / root_node.node_id,
+            node_payload=asdict(root_node),
+            raw_traj_payload=raw_traj if self.search_config.write_raw_traj else None,
+            messages_payload=build_slim_trajectory(raw_traj, model_name=self.policy_model_name),
+            judge_payload=root_judge,
+            snapshot_payload=root_snapshot,
         )
+        self.artifact_writer.submit_round([root_bundle])
         self.frontier_ids = ["root"]
         self.best_node_id = None
         self.finished_node_ids = []
@@ -1858,7 +1847,7 @@ class TrajectorySearchRunner:
         branch_records: list[dict[str, Any]] = []
         policy_generation_errors: list[dict[str, Any]] = []
         sample_plan: list[tuple[str, str]] = []
-        sample_count = self.search_config.m + 2 if parent_id == "root" else self.search_config.m
+        sample_count = self.search_config.m if parent_id == "root" else self.search_config.m
         if self.student_policy_model_name:
             teacher_count = (sample_count + 1) // 2
             student_count = sample_count // 2
@@ -2116,11 +2105,8 @@ class TrajectorySearchRunner:
                 if branch["result"]["status"] != "finished":
                     completed_steps = max(branch["step_end"] + 1, 0)
                     remaining_steps = max(self.search_config.step_limit - completed_steps, 0)
-                    model_config = getattr(getattr(branch["session"].agent, "model", None), "config", None)
-                    model_kwargs = getattr(model_config, "model_kwargs", None)
-                    if isinstance(model_kwargs, dict):
-                        model_kwargs["temperature"] = 0.0
-                        model_kwargs["top_p"] = 1.0
+                    branch["session"].agent.model.config.model_kwargs["temperature"] = 0.0
+                    branch["session"].agent.model.config.model_kwargs["top_p"] = 1.0
                     if remaining_steps > 0:
                         terminal_result = branch["session"].run_until_pause(max_steps=remaining_steps).model_dump(mode="json")
                         terminal_snapshot = branch["session"].snapshot().model_dump(mode="json")
@@ -2273,6 +2259,7 @@ class TrajectorySearchRunner:
                         ),
                     )
             else:
+                error = False
                 try:
                     reward = evaluate_swebench_instance_patches(
                         instance=self.instance,

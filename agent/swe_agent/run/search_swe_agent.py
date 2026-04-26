@@ -82,11 +82,11 @@ def _run_single_instance(
     runner = TrajectorySearchRunner(
         instance=instance,
         backend=SWEAgentRolloutBackend(
-            model=config.get("model", {}),
-            environment=config.get("environment", {}),
-            agent=config.get("agent", {}),
+            model=instance_config.get("model", {}),
+            environment=instance_config.get("environment", {}),
+            agent=instance_config.get("agent", {}),
             default_agent_type="default",
-            default_environment_type=config.get("environment", {}).get("environment_class", "docker"),
+            default_environment_type=instance_config.get("environment", {}).get("environment_class", "docker"),
         ),
         run_dir=run_dir,
         policy_model_name=policy_model_name,
@@ -314,7 +314,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n", type=int, default=2)
     parser.add_argument("--k", type=int, default=20)
     parser.add_argument("--p", type=int, default=1)
-    parser.add_argument("--max-rounds", type=int, default=100)
+    parser.add_argument("--max-rounds", type=int, default=5)
+    parser.add_argument("--step-limit", type=int, default=100)
     parser.add_argument("--max-active-rubrics", type=int, default=6)
     parser.add_argument("--policy-temperature", type=float, default=0.5)
     parser.add_argument("--policy-top-p", type=float, default=0.9)

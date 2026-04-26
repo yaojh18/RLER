@@ -261,28 +261,11 @@ class GRPODataExporter:
                         prompt=self.artifacts.build_prefix_messages(node.get("parent_id")),
                         turns=turns,
                         reward=float(judge["overall_reward"]),
-                        metadata={
-                            "group_id": group_id,
-                            "node_id": node_id,
-                            "round_index": round_index,
-                            "parent_id": parent_id,
-                            "ground_truth_reward": float(judge.get("ground_truth_reward") or 0.0),
-                            "policy_source": str(node.get("policy_source") or ""),
-                        },
                     )
                 )
 
             if policy_samples:
-                policy_groups.append(
-                    ExportGroup(
-                        group_id=group_id,
-                        samples=policy_samples,
-                        metadata={
-                            "round_index": round_index,
-                            "parent_id": parent_id,
-                        },
-                    )
-                )
+                policy_groups.append(ExportGroup(group_id=group_id, samples=policy_samples))
 
             rubric_samples: list[ExportSample] = []
             for sample_payload in round_payload.get("rubric_samples", []):
@@ -310,44 +293,16 @@ class GRPODataExporter:
                         prompt=conversation[:1],
                         turns=conversation[1:],
                         reward=scalar_reward,
-                        metadata={
-                            "group_id": group_id,
-                            "round_index": round_index,
-                            "parent_id": parent_id,
-                            "rubric_list_id": rubric_list_id,
-                            "selected": bool(rubric_payload.get("selected", False)),
-                            "turn_rewards": turn_rewards,
-                            "variance_by_rubric": {
-                                rubric["rubric_id"]: float(variance_by_rubric.get(rubric["rubric_id"], 0.0))
-                                for rubric in generated
-                            },
-                            "redundency_by_rubric": {
-                                rubric["rubric_id"]: float(redundency_by_rubric.get(rubric["rubric_id"], 0.0))
-                                for rubric in generated
-                            },
-                            "gt_reward_siblings": float(rubric_payload.get("gt_reward_siblings") or 0.0),
-                            "gt_reward_parent": float(rubric_payload.get("gt_reward_parent") or 0.0),
-                        },
+                        metadata={"turn_rewards": turn_rewards},
                     )
                 )
 
             if rubric_samples:
-                rubric_groups.append(
-                    ExportGroup(
-                        group_id=group_id,
-                        samples=rubric_samples,
-                        metadata={
-                            "round_index": round_index,
-                            "parent_id": parent_id,
-                            "rubric_parent_weight": self.rubric_parent_weight,
-                        },
-                    )
-                )
+                rubric_groups.append(ExportGroup(group_id=group_id, samples=rubric_samples))
 
         return GRPOExportBundle(
             instance_id=self.artifacts.instance_id,
             run_dir=str(self.artifacts.run_dir),
             policy_groups=policy_groups,
             rubric_groups=rubric_groups,
-            metadata={"current_round": self.artifacts.manifest.get("current_round", 0)},
         )
