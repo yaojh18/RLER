@@ -315,7 +315,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k", type=int, default=20)
     parser.add_argument("--p", type=int, default=1)
     parser.add_argument("--max-rounds", type=int, default=5)
-    parser.add_argument("--step-limit", type=int, default=100)
     parser.add_argument("--max-active-rubrics", type=int, default=6)
     parser.add_argument("--policy-temperature", type=float, default=0.5)
     parser.add_argument("--policy-top-p", type=float, default=0.9)

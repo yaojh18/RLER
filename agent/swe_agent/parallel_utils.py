@@ -34,6 +34,7 @@ class NodeArtifactBundle:
     raw_traj_payload: dict[str, Any] | None
     messages_payload: dict[str, Any]
     judge_payload: dict[str, Any]
+    prompt_payload: dict[str, Any]
     snapshot_payload: dict[str, Any] | None = None
     terminal_raw_traj_payload: dict[str, Any] | None = None
     terminal_messages_payload: dict[str, Any] | None = None
@@ -97,19 +98,19 @@ class GRPOCollector:
     def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
         return {
             "role": message["role"],
-            "content": message["message"],
+            "content": message.get("content", message.get("message")),
         }
 
     @classmethod
     def _normalize_messages(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        messages = [cls._normalize_message(message) for message in payload.get("messages", [])]
+        messages = [cls._normalize_message(message) for message in payload.get("messages")]
         if len(messages) > 1 and messages[-1]["role"] == "user":
             return messages[:-1]
         return messages
 
     @classmethod
     def _normalize_prompt(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return [cls._normalize_message(message) for message in payload.get("prompt", [])]
+        return [cls._normalize_message(message) for message in payload.get("messages")]
 
     def _build_policy_samples(
         self,
@@ -126,8 +127,7 @@ class GRPOCollector:
                 ExportSample(
                     sample_id=bundle.node_id,
                     group_id=group_id,
-                    # TODO: the prompt part is wrong. The prompt should be every history message list by far, including system prompt and initial user prompt.
-                    prompt=self._normalize_prompt(bundle.messages_payload),
+                    prompt=self._normalize_prompt(bundle.prompt_payload),
                     turns=turns,
                     reward=float(reward),
                 )

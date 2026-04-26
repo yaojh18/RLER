@@ -1566,6 +1566,7 @@ class TrajectorySearchRunner:
             node_payload=asdict(root_node),
             raw_traj_payload=raw_traj if self.search_config.write_raw_traj else None,
             messages_payload=build_slim_trajectory(raw_traj, model_name=self.policy_model_name),
+            prompt_payload={"messages": copy.deepcopy(messages)},
             judge_payload=root_judge,
             snapshot_payload=root_snapshot,
         )
@@ -1904,6 +1905,7 @@ class TrajectorySearchRunner:
                         "policy_source": policy_source,
                         "policy_model_name": policy_model_name,
                         "workspace_meta": workspace_meta,
+                        "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
                         "segment_raw": segment_raw,
                         "segment_messages": build_slim_trajectory(segment_raw, model_name=policy_model_name),
                         "step_start": step_start,
@@ -2157,6 +2159,7 @@ class TrajectorySearchRunner:
                     raw_traj_payload=branch["segment_raw"] if self.search_config.write_raw_traj else None,
                     messages_payload=branch["segment_messages"],
                     judge_payload=judge_payload,
+                    prompt_payload=branch["prompt_payload"],
                     snapshot_payload=snapshot_payload,
                     terminal_raw_traj_payload=terminal_raw,
                     terminal_messages_payload=terminal_messages,
