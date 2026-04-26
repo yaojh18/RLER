@@ -1760,7 +1760,7 @@ class TrajectorySearchRunner:
             for branch in branch_records:
                 score_lookup = child_score_lookup_by_node[branch["node_id"]]
                 child_rewards[branch["node_id"]] = (
-                    sum(score_lookup.get(rubric.rubric_id, 0.0) for rubric in active_after) / len(active_after)
+                    sum(score_lookup.get(rubric.rubric_id, 0.0) * rubric.weight for rubric in active_after) / len(active_after)
                     if active_after
                     else 0.0
                 )

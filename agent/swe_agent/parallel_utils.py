@@ -25,6 +25,21 @@ def _atomic_write_json(path: Path, data: Any) -> None:
             os.remove(temp_path)
         raise
 
+def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "role": message["role"],
+        "content": message.get("content", message.get("message")),
+    }
+
+def _normalize_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    messages = [_normalize_message(message) for message in payload.get("messages")]
+    if len(messages) > 1 and messages[-1]["role"] == "user":
+        return messages[:-1]
+    return messages
+
+def _normalize_prompt(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_normalize_message(message) for message in payload.get("messages")]
+
 
 @dataclass
 class NodeArtifactBundle:
@@ -94,24 +109,6 @@ class GRPOCollector:
                 )
             )
 
-    @staticmethod
-    def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "role": message["role"],
-            "content": message.get("content", message.get("message")),
-        }
-
-    @classmethod
-    def _normalize_messages(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        messages = [cls._normalize_message(message) for message in payload.get("messages")]
-        if len(messages) > 1 and messages[-1]["role"] == "user":
-            return messages[:-1]
-        return messages
-
-    @classmethod
-    def _normalize_prompt(cls, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        return [cls._normalize_message(message) for message in payload.get("messages")]
-
     def _build_policy_samples(
         self,
         bundles: list[NodeArtifactBundle],
@@ -119,7 +116,7 @@ class GRPOCollector:
     ) -> list[ExportSample]:
         samples: list[ExportSample] = []
         for bundle in bundles:
-            turns = self._normalize_messages(bundle.messages_payload)
+            turns = _normalize_messages(bundle.messages_payload)
             reward = bundle.judge_payload.get("overall_reward") # NOTE: if we want to add gt reward: + bundle.judge_payload.get("ground_truth_reward")
             if not turns or reward is None:
                 continue
@@ -127,7 +124,7 @@ class GRPOCollector:
                 ExportSample(
                     sample_id=bundle.node_id,
                     group_id=group_id,
-                    prompt=self._normalize_prompt(bundle.prompt_payload),
+                    prompt=_normalize_prompt(bundle.prompt_payload),
                     turns=turns,
                     reward=float(reward),
                 )
@@ -143,7 +140,7 @@ class GRPOCollector:
         for bundle in rubric_bundles:
             payload = bundle.rubric_payload
             rubric_list_id = str(payload.get("rubric_list_id") or bundle.rubric_dir.name)
-            conversation = self._normalize_messages(bundle.messages_payload)
+            conversation = _normalize_messages(bundle.messages_payload)
             if not rubric_list_id or not conversation:
                 continue
             generated = list(payload.get("generated"))
