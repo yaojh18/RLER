@@ -1,7 +1,6 @@
 """Environment implementations for mini-SWE-agent."""
 
 import copy
-import importlib
 
 from swe_agent import Environment
 
@@ -18,13 +17,36 @@ _ENVIRONMENT_MAPPING = {
 
 def get_environment_class(spec: str) -> type[Environment]:
     full_path = _ENVIRONMENT_MAPPING.get(spec, spec)
-    try:
-        module_name, class_name = full_path.rsplit(".", 1)
-        module = importlib.import_module(module_name)
-        return getattr(module, class_name)
-    except (ValueError, ImportError, AttributeError):
-        msg = f"Unknown environment type: {spec} (resolved to {full_path}, available: {_ENVIRONMENT_MAPPING})"
-        raise ValueError(msg)
+    if full_path == "swe_agent.environments.docker.DockerEnvironment":
+        from swe_agent.environments.docker import DockerEnvironment
+
+        return DockerEnvironment
+    if full_path == "swe_agent.environments.singularity.SingularityEnvironment":
+        from swe_agent.environments.singularity import SingularityEnvironment
+
+        return SingularityEnvironment
+    if full_path == "swe_agent.environments.local.LocalEnvironment":
+        from swe_agent.environments.local import LocalEnvironment
+
+        return LocalEnvironment
+    if full_path == "swe_agent.environments.extra.swerex_docker.SwerexDockerEnvironment":
+        from swe_agent.environments.extra.swerex_docker import SwerexDockerEnvironment
+
+        return SwerexDockerEnvironment
+    if full_path == "swe_agent.environments.extra.swerex_modal.SwerexModalEnvironment":
+        from swe_agent.environments.extra.swerex_modal import SwerexModalEnvironment
+
+        return SwerexModalEnvironment
+    if full_path == "swe_agent.environments.extra.bubblewrap.BubblewrapEnvironment":
+        from swe_agent.environments.extra.bubblewrap import BubblewrapEnvironment
+
+        return BubblewrapEnvironment
+    if full_path == "swe_agent.environments.extra.contree.ContreeEnvironment":
+        from swe_agent.environments.extra.contree import ContreeEnvironment
+
+        return ContreeEnvironment
+    msg = f"Unknown environment type: {spec} (resolved to {full_path}, available: {_ENVIRONMENT_MAPPING})"
+    raise ValueError(msg)
 
 
 def get_environment(config: dict, *, default_type: str = "") -> Environment:

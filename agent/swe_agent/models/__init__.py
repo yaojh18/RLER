@@ -3,7 +3,6 @@ You can ignore this file completely if you explicitly set your model in your run
 """
 
 import copy
-import importlib
 import os
 import threading
 
@@ -101,13 +100,56 @@ def get_model_class(model_name: str, model_class: str = "") -> type:
     """
     if model_class:
         full_path = _MODEL_CLASS_MAPPING.get(model_class, model_class)
-        try:
-            module_name, class_name = full_path.rsplit(".", 1)
-            module = importlib.import_module(module_name)
-            return getattr(module, class_name)
-        except (ValueError, ImportError, AttributeError):
-            msg = f"Unknown model class: {model_class} (resolved to {full_path}, available: {_MODEL_CLASS_MAPPING})"
-            raise ValueError(msg)
+        if full_path == "swe_agent.models.litellm_model.LitellmModel":
+            from swe_agent.models.litellm_model import LitellmModel
+
+            return LitellmModel
+        if full_path == "swe_agent.models.litellm_textbased_model.LitellmTextbasedModel":
+            from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel
+
+            return LitellmTextbasedModel
+        if full_path == "swe_agent.models.litellm_response_model.LitellmResponseModel":
+            from swe_agent.models.litellm_response_model import LitellmResponseModel
+
+            return LitellmResponseModel
+        if full_path == "swe_agent.models.openrouter_model.OpenRouterModel":
+            from swe_agent.models.openrouter_model import OpenRouterModel
+
+            return OpenRouterModel
+        if full_path == "swe_agent.models.openrouter_textbased_model.OpenRouterTextbasedModel":
+            from swe_agent.models.openrouter_textbased_model import OpenRouterTextbasedModel
+
+            return OpenRouterTextbasedModel
+        if full_path == "swe_agent.models.openrouter_response_model.OpenRouterResponseModel":
+            from swe_agent.models.openrouter_response_model import OpenRouterResponseModel
+
+            return OpenRouterResponseModel
+        if full_path == "swe_agent.models.portkey_model.PortkeyModel":
+            from swe_agent.models.portkey_model import PortkeyModel
+
+            return PortkeyModel
+        if full_path == "swe_agent.models.portkey_response_model.PortkeyResponseAPIModel":
+            from swe_agent.models.portkey_response_model import PortkeyResponseAPIModel
+
+            return PortkeyResponseAPIModel
+        if full_path == "swe_agent.models.requesty_model.RequestyModel":
+            from swe_agent.models.requesty_model import RequestyModel
+
+            return RequestyModel
+        if full_path == "swe_agent.models.model_service_textbased_model.ModelServiceTextbasedModel":
+            from swe_agent.models.model_service_textbased_model import ModelServiceTextbasedModel
+
+            return ModelServiceTextbasedModel
+        if full_path == "swe_agent.models.route_textbased_model.RouteTextbasedModel":
+            from swe_agent.models.route_textbased_model import RouteTextbasedModel
+
+            return RouteTextbasedModel
+        if full_path == "swe_agent.models.test_models.DeterministicModel":
+            from swe_agent.models.test_models import DeterministicModel
+
+            return DeterministicModel
+        msg = f"Unknown model class: {model_class} (resolved to {full_path}, available: {_MODEL_CLASS_MAPPING})"
+        raise ValueError(msg)
 
     # Default to LitellmModel
     from swe_agent.models.litellm_model import LitellmModel

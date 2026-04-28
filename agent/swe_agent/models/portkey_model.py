@@ -21,12 +21,7 @@ from swe_agent.models.utils.retry import retry
 
 logger = logging.getLogger("portkey_model")
 
-try:
-    from portkey_ai import Portkey
-except ImportError:
-    raise ImportError(
-        "The portkey-ai package is required to use PortkeyModel. Please install it with: pip install portkey-ai"
-    )
+from portkey_ai import Portkey
 
 
 class PortkeyModelConfig(BaseModel):

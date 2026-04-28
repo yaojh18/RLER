@@ -27,7 +27,7 @@ from agent_rl.run_utils import (
     run_chat_with_route_async,
 )
 
-from swe_agent.rl_backend import SWEAgentRolloutBackend
+from swe_agent.backend import SWEAgentRolloutBackend
 from swe_agent.run.benchmarks.swebench import (
     DATASET_MAPPING,
     build_swebench_config,

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 import numpy as np
-from slime.swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
+from swe_agent.rl_contracts import ExportGroup, ExportSample, GRPOExportBundle
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -335,7 +335,7 @@ class PatchEvalManager:
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
             parent_node_id = payload.get("parent_node_id")
-            parent_gt = None
+            parent_gt = 0.0
             if parent_node_id:
                 parent_judge_path = self.work_dir / "nodes" / str(parent_node_id) / "judge.json"
                 if parent_judge_path.exists():
@@ -344,11 +344,12 @@ class PatchEvalManager:
             sibling_scores = [float(payload["child_rewards"][node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
             sibling_gt = [float(gt_by_node_id[node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
             gt_reward_siblings = gap_corr(sibling_scores, sibling_gt)
-            parent_reward = payload.get("parent_reward")
-            gt_reward_parent = float(np.mean([
+            parent_reward = payload.get("parent_reward", 0.0)
+            parent_child_diffs = [
                 1.0 - abs(float(payload["child_rewards"][node_id]) - float(parent_reward) - float(gt_by_node_id[node_id]) + float(parent_gt))
-                for node_id in ordered_node_ids
-            ]))
+                for node_id in ordered_node_ids if node_id in gt_by_node_id
+            ]
+            gt_reward_parent = float(np.mean(parent_child_diffs)) if parent_child_diffs else 0.0
             payload["gt_reward_siblings"] = float(gt_reward_siblings)
             payload["gt_reward_parent"] = float(gt_reward_parent)
             payload["gt_by_rubric"] = {

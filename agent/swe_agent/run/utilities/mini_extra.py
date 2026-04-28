@@ -6,15 +6,18 @@ inspecting trajectories, etc.
 """
 
 import sys
-from importlib import import_module
 
 from rich.console import Console
+from swe_agent.run.benchmarks.swebench import app as swebench_app
+from swe_agent.run.benchmarks.swebench_single import app as swebench_single_app
+from swe_agent.run.utilities.config import app as config_app
+from swe_agent.run.utilities.inspector import app as inspector_app
 
 subcommands = [
-    ("swe_agent.run.utilities.config", ["config"], "Manage the global config file"),
-    ("swe_agent.run.utilities.inspector", ["inspect", "i", "inspector"], "Run inspector (browse trajectories)"),
-    ("swe_agent.run.benchmarks.swebench", ["swebench"], "Evaluate on SWE-bench (batch mode)"),
-    ("swe_agent.run.benchmarks.swebench_single", ["swebench-single"], "Evaluate on SWE-bench (single instance)"),
+    (config_app, ["config"], "Manage the global config file"),
+    (inspector_app, ["inspect", "i", "inspector"], "Run inspector (browse trajectories)"),
+    (swebench_app, ["swebench"], "Evaluate on SWE-bench (batch mode)"),
+    (swebench_single_app, ["swebench-single"], "Evaluate on SWE-bench (single instance)"),
 ]
 
 
@@ -37,9 +40,9 @@ def main():
     if len(args) == 0 or len(args) == 1 and args[0] in ["-h", "--help"]:
         return Console().print(get_docstring())
 
-    for module_path, aliases, _ in subcommands:
+    for app, aliases, _ in subcommands:
         if args[0] in aliases:
-            return import_module(module_path).app(args[1:], prog_name=f"mini-extra {aliases[0]}")
+            return app(args[1:], prog_name=f"mini-extra {aliases[0]}")
 
     return Console().print(get_docstring())
 

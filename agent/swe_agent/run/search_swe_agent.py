@@ -12,7 +12,7 @@ from typing import Any, Sequence
 from dr_agent.utils import launch_vllm_server_handle
 from agent_rl import clear_model_services, register_model_service
 from agent_rl.run_utils import ModelRouteConfig, clear_model_routes, configure_model_route
-from swe_agent.rl_backend import SWEAgentRolloutBackend
+from swe_agent.backend import SWEAgentRolloutBackend
 from swe_agent.run.benchmarks.swebench import (
     build_swebench_config,
     get_swebench_docker_image_name,
@@ -33,6 +33,10 @@ from swe_agent.run.run_swe_agent import (
     DEFAULT_SPLIT,
     DEFAULT_VLLM_PORT,
     DEFAULT_SERVE_MODEL,
+    SLIME_SERVICE_NAME,
+    VLLM_SERVICE_NAME,
+    SLIME_API_BASE,
+    SLIME_API_KEY,
     ParseInstanceIds,
     choose_gpus,
     find_free_port,
@@ -42,23 +46,11 @@ from swe_agent.run.run_swe_agent import (
     temporary_env,
     terminate_process,
     write_failure_artifacts,
+    _resolve_model_name
 )
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
 from swe_agent.trajectory_search import SearchConfig, TrajectorySearchRunner
-from slime.swe_agent.serving import SGLangChatService
-
-SLIME_SERVICE_NAME = "slime"
-VLLM_SERVICE_NAME = "vllm"
-SLIME_API_BASE = os.environ.get("SEARCH_SWE_SLIME_API_BASE", "http://127.0.0.1:8021")
-SLIME_API_KEY = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
-
-
-def _resolve_model_name(args: argparse.Namespace) -> str:
-    if args.backend == "vllm":
-        return args.vllm_model
-    if args.backend == "slime":
-        return args.slime_model
-    return args.openai_model
+from swe_agent.serving import SGLangChatService
 
 
 def _run_single_instance(
@@ -100,6 +92,9 @@ def _run_single_instance(
         resume=resume,
     )
     runner.run()
+    if search_config.export_grpo_bundles:
+        return runner.grpo_collector.bundle
+    return None
 
 
 def run_search(
@@ -132,6 +127,8 @@ def run_search(
     shared_model_kwargs: dict[str, Any] = {}
     if "qwen" in model_name.lower():
         shared_model_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
+    slime_api_base = os.environ.get("SEARCH_SWE_SLIME_API_BASE", SLIME_API_BASE)
+    slime_api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", SLIME_API_KEY)
     if args.backend == "vllm":
         gpu_ids = choose_gpus(args.gpu_id)
         gpu_id = gpu_ids[0] if gpu_ids else None
@@ -165,8 +162,8 @@ def run_search(
         register_model_service(
             service_name,
             SGLangChatService(
-                base_url=SLIME_API_BASE,
-                api_key=SLIME_API_KEY,
+                base_url=slime_api_base,
+                api_key=slime_api_key,
                 default_model_name=args.slime_model,
             ),
         )
@@ -176,8 +173,8 @@ def run_search(
             register_model_service(
                 SLIME_SERVICE_NAME,
                 SGLangChatService(
-                    base_url=SLIME_API_BASE,
-                    api_key=SLIME_API_KEY,
+                    base_url=slime_api_base,
+                    api_key=slime_api_key,
                     default_model_name=student_model_name,
                 ),
             )
@@ -258,7 +255,7 @@ def run_search(
                     run_dir = args.resume_run_dir or (run_root / instance["instance_id"] / timestamp)
                     run_dir.mkdir(parents=True, exist_ok=True)
                     try:
-                        _run_single_instance(
+                        grpo_bundle =_run_single_instance(
                             instance=instance,
                             run_dir=run_dir,
                             config=config,
@@ -281,7 +278,7 @@ def run_search(
                         )
         if errors:
             raise RuntimeError("; ".join(errors))
-        return run_dir
+        return run_dir, grpo_bundle
     finally:
         clear_model_services()
         clear_model_routes()

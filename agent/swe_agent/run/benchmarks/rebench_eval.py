@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import importlib
 import json
 import re
 import subprocess
-import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from swe_agent.run.benchmarks.swebench import get_swebench_docker_image_name
+from swe_agent.run.benchmarks.swe_rebench_v2.lib.agent import log_parsers
 
 REBENCH_DATASET_NAMES = {
     "nebius/SWE-rebench",
@@ -31,15 +29,6 @@ def is_rebench_dataset_name(dataset_name: str) -> bool:
 
 def is_rebench_instance(instance: dict[str, Any]) -> bool:
     return bool(instance.get("image_name")) and isinstance(instance.get("install_config"), dict)
-
-
-@lru_cache(maxsize=1)
-def _load_log_parsers_module():
-    vendor_root = Path(__file__).resolve().parent / "SWE-rebench-V2"
-    if not vendor_root.exists():
-        raise FileNotFoundError(f"Missing vendored SWE-rebench-V2 repository at {vendor_root}")
-    sys.path.insert(0, str(vendor_root))
-    return importlib.import_module("lib.agent.log_parsers")
 
 
 def _normalize_test_name(name: str) -> str:
@@ -78,7 +67,6 @@ def evaluate_rebench_instance(
     if not parser_name:
         raise ValueError(f"Task {instance_id} missing install_config.log_parser.")
 
-    log_parsers = _load_log_parsers_module()
     parser = log_parsers.NAME_TO_PARSER.get(parser_name) or getattr(log_parsers, parser_name, None)
     if parser is None:
         raise ValueError(f"Unknown log parser: {parser_name}")

@@ -75,7 +75,7 @@ _PREPARED_IMAGES: set[str] = set()
 _IMAGE_RESOLUTION_LOCK = threading.Lock()
 _IMAGE_RESOLUTION_CACHE: dict[str, tuple[str, str | None]] = {}
 OFFICIAL_IMAGE_NAMESPACE = "swebench"
-REBENCH_VENDOR_ROOT = Path(__file__).resolve().parent / "SWE-rebench-V2"
+REBENCH_VENDOR_ROOT = Path(__file__).resolve().parent / "swe_rebench_v2"
 
 
 class ProgressTrackingAgent(DefaultAgent):

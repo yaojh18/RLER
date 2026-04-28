@@ -797,6 +797,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--swe-rtt-alpha",
+                type=float,
+                default=1.0,
+                help="SWE RTT-GRPO response-level advantage weight.",
+            )
+            parser.add_argument(
+                "--swe-rtt-beta",
+                type=float,
+                default=1.0,
+                help="SWE RTT-GRPO turn-wise token advantage weight.",
+            )
+            parser.add_argument(
                 "--kl-loss-type",
                 type=str,
                 choices=["k1", "k2", "k3", "low_var_kl"],

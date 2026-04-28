@@ -66,9 +66,11 @@ DEFAULT_ENV_TIMEOUT = 120
 DEFAULT_PULL_TIMEOUT = 600
 DEFAULT_EVAL_TIMEOUT = 900
 DEFAULT_COMPLETION_MAX_TOKENS = 4096
-
 SWE_AGENT_TEXTBASED_CONFIG = AGENT_ROOT / "swe_agent" / "config" / "benchmarks" / "swebench_backticks.yaml"
-
+SLIME_SERVICE_NAME = "slime"
+VLLM_SERVICE_NAME = "vllm"
+SLIME_API_BASE = os.environ.get("SEARCH_SWE_SLIME_API_BASE", "http://127.0.0.1:8021")
+SLIME_API_KEY = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
 
@@ -98,6 +100,14 @@ class ParseInstanceIds(argparse.Action):
         for value in values:
             parsed.extend(part for part in value.split(",") if part)
         setattr(namespace, self.dest, parsed)
+
+
+def _resolve_model_name(args: argparse.Namespace) -> str:
+    if args.backend == "vllm":
+        return args.vllm_model
+    if args.backend == "slime":
+        return args.slime_model
+    return args.openai_model
 
 
 def parse_nvidia_smi_csv(text: str) -> list[dict[str, int | str]]:
