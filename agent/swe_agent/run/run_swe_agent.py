@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import socket
 import subprocess
 import sys
@@ -271,17 +270,22 @@ SLIM_TRAJECTORY_PARSERS = {
 }
 
 
-def build_slim_trajectory(raw_traj: dict[str, Any], *, model_name: str) -> dict[str, Any]:
-    parser = SLIM_TRAJECTORY_PARSERS.get(raw_traj.get("trajectory_format"), parse_generic_message)
+def build_messages(
+    messages_payload: list[dict[str, Any]],
+    *,
+    model_name: str,
+    trajectory_format: str | None = "mini-swe-agent-1.1",
+) -> dict[str, Any]:
+    parser = SLIM_TRAJECTORY_PARSERS.get(trajectory_format, parse_generic_message)
     messages = []
-    for index, message in enumerate(raw_traj.get("messages", [])):
+    for index, message in enumerate(messages_payload):
         parsed = parser(message, model_name=model_name)
         if parsed is None:
             continue
         parsed["index"] = index
         messages.append(parsed)
     return {
-        "trajectory_format": raw_traj.get("trajectory_format"),
+        "trajectory_format": trajectory_format,
         "parser": parser.__name__,
         "model_name": model_name,
         "messages": messages,
@@ -342,19 +346,21 @@ def materialize_backend_run(
     run_log_path: Path | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
-    raw_traj_temp = temp_output_dir / instance_id / f"{instance_id}.traj.json"
-    raw_traj_path = run_dir / "raw_traj.json"
-    raw_traj: dict[str, Any] = {}
-    if raw_traj_temp.exists():
-        shutil.copy2(raw_traj_temp, raw_traj_path)
-    else:
-        raw_traj_path.write_text(json.dumps({}, indent=2), encoding="utf-8")
-    if raw_traj_path.exists():
-        raw_traj = json.loads(raw_traj_path.read_text(encoding="utf-8"))
+    trajectory_temp = temp_output_dir / instance_id / f"{instance_id}.traj.json"
+    trajectory_payload: dict[str, Any] = {}
+    if trajectory_temp.exists():
+        trajectory_payload = json.loads(trajectory_temp.read_text(encoding="utf-8"))
 
     slim_traj_path = run_dir / "messages.json"
     slim_traj_path.write_text(
-        json.dumps(build_slim_trajectory(raw_traj, model_name=model_name), indent=2),
+        json.dumps(
+            build_messages(
+                trajectory_payload.get("messages", []),
+                model_name=model_name,
+                trajectory_format=trajectory_payload.get("trajectory_format"),
+            ),
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -877,17 +883,10 @@ def run_swe_agent_backend(
             if instance_id not in by_id:
                 raise RuntimeError(f"Instance not found in {args.subset}/{args.split}: {instance_id}")
             run_dir = run_root / instance_id / args._evaluation_only
-            raw_trajectory_path = run_dir / "raw_traj.json"
-            patch_path = run_dir / "model_patch.json"
-            if not raw_trajectory_path.exists() or not patch_path.exists():
-                raise RuntimeError(f"Missing raw_traj.json or model_patch.json in {run_dir}")
-            raw_traj = json.loads(raw_trajectory_path.read_text())
             slim_trajectory_path = run_dir / "messages.json"
-            if not slim_trajectory_path.exists():
-                slim_trajectory_path.write_text(
-                    json.dumps(build_slim_trajectory(raw_traj, model_name=model_name), indent=2),
-                    encoding="utf-8",
-                )
+            patch_path = run_dir / "model_patch.json"
+            if not slim_trajectory_path.exists() or not patch_path.exists():
+                raise RuntimeError(f"Missing messages.json or model_patch.json in {run_dir}")
             run_dirs.append(run_dir)
         run_harness_evaluation(
             run_dirs=run_dirs,

@@ -33,8 +33,9 @@ def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
         "content": message.get("content", message.get("message")),
     }
 
-def _normalize_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    messages = [_normalize_message(message) for message in payload.get("messages")]
+def _normalize_messages(payload: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source_messages = payload if isinstance(payload, list) else payload.get("messages")
+    messages = [_normalize_message(message) for message in source_messages]
     if len(messages) > 1 and messages[-1]["role"] == "user":
         return messages[:-1]
     return messages
@@ -48,12 +49,10 @@ class NodeArtifactBundle:
     node_id: str
     node_dir: Path
     node_payload: dict[str, Any]
-    raw_traj_payload: dict[str, Any] | None
     messages_payload: dict[str, Any]
     judge_payload: dict[str, Any]
     prompt_payload: dict[str, Any]
     snapshot_payload: dict[str, Any] | None = None
-    terminal_raw_traj_payload: dict[str, Any] | None = None
     terminal_messages_payload: dict[str, Any] | None = None
     terminal_patch_payload: dict[str, Any] | None = None
 
@@ -63,7 +62,6 @@ class RubricArtifactBundle:
     rubric_dir: Path
     rubric_payload: dict[str, Any]
     messages_payload: dict[str, Any]
-    raw_traj_payload: dict[str, Any] | None = None
     round_summary_path: Path | None = None
     selected_for_round_summary: bool = False
 
@@ -201,14 +199,10 @@ def _write_base_artifacts(
 ) -> None:
     for bundle in bundles:
         bundle.node_dir.mkdir(parents=True, exist_ok=True)
-        if bundle.raw_traj_payload is not None:
-            _atomic_write_json(bundle.node_dir / "raw_traj.json", bundle.raw_traj_payload)
         _atomic_write_json(bundle.node_dir / "messages.json", bundle.messages_payload)
         if bundle.snapshot_payload is not None:
             _atomic_write_json(bundle.node_dir / "snapshot.json", bundle.snapshot_payload)
         _atomic_write_json(bundle.node_dir / "node.json", bundle.node_payload)
-        if bundle.terminal_raw_traj_payload is not None:
-            _atomic_write_json(bundle.node_dir / "terminal_raw_traj.json", bundle.terminal_raw_traj_payload)
         if bundle.terminal_messages_payload is not None:
             _atomic_write_json(bundle.node_dir / "terminal_messages.json", bundle.terminal_messages_payload)
         if bundle.terminal_patch_payload is not None:
@@ -216,8 +210,6 @@ def _write_base_artifacts(
     for bundle in rubric_bundles or []:
         bundle.rubric_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(bundle.rubric_dir / "messages.json", bundle.messages_payload)
-        if bundle.raw_traj_payload is not None:
-            _atomic_write_json(bundle.rubric_dir / "raw_traj.json", bundle.raw_traj_payload)
     for path, payload in extra_json_writes or []:
         _atomic_write_json(path, payload)
 

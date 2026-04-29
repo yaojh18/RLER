@@ -48,7 +48,7 @@ from swe_agent.run.run_swe_agent import (
     DEFAULT_SUBSET,
     DEFAULT_VLLM_PORT,
     ParseInstanceIds,
-    build_slim_trajectory,
+    build_messages,
     choose_gpus,
     find_free_port,
     infer_litellm_api_env,
@@ -71,7 +71,6 @@ from swe_agent.trajectory_search import (
     _build_step_cards,
     _collect_workspace_meta,
     _compute_weighted_reward,
-    _make_raw_trajectory,
     _parse_judge_score,
     _convert_generated_rubric,
     _update_rubric_bank,
@@ -553,29 +552,23 @@ class AggregateTrajectoryRunner:
         result_payload = result.model_dump(mode="json")
         snapshot_payload = session.snapshot().model_dump(mode="json")
         workspace_meta = _collect_workspace_meta(session.agent.env)
-        raw_traj = _make_raw_trajectory(
-            snapshot=snapshot_payload,
-            result=result_payload,
-            info_extra={"aggregate_candidate_index": candidate_index},
+        slim_traj = build_messages(
+            snapshot_payload["agent"]["state"].get("messages", []),
+            model_name=self.policy_model_name,
         )
-        slim_traj = build_slim_trajectory(raw_traj, model_name=self.policy_model_name)
         patch_record = {
             "model_name_or_path": self.policy_model_name,
             "instance_id": self.task_id,
             "model_patch": result_payload.get("submission", "") or "",
         }
-        raw_traj_path = candidate_dir / "raw_traj.json"
         slim_traj_path = candidate_dir / "messages.json"
         patch_path = candidate_dir / "model_patch.json"
-        raw_traj_path.write_text(json.dumps(raw_traj, indent=2, ensure_ascii=False), encoding="utf-8")
         slim_traj_path.write_text(json.dumps(slim_traj, indent=2, ensure_ascii=False), encoding="utf-8")
         patch_path.write_text(json.dumps({self.task_id: patch_record}, indent=2, ensure_ascii=False), encoding="utf-8")
         return {
             "candidate_id": candidate_id,
             "candidate_index": candidate_index,
             "candidate_dir": candidate_dir,
-            "raw_traj": raw_traj,
-            "raw_traj_path": str(raw_traj_path),
             "slim_traj_path": str(slim_traj_path),
             "patch_path": str(patch_path),
             "snapshot": snapshot_payload,
@@ -597,7 +590,7 @@ class AggregateTrajectoryRunner:
                     "step_count": len(candidate["step_cards"]),
                     "result_status": candidate["result"].get("status", ""),
                     "exit_status": candidate["result"].get("exit_status", ""),
-                    "model_stats": candidate["raw_traj"].get("info", {}).get("model_stats", {}),
+                    "model_stats": candidate["result"].get("metadata", {}),
                 },
                 model_name=self.rubric_model_name,
                 temperature=self.search_config.rubric_temperature,
@@ -748,10 +741,8 @@ class AggregateTrajectoryRunner:
             encoding="utf-8",
         )
 
-        raw_traj_path = self.run_dir / "raw_traj.json"
         slim_traj_path = self.run_dir / "messages.json"
         patch_path = self.run_dir / "model_patch.json"
-        shutil.copy2(best_candidate["raw_traj_path"], raw_traj_path)
         shutil.copy2(best_candidate["slim_traj_path"], slim_traj_path)
         shutil.copy2(best_candidate["patch_path"], patch_path)
 
@@ -772,7 +763,6 @@ class AggregateTrajectoryRunner:
                             "reward": candidate["reward"],
                             "status": candidate["result"].get("status", ""),
                             "exit_status": candidate["result"].get("exit_status", ""),
-                            "raw_trajectory_path": candidate["raw_traj_path"],
                             "slim_trajectory_path": candidate["slim_traj_path"],
                             "patch_path": candidate["patch_path"],
                             "view_path": str(candidate["candidate_dir"] / "view.json"),

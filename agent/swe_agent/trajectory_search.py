@@ -22,7 +22,6 @@ from agent_rl.run_utils import (
     run_chat_with_route_completion_async,
 )
 
-from swe_agent import __version__
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
 from swe_agent.backend import SWEAgentRolloutBackend
 from swe_agent.parallel_utils import (
@@ -34,7 +33,7 @@ from swe_agent.parallel_utils import (
     _atomic_write_json,
     gap_redundancy
 )
-from swe_agent.run.run_swe_agent import build_slim_trajectory, evaluate_swebench_instance_patches
+from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches
 from swe_agent.prompt import *
 
 
@@ -72,7 +71,6 @@ class SearchConfig:
     evaluate_final_patch: bool = True
     export_grpo_bundles: bool = True
     write_artifacts: bool = True
-    write_raw_traj: bool = False
     strategy: Literal["best", "probability", "random"] = "best"
 
 
@@ -94,7 +92,6 @@ class RubricGenerationSample:
     rubric_list_id: str
     generated: list[RubricRecord]
     messages: list[dict[str, Any]]
-    raw_traj: dict[str, Any]
     format_errors: list[dict[str, Any]] | None = None
 
 
@@ -107,7 +104,7 @@ class SearchNode:
     session_id: str
     status: str
     step_start: int = 0
-    step_end: int = -1
+    step_end: int = 0
     submission: str = ""
     exit_status: str = ""
     policy_source: Literal["teacher", "student"] = "teacher"
@@ -132,41 +129,6 @@ def _build_evaluation_payload(
         "error_ids": [instance_id] if error else [],
         "schema_version": 2,
     }
-
-def _make_raw_trajectory(
-    *,
-    snapshot: dict[str, Any],
-    result: dict[str, Any] | None = None,
-    info_extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    agent_component = snapshot["agent"]
-    model_component = snapshot["model"]
-    env_component = snapshot["environment"]
-    result_meta = (result or {}).get("metadata", {})
-    payload = {
-        "info": {
-            "model_stats": {
-                "instance_cost": result_meta.get("cost", agent_component.get("state", {}).get("cost", 0.0)),
-                "api_calls": result_meta.get("n_calls", agent_component.get("state", {}).get("n_calls", 0)),
-            },
-            "config": {
-                "agent": copy.deepcopy(agent_component["config"]),
-                "agent_type": agent_component["type_path"],
-                "model": copy.deepcopy(model_component["config"]),
-                "model_type": model_component["type_path"],
-                "environment": copy.deepcopy(env_component["config"]),
-                "environment_type": env_component["type_path"],
-            },
-            "mini_version": __version__,
-            "exit_status": (result or {}).get("exit_status", ""),
-            "submission": (result or {}).get("submission", ""),
-        },
-        "messages": copy.deepcopy(agent_component.get("state", {}).get("messages", [])),
-        "trajectory_format": "mini-swe-agent-1.1",
-    }
-    if info_extra:
-        payload["info"].update(copy.deepcopy(info_extra))
-    return payload
 
 
 def _truncate_middle(text: str, limit: int) -> str:
@@ -252,12 +214,10 @@ def _truncate_structured_observation(observation: str) -> str:
     return truncated
 
 
-def _build_step_cards(segment_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_step_cards(segment_events: list[dict[str, Any]], step_start: int) -> list[dict[str, Any]]:
     cards: dict[int, dict[str, Any]] = {}
+    step_index = step_start
     for event in segment_events:
-        step_index = int(event.get("step_index", -1))
-        if step_index < 0:
-            continue
         card = cards.setdefault(
             step_index,
             {
@@ -284,6 +244,7 @@ def _build_step_cards(segment_events: list[dict[str, Any]]) -> list[dict[str, An
             continue
         observation = messages[0].get("content", "")
         card["observation"] = _truncate_structured_observation(observation or "")
+        step_index += 1
     return [cards[index] for index in sorted(cards)]
 
 
@@ -626,42 +587,6 @@ async def _generate_round_rubrics(
         rubric_list_id=f"rubric-r{round_index:03d}-s{sample_index:02d}",
         generated=generated,
         messages=copy.deepcopy(conversation_messages),
-        raw_traj={
-            "info": {
-                "model_stats": {
-                    "instance_cost": 0.0,
-                    "api_calls": sum(1 for message in conversation_messages if message.get("role") == "assistant"),
-                },
-                "config": {
-                    "agent": {
-                        "mode": "rubric_generation",
-                        "question": {
-                            "system_prompt": question.get("system_prompt", ""),
-                            "user_prompt": question.get("user_prompt", ""),
-                        },
-                    },
-                    "model": {
-                        "name": model_name,
-                        "temperature": temperature,
-                        "top_p": top_p,
-                        "max_tokens": max_tokens,
-                    },
-                    "environment": {
-                        "parent_node_id": parent_node_id,
-                        "active_bank_before": [asdict(rubric) for rubric in active_bank],
-                    },
-                },
-                "instance_id": question.get("instance_id"),
-                "round_index": round_index,
-                "sample_index": sample_index,
-                "parent_node_id": parent_node_id,
-                "source": source,
-                "generated": [asdict(rubric) for rubric in generated],
-                "format_errors": copy.deepcopy(format_errors),
-            },
-            "messages": copy.deepcopy(conversation_messages),
-            "trajectory_format": "mini-swe-agent-1.1",
-        },
         format_errors=format_errors,
     )
 
@@ -1198,12 +1123,10 @@ class TrajectorySearchRunner:
             session_id=spec.session_id,
             status="frontier",
             step_start=0,
-            step_end=-1,
+            step_end=0,
             policy_source="teacher",
             policy_model_name=self.policy_model_name,
         )
-        raw_traj = _make_raw_trajectory(snapshot=snapshot, info_extra={"segment_step_range": [-1, -1]})
-        raw_traj["messages"] = []
         root_judge = {
             "persistent_state": copy.deepcopy(EMPTY_PERSISTENT_STATE),
             "recent_segments": [],
@@ -1243,8 +1166,7 @@ class TrajectorySearchRunner:
             node_id=root_node.node_id,
             node_dir=self.nodes_dir / root_node.node_id,
             node_payload=asdict(root_node),
-            raw_traj_payload=raw_traj if self.search_config.write_raw_traj else None,
-            messages_payload=build_slim_trajectory(raw_traj, model_name=self.policy_model_name),
+            messages_payload=build_messages([], model_name=self.policy_model_name),
             prompt_payload={"messages": copy.deepcopy(messages)},
             judge_payload=root_judge,
             snapshot_payload=root_snapshot,
@@ -1383,7 +1305,6 @@ class TrajectorySearchRunner:
                         "rubric_list_id": generated_sample.rubric_list_id,
                         "generated": generated_sample.generated,
                         "messages": generated_sample.messages,
-                        "raw_traj": generated_sample.raw_traj,
                         "format_errors": format_errors,
                         "is_valid": False,
                         "selected": False,
@@ -1499,7 +1420,6 @@ class TrajectorySearchRunner:
                 "rubric_list_id": generated_sample.rubric_list_id,
                 "generated": generated_sample.generated,
                 "messages": generated_sample.messages,
-                "raw_traj": generated_sample.raw_traj,
                 "format_errors": copy.deepcopy(generated_sample.format_errors or []),
                 "generated_titles": [rubric.title for rubric in generated_sample.generated],
                 "active_before": copy.deepcopy(self.active_bank),
@@ -1624,7 +1544,7 @@ class TrajectorySearchRunner:
                 )
                 snapshot_after = session.snapshot().model_dump(mode="json")
                 before_message_count = len(parent_snapshot.get("agent", {}).get("state", {}).get("messages", []))
-                segment_messages = copy.deepcopy(
+                message_payload = copy.deepcopy(
                     snapshot_after.get("agent", {}).get("state", {}).get("messages", [])[before_message_count:]
                 )
                 result = {
@@ -1633,11 +1553,6 @@ class TrajectorySearchRunner:
                     "submission": "",
                     "metadata": {},
                 }
-                segment_raw = _make_raw_trajectory(
-                    snapshot=snapshot_after,
-                    result=result,
-                )
-                segment_raw["messages"] = segment_messages
                 branch_records.append({
                     "node_id": node_id,
                     "result": result,
@@ -1645,8 +1560,7 @@ class TrajectorySearchRunner:
                     "policy_model_name": policy_model_name,
                     "error": error_text,
                     "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
-                    "segment_raw": segment_raw,
-                    "segment_messages": build_slim_trajectory(segment_raw, model_name=policy_model_name),
+                    "message_payload": build_messages(message_payload, model_name=policy_model_name),
                     "is_valid": False,
                 })
                 self._dispose_session(session)
@@ -1656,18 +1570,12 @@ class TrajectorySearchRunner:
             before_event_count = len(parent_snapshot.get("metadata", {}).get("events", []))
             before_message_count = len(parent_snapshot.get("agent", {}).get("state", {}).get("messages", []))
             segment_events = copy.deepcopy(snapshot_after.get("metadata", {}).get("events", [])[before_event_count:])
-            segment_messages = copy.deepcopy(
+            message_payload = copy.deepcopy(
                 snapshot_after.get("agent", {}).get("state", {}).get("messages", [])[before_message_count:]
             )
-            step_cards = _build_step_cards(segment_events)
-            step_start = step_cards[0]["step_index"] if step_cards else parent_node.step_end + 1
-            step_end = step_cards[-1]["step_index"] if step_cards else parent_node.step_end
-            segment_raw = _make_raw_trajectory(
-                snapshot=snapshot_after,
-                result=result,
-                info_extra={"segment_step_range": [step_start, step_end]},
-            )
-            segment_raw["messages"] = segment_messages
+            step_start = parent_node.step_end
+            step_cards = _build_step_cards(segment_events, step_start)
+            step_end = step_start + len(step_cards)
             recent_segments = copy.deepcopy(parent_judge["recent_segments"])
             recent_segments.append({"step_cards": copy.deepcopy(step_cards), "segment_step_range": [step_start, step_end]})
             if len(recent_segments) > 2:
@@ -1681,12 +1589,10 @@ class TrajectorySearchRunner:
                 "policy_model_name": policy_model_name,
                 "workspace_meta": workspace_meta,
                 "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
-                "segment_raw": segment_raw,
-                "segment_messages": build_slim_trajectory(segment_raw, model_name=policy_model_name),
+                "message_payload": build_messages(message_payload, model_name=policy_model_name),
                 "step_start": step_start,
                 "step_end": step_end,
                 "recent_segments": recent_segments,
-                "message_start_index": before_message_count,
                 "is_valid": True,
             }
             branch_records.append(branch_record)
@@ -1784,7 +1690,6 @@ class TrajectorySearchRunner:
                     rubric_dir=rubric_dir,
                     rubric_payload=rubric_payload,
                     messages_payload=sample["messages"],
-                    raw_traj_payload=sample["raw_traj"],
                     round_summary_path=round_rubric_path,
                     selected_for_round_summary=bool(sample["selected"]),
                 )
@@ -1852,8 +1757,7 @@ class TrajectorySearchRunner:
                             "policy_source": branch["policy_source"],
                             "policy_model_name": branch["policy_model_name"],
                         },
-                        raw_traj_payload=branch["segment_raw"] if self.search_config.write_raw_traj else None,
-                        messages_payload=branch["segment_messages"],
+                        messages_payload=branch["message_payload"],
                         judge_payload={"is_valid": False},
                         prompt_payload=branch["prompt_payload"],
                     )
@@ -1897,7 +1801,6 @@ class TrajectorySearchRunner:
             if self.search_config.calculate_gt_reward:
                 judge_payload["ground_truth_reward"] = None
 
-            terminal_raw = None
             terminal_messages = None
             terminal_patch = None
             if self.search_config.calculate_gt_reward:
@@ -1911,12 +1814,10 @@ class TrajectorySearchRunner:
                     if remaining_steps > 0:
                         terminal_result = branch["session"].run_until_pause(max_steps=remaining_steps).model_dump(mode="json")
                         terminal_snapshot = branch["session"].snapshot().model_dump(mode="json")
-                terminal_raw = _make_raw_trajectory(
-                    snapshot=terminal_snapshot,
-                    result=terminal_result,
-                    info_extra={"terminal_rollout_from_node_id": node.node_id},
+                terminal_messages = build_messages(
+                    terminal_snapshot["agent"]["state"].get("messages", []),
+                    model_name=branch["policy_model_name"],
                 )
-                terminal_messages = build_slim_trajectory(terminal_raw, model_name=branch["policy_model_name"])
                 terminal_patch = {
                     self.task_id: {
                         "model_name_or_path": branch["policy_model_name"],
@@ -1955,12 +1856,10 @@ class TrajectorySearchRunner:
                     node_id=node.node_id,
                     node_dir=self.nodes_dir / node.node_id,
                     node_payload=asdict(node),
-                    raw_traj_payload=branch["segment_raw"] if self.search_config.write_raw_traj else None,
-                    messages_payload=branch["segment_messages"],
+                    messages_payload=branch["message_payload"],
                     judge_payload=judge_payload,
                     prompt_payload=branch["prompt_payload"],
                     snapshot_payload=snapshot_payload,
-                    terminal_raw_traj_payload=terminal_raw,
                     terminal_messages_payload=terminal_messages,
                     terminal_patch_payload=terminal_patch,
                 )
@@ -2027,15 +1926,15 @@ class TrajectorySearchRunner:
         if final_node_id not in self._node_snapshot_cache:
             raise RuntimeError(f"Node {final_node_id} does not have a cached restorable snapshot")
         snapshot = copy.deepcopy(self._node_snapshot_cache[final_node_id])
-        raw_traj = _make_raw_trajectory(
-            snapshot=snapshot,
-            result={"exit_status": final_node.exit_status, "submission": final_node.submission, "metadata": {}},
-            info_extra={"search": {"best_node_id": final_node_id, "current_round": self.current_round, "frontier_ids": self.frontier_ids}},
-        )
         final_policy_model_name = final_node.policy_model_name or self.policy_model_name
         if self.search_config.write_artifacts:
-            _atomic_write_json(self.run_dir / "raw_traj.json", raw_traj)
-            _atomic_write_json(self.run_dir / "messages.json", build_slim_trajectory(raw_traj, model_name=final_policy_model_name))
+            _atomic_write_json(
+                self.run_dir / "messages.json",
+                build_messages(
+                    snapshot["agent"]["state"].get("messages", []),
+                    model_name=final_policy_model_name,
+                ),
+            )
             _atomic_write_json(
                 self.run_dir / "model_patch.json",
                 {

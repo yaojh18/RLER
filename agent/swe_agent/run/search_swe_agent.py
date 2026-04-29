@@ -243,7 +243,6 @@ def run_search(
             evaluate_final_patch=args.evaluate_final_patch,
             export_grpo_bundles=args.export_grpo_bundles,
             write_artifacts=args.write_artifacts,
-            write_raw_traj=args.write_raw_traj,
             strategy=args.strategy,
         )
         rubric_model_name = args.rubric_model or model_name
@@ -327,7 +326,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rubric-model", default=None)
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--calculate-gt-reward", action="store_true", default=True)
-    parser.add_argument("--write-raw-traj", action="store_false", default=False)
     parser.add_argument("--strategy", choices=["best", "probability", "random"], default="best")
     parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
     parser.add_argument("--student-model", default=None)
