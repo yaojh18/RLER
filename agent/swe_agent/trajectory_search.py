@@ -1340,8 +1340,34 @@ class TrajectorySearchRunner:
             ],
         )
         rubric_samples: list[dict[str, Any]] = []
-        valid_rubirc_samples: list[dict[str, Any]] = []
+        valid_rubric_samples: list[dict[str, Any]] = []
         rubric_generation_errors: list[dict[str, Any]] = []
+        active_continuation_scores, active_continuation_errors = await _score_round(
+            question=question,
+            shared_context=shared_context,
+            continuations=continuations,
+            rubrics=self.active_bank,
+            model_name=self.judge_model_name,
+            temperature=self.search_config.judge_temperature,
+            top_p=self.search_config.judge_top_p,
+            max_tokens=self.search_config.judge_max_tokens,
+            model_kwargs=self.judge_model_kwargs,
+        )
+        active_parent_scores: list[dict[str, Any]] = []
+        active_parent_errors: list[dict[str, str]] = []
+        if compare_parent:
+            active_parent_scores, active_parent_errors = await _score_parent_round(
+                question=question,
+                shared_context=shared_context,
+                rubrics=self.active_bank,
+                model_name=self.judge_model_name,
+                temperature=self.search_config.judge_temperature,
+                top_p=self.search_config.judge_top_p,
+                max_tokens=self.search_config.judge_max_tokens,
+                node_id=parent_node.node_id,
+                model_kwargs=self.judge_model_kwargs,
+            )
+        active_ids = {rubric.rubric_id for rubric in self.active_bank}
         for generated_sample in generated_samples:
             format_errors = copy.deepcopy(generated_sample.format_errors or [])
             if format_errors:
@@ -1364,32 +1390,40 @@ class TrajectorySearchRunner:
                     }
                 )
                 continue
-            # TODO: there should be an efficiency change: since rubrics in active rubric banks will always be scored, score them at the beginning and make it a common cache
-            scoring_rubrics: list[RubricRecord] = []
+            generated_rubrics: list[RubricRecord] = []
             seen_rubric_ids: set[str] = set()
-            for rubric in self.active_bank + generated_sample.generated:
-                if rubric.rubric_id in seen_rubric_ids:
+            for rubric in generated_sample.generated:
+                if rubric.rubric_id in active_ids or rubric.rubric_id in seen_rubric_ids:
                     continue
                 seen_rubric_ids.add(rubric.rubric_id)
-                scoring_rubrics.append(rubric)
-            scored_continuations, continuation_errors = await _score_round(
-                question=question,
-                shared_context=shared_context,
-                continuations=continuations,
-                rubrics=scoring_rubrics,
-                model_name=self.judge_model_name,
-                temperature=self.search_config.judge_temperature,
-                top_p=self.search_config.judge_top_p,
-                max_tokens=self.search_config.judge_max_tokens,
-                model_kwargs=self.judge_model_kwargs,
-            )
-            parent_score_records: list[dict[str, Any]] = []
-            judge_errors_payload = copy.deepcopy(continuation_errors)
-            if compare_parent:
-                parent_score_records, parent_errors = await _score_parent_round(
+                generated_rubrics.append(rubric)
+            scoring_rubrics = self.active_bank + generated_rubrics
+            if generated_rubrics:
+                generated_continuation_scores, continuation_errors = await _score_round(
                     question=question,
                     shared_context=shared_context,
-                    rubrics=scoring_rubrics,
+                    continuations=continuations,
+                    rubrics=generated_rubrics,
+                    model_name=self.judge_model_name,
+                    temperature=self.search_config.judge_temperature,
+                    top_p=self.search_config.judge_top_p,
+                    max_tokens=self.search_config.judge_max_tokens,
+                    model_kwargs=self.judge_model_kwargs,
+                )
+            else:
+                generated_continuation_scores = [[] for _ in continuations]
+                continuation_errors = []
+            scored_continuations = [
+                copy.deepcopy(active_records) + generated_records
+                for active_records, generated_records in zip(active_continuation_scores, generated_continuation_scores)
+            ]
+            parent_scores = copy.deepcopy(active_parent_scores)
+            judge_errors_payload = copy.deepcopy(active_continuation_errors + active_parent_errors + continuation_errors)
+            if compare_parent and generated_rubrics:
+                parent_scores, parent_errors = await _score_parent_round(
+                    question=question,
+                    shared_context=shared_context,
+                    rubrics=generated_rubrics,
                     model_name=self.judge_model_name,
                     temperature=self.search_config.judge_temperature,
                     top_p=self.search_config.judge_top_p,
@@ -1397,13 +1431,14 @@ class TrajectorySearchRunner:
                     node_id=parent_node.node_id,
                     model_kwargs=self.judge_model_kwargs,
                 )
+                parent_scores = copy.deepcopy(active_parent_scores) + parent_scores
                 judge_errors_payload.extend(parent_errors)
 
             child_score_lookup_by_node = {branch["node_id"]: {} for branch in branch_records}
             for branch, score_records in zip(branch_records, scored_continuations):
                 for record in score_records:
                     child_score_lookup_by_node[branch["node_id"]][record["rubric_id"]] = float(record["score_normalized"])
-            parent_score_lookup = {record["rubric_id"]: float(record["score_normalized"]) for record in parent_score_records}
+            parent_score_lookup = {record["rubric_id"]: float(record["score_normalized"]) for record in parent_scores}
 
             parent_score_by_rubric: dict[str, float] = {}
             child_score_by_rubric: dict[str, dict[str, float]] = {}
@@ -1509,22 +1544,22 @@ class TrajectorySearchRunner:
                 "selected": False,
             }
             rubric_samples.append(sample_payload)
-            valid_rubirc_samples.append(sample_payload)
+            valid_rubric_samples.append(sample_payload)
 
-        if not valid_rubirc_samples:
+        if len(valid_rubric_samples) < min(2, self.search_config.n):
             return {
                 "rubric_samples": rubric_samples,
                 "rubric_generation_errors": rubric_generation_errors,
                 "stop_search": True,
             }
 
-        selected_sample = random.choice(valid_rubirc_samples)
+        selected_sample = random.choice(valid_rubric_samples)
         selected_sample["selected"] = True
         averaged_child_rewards = [
-            sum(sample["child_rewards"][branch["node_id"]] for sample in valid_rubirc_samples) / len(valid_rubirc_samples)
+            sum(sample["child_rewards"][branch["node_id"]] for sample in valid_rubric_samples) / len(valid_rubric_samples)
             for branch in branch_records
         ]
-        parent_reward = sum(sample["parent_reward"] for sample in rubric_samples) / len(rubric_samples)
+        parent_reward = sum(sample["parent_reward"] for sample in valid_rubric_samples) / len(valid_rubric_samples)
         return {
             "rubric_samples": rubric_samples,
             "child_rewards": averaged_child_rewards,
@@ -1580,8 +1615,6 @@ class TrajectorySearchRunner:
             try:
                 result = session.run_until_pause(max_steps=self.search_config.k).model_dump(mode="json")
             except Exception as exc:
-                if session is not None:
-                    self._dispose_session(session)
                 error_text = f"{type(exc).__name__}: {exc}"
                 policy_generation_errors.append(
                     {
@@ -1589,18 +1622,35 @@ class TrajectorySearchRunner:
                         "error": error_text,
                     }
                 )
-                # TODO:
+                snapshot_after = session.snapshot().model_dump(mode="json")
+                before_message_count = len(parent_snapshot.get("agent", {}).get("state", {}).get("messages", []))
+                segment_messages = copy.deepcopy(
+                    snapshot_after.get("agent", {}).get("state", {}).get("messages", [])[before_message_count:]
+                )
+                result = {
+                    "status": "error",
+                    "exit_status": type(exc).__name__,
+                    "submission": "",
+                    "metadata": {},
+                }
+                segment_raw = _make_raw_trajectory(
+                    snapshot=snapshot_after,
+                    result=result,
+                )
+                segment_raw["messages"] = segment_messages
                 branch_records.append({
                     "node_id": node_id,
-                    "session": session,
-                    "result": {}, # TODO
+                    "result": result,
                     "policy_source": policy_source,
                     "policy_model_name": policy_model_name,
+                    "error": error_text,
                     "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
-                    "segment_raw": {}, # TODO
-                    "segment_messages": {}, # TODO
+                    "segment_raw": segment_raw,
+                    "segment_messages": build_slim_trajectory(segment_raw, model_name=policy_model_name),
                     "is_valid": False,
                 })
+                self._dispose_session(session)
+                continue
             snapshot_after = session.snapshot().model_dump(mode="json")
             workspace_meta = _collect_workspace_meta(session.agent.env)
             before_event_count = len(parent_snapshot.get("metadata", {}).get("events", []))
@@ -1642,8 +1692,9 @@ class TrajectorySearchRunner:
             branch_records.append(branch_record)
             valid_branch_records.append(branch_record)
 
-        if not valid_branch_records:
-            self.peaceful_exit()
+        if len(valid_branch_records) < 2:
+            self.peaceful_exit(branch_records, parent_id)
+            return
 
         judged = asyncio.run(
             self._prepare_round_judging(
@@ -1655,7 +1706,8 @@ class TrajectorySearchRunner:
             )
         )
         if bool(judged.get("stop_search")):
-            self.peaceful_exit()
+            self.peaceful_exit(branch_records, parent_id)
+            return
         selected_sample = judged["selected_sample"]
         parent_baseline_reward = float(judged["parent_reward"])
         node_round_records = []
@@ -1694,38 +1746,44 @@ class TrajectorySearchRunner:
         rubric_artifact_bundles: list[RubricArtifactBundle] = []
         for sample in judged["rubric_samples"]:
             rubric_dir = self.rubrics_dir / sample["rubric_list_id"]
-            rubric_payload = {
-                "rubric_list_id": sample["rubric_list_id"],
-                "parent_node_id": parent_id,
-                "generated": [asdict(rubric) for rubric in sample["generated"]],
-                "active_bank_before": [asdict(rubric) for rubric in sample["active_before"]],
-                "active_bank_after": [asdict(rubric) for rubric in sample["active_after"]],
-                "inactive_bank_after": [asdict(rubric) for rubric in sample["inactive_after"]],
-                "variance_by_rubric": copy.deepcopy(sample["variance_by_rubric"]),
-                "redundency_by_rubric": copy.deepcopy(sample["redundency_by_rubric"]),
-                "judge_error_by_rubric": copy.deepcopy(sample["judge_error_by_rubric"]),
-                "reward_by_rubric": copy.deepcopy(sample["reward_by_rubric"]),
-                "child_score_by_rubric": copy.deepcopy(sample["child_score_by_rubric"]),
-                "parent_score_by_rubric": copy.deepcopy(sample["parent_score_by_rubric"]),
-                "child_rewards": copy.deepcopy(sample["child_rewards"]),
-                "parent_reward": sample["parent_reward"],
-                "invalid_generation_reward": sample.get("invalid_generation_reward"),
-                "generated_titles": list(sample["generated_titles"]),
-                "selected": bool(sample["selected"]),
-                "gt_by_rubric": {},
-                "gt_reward_siblings": 0.0,
-                "gt_reward_parent": 0.0,
-            }
+            if sample.get("is_valid") is False:
+                rubric_payload = {
+                    "rubric_list_id": sample["rubric_list_id"],
+                    "parent_node_id": parent_id,
+                    "generated": [asdict(rubric) for rubric in sample["generated"]],
+                    "format_errors": copy.deepcopy(sample["format_errors"]),
+                    "is_valid": False,
+                    "selected": bool(sample["selected"]),
+                }
+            else:
+                rubric_payload = {
+                    "rubric_list_id": sample["rubric_list_id"],
+                    "parent_node_id": parent_id,
+                    "generated": [asdict(rubric) for rubric in sample["generated"]],
+                    "active_bank_before": [asdict(rubric) for rubric in sample["active_before"]],
+                    "active_bank_after": [asdict(rubric) for rubric in sample["active_after"]],
+                    "inactive_bank_after": [asdict(rubric) for rubric in sample["inactive_after"]],
+                    "variance_by_rubric": copy.deepcopy(sample["variance_by_rubric"]),
+                    "redundency_by_rubric": copy.deepcopy(sample["redundency_by_rubric"]),
+                    "judge_error_by_rubric": copy.deepcopy(sample["judge_error_by_rubric"]),
+                    "reward_by_rubric": copy.deepcopy(sample["reward_by_rubric"]),
+                    "child_score_by_rubric": copy.deepcopy(sample["child_score_by_rubric"]),
+                    "parent_score_by_rubric": copy.deepcopy(sample["parent_score_by_rubric"]),
+                    "child_rewards": copy.deepcopy(sample["child_rewards"]),
+                    "parent_reward": sample["parent_reward"],
+                    "generated_titles": list(sample["generated_titles"]),
+                    "is_valid": True,
+                    "selected": bool(sample["selected"]),
+                    "gt_by_rubric": {},
+                    "gt_reward_siblings": 0.0,
+                    "gt_reward_parent": 0.0,
+                }
             rubric_sample_payloads.append(rubric_payload)
             rubric_artifact_bundles.append(
                 RubricArtifactBundle(
                     rubric_dir=rubric_dir,
                     rubric_payload=rubric_payload,
-                    messages_payload={
-                        "rubric_list_id": sample["rubric_list_id"],
-                        "messages": sample["messages"],
-                        "generated": [asdict(rubric) for rubric in sample["generated"]],
-                    },
+                    messages_payload=sample["messages"],
                     raw_traj_payload=sample["raw_traj"],
                     round_summary_path=round_rubric_path,
                     selected_for_round_summary=bool(sample["selected"]),
@@ -1780,7 +1838,26 @@ class TrajectorySearchRunner:
         artifact_bundles: list[NodeArtifactBundle] = []
         for branch in branch_records:
             if not branch["is_valid"]:
-                # TODO:
+                artifact_bundles.append(
+                    NodeArtifactBundle(
+                        node_id=branch["node_id"],
+                        node_dir=self.nodes_dir / branch["node_id"],
+                        node_payload={
+                            "node_id": branch["node_id"],
+                            "parent_id": parent_id,
+                            "round_index": round_index,
+                            "depth": parent_node.depth + 1,
+                            "status": "error",
+                            "error": branch.get("error"),
+                            "policy_source": branch["policy_source"],
+                            "policy_model_name": branch["policy_model_name"],
+                        },
+                        raw_traj_payload=branch["segment_raw"] if self.search_config.write_raw_traj else None,
+                        messages_payload=branch["segment_messages"],
+                        judge_payload={"is_valid": False},
+                        prompt_payload=branch["prompt_payload"],
+                    )
+                )
                 continue
             node = SearchNode(
                 node_id=branch["node_id"],
@@ -2014,7 +2091,10 @@ class TrajectorySearchRunner:
             self.frontier_ids = [final_node_id]
         self._save_manifest()
 
-    def peaceful_exit(self) -> None:
-        # TODO:
-        pass
-
+    def peaceful_exit(self, branch_records, parent_id: int) -> None:
+        for branch in branch_records:
+            if branch.get("session") is not None:
+                self._dispose_session(branch["session"])
+                branch["session"] = None
+        self.best_node_id = parent_id
+        self.frontier_ids = []

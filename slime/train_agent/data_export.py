@@ -1,4 +1,3 @@
-# TODO: deal with invalide rubric or policy tracjectory here
 from __future__ import annotations
 
 import json
@@ -74,7 +73,10 @@ class _RunArtifacts:
         return float(node.get("ground_truth_reward")) >= 1.0
 
     def build_policy_sft_sample(self, round_index: int) -> tuple[str, list[str], ExportSample | None]:
-        first_rubric = next(iter(self.rounds[round_index].values()))
+        valid_rubrics = [rubric for rubric in self.rounds[round_index].values() if rubric.get("is_valid") is not False]
+        if not valid_rubrics:
+            return f"round_{round_index}", [], None
+        first_rubric = valid_rubrics[0]
         group_id = first_rubric["parent_node_id"] if round_index in self.rounds else f"round_{round_index}"
         node_ids = list(first_rubric["child_rewards"].keys())
         teacher_nodes = [node_id for node_id in node_ids if self._is_teacher_gt_node(node_id)]
@@ -100,6 +102,8 @@ class _RunArtifacts:
             return None
 
         for rubric in self.rounds[round_index].values():
+            if rubric.get("is_valid") is False:
+                continue
             if not self._rubic_judge_corr_gt(node_ids, rubric):
                 continue
             rubric_list_id = str(rubric.get("rubric_list_id") or "")

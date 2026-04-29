@@ -1,4 +1,3 @@
-# TODO:
 from __future__ import annotations
 
 import copy
@@ -16,7 +15,7 @@ from agent_rl import (
 )
 from swe_agent.agents import get_agent, get_agent_class
 from swe_agent.environments import get_environment, get_environment_class
-from swe_agent.exceptions import InterruptAgentFlow
+from swe_agent.exceptions import FormatError, InterruptAgentFlow
 from swe_agent.models import get_model, get_model_class
 
 
@@ -192,6 +191,36 @@ class SWEAgentSession:
                 )
             observation_messages = self.agent.execute_actions(model_message)
         except InterruptAgentFlow as exc:
+            if isinstance(exc, FormatError):
+                model_message = copy.deepcopy(getattr(exc, "assistant_message", None))
+                if model_message is not None:
+                    model_message.setdefault("extra", {})
+                    model_message["extra"]["format_error"] = True
+                    model_message["extra"]["interrupt_type"] = "FormatError"
+                    self.agent.add_messages(model_message)
+                    self._record_event(
+                        step_index=step_index,
+                        kind="model_response",
+                        payload={"message": model_message},
+                    )
+                    self.model_turns.append(
+                        ModelTurn(
+                            session_id=self.spec.session_id,
+                            step_index=step_index,
+                            query_messages=_messages_to_protocol(query_messages, source="conversation", trainable=False),
+                            response_message=_message_to_protocol(model_message, source="model", trainable=True),
+                            metadata={
+                                "policy_ref": self.spec.policy_ref,
+                                "policy_version": self.spec.policy_version,
+                                "dataset_name": self.spec.dataset_name,
+                                "ground_truth": self.spec.ground_truth,
+                                "format_error": True,
+                            },
+                        )
+                    )
+                self.last_step_index = step_index
+                self.status = "error"
+                raise
             self._record_interrupt(step_index=step_index, messages=self.agent.add_messages(*exc.messages))
             self.status = "finished" if self.is_finished() else "running"
             return

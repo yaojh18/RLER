@@ -4,6 +4,7 @@ from typing import Any
 from agent_rl import ChatSamplingParams, call_model_service
 
 from swe_agent.models import GLOBAL_MODEL_STATS
+from swe_agent.exceptions import FormatError
 from swe_agent.models.litellm_model import LitellmModel
 from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel, LitellmTextbasedModelConfig
 from swe_agent.models.utils.actions_text import parse_regex_actions
@@ -44,18 +45,12 @@ class ModelServiceTextbasedModel(LitellmTextbasedModel):
                 )
 
         content = completion.content or ""
-        actions = parse_regex_actions(
-            content,
-            action_regex=self.config.action_regex,
-            format_error_template=self.config.format_error_template,
-        )
-        GLOBAL_MODEL_STATS.add(completion.cost)
-        return {
+        assistant_message = {
             "role": "assistant",
             "content": content,
             "content_no_thinking": completion.metadata.get("content_no_thinking", content),
             "extra": {
-                "actions": actions,
+                "actions": [],
                 "response": completion.raw_response,
                 "cost": completion.cost,
                 "timestamp": time.time(),
@@ -63,6 +58,19 @@ class ModelServiceTextbasedModel(LitellmTextbasedModel):
                 **completion.metadata,
             },
         }
+        try:
+            assistant_message["extra"]["actions"] = parse_regex_actions(
+                content,
+                action_regex=self.config.action_regex,
+                format_error_template=self.config.format_error_template,
+            )
+        except FormatError as exc:
+            assistant_message["extra"]["format_error"] = True
+            setattr(exc, "assistant_message", assistant_message)
+            GLOBAL_MODEL_STATS.add(completion.cost)
+            raise
+        GLOBAL_MODEL_STATS.add(completion.cost)
+        return assistant_message
 
     def get_state(self) -> dict[str, Any]:
         return {"policy_version": self.policy_version}

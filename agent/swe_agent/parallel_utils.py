@@ -1,5 +1,3 @@
-# TODO: deal with invalide rubric or policy tracjectory here
-
 from __future__ import annotations
 
 import json
@@ -11,6 +9,8 @@ from pathlib import Path
 from typing import Any, Callable
 import numpy as np
 from swe_agent.rl_contracts import ExportGroup, ExportSample, GRPOExportBundle
+
+INVALID_SAMPLE_REWARD = -1.0
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -123,7 +123,11 @@ class GRPOCollector:
         samples: list[ExportSample] = []
         for bundle in bundles:
             turns = _normalize_messages(bundle.messages_payload)
-            reward = bundle.judge_payload.get("overall_reward") # NOTE: if we want to add gt reward: + bundle.judge_payload.get("ground_truth_reward")
+            reward = (
+                INVALID_SAMPLE_REWARD
+                if bundle.judge_payload.get("is_valid") is False
+                else bundle.judge_payload.get("overall_reward") # NOTE: if we want to add gt reward: + bundle.judge_payload.get("ground_truth_reward")
+            )
             if not turns or reward is None:
                 continue
             samples.append(
@@ -148,6 +152,18 @@ class GRPOCollector:
             rubric_list_id = str(payload.get("rubric_list_id") or bundle.rubric_dir.name)
             conversation = _normalize_messages(bundle.messages_payload)
             if not rubric_list_id or not conversation:
+                continue
+            if payload.get("is_valid") is False:
+                samples.append(
+                    ExportSample(
+                        sample_id=rubric_list_id,
+                        group_id=group_id,
+                        prompt=conversation[:1],
+                        turns=conversation[1:],
+                        reward=INVALID_SAMPLE_REWARD,
+                        metadata={"turn_rewards": []},
+                    )
+                )
                 continue
             generated = list(payload.get("generated"))
             variance_by_rubric = payload.get("variance_by_rubric")
