@@ -46,6 +46,7 @@ OBSERVATION_TRUNCATION_MARKER = "\n[... Observation truncated due to length ...]
 MAX_OBSERVATION_CHARS = 1024
 MIN_OBSERVATION_SECTION_CHARS = 256
 EVALUATOR_MAX_RETRIES = 4
+JUDGE_ERROR_REWARD = -0.2
 
 
 @dataclass
@@ -416,22 +417,23 @@ async def _update_persistent_state(
 
 
 def _convert_generated_rubric(task: str, payload: dict[str, Any], round_index: int) -> RubricRecord | None:
-    item = payload.get("rubric")
-    if not isinstance(item, dict):
-        for key, direction in [("positive_rubrics", "positive"), ("negative_rubrics", "negative")]:
-            candidates = payload.get(key)
-            if isinstance(candidates, list) and candidates:
-                item = {**candidates[0], "polarity": direction}
-                break
-        if not isinstance(item, dict):
-            return None
-    direction = str(item.get("polarity", "")).strip().lower()
+    item = payload.get("rubric", None)
+    if item is None or not isinstance(item, dict):
+        return None
+    direction = item.get("polarity", None)
     if direction not in {"positive", "negative"}:
         return None
-    title = str(item.get("title", "")).strip()
-    description = str(item.get("description", "")).strip()
-    scale = {str(score): str(text) for score, text in (item.get("scale") or {}).items()}
-    if not title or not description or set(scale) != {"1", "2", "3", "4", "5"}:
+    title = item.get("title", None)
+    if title is None or not isinstance(title, str):
+        return None
+    description = item.get("description", None)
+    if description is None or not isinstance(description, str):
+        return None
+    scale = {str(score): text for score, text in (item.get("scale") or {}).items()}
+    if set(scale) != {"1", "2", "3", "4", "5"}:
+        return None
+    scale_text = {isinstance(text, str) for _, text in (item.get("scale") or {}).items()}
+    if not scale_text or not all(scale_text):
         return None
     rubric_id = hashlib.md5(
         json.dumps(
@@ -577,6 +579,7 @@ async def _generate_round_rubrics(
     format_errors: list[dict[str, Any]] = []
     remaining_budget = 6
     for idx in range(remaining_budget):
+        parsed_candidate: dict[str, Any] | None = None
         parsed: dict[str, Any] | None = None
         assistant_content = ""
         assistant_content_no_thinking = ""
@@ -598,8 +601,10 @@ async def _generate_round_rubrics(
             except Exception:
                 continue
             parsed_candidate = extract_json_from_response(assistant_content or "")
+            if parsed_candidate == {}:
+                break
             if isinstance(parsed_candidate, dict):
-                parsed = parsed_candidate
+                parsed = _convert_generated_rubric(task_text, parsed_candidate, round_index)
                 break
         conversation_messages.append(
             {
@@ -608,18 +613,12 @@ async def _generate_round_rubrics(
                 "content_no_thinking": assistant_content_no_thinking,
             }
         )
-        rubric = _convert_generated_rubric(task_text, parsed, round_index) if parsed else None
-        if rubric is None:
-            if assistant_content.strip():
-                format_errors.append(
-                    {
-                        "turn_index": len(generated) + 1,
-                        "error_type": "invalid_rubric_generation_response",
-                        "response_content": assistant_content,
-                    }
-                )
+        if parsed_candidate == {}:
             break
-        generated.append(rubric)
+        if parsed is None:
+            format_errors.append({"turn_index": len(generated) + 1})
+            break
+        generated.append(parsed)
         if idx < remaining_budget - 1:
             conversation_messages.append({"role": "user", "content": RUBRIC_GENERATION_CONTINUE_PROMPT})
     return RubricGenerationSample(
@@ -1217,6 +1216,7 @@ class TrajectorySearchRunner:
                 "variance_by_rubric": {},
             },
             "overall_reward": 0.0,
+            "ground_truth_reward": 0.0,
             "baseline_parent_reward": None,
             "regressed_vs_parent": False,
         }
@@ -1338,29 +1338,33 @@ class TrajectorySearchRunner:
                 )
                 for sample_index in range(self.search_config.n)
             ],
-            return_exceptions=True,
         )
         rubric_samples: list[dict[str, Any]] = []
+        valid_rubirc_samples: list[dict[str, Any]] = []
         rubric_generation_errors: list[dict[str, Any]] = []
-        for sample_index, generated_sample in enumerate(generated_samples):
-            rubric_list_id = f"rubric-r{round_index:03d}-s{sample_index:02d}"
-            if isinstance(generated_sample, Exception):
-                error_text = f"{type(generated_sample).__name__}: {generated_sample}"
-                error_payload = {
-                    "rubric_list_id": rubric_list_id,
-                    "error": error_text,
-                }
-                rubric_generation_errors.append(error_payload)
-                continue
-
-            if not generated_sample.generated:
+        for generated_sample in generated_samples:
+            format_errors = copy.deepcopy(generated_sample.format_errors or [])
+            if format_errors:
                 error_payload = {
                     "rubric_list_id": generated_sample.rubric_list_id,
-                    "error": "No rubric generated",
+                    "error": "Invalid rubric generation response",
+                    "format_errors": format_errors,
                 }
                 rubric_generation_errors.append(error_payload)
+                rubric_samples.append(
+                    {
+                        "sample_index": generated_sample.sample_index,
+                        "rubric_list_id": generated_sample.rubric_list_id,
+                        "generated": generated_sample.generated,
+                        "messages": generated_sample.messages,
+                        "raw_traj": generated_sample.raw_traj,
+                        "format_errors": format_errors,
+                        "is_valid": False,
+                        "selected": False,
+                    }
+                )
                 continue
-
+            # TODO: there should be an efficiency change: since rubrics in active rubric banks will always be scored, score them at the beginning and make it a common cache
             scoring_rubrics: list[RubricRecord] = []
             seen_rubric_ids: set[str] = set()
             for rubric in self.active_bank + generated_sample.generated:
@@ -1405,8 +1409,13 @@ class TrajectorySearchRunner:
             child_score_by_rubric: dict[str, dict[str, float]] = {}
             variance_by_rubric: dict[str, float] = {}
             redundency_by_rubric: dict[str, float] = {}
+            judge_error_by_rubric: dict[str, float] = {}
             reward_by_rubric: dict[str, float] = {}
             previous_score_vectors: list[list[float]] = []
+            for error in judge_errors_payload:
+                rubric_id = error.get("rubric_id")
+                if rubric_id:
+                    judge_error_by_rubric[rubric_id] = judge_error_by_rubric.get(rubric_id, 0.0) + JUDGE_ERROR_REWARD
             for rubric in scoring_rubrics:
                 vector: list[float] = []
                 parent_score = parent_score_lookup.get(rubric.rubric_id, 0.0)
@@ -1422,7 +1431,12 @@ class TrajectorySearchRunner:
                 variance_by_rubric[rubric.rubric_id] = 0.0 if len(vector) <= 1 else float(pvariance(vector))
                 redundancy_reward = _redundancy_reward(vector, previous_score_vectors)
                 redundency_by_rubric[rubric.rubric_id] = redundancy_reward
-                reward_by_rubric[rubric.rubric_id] = variance_by_rubric[rubric.rubric_id] + redundancy_reward
+                # NOTE: when computing the rubric bank, we use equal weight
+                reward_by_rubric[rubric.rubric_id] = (
+                    variance_by_rubric[rubric.rubric_id]
+                    + redundancy_reward
+                    + judge_error_by_rubric.get(rubric.rubric_id, 0.0)
+                )
                 previous_score_vectors.append(vector)
 
             active_after, inactive_after, _ = _update_rubric_bank(
@@ -1481,23 +1495,33 @@ class TrajectorySearchRunner:
                     for rubric_id, reward in redundency_by_rubric.items()
                     if rubric_id in generated_ids
                 },
+                "judge_error_by_rubric": {
+                    rubric_id: judge_error_by_rubric.get(rubric_id, 0.0)
+                    for rubric_id in generated_ids
+                },
                 "reward_by_rubric": {
                     rubric_id: reward
                     for rubric_id, reward in reward_by_rubric.items()
                     if rubric_id in generated_ids
                 },
                 "judge_errors": judge_errors_payload,
+                "is_valid": True,
                 "selected": False,
             }
             rubric_samples.append(sample_payload)
+            valid_rubirc_samples.append(sample_payload)
 
-        if not rubric_samples:
-            raise ValueError(f"No valid rubric samples generated in round {round_index}")
+        if not valid_rubirc_samples:
+            return {
+                "rubric_samples": rubric_samples,
+                "rubric_generation_errors": rubric_generation_errors,
+                "stop_search": True,
+            }
 
-        selected_sample = random.choice(rubric_samples)
+        selected_sample = random.choice(valid_rubirc_samples)
         selected_sample["selected"] = True
         averaged_child_rewards = [
-            sum(sample["child_rewards"][branch["node_id"]] for sample in rubric_samples) / len(rubric_samples)
+            sum(sample["child_rewards"][branch["node_id"]] for sample in valid_rubirc_samples) / len(valid_rubirc_samples)
             for branch in branch_records
         ]
         parent_reward = sum(sample["parent_reward"] for sample in rubric_samples) / len(rubric_samples)
@@ -1508,6 +1532,7 @@ class TrajectorySearchRunner:
             "selected_sample_index": selected_sample["sample_index"],
             "selected_sample": selected_sample,
             "rubric_generation_errors": rubric_generation_errors,
+            "stop_search": False,
         }
 
     def _run_round(self, parent_id: str, round_index: int) -> None:
@@ -1525,6 +1550,7 @@ class TrajectorySearchRunner:
         self.inactive_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("inactive_bank_after", [])]
         previous_frontier = list(self.frontier_ids)
         branch_records: list[dict[str, Any]] = []
+        valid_branch_records: list[dict[str, Any]] = []
         policy_generation_errors: list[dict[str, Any]] = []
         sample_plan: list[tuple[str, str]] = []
         sample_count = self.search_config.m if parent_id == "root" else self.search_config.m
@@ -1537,62 +1563,22 @@ class TrajectorySearchRunner:
 
         for sample_index, (policy_source, policy_model_name) in enumerate(sample_plan):
             node_id = f"node-r{round_index:03d}-s{sample_index:02d}-{uuid.uuid4().hex[:6]}"
-            session = None
+            resumed_snapshot = copy.deepcopy(parent_snapshot)
+            resumed_snapshot["session_id"] = f"{node_id}-session"
+            resumed_snapshot["spec"]["session_id"] = resumed_snapshot["session_id"]
+            resumed_snapshot["spec"]["policy_ref"] = policy_model_name
+            
+            resumed_snapshot["spec"]["policy_version"] = policy_model_name
+            resumed_snapshot["model"]["config"]["model_name"] = policy_model_name
+            resumed_snapshot["model"]["config"]["route_name"] = "policy_student" if policy_source == "student" else "policy"
+            for index, event in enumerate(resumed_snapshot.get("metadata", {}).get("events", [])):
+                event["session_id"] = resumed_snapshot["session_id"]
+                event["event_id"] = f"{resumed_snapshot['session_id']}:{index}"
+            for turn in resumed_snapshot.get("metadata", {}).get("model_turns", []):
+                turn["session_id"] = resumed_snapshot["session_id"]
+            session = self.backend.resume_session(RolloutSnapshot(**resumed_snapshot))
             try:
-                resumed_snapshot = copy.deepcopy(parent_snapshot)
-                resumed_snapshot["session_id"] = f"{node_id}-session"
-                resumed_snapshot["spec"]["session_id"] = resumed_snapshot["session_id"]
-                resumed_snapshot["spec"]["policy_ref"] = policy_model_name
-                
-                resumed_snapshot["spec"]["policy_version"] = policy_model_name
-                resumed_snapshot["model"]["config"]["model_name"] = policy_model_name
-                resumed_snapshot["model"]["config"]["route_name"] = "policy_student" if policy_source == "student" else "policy"
-                for index, event in enumerate(resumed_snapshot.get("metadata", {}).get("events", [])):
-                    event["session_id"] = resumed_snapshot["session_id"]
-                    event["event_id"] = f"{resumed_snapshot['session_id']}:{index}"
-                for turn in resumed_snapshot.get("metadata", {}).get("model_turns", []):
-                    turn["session_id"] = resumed_snapshot["session_id"]
-                session = self.backend.resume_session(RolloutSnapshot(**resumed_snapshot))
                 result = session.run_until_pause(max_steps=self.search_config.k).model_dump(mode="json")
-                snapshot_after = session.snapshot().model_dump(mode="json")
-                workspace_meta = _collect_workspace_meta(session.agent.env)
-                before_event_count = len(parent_snapshot.get("metadata", {}).get("events", []))
-                before_message_count = len(parent_snapshot.get("agent", {}).get("state", {}).get("messages", []))
-                segment_events = copy.deepcopy(snapshot_after.get("metadata", {}).get("events", [])[before_event_count:])
-                segment_messages = copy.deepcopy(
-                    snapshot_after.get("agent", {}).get("state", {}).get("messages", [])[before_message_count:]
-                )
-                step_cards = _build_step_cards(segment_events)
-                step_start = step_cards[0]["step_index"] if step_cards else parent_node.step_end + 1
-                step_end = step_cards[-1]["step_index"] if step_cards else parent_node.step_end
-                segment_raw = _make_raw_trajectory(
-                    snapshot=snapshot_after,
-                    result=result,
-                    info_extra={"segment_step_range": [step_start, step_end]},
-                )
-                segment_raw["messages"] = segment_messages
-                recent_segments = copy.deepcopy(parent_judge["recent_segments"])
-                recent_segments.append({"step_cards": copy.deepcopy(step_cards), "segment_step_range": [step_start, step_end]})
-                if len(recent_segments) > 2:
-                    recent_segments = recent_segments[-2:]
-                branch_records.append(
-                    {
-                        "node_id": node_id,
-                        "session": session,
-                        "result": result,
-                        "snapshot_after": snapshot_after,
-                        "policy_source": policy_source,
-                        "policy_model_name": policy_model_name,
-                        "workspace_meta": workspace_meta,
-                        "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
-                        "segment_raw": segment_raw,
-                        "segment_messages": build_slim_trajectory(segment_raw, model_name=policy_model_name),
-                        "step_start": step_start,
-                        "step_end": step_end,
-                        "recent_segments": recent_segments,
-                        "message_start_index": before_message_count,
-                    }
-                )
             except Exception as exc:
                 if session is not None:
                     self._dispose_session(session)
@@ -1600,29 +1586,81 @@ class TrajectorySearchRunner:
                 policy_generation_errors.append(
                     {
                         "node_id": node_id,
-                        "policy_source": policy_source,
-                        "policy_model_name": policy_model_name,
                         "error": error_text,
                     }
                 )
+                # TODO:
+                branch_records.append({
+                    "node_id": node_id,
+                    "session": session,
+                    "result": {}, # TODO
+                    "policy_source": policy_source,
+                    "policy_model_name": policy_model_name,
+                    "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
+                    "segment_raw": {}, # TODO
+                    "segment_messages": {}, # TODO
+                    "is_valid": False,
+                })
+            snapshot_after = session.snapshot().model_dump(mode="json")
+            workspace_meta = _collect_workspace_meta(session.agent.env)
+            before_event_count = len(parent_snapshot.get("metadata", {}).get("events", []))
+            before_message_count = len(parent_snapshot.get("agent", {}).get("state", {}).get("messages", []))
+            segment_events = copy.deepcopy(snapshot_after.get("metadata", {}).get("events", [])[before_event_count:])
+            segment_messages = copy.deepcopy(
+                snapshot_after.get("agent", {}).get("state", {}).get("messages", [])[before_message_count:]
+            )
+            step_cards = _build_step_cards(segment_events)
+            step_start = step_cards[0]["step_index"] if step_cards else parent_node.step_end + 1
+            step_end = step_cards[-1]["step_index"] if step_cards else parent_node.step_end
+            segment_raw = _make_raw_trajectory(
+                snapshot=snapshot_after,
+                result=result,
+                info_extra={"segment_step_range": [step_start, step_end]},
+            )
+            segment_raw["messages"] = segment_messages
+            recent_segments = copy.deepcopy(parent_judge["recent_segments"])
+            recent_segments.append({"step_cards": copy.deepcopy(step_cards), "segment_step_range": [step_start, step_end]})
+            if len(recent_segments) > 2:
+                recent_segments = recent_segments[-2:]
+            branch_record = {
+                "node_id": node_id,
+                "session": session,
+                "result": result,
+                "snapshot_after": snapshot_after,
+                "policy_source": policy_source,
+                "policy_model_name": policy_model_name,
+                "workspace_meta": workspace_meta,
+                "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
+                "segment_raw": segment_raw,
+                "segment_messages": build_slim_trajectory(segment_raw, model_name=policy_model_name),
+                "step_start": step_start,
+                "step_end": step_end,
+                "recent_segments": recent_segments,
+                "message_start_index": before_message_count,
+                "is_valid": True,
+            }
+            branch_records.append(branch_record)
+            valid_branch_records.append(branch_record)
 
-        if not branch_records:
-            raise ValueError(f"No valid policy samples generated in round {round_index}")
+        if not valid_branch_records:
+            self.peaceful_exit()
 
         judged = asyncio.run(
             self._prepare_round_judging(
                 parent_node=parent_node,
                 parent_judge=parent_judge,
-                branch_records=branch_records,
+                branch_records=valid_branch_records,
                 round_index=round_index,
                 compare_parent=parent_id != "root",
             )
         )
+        if bool(judged.get("stop_search")):
+            self.peaceful_exit()
         selected_sample = judged["selected_sample"]
         parent_baseline_reward = float(judged["parent_reward"])
         node_round_records = []
         valid_branches: list[dict[str, Any]] = []
-        for index, (branch, averaged_reward) in enumerate(zip(branch_records, judged["child_rewards"])):
+        for index, (branch, averaged_reward) in enumerate(zip(valid_branch_records, judged["child_rewards"])):
             branch["reward"] = float(averaged_reward)
             valid_branches.append(branch)
             node_round_records.append({
@@ -1665,12 +1703,13 @@ class TrajectorySearchRunner:
                 "inactive_bank_after": [asdict(rubric) for rubric in sample["inactive_after"]],
                 "variance_by_rubric": copy.deepcopy(sample["variance_by_rubric"]),
                 "redundency_by_rubric": copy.deepcopy(sample["redundency_by_rubric"]),
+                "judge_error_by_rubric": copy.deepcopy(sample["judge_error_by_rubric"]),
                 "reward_by_rubric": copy.deepcopy(sample["reward_by_rubric"]),
                 "child_score_by_rubric": copy.deepcopy(sample["child_score_by_rubric"]),
                 "parent_score_by_rubric": copy.deepcopy(sample["parent_score_by_rubric"]),
                 "child_rewards": copy.deepcopy(sample["child_rewards"]),
                 "parent_reward": sample["parent_reward"],
-                "judge_errors": copy.deepcopy(sample["judge_errors"]),
+                "invalid_generation_reward": sample.get("invalid_generation_reward"),
                 "generated_titles": list(sample["generated_titles"]),
                 "selected": bool(sample["selected"]),
                 "gt_by_rubric": {},
@@ -1708,6 +1747,7 @@ class TrajectorySearchRunner:
             "child_score_by_rubric": copy.deepcopy(selected_sample["child_score_by_rubric"]),
             "variance_by_rubric": copy.deepcopy(selected_sample["variance_by_rubric"]),
             "redundency_by_rubric": copy.deepcopy(selected_sample["redundency_by_rubric"]),
+            "judge_error_by_rubric": copy.deepcopy(selected_sample["judge_error_by_rubric"]),
             "reward_by_rubric": copy.deepcopy(selected_sample["reward_by_rubric"]),
             "gt_by_rubric": {},
             "gt_reward_siblings": 0.0,
@@ -1722,7 +1762,7 @@ class TrajectorySearchRunner:
         self.active_bank = copy.deepcopy(selected_sample["active_after"])
         self.inactive_bank = copy.deepcopy(selected_sample["inactive_after"])
 
-        for branch in branch_records:
+        for branch in valid_branch_records:
             branch["keep_snapshot"] = branch["node_id"] in kept_child_ids
             branch["image_tag"] = None
             branch["image_id"] = None
@@ -1739,7 +1779,9 @@ class TrajectorySearchRunner:
 
         artifact_bundles: list[NodeArtifactBundle] = []
         for branch in branch_records:
-            regressed_vs_parent = regressed and bool(valid_branches) and branch["node_id"] == valid_branches[0]["node_id"]
+            if not branch["is_valid"]:
+                # TODO:
+                continue
             node = SearchNode(
                 node_id=branch["node_id"],
                 parent_id=parent_id,
@@ -1767,12 +1809,13 @@ class TrajectorySearchRunner:
                     "inactive_bank_after": [asdict(rubric) for rubric in selected_sample["inactive_after"]],
                     "variance_by_rubric": copy.deepcopy(selected_sample["variance_by_rubric"]),
                     "redundency_by_rubric": copy.deepcopy(selected_sample["redundency_by_rubric"]),
+                    "judge_error_by_rubric": copy.deepcopy(selected_sample["judge_error_by_rubric"]),
                     "reward_by_rubric": copy.deepcopy(selected_sample["reward_by_rubric"]),
                     "judge_errors": copy.deepcopy(selected_sample["judge_errors"]),
                 },
                 "overall_reward": branch["reward"],
                 "baseline_parent_reward": parent_baseline_reward if parent_id != "root" else None,
-                "regressed_vs_parent": regressed_vs_parent,
+                "regressed_vs_parent": regressed,
             }
             if self.search_config.calculate_gt_reward:
                 judge_payload["ground_truth_reward"] = None
@@ -1860,7 +1903,7 @@ class TrajectorySearchRunner:
             if node_id in self.nodes and self.nodes[node_id].status == "frontier" and node_id not in self.frontier_ids:
                 self.nodes[node_id].status = "archived"
                 non_gt_extra_json_writes.append((self.nodes_dir / node_id / "node.json", asdict(self.nodes[node_id])))
-        for branch in branch_records:
+        for branch in valid_branch_records:
             self._dispose_session(branch["session"])
 
         if self.patch_eval_manager is not None:
@@ -1970,3 +2013,8 @@ class TrajectorySearchRunner:
         if final_node.status == "finished":
             self.frontier_ids = [final_node_id]
         self._save_manifest()
+
+    def peaceful_exit(self) -> None:
+        # TODO:
+        pass
+

@@ -1,3 +1,5 @@
+# TODO: deal with invalide rubric or policy tracjectory here
+
 from __future__ import annotations
 
 import json
@@ -72,12 +74,16 @@ class GRPOCollector:
         *,
         instance_id: str,
         run_dir: Path,
-        alpha: float = 0.5,
+        alpha: float = 1.0,
         beta: float = 0.5,
+        gamma: float = 1.0,
+        theta: float = 1.0,
     ) -> None:
         self.instance_id = instance_id
         self.run_dir = run_dir
         self.alpha = alpha
+        self.gamma = gamma
+        self.theta = theta
         self.beta = beta
         self.bundle = GRPOExportBundle(
             instance_id=instance_id,
@@ -146,9 +152,11 @@ class GRPOCollector:
             generated = list(payload.get("generated"))
             variance_by_rubric = payload.get("variance_by_rubric")
             redundency_by_rubric = payload.get("redundency_by_rubric")
+            judge_error_by_rubric = payload.get("judge_error_by_rubric")
             turn_rewards = [
-                (1.0 - self.alpha) * float(variance_by_rubric.get(rubric["rubric_id"]))
-                + self.alpha * float(redundency_by_rubric.get(rubric["rubric_id"]))
+                (self.alpha * float(variance_by_rubric.get(rubric["rubric_id"]))
+                + self.gamma * float(redundency_by_rubric.get(rubric["rubric_id"]))
+                + self.theta * float(judge_error_by_rubric.get(rubric["rubric_id"], 0.0))) / (self.alpha + self.gamma + self.theta)
                 for rubric in generated
             ]
             scalar_reward = (
@@ -339,7 +347,11 @@ class PatchEvalManager:
             if parent_node_id:
                 parent_judge_path = self.work_dir / "nodes" / str(parent_node_id) / "judge.json"
                 if parent_judge_path.exists():
-                    parent_gt = json.loads(parent_judge_path.read_text(encoding="utf-8")).get("ground_truth_reward")
+                    parent_gt_value = json.loads(parent_judge_path.read_text(encoding="utf-8")).get("ground_truth_reward")
+                    if parent_gt_value is not None:
+                        parent_gt = float(parent_gt_value)
+                    elif parent_node_id != "root":
+                        raise RuntimeError(f"parent node {parent_node_id} has no ground_truth_reward")
             ordered_node_ids = sorted(str(node_id) for node_id in payload.get("child_rewards", {}))
             sibling_scores = [float(payload["child_rewards"][node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
             sibling_gt = [float(gt_by_node_id[node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]

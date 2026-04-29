@@ -52,6 +52,8 @@ def collect_grpo_bundle(
 
     run_dir, bundle = search_module.run_search(args, [instance_id])
     bundle.run_dir = str(run_dir)
+    for path in [run_dir, *run_dir.rglob("*")]:
+        path.chmod(0o755 if path.is_dir() else 0o644)
     return bundle
 
 
@@ -113,10 +115,12 @@ def _build_turn_metadata(
         turn_mask = [0] * response_length
         turn_mask[start:] = [1] * (response_length - start)
         turn_masks.append(turn_mask)
-    if len(turn_rewards) != len(turn_masks):
+    if len(turn_rewards) > len(turn_masks):
         raise ValueError(
             f"Sample {export_sample.sample_id} has {len(turn_rewards)} turn rewards but only {len(turn_masks)} trainable turns."
         )
+    if len(turn_rewards) < len(turn_masks):
+        turn_rewards.extend([0.0] * (len(turn_masks) - len(turn_rewards)))
     return {"turn_rewards": turn_rewards, "turn_loss_masks": turn_masks}
 
 
@@ -140,7 +144,10 @@ def _configure_slime_route(args) -> str:
 
 def build_grpo_prompt_rows(instance_ids: list[str], subset: str, split: str) -> list[dict[str, object]]:
     return [
-        {"input": instance_id, "metadata": {"instance_id": instance_id, "subset": subset, "split": split}}
+        {
+            "input": [{"role": "user", "content": instance_id}],
+            "metadata": {"instance_id": instance_id, "subset": subset, "split": split},
+        }
         for instance_id in instance_ids
     ]
 
@@ -158,6 +165,17 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     all_samples: list[Sample] = []
     group_index_offset = 0
     collected_instances: list[str] = []
+    search_values: dict[str, int | None] = {}
+    for env_name, arg_name in (
+        ("SWE_AGENT_GRPO_M", "m"),
+        ("SWE_AGENT_GRPO_N", "n"),
+        ("SWE_AGENT_GRPO_K", "k"),
+        ("SWE_AGENT_GRPO_P", "p"),
+        ("SWE_AGENT_GRPO_MAX_ROUNDS", "max_rounds"),
+        ("SWE_AGENT_GRPO_STEP_LIMIT", "step_limit"),
+    ):
+        value = os.environ[env_name]
+        search_values[arg_name] = int(value) if value else None
 
     for prompt_group in prompt_groups:
         bundle = collect_grpo_bundle(
@@ -166,12 +184,8 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             split=prompt_group[0].metadata["split"],
             output_root=output_root / f"rollout_{rollout_id:04d}",
             model_name=model_name,
-            workers=os.environ.get("SWE_AGENT_GRPO_WORKERS", 1),
-            m=os.environ.get("SWE_AGENT_GRPO_M", 4),
-            k=os.environ.get("SWE_AGENT_GRPO_K", 20),
-            p=os.environ.get("SWE_AGENT_GRPO_P", 2),
-            max_rounds=os.environ.get("SWE_AGENT_GRPO_MAX_ROUNDS"),
-            step_limit=os.environ.get("SWE_AGENT_GRPO_STEP_LIMIT"),
+            workers=int(os.environ["SWE_AGENT_GRPO_WORKERS"]),
+            **search_values,
         )
         groups = bundle.policy_groups if target == "policy" else bundle.rubric_groups
         samples = build_rollout_samples(

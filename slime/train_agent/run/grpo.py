@@ -133,7 +133,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config-path", type=Path, default=Path("/workspace/rler/slime/train_agent/configs/grpo.sh"))
     parser.add_argument("--rollout-batch-size", type=int, default=2)
     parser.add_argument("--global-batch-size", type=int)
-    parser.add_argument("--num-rollout", type=int, default=2)
     parser.add_argument("--actor-num-gpus", type=int, default=2)
     parser.add_argument("--rollout-num-gpus", type=int, default=2)
     parser.add_argument("--rollout-num-gpus-per-engine", type=int, default=2)
@@ -141,6 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--search-output-root", type=Path, required=True)
     parser.add_argument("--search-m", type=int)
+    parser.add_argument("--search-n", type=int)
     parser.add_argument("--search-k", type=int)
     parser.add_argument("--search-p", type=int)
     parser.add_argument("--search-max-rounds", type=int)
@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     total_gpus = args.actor_num_gpus + args.rollout_num_gpus
     ref_load_dir = args.ref_load_dir or args.load_dir
     wandb_dir = args.wandb_dir or (args.save_dir / "wandb")
-    global_batch_size = args.global_batch_size or 1
+    global_batch_size = shlex.quote(str(args.global_batch_size)) if args.global_batch_size is not None else "''"
     wandb_args = ""
     if args.wandb_mode != "disabled":
         pieces = [
@@ -175,18 +175,19 @@ def main(argv: list[str] | None = None) -> int:
     command = f"""
 set -euo pipefail
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="/workspace/rler/slime:/workspace/rler:/workspace/rler/agent:/root/Megatron-LM:${{PYTHONPATH:-}}"
-export CUDA_DEVICE_MAX_CONNECTIONS="${{CUDA_DEVICE_MAX_CONNECTIONS:-1}}"
+export PYTHONPATH="/workspace/rler/slime:/workspace/rler:/workspace/rler/agent:/root/Megatron-LM"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 export SWE_AGENT_GRPO_TARGET={shlex.quote(args.target)}
 export SWE_AGENT_GRPO_OUTPUT_ROOT={shlex.quote(str(args.search_output_root))}
 export SWE_AGENT_GRPO_MODEL_NAME={shlex.quote(args.student_model)}
 export SWE_AGENT_GRPO_WORKERS={args.search_workers}
 export SWE_AGENT_GRPO_M={"" if args.search_m is None else args.search_m}
+export SWE_AGENT_GRPO_N={"" if args.search_n is None else args.search_n}
 export SWE_AGENT_GRPO_K={"" if args.search_k is None else args.search_k}
 export SWE_AGENT_GRPO_P={"" if args.search_p is None else args.search_p}
 export SWE_AGENT_GRPO_MAX_ROUNDS={"" if args.search_max_rounds is None else args.search_max_rounds}
 export SWE_AGENT_GRPO_STEP_LIMIT={"" if args.search_step_limit is None else args.search_step_limit}
-export SWE_AGENT_PYTHON="${{SWE_AGENT_PYTHON:-/workspace/rler/agent/.venv/bin/python}}"
+export SWE_AGENT_PYTHON="/workspace/rler/agent/.venv/bin/python"
 trap 'ray stop --force >/dev/null 2>&1 || true' EXIT
 pkill -9 sglang >/dev/null 2>&1 || true
 ray stop --force >/dev/null 2>&1 || true
@@ -197,6 +198,15 @@ if [ {shlex.quote(args.target)} = "rubric" ]; then
   GRPO_TARGET_ARGS=("${{GRPO_RUBRIC_ARGS[@]}}")
 else
   GRPO_TARGET_ARGS=("${{GRPO_POLICY_ARGS[@]}}")
+fi
+GLOBAL_BATCH_SIZE={global_batch_size}
+: "${{GRPO_CONTEXT_PARALLEL_SIZE:?GRPO_CONTEXT_PARALLEL_SIZE must be set in the GRPO config}}"
+if [ -z "${{GLOBAL_BATCH_SIZE}}" ]; then
+  if [ $(( {args.actor_num_gpus} % GRPO_CONTEXT_PARALLEL_SIZE )) -ne 0 ]; then
+    echo "actor-num-gpus {args.actor_num_gpus} must be divisible by GRPO_CONTEXT_PARALLEL_SIZE=${{GRPO_CONTEXT_PARALLEL_SIZE}}" >&2
+    exit 1
+  fi
+  GLOBAL_BATCH_SIZE=$(( {args.actor_num_gpus} / GRPO_CONTEXT_PARALLEL_SIZE ))
 fi
 for CHECKPOINT_DIR in {shlex.quote(str(args.load_dir))} {shlex.quote(str(ref_load_dir))}; do
   TRACKER="${{CHECKPOINT_DIR}}/latest_checkpointed_iteration.txt"
@@ -221,10 +231,9 @@ python3 train_async.py \\
   --load {shlex.quote(str(args.load_dir))} \\
   --ref-load {shlex.quote(str(ref_load_dir))} \\
   --save {shlex.quote(str(args.save_dir))} \\
-  --num-rollout {args.num_rollout} \\
   --prompt-data {shlex.quote(str(args.prompt_data))} \\
   --rollout-batch-size {args.rollout_batch_size} \\
-  --global-batch-size {global_batch_size} \\
+  --global-batch-size "${{GLOBAL_BATCH_SIZE}}" \\
   --sglang-served-model-name {shlex.quote(args.student_model)} \\
   "${{GRPO_COMMON_ARGS[@]}}" \\
   "${{GRPO_TARGET_ARGS[@]}}" \\

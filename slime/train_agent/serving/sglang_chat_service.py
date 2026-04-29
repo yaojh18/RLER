@@ -48,9 +48,10 @@ def start_slime_server(args: argparse.Namespace, log_path: Path) -> ManagedServe
         return None
 
     name = f"slime-search-{int(time.time())}-{os.getpid()}"
+    selected_gpus = choose_gpus(args.search_gpus)
     docker_cmd = [
         "docker", "run", "--rm", "--name", name, "--runtime", "nvidia", "--net=host", "--shm-size=64g",
-        "-e", f"NVIDIA_VISIBLE_DEVICES={','.join(str(gpu) for gpu in choose_gpus(args.search_gpus))}",
+        "-e", f"NVIDIA_VISIBLE_DEVICES={','.join(str(gpu) for gpu in selected_gpus)}",
         "-e", "FLASHINFER_USE_CUDA_NORM=1",
         *extra_mount_args([args.model_dir]),
         "-v", f"{REPO_ROOT.resolve()}:/workspace/rler",
@@ -63,7 +64,7 @@ def start_slime_server(args: argparse.Namespace, log_path: Path) -> ManagedServe
                 "--model-path", shlex.quote(to_container_path(args.model_dir)),
                 "--host 127.0.0.1",
                 "--port", str(args.slime_port),
-                "--tensor-parallel-size 2",
+                "--tensor-parallel-size", str(len(selected_gpus)),
                 "--context-length 80960",
                 "--served-model-name", shlex.quote(args.student_model),
                 "--reasoning-parser qwen3",

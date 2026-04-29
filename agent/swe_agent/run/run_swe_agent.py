@@ -26,7 +26,6 @@ from swebench.harness.docker_build import build_instance_image
 
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 
-from dr_agent.utils import launch_vllm_server_handle
 from swe_agent.run.benchmarks.rebench_eval import (
     evaluate_rebench_instances as evaluate_rebench_instance_patches_backend,
     evaluate_rebench_instance as evaluate_rebench_prediction,
@@ -44,7 +43,7 @@ from swe_agent.run.benchmarks.swebench import (
 
 def find_repo_root(start: Path) -> Path:
     for candidate in [start, *start.parents]:
-        if (candidate / "agent").is_dir() and (candidate / "rl").is_dir():
+        if (candidate / "agent").is_dir() and ((candidate / "slime").is_dir() or (candidate / "rl").is_dir()):
             return candidate
     raise RuntimeError(f"Could not find repository root from {start}")
 
@@ -906,6 +905,8 @@ def run_swe_agent_backend(
     gpu_ids: list[int] = []
     vllm_handle = None
     if backend_name == "vllm":
+        from dr_agent.utils import launch_vllm_server_handle
+
         gpu_ids = choose_gpus(args.gpu_id)
         gpu_id = gpu_ids[0] if gpu_ids else None
         if gpu_id is None:

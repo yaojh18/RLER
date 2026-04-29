@@ -13,15 +13,17 @@ from pathlib import Path
 
 from train_agent.collect_sft_rollout import DEFAULT_TEACHER_MODEL, build_sft_training_rows, collect_teacher_student_exports
 from train_agent.collect_grpo_rollout import build_grpo_prompt_rows
+from train_agent.data_export import SFTDataExporter
 from swe_agent.run.run_swe_agent import choose_gpus
 from train_agent.serving.sglang_chat_service import start_slime_server, stop_slime_server, to_container_path, extra_mount_args, REPO_ROOT, AGENT_ROOT
 
 
 DEFAULT_INSTANCE_IDS = ["elastic__synthetics-316", "wtforms__wtforms-614"]
-DEFAULT_SLIME_IMAGE = "slimerl/slime:qwen35-grpo-fixed-20260415-v4"
+DEFAULT_SLIME_IMAGE = "slimerl/slime:qwen35-route-agentdeps-20260428-v1"
 DEFAULT_MODEL_NAME = "Qwen/Qwen3.5-9B"
 DEFAULT_MODEL_DIR = Path("/m-coriander/coriander/zhichen/models/Qwen3.5-9B")
 DEFAULT_TORCH_DIST_DIR = REPO_ROOT / "slime/train_agent/artifacts/stage7_qwen35_compatible_torch_dist"
+DEFAULT_WANDB_API_KEY = "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"
 
 
 @dataclass(frozen=True)
@@ -39,20 +41,28 @@ class TrainingGpuLayout:
     def docker_gpu_spec(self) -> str:
         return ",".join(str(gpu) for gpu in self.selected_gpus)
 
+    @property
+    def actor_gpu_spec(self) -> str:
+        return ",".join(str(gpu) for gpu in self.selected_gpus[: self.actor_gpus])
 
-def plan_training_gpu_layout(train_gpus: str) -> TrainingGpuLayout:
+
+def plan_training_gpu_layout(train_gpus: str, rollout_count: int | str) -> TrainingGpuLayout:
+    rollout_count = int(rollout_count)
     selected_gpus = choose_gpus(train_gpus)
-    if len(selected_gpus) < 2:
-        raise ValueError("online GRPO smoke needs at least 2 GPUs: one actor GPU and one rollout GPU.")
+    if rollout_count < 1:
+        raise ValueError("--rollout-gpus must be at least 1.")
+    if len(selected_gpus) <= rollout_count:
+        raise ValueError(
+            f"--train-gpus selected {len(selected_gpus)} GPU(s), but online GRPO needs more GPUs than "
+            f"the {rollout_count} rollout GPU(s)."
+        )
 
-    actor_gpus = max(1, len(selected_gpus) // 2)
-    rollout_gpus = len(selected_gpus) - actor_gpus
-    rollout_gpus_per_engine = 2 if rollout_gpus >= 2 else 1
+    actor_gpus = len(selected_gpus) - rollout_count
     return TrainingGpuLayout(
         selected_gpus=selected_gpus,
         actor_gpus=actor_gpus,
-        rollout_gpus=rollout_gpus,
-        rollout_gpus_per_engine=rollout_gpus_per_engine,
+        rollout_gpus=rollout_count,
+        rollout_gpus_per_engine=1,
     )
 
 
@@ -66,7 +76,9 @@ def run_training_module(
     mounts: list[Path],
     env_vars: dict[str, str],
 ) -> None:
-    gpu_list = ",".join(str(gpu) for gpu in choose_gpus(gpus))
+    selected_gpus = choose_gpus(gpus)
+    gpu_list = ",".join(str(gpu) for gpu in selected_gpus)
+    container_gpu_list = ",".join(str(index) for index in range(len(selected_gpus)))
     docker_env = [item for key, value in env_vars.items() for item in ("-e", f"{key}={value}") if value]
     docker_mounts = [
         "-v", f"{REPO_ROOT.resolve()}:/workspace/rler",
@@ -82,7 +94,7 @@ def run_training_module(
     docker_cmd = [
         "docker", "run", "--rm", "--runtime", "nvidia", "--ipc=host", "--shm-size=64g",
         "--ulimit", "nofile=1048576:1048576",
-        "-e", f"CUDA_VISIBLE_DEVICES={gpu_list}",
+        "-e", f"CUDA_VISIBLE_DEVICES={container_gpu_list}",
         "-e", f"NVIDIA_VISIBLE_DEVICES={gpu_list}",
         "-e", "RAY_USE_MULTIPROCESSING_CPU_COUNT=1",
         "-e", "RAY_DISABLE_DOCKER_CPU_WARNING=1",
@@ -127,6 +139,7 @@ def search_override_args(args: argparse.Namespace) -> list[str]:
     overrides: list[str] = []
     for cli_name, value in (
         ("--search-m", args.search_m),
+        ("--search-n", args.search_n),
         ("--search-k", args.search_k),
         ("--search-p", args.search_p),
         ("--search-max-rounds", args.search_max_rounds),
@@ -151,51 +164,59 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sft-config-path", type=Path, default=Path("/workspace/rler/slime/train_agent/configs/sft.sh"))
     parser.add_argument("--grpo-config-path", type=Path, default=Path("/workspace/rler/slime/train_agent/configs/grpo.sh"))
     parser.add_argument("--slime-image", default=DEFAULT_SLIME_IMAGE)
-    parser.add_argument("--train-gpus", default="auto:2")
-    parser.add_argument("--search-gpus", default="auto:2")
+    parser.add_argument("--train-gpus", default="auto:4")
+    parser.add_argument("--rollout-gpus", type=int, default=2)
+    parser.add_argument("--search-gpus", default="auto:1")
     parser.add_argument("--slime-port", type=int, default=8032)
     parser.add_argument("--slime-api-base", default="http://127.0.0.1:8032")
     parser.add_argument("--slime-api-key", default="EMPTY")
     parser.add_argument("--use-existing-slime-server", action="store_true")
     parser.add_argument("--serving-timeout", type=int, default=1200)
     parser.add_argument("--search-m", type=int)
+    parser.add_argument("--search-n", type=int)
     parser.add_argument("--search-k", type=int)
     parser.add_argument("--search-p", type=int)
     parser.add_argument("--search-max-rounds", type=int, default=2)
     parser.add_argument("--search-step-limit", type=int, default=40)
     parser.add_argument("--search-output-root", type=Path, default=REPO_ROOT / "agent/outputs/search_outputs" / f"search_training_{time.strftime('%Y%m%d-%H%M%S')}")
     parser.add_argument("--artifact-root", type=Path, default=REPO_ROOT / "slime/train_agent/artifacts" / f"search_training_{time.strftime('%Y%m%d-%H%M%S')}")
+    parser.add_argument("--sft-run-dir", type=Path)
     parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE") or ("online" if os.environ.get("WANDB_API_KEY") else "offline"))
-    parser.add_argument("--wandb-key", default=os.environ.get("WANDB_API_KEY") or "wandb_v1_5aJeIB3lLiqAN8opuJfCiweHBb9_Ra1ZyN9VEteLf9LptHbztY")
+    parser.add_argument("--wandb-key", default=os.environ.get("SWE_WANDB_API_KEY") or DEFAULT_WANDB_API_KEY)
     parser.add_argument("--wandb-team", default=os.environ.get("WANDB_ENTITY"))
     args = parser.parse_args(argv)
 
     args.artifact_root.mkdir(parents=True, exist_ok=True)
     logs_dir = args.artifact_root / "logs"
-    gpu_layout = plan_training_gpu_layout(args.train_gpus)
+    gpu_layout = plan_training_gpu_layout(args.train_gpus, args.rollout_gpus)
     server = None
-    try:
-        server = start_slime_server(args, logs_dir / "slime_server.log")
-        sft_bundle = collect_teacher_student_exports(
-            instance_ids=args.instance_id,
-            output_root=args.search_output_root / "teacher_student",
-            teacher_api_key=args.teacher_api_key,
-            student_model_name=args.student_model,
-            teacher_model_name=args.teacher_model,
-            teacher_backend=args.teacher_backend,
-            subset=args.subset,
-            split=args.split,
-            m=args.search_m,
-            k=args.search_k,
-            p=args.search_p,
-            max_rounds=args.search_max_rounds,
-        )
-        sft_rows = build_sft_training_rows(
-            bundle=sft_bundle,
-            pad_to_multiple=gpu_layout.total_gpus,
-        )
-    finally:
-        stop_slime_server(server)
+    if args.sft_run_dir is not None:
+        sft_bundle = SFTDataExporter(run_dir=args.sft_run_dir).export_bundle()
+    else:
+        try:
+            server = start_slime_server(args, logs_dir / "slime_server.log")
+            sft_bundle = collect_teacher_student_exports(
+                instance_ids=args.instance_id,
+                output_root=args.search_output_root / "teacher_student",
+                teacher_api_key=args.teacher_api_key,
+                student_model_name=args.student_model,
+                teacher_model_name=args.teacher_model,
+                teacher_backend=args.teacher_backend,
+                subset=args.subset,
+                split=args.split,
+                m=args.search_m,
+                n=args.search_n,
+                k=args.search_k,
+                p=args.search_p,
+                max_rounds=args.search_max_rounds,
+                step_limit=args.search_step_limit,
+            )
+        finally:
+            stop_slime_server(server)
+    sft_rows = build_sft_training_rows(
+        bundle=sft_bundle,
+        pad_to_multiple=gpu_layout.actor_gpus,
+    )
 
     grpo_rows = build_grpo_prompt_rows(args.instance_id, args.subset, args.split)
     sft_counts = {target: len(rows) for target, rows in sft_rows.items()}
@@ -215,10 +236,10 @@ def main(argv: list[str] | None = None) -> int:
                 "grpo_instances": grpo_rows,
             },
         )
-        for target in ("policy", "rubric"):
+        for target in ("rubric", "policy"):
             run_training_module(
                 image=args.slime_image,
-                gpus=gpu_layout.docker_gpu_spec,
+                gpus=gpu_layout.actor_gpu_spec,
                 module="train_agent.run.sft",
                 log_path=logs_dir / f"{target}_sft_train.log",
                 mounts=common_mounts + [temp_path],
@@ -232,12 +253,18 @@ def main(argv: list[str] | None = None) -> int:
                     "--model-torch-dist-dir", to_container_path(args.model_torch_dist_dir),
                     "--save-dir", to_container_path(args.artifact_root / f"{target}_sft"),
                     "--config-path", str(args.sft_config_path),
-                    "--num-gpus", str(gpu_layout.total_gpus),
+                    "--num-gpus", str(gpu_layout.actor_gpus),
                     "--wandb-mode", args.wandb_mode,
                     "--wandb-project", "swe-agent-sft",
                     "--wandb-group", f"{args.artifact_root.name}-{target}-sft",
                 ],
             )
+            target_search_args = search_override_args(args)
+            if target == "policy":
+                if "--search-n" in target_search_args:
+                    target_search_args[target_search_args.index("--search-n") + 1] = "1"
+                else:
+                    target_search_args.extend(["--search-n", "1"])
             run_training_module(
                 image=args.slime_image,
                 gpus=gpu_layout.docker_gpu_spec,
@@ -254,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
                     "--config-path", str(args.grpo_config_path),
                     "--student-model", args.student_model,
                     "--search-output-root", str((args.search_output_root / f"online_grpo_{target}").resolve()),
-                    *search_override_args(args),
+                    *target_search_args,
                     "--rollout-batch-size", str(len(grpo_rows)),
                     "--actor-num-gpus", str(gpu_layout.actor_gpus),
                     "--rollout-num-gpus", str(gpu_layout.rollout_gpus),

@@ -26,9 +26,11 @@ def build_search_args(
     student_backend: str = "slime",
     completion_max_tokens: int | None = None,
     m: int | None = None,
+    n: int | None = None,
     k: int | None = None,
     p: int | None = None,
     max_rounds: int | None = None,
+    step_limit: int | None = None,
 ) -> argparse.Namespace:
     args = build_arg_parser().parse_args([])
     args.backend = backend
@@ -44,9 +46,11 @@ def build_search_args(
     for name, value in {
         "completion_max_tokens": completion_max_tokens,
         "m": m,
+        "n": n,
         "k": k,
         "p": p,
         "max_rounds": max_rounds,
+        "step_limit": step_limit,
     }.items():
         if value is not None:
             setattr(args, name, value)
@@ -72,9 +76,11 @@ def collect_teacher_student_export(
     split: str = "train",
     completion_max_tokens: int | None = None,
     m: int | None = None,
+    n: int | None = None,
     k: int | None = None,
     p: int | None = None,
     max_rounds: int | None = None,
+    step_limit: int | None = None,
     run_dir: Path | None = None,
 ) -> SFTExportBundle:
     if run_dir is None:
@@ -97,9 +103,11 @@ def collect_teacher_student_export(
             student_backend=student_backend,
             completion_max_tokens=completion_max_tokens,
             m=m,
+            n=n,
             k=k,
             p=p,
             max_rounds=max_rounds,
+            step_limit=step_limit,
         )
         result = run_search(search_args, [instance_id])
         run_dir = Path(result[0] if isinstance(result, tuple) else result)
@@ -127,9 +135,11 @@ def collect_teacher_student_exports(
     split: str = "train",
     completion_max_tokens: int | None = None,
     m: int | None = None,
+    n: int | None = None,
     k: int | None = None,
     p: int | None = None,
     max_rounds: int | None = None,
+    step_limit: int | None = None,
 ) -> SFTExportBundle:
     bundles = [
         collect_teacher_student_export(
@@ -144,9 +154,11 @@ def collect_teacher_student_exports(
             split=split,
             completion_max_tokens=completion_max_tokens,
             m=m,
+            n=n,
             k=k,
             p=p,
             max_rounds=max_rounds,
+            step_limit=step_limit,
         )
         for instance_id in instance_ids
     ]
@@ -204,9 +216,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--split", default="train")
     parser.add_argument("--completion-max-tokens", type=int)
     parser.add_argument("--m", type=int)
+    parser.add_argument("--n", type=int)
     parser.add_argument("--k", type=int)
     parser.add_argument("--p", type=int)
     parser.add_argument("--max-rounds", type=int)
+    parser.add_argument("--step-limit", type=int)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--pad-to-multiple", type=int, default=1)
     args = parser.parse_args(argv)
@@ -226,9 +240,11 @@ def main(argv: list[str] | None = None) -> int:
             split=args.split,
             completion_max_tokens=args.completion_max_tokens,
             m=args.m,
+            n=args.n,
             k=args.k,
             p=args.p,
             max_rounds=args.max_rounds,
+            step_limit=args.step_limit,
             run_dir=args.run_dir,
         )
     else:
@@ -244,9 +260,11 @@ def main(argv: list[str] | None = None) -> int:
             split=args.split,
             completion_max_tokens=args.completion_max_tokens,
             m=args.m,
+            n=args.n,
             k=args.k,
             p=args.p,
             max_rounds=args.max_rounds,
+            step_limit=args.step_limit,
         )
     rows = build_sft_training_rows(
         bundle=bundle,

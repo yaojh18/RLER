@@ -1,3 +1,4 @@
+# TODO: deal with invalide rubric or policy tracjectory here
 from __future__ import annotations
 
 import json

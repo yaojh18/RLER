@@ -54,8 +54,8 @@ def main(argv: list[str] | None = None) -> int:
     command = f"""
 set -euo pipefail
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="/workspace/rler/slime:/workspace/rler:/workspace/rler/agent:/root/Megatron-LM:${{PYTHONPATH:-}}"
-export CUDA_DEVICE_MAX_CONNECTIONS="${{CUDA_DEVICE_MAX_CONNECTIONS:-1}}"
+export PYTHONPATH="/workspace/rler/slime:/workspace/rler:/workspace/rler/agent:/root/Megatron-LM"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 trap 'ray stop --force >/dev/null 2>&1 || true' EXIT
 pkill -9 sglang >/dev/null 2>&1 || true
 ray stop --force >/dev/null 2>&1 || true

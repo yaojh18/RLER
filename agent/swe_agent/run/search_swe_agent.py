@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from dr_agent.utils import launch_vllm_server_handle
 from agent_rl import clear_model_services, register_model_service
 from agent_rl.run_utils import ModelRouteConfig, clear_model_routes, configure_model_route
 from swe_agent.backend import SWEAgentRolloutBackend
@@ -130,6 +129,8 @@ def run_search(
     slime_api_base = os.environ.get("SEARCH_SWE_SLIME_API_BASE", SLIME_API_BASE)
     slime_api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", SLIME_API_KEY)
     if args.backend == "vllm":
+        from dr_agent.utils import launch_vllm_server_handle
+
         gpu_ids = choose_gpus(args.gpu_id)
         gpu_id = gpu_ids[0] if gpu_ids else None
         if gpu_id is None:
