@@ -141,34 +141,41 @@ def collect_teacher_student_exports(
     max_rounds: int | None = None,
     step_limit: int | None = None,
 ) -> SFTExportBundle:
-    bundles = [
-        collect_teacher_student_export(
-            instance_id=instance_id,
-            output_root=output_root,
-            teacher_api_key=teacher_api_key,
-            student_model_name=student_model_name,
-            teacher_model_name=teacher_model_name,
-            student_backend=student_backend,
-            teacher_backend=teacher_backend,
-            subset=subset,
-            split=split,
-            completion_max_tokens=completion_max_tokens,
-            m=m,
-            n=n,
-            k=k,
-            p=p,
-            max_rounds=max_rounds,
-            step_limit=step_limit,
-        )
-        for instance_id in instance_ids
-    ]
+    bundles: list[SFTExportBundle] = []
+    failed_instances: list[dict[str, str]] = []
+    for instance_id in instance_ids:
+        try:
+            bundles.append(
+                collect_teacher_student_export(
+                    instance_id=instance_id,
+                    output_root=output_root,
+                    teacher_api_key=teacher_api_key,
+                    student_model_name=student_model_name,
+                    teacher_model_name=teacher_model_name,
+                    student_backend=student_backend,
+                    teacher_backend=teacher_backend,
+                    subset=subset,
+                    split=split,
+                    completion_max_tokens=completion_max_tokens,
+                    m=m,
+                    n=n,
+                    k=k,
+                    p=p,
+                    max_rounds=max_rounds,
+                    step_limit=step_limit,
+                )
+            )
+        except Exception as exc:
+            failed_instances.append({"instance_id": instance_id, "error": f"{type(exc).__name__}: {exc}"})
+    if not bundles:
+        raise RuntimeError(f"all SFT rollout instances failed: {failed_instances}")
     return SFTExportBundle(
         instance_id=",".join(bundle.instance_id for bundle in bundles),
         run_dir=",".join(bundle.run_dir for bundle in bundles),
         accepted_group_ids=[bundle.instance_id + '_' + group_id for bundle in bundles for group_id in bundle.accepted_group_ids],
         policy_samples=[sample for bundle in bundles for sample in bundle.policy_samples],
         rubric_samples=[sample for bundle in bundles for sample in bundle.rubric_samples],
-        metadata={},
+        metadata={"failed_instances": failed_instances},
     )
 
 

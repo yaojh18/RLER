@@ -50,11 +50,16 @@ def collect_grpo_bundle(
         if value is not None:
             setattr(args, name, value)
 
-    run_dir, bundle = search_module.run_search(args, [instance_id])
-    bundle.run_dir = str(run_dir)
-    for path in [run_dir, *run_dir.rglob("*")]:
-        path.chmod(0o755 if path.is_dir() else 0o644)
-    return bundle
+    run_dir = None
+    try:
+        run_dir, bundle = search_module.run_search(args, [instance_id])
+        bundle.run_dir = str(run_dir)
+        return bundle
+    finally:
+        chmod_root = run_dir or output_root
+        if chmod_root.exists():
+            for path in [chmod_root, *chmod_root.rglob("*")]:
+                path.chmod(0o755 if path.is_dir() else 0o644)
 
 
 def build_rollout_samples(
@@ -161,10 +166,10 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     target = os.environ.get("SWE_AGENT_GRPO_TARGET", "policy")
     output_root = Path(os.environ.get("SWE_AGENT_GRPO_OUTPUT_ROOT", "/workspace/rler/agent/outputs/search_outputs/train_async_grpo"))
     model_name = os.environ.get("SWE_AGENT_GRPO_MODEL_NAME") or "Qwen/Qwen3.5-9B"
-    prompt_groups = data_buffer.get_samples(args.rollout_batch_size)
     all_samples: list[Sample] = []
     group_index_offset = 0
     collected_instances: list[str] = []
+    failed_instances: list[str] = []
     search_values: dict[str, int | None] = {}
     for env_name, arg_name in (
         ("SWE_AGENT_GRPO_M", "m"),
@@ -177,16 +182,22 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         value = os.environ[env_name]
         search_values[arg_name] = int(value) if value else None
 
+    prompt_groups = data_buffer.get_samples(args.rollout_batch_size)
     for prompt_group in prompt_groups:
-        bundle = collect_grpo_bundle(
-            instance_id=prompt_group[0].metadata["instance_id"],
-            subset=prompt_group[0].metadata["subset"],
-            split=prompt_group[0].metadata["split"],
-            output_root=output_root / f"rollout_{rollout_id:04d}",
-            model_name=model_name,
-            workers=int(os.environ["SWE_AGENT_GRPO_WORKERS"]),
-            **search_values,
-        )
+        instance_id = prompt_group[0].metadata["instance_id"]
+        try:
+            bundle = collect_grpo_bundle(
+                instance_id=instance_id,
+                subset=prompt_group[0].metadata["subset"],
+                split=prompt_group[0].metadata["split"],
+                output_root=output_root / f"rollout_{rollout_id:04d}" / f"attempt_{attempt_index:02d}",
+                model_name=model_name,
+                workers=int(os.environ["SWE_AGENT_GRPO_WORKERS"]),
+                **search_values,
+            )
+        except Exception as exc:
+            failed_instances.append(f"{instance_id}: {type(exc).__name__}: {exc}")
+            continue
         groups = bundle.policy_groups if target == "policy" else bundle.rubric_groups
         samples = build_rollout_samples(
             groups=groups,
@@ -196,11 +207,11 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             group_index_offset=group_index_offset,
         )
         group_index_offset += len(groups)
-        collected_instances.append(prompt_group[0].metadata["instance_id"])
+        collected_instances.append(instance_id)
         all_samples.extend(samples)
 
     if not all_samples:
-        raise RuntimeError(f"SWE-agent GRPO rollout produced no {target} samples for {collected_instances}")
+        raise RuntimeError(f"SWE-agent GRPO rollout produced no {target} samples; failed={failed_instances}")
     for index, sample in enumerate(all_samples):
         sample.index = index
     return RolloutFnTrainOutput(
@@ -210,6 +221,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/instances": len(collected_instances),
             "swe_agent/samples": len(all_samples),
             "swe_agent/groups": group_index_offset,
+            "swe_agent/failed_instances": len(failed_instances),
             "swe_agent/seconds": time.perf_counter() - started,
         },
     )

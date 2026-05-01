@@ -786,6 +786,7 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "metadata",
             ]:
                 if key not in data:
                     continue

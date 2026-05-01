@@ -40,15 +40,17 @@ class _RunArtifacts:
             payload = _load_json(judge_path)
             self.nodes[node_id]["ground_truth_reward"] = payload.get("ground_truth_reward", 0.0)
 
-        for round_path in sorted((run_dir / "rubrics").glob("round_*.json")):
-            payload = _load_json(round_path)
-            self.rounds[int(payload["round_index"])] = {rubric["rubric_list_id"]: rubric for rubric in payload["rubric_samples"]}
+        rubrics_dir = run_dir / "rubrics"
+        if rubrics_dir.exists():
+            for round_path in sorted(rubrics_dir.glob("round_*.json")):
+                payload = _load_json(round_path)
+                self.rounds[int(payload["round_index"])] = {rubric["rubric_list_id"]: rubric for rubric in payload["rubric_samples"]}
 
-        for rubric_dir in sorted(path for path in (run_dir / "rubrics").iterdir() if path.is_dir()):
-            rubric_id = rubric_dir.name
-            messages_path = rubric_dir / "messages.json"
-            payload = _load_json(messages_path)
-            self.rubric_messages[rubric_id] = _normalize_messages(payload)
+            for rubric_dir in sorted(path for path in rubrics_dir.iterdir() if path.is_dir()):
+                rubric_id = rubric_dir.name
+                messages_path = rubric_dir / "messages.json"
+                payload = _load_json(messages_path)
+                self.rubric_messages[rubric_id] = _normalize_messages(payload)
 
     def build_prefix_messages(self, parent_node_id: str | None) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []

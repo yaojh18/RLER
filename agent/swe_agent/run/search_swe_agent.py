@@ -90,7 +90,14 @@ def _run_single_instance(
         harness_namespace=get_swebench_harness_namespace(instance),
         resume=resume,
     )
-    runner.run()
+    try:
+        runner.run()
+    except Exception:
+        if search_config.export_grpo_bundles:
+            bundle = runner.grpo_collector.bundle
+            if bundle.policy_groups or bundle.rubric_groups:
+                return bundle
+        raise
     if search_config.export_grpo_bundles:
         return runner.grpo_collector.bundle
     return None

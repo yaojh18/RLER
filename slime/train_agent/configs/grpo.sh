@@ -16,9 +16,12 @@ GRPO_COMMON_ARGS=(
   --eps-clip 0.2
   --entropy-coef 0.0
   --calculate-per-token-loss
+  --log-probs-chunk-size 256
   --use-dynamic-global-batch-size
   --micro-batch-size 1
 )
+
+GRPO_CONTEXT_PARALLEL_SIZE=2
 
 GRPO_POLICY_ARGS=(
   --loss-type policy_loss

@@ -8,6 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
+from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
 from slime.backends.megatron_utils.loss import policy_loss_function
 
 
@@ -79,9 +80,15 @@ def compute_rubric_loss(args, batch, logits, sum_of_sample_mean):
     alpha = float(getattr(args, "swe_rtt_alpha", 1.0))
     beta = float(getattr(args, "swe_rtt_beta", 1.0))
     metadata_list = batch.get("metadata")
+    if metadata_list is None:
+        raise RuntimeError("rubric custom loss requires per-sample metadata")
+
     token_advantages = []
-    for loss_mask, metadata in zip(batch["loss_masks"], metadata_list, strict=False):
-        local_advantage = torch.zeros_like(loss_mask, dtype=torch.float32)
+    max_seq_lens = batch.get("max_seq_lens")
+    for index, (loss_mask, metadata, total_length, response_length) in enumerate(
+        zip(batch["loss_masks"], metadata_list, batch["total_lengths"], batch["response_lengths"], strict=False)
+    ):
+        full_token_advantage = torch.zeros_like(loss_mask, dtype=torch.float32)
         turn_rewards = list((metadata).get("turn_rewards"))
         turn_masks = list((metadata).get("turn_loss_masks"))
         if turn_rewards and turn_masks:
@@ -99,9 +106,18 @@ def compute_rubric_loss(args, batch, logits, sum_of_sample_mean):
                     raise RuntimeError(
                         f"rubric turn mask shape mismatch: mask={turn_mask_tensor.shape} loss_mask={loss_mask.shape}"
                     )
-                local_advantage = local_advantage + turn_mask_tensor * turn_value
-            local_advantage = local_advantage * (loss_mask > 0)
-        token_advantages.append(local_advantage)
+                full_token_advantage = full_token_advantage + turn_mask_tensor * turn_value
+            full_token_advantage = full_token_advantage * (loss_mask > 0)
+        max_seq_len = max_seq_lens[index] if max_seq_lens is not None else None
+        token_advantages.append(
+            slice_log_prob_with_cp(
+                full_token_advantage,
+                total_length,
+                response_length,
+                args.qkv_format,
+                max_seq_len,
+            )
+        )
 
     response_advantages = batch["advantages"]
     combined_advantages = []
@@ -115,8 +131,14 @@ def compute_rubric_loss(args, batch, logits, sum_of_sample_mean):
         )
 
     loss, metrics = policy_loss_function(args, {**batch, "advantages": combined_advantages}, logits, sum_of_sample_mean)
-    metrics["response_adv_mean"] = torch.cat(response_advantages, dim=0).mean().clone().detach()
-    metrics["token_adv_mean"] = torch.cat(token_advantages, dim=0).mean().clone().detach()
+    response_values = torch.cat(response_advantages, dim=0)
+    token_values = torch.cat(token_advantages, dim=0)
+    metrics["response_adv_mean"] = (
+        response_values.mean().clone().detach() if response_values.numel() else torch.zeros((), device=logits.device)
+    )
+    metrics["token_adv_mean"] = (
+        token_values.mean().clone().detach() if token_values.numel() else torch.zeros((), device=logits.device)
+    )
     metrics["rtt_alpha"] = torch.tensor(alpha, device=logits.device)
     metrics["rtt_beta"] = torch.tensor(beta, device=logits.device)
     return loss, metrics
