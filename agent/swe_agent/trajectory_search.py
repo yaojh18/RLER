@@ -45,6 +45,7 @@ OBSERVATION_TRUNCATION_MARKER = "\n[... Observation truncated due to length ...]
 MAX_OBSERVATION_CHARS = 1024
 MIN_OBSERVATION_SECTION_CHARS = 256
 EVALUATOR_MAX_RETRIES = 4
+RUBRIC_LIST_FORMAT_MAX_RETRIES = 4
 JUDGE_ERROR_REWARD = -0.2
 
 
@@ -487,8 +488,6 @@ async def _generate_round_rubrics(
     round_index: int,
     sample_index: int = 0,
     model_kwargs: dict[str, Any] | None = None,
-    parent_node_id: str | None = None,
-    source: Literal["teacher", "student"] = "teacher",
 ) -> RubricGenerationSample:
     latest_shared_segment_text = json.dumps(latest_shared_segment, indent=2, ensure_ascii=False) if latest_shared_segment else "None"
     prompt_parts = [
@@ -544,6 +543,7 @@ async def _generate_round_rubrics(
         parsed: dict[str, Any] | None = None
         assistant_content = ""
         assistant_content_no_thinking = ""
+        last_error = ""
         for _ in range(EVALUATOR_MAX_RETRIES):
             try:
                 completion = await run_chat_with_route_completion_async(
@@ -559,7 +559,8 @@ async def _generate_round_rubrics(
                 )
                 assistant_content = completion.content or ""
                 assistant_content_no_thinking = completion.metadata.get("content_no_thinking", assistant_content)
-            except Exception:
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
                 continue
             parsed_candidate = extract_json_from_response(assistant_content or "")
             if parsed_candidate == {}:
@@ -577,7 +578,7 @@ async def _generate_round_rubrics(
         if parsed_candidate == {}:
             break
         if parsed is None:
-            format_errors.append({"turn_index": len(generated) + 1})
+            format_errors.append({"turn_index": len(generated) + 1, "error": last_error})
             break
         generated.append(parsed)
         if idx < remaining_budget - 1:
@@ -1240,27 +1241,42 @@ class TrajectorySearchRunner:
                 "trajectory_continuation": copy.deepcopy(branch["recent_segments"][-1]) if branch["recent_segments"] else None,
             }
             continuations.append(branch["continuation_view"])
-        generated_samples = await asyncio.gather(
-            *[
-                _generate_round_rubrics(
-                    question={**question, "instance_id": self.task_id},
-                    previous_state=updated_parent_state,
-                    latest_shared_segment=latest_shared_segment,
-                    continuations=continuations,
-                    active_bank=self.active_bank,
-                    model_name=self.rubric_model_name,
-                    temperature=self.search_config.rubric_temperature,
-                    top_p=self.search_config.rubric_top_p,
-                    max_tokens=self.search_config.rubric_max_tokens,
-                    round_index=round_index,
-                    sample_index=sample_index,
-                    model_kwargs=self.rubric_model_kwargs,
-                    parent_node_id=parent_node.node_id,
-                    source="teacher",
+        rubric_generation_kwargs = {
+            "question": {**question, "instance_id": self.task_id},
+            "previous_state": updated_parent_state,
+            "latest_shared_segment": latest_shared_segment,
+            "continuations": continuations,
+            "active_bank": self.active_bank,
+            "model_name": self.rubric_model_name,
+            "temperature": self.search_config.rubric_temperature,
+            "top_p": self.search_config.rubric_top_p,
+            "max_tokens": self.search_config.rubric_max_tokens,
+            "round_index": round_index,
+            "model_kwargs": self.rubric_model_kwargs,
+        }
+        if self.search_config.n == 1:
+            generated_sample = await _generate_round_rubrics(
+                **rubric_generation_kwargs,
+                sample_index=0,
+            )
+            for _ in range(RUBRIC_LIST_FORMAT_MAX_RETRIES):
+                if not generated_sample.format_errors:
+                    break
+                generated_sample = await _generate_round_rubrics(
+                    **rubric_generation_kwargs,
+                    sample_index=0,
                 )
-                for sample_index in range(self.search_config.n)
-            ],
-        )
+            generated_samples = [generated_sample]
+        else:
+            generated_samples = await asyncio.gather(
+                *[
+                    _generate_round_rubrics(
+                        **rubric_generation_kwargs,
+                        sample_index=sample_index,
+                    )
+                    for sample_index in range(self.search_config.n)
+                ],
+            )
         rubric_samples: list[dict[str, Any]] = []
         valid_rubric_samples: list[dict[str, Any]] = []
         rubric_generation_errors: list[dict[str, Any]] = []
@@ -1798,21 +1814,28 @@ class TrajectorySearchRunner:
                 "baseline_parent_reward": parent_baseline_reward if parent_id != "root" else None,
                 "regressed_vs_parent": regressed,
             }
-            if self.search_config.calculate_gt_reward:
-                judge_payload["ground_truth_reward"] = None
 
             terminal_messages = None
             terminal_patch = None
             if self.search_config.calculate_gt_reward:
+                judge_payload["ground_truth_reward"] = None
                 terminal_result = branch["result"]
                 terminal_snapshot = branch["snapshot_after"]
+                terminal_error = None
                 if branch["result"]["status"] != "finished":
                     completed_steps = max(branch["step_end"] + 1, 0)
                     remaining_steps = max(self.search_config.step_limit - completed_steps, 0)
-                    branch["session"].agent.model.config.model_kwargs["temperature"] = 0.0
-                    branch["session"].agent.model.config.model_kwargs["top_p"] = 1.0
+                    branch["session"].agent.model.config.model_kwargs["temperature"] = self.search_config.judge_temperature
+                    branch["session"].agent.model.config.model_kwargs["top_p"] = self.search_config.judge_top_p
                     if remaining_steps > 0:
-                        terminal_result = branch["session"].run_until_pause(max_steps=remaining_steps).model_dump(mode="json")
+                        try:
+                            terminal_result = branch["session"].run_until_pause(max_steps=remaining_steps).model_dump(mode="json")
+                        except Exception as exc:
+                            terminal_result = {
+                                "status": "error",
+                                "exit_status": type(exc).__name__,
+                            }
+                            terminal_error = f"{type(exc).__name__}: {exc}"
                         terminal_snapshot = branch["session"].snapshot().model_dump(mode="json")
                 terminal_messages = build_messages(
                     terminal_snapshot["agent"]["state"].get("messages", []),
@@ -1823,6 +1846,7 @@ class TrajectorySearchRunner:
                         "model_name_or_path": branch["policy_model_name"],
                         "instance_id": self.task_id,
                         "model_patch": terminal_result.get("submission", "") or "",
+                        "terminal_error": terminal_error,
                     }
                 }
             snapshot_payload = (

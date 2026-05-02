@@ -21,7 +21,9 @@ GRPO_COMMON_ARGS=(
   --micro-batch-size 1
 )
 
-GRPO_CONTEXT_PARALLEL_SIZE=2
+GRPO_ROLLOUT_ARGS=(
+  --rollout-num-gpus-per-engine 1
+)
 
 GRPO_POLICY_ARGS=(
   --loss-type policy_loss

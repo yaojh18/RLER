@@ -15,7 +15,15 @@ from train_agent.collect_sft_rollout import DEFAULT_TEACHER_MODEL, build_sft_tra
 from train_agent.collect_grpo_rollout import build_grpo_prompt_rows
 from train_agent.data_export import SFTDataExporter
 from swe_agent.run.run_swe_agent import choose_gpus
-from train_agent.serving.sglang_chat_service import start_slime_server, stop_slime_server, to_container_path, extra_mount_args, REPO_ROOT, AGENT_ROOT
+from train_agent.serving.sglang_chat_service import (
+    AGENT_ROOT,
+    REPO_ROOT,
+    extra_mount_args,
+    start_slime_server,
+    stop_slime_server,
+    to_container_path,
+    warmup_slime_policy_route,
+)
 
 
 DEFAULT_INSTANCE_IDS = ["elastic__synthetics-316", "wtforms__wtforms-614"]
@@ -31,7 +39,6 @@ class TrainingGpuLayout:
     selected_gpus: list[int]
     actor_gpus: int
     rollout_gpus: int
-    rollout_gpus_per_engine: int
 
     @property
     def total_gpus(self) -> int:
@@ -46,7 +53,10 @@ class TrainingGpuLayout:
         return ",".join(str(gpu) for gpu in self.selected_gpus[: self.actor_gpus])
 
 
-def plan_training_gpu_layout(train_gpus: str, rollout_count: int | str) -> TrainingGpuLayout:
+def plan_training_gpu_layout(
+    train_gpus: str,
+    rollout_count: int | str,
+) -> TrainingGpuLayout:
     rollout_count = int(rollout_count)
     selected_gpus = choose_gpus(train_gpus)
     if rollout_count < 1:
@@ -62,7 +72,6 @@ def plan_training_gpu_layout(train_gpus: str, rollout_count: int | str) -> Train
         selected_gpus=selected_gpus,
         actor_gpus=actor_gpus,
         rollout_gpus=rollout_count,
-        rollout_gpus_per_engine=1,
     )
 
 
@@ -195,6 +204,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         try:
             server = start_slime_server(args, logs_dir / "slime_server.log")
+            warmup_times = warmup_slime_policy_route(
+                base_url=os.environ["SEARCH_SWE_SLIME_API_BASE"],
+                api_key=os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY"),
+                model_name=args.student_model,
+                wait_for_health=True,
+                health_timeout=args.serving_timeout,
+            )
+            print(json.dumps({"sft_rollout_warmup_seconds": warmup_times}, ensure_ascii=False), flush=True)
             sft_bundle = collect_teacher_student_exports(
                 instance_ids=args.instance_id,
                 output_root=args.search_output_root / "teacher_student",
@@ -225,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
 
     common_mounts = [args.model_dir, args.model_torch_dist_dir]
     common_env = training_env(args)
+    rollout_instance_workers = min(len(grpo_rows), gpu_layout.rollout_gpus)
 
     with tempfile.TemporaryDirectory(prefix="swe-training-data-") as temp_dir:
         temp_path = Path(temp_dir)
@@ -285,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
                     "--rollout-batch-size", str(len(grpo_rows)),
                     "--actor-num-gpus", str(gpu_layout.actor_gpus),
                     "--rollout-num-gpus", str(gpu_layout.rollout_gpus),
-                    "--rollout-num-gpus-per-engine", str(gpu_layout.rollout_gpus_per_engine),
+                    "--rollout-instance-workers", str(rollout_instance_workers),
                     "--wandb-mode", args.wandb_mode,
                     "--wandb-project", "swe-agent-grpo",
                     "--wandb-group", f"{args.artifact_root.name}-{target}-grpo",

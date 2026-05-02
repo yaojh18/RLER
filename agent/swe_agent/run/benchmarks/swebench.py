@@ -410,6 +410,25 @@ def load_swebench_instances(subset: str, split: str) -> list[dict]:
     return list(load_dataset(dataset_path, split=split))
 
 
+def load_swebench_instances_by_id(subset: str, split: str, instance_ids: list[str]) -> list[dict]:
+    from datasets import load_dataset
+
+    dataset_path = DATASET_MAPPING.get(subset, subset)
+    logger.info(f"Loading {len(instance_ids)} instance(s) from {dataset_path}, split {split}...")
+    wanted = set(instance_ids)
+    found: dict[str, dict] = {}
+    for instance in load_dataset(dataset_path, split=split):
+        instance_id = instance["instance_id"]
+        if instance_id in wanted:
+            found[instance_id] = dict(instance)
+            if len(found) == len(wanted):
+                break
+    missing = [instance_id for instance_id in instance_ids if instance_id not in found]
+    if missing:
+        raise RuntimeError(f"Instances not found in {subset}/{split}: {', '.join(missing)}")
+    return [found[instance_id] for instance_id in instance_ids]
+
+
 def build_swebench_config(
     *,
     config_spec: list[str],

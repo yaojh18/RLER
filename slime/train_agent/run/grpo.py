@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--global-batch-size", type=int)
     parser.add_argument("--actor-num-gpus", type=int, default=2)
     parser.add_argument("--rollout-num-gpus", type=int, default=2)
-    parser.add_argument("--rollout-num-gpus-per-engine", type=int, default=2)
+    parser.add_argument("--rollout-instance-workers", type=int, default=2)
     parser.add_argument("--ray-num-cpus", type=int, default=32)
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--search-output-root", type=Path, required=True)
@@ -209,6 +209,7 @@ export SWE_AGENT_GRPO_K={"" if args.search_k is None else args.search_k}
 export SWE_AGENT_GRPO_P={"" if args.search_p is None else args.search_p}
 export SWE_AGENT_GRPO_MAX_ROUNDS={"" if args.search_max_rounds is None else args.search_max_rounds}
 export SWE_AGENT_GRPO_STEP_LIMIT={"" if args.search_step_limit is None else args.search_step_limit}
+export SWE_AGENT_GRPO_INSTANCE_WORKERS={args.rollout_instance_workers}
 export SWE_AGENT_PYTHON="/workspace/rler/agent/.venv/bin/python"
 trap 'ray stop --force >/dev/null 2>&1 || true' EXIT
 pkill -9 sglang >/dev/null 2>&1 || true
@@ -222,13 +223,19 @@ else
   GRPO_TARGET_ARGS=("${{GRPO_POLICY_ARGS[@]}}")
 fi
 GLOBAL_BATCH_SIZE={global_batch_size}
-: "${{GRPO_CONTEXT_PARALLEL_SIZE:?GRPO_CONTEXT_PARALLEL_SIZE must be set in the GRPO config}}"
+CONTEXT_PARALLEL_SIZE=""
+for ((ARG_INDEX=0; ARG_INDEX<${{#GRPO_PARALLEL_ARGS[@]}}; ARG_INDEX++)); do
+  if [ "${{GRPO_PARALLEL_ARGS[$ARG_INDEX]}}" = "--context-parallel-size" ]; then
+    CONTEXT_PARALLEL_SIZE="${{GRPO_PARALLEL_ARGS[$((ARG_INDEX + 1))]:-}}"
+  fi
+done
+: "${{CONTEXT_PARALLEL_SIZE:?GRPO_PARALLEL_ARGS must include --context-parallel-size <value>}}"
 if [ -z "${{GLOBAL_BATCH_SIZE}}" ]; then
-  if [ $(( {args.actor_num_gpus} % GRPO_CONTEXT_PARALLEL_SIZE )) -ne 0 ]; then
-    echo "actor-num-gpus {args.actor_num_gpus} must be divisible by GRPO_CONTEXT_PARALLEL_SIZE=${{GRPO_CONTEXT_PARALLEL_SIZE}}" >&2
+  if [ $(( {args.actor_num_gpus} % CONTEXT_PARALLEL_SIZE )) -ne 0 ]; then
+    echo "actor-num-gpus {args.actor_num_gpus} must be divisible by --context-parallel-size ${{CONTEXT_PARALLEL_SIZE}}" >&2
     exit 1
   fi
-  GLOBAL_BATCH_SIZE=$(( {args.actor_num_gpus} / GRPO_CONTEXT_PARALLEL_SIZE ))
+  GLOBAL_BATCH_SIZE=$(( {args.actor_num_gpus} / CONTEXT_PARALLEL_SIZE ))
 fi
 for CHECKPOINT_DIR in {shlex.quote(str(args.load_dir))} {shlex.quote(str(ref_load_dir))}; do
   TRACKER="${{CHECKPOINT_DIR}}/latest_checkpointed_iteration.txt"
@@ -246,7 +253,6 @@ python3 train_async.py \\
   --actor-num-nodes 1 \\
   --actor-num-gpus-per-node {args.actor_num_gpus} \\
   --rollout-num-gpus {args.rollout_num_gpus} \\
-  --rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} \\
   --num-gpus-per-node {total_gpus} \\
   "${{MODEL_ARGS[@]}}" \\
   --hf-checkpoint {shlex.quote(str(args.hf_checkpoint))} \\
@@ -262,6 +268,7 @@ python3 train_async.py \\
   "${{GRPO_PARALLEL_ARGS[@]}}" \\
   "${{GRPO_RECOMPUTE_ARGS[@]}}" \\
   "${{GRPO_OPTIMIZER_ARGS[@]}}" \\
+  "${{GRPO_ROLLOUT_ARGS[@]}}" \\
   "${{GRPO_SGLANG_ARGS[@]}}" \\
   "${{GRPO_MISC_ARGS[@]}}" \\
   {wandb_args}

@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
 import time
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import swe_agent.run.search_swe_agent as search_module
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.utils.mask_utils import MultiTurnLossMaskGenerator
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
+import swe_agent.run.search_swe_agent as search_module
 
 from train_agent.collect_sft_rollout import build_training_messages
 from train_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
+from train_agent.serving.sglang_chat_service import warmup_slime_policy_route
 
 _TOKENIZER = None
 
@@ -136,36 +140,72 @@ def _rollout_tokenizer(args):
     return _TOKENIZER
 
 
-def _configure_slime_route(args) -> str:
-    routers = getattr(args, "sglang_model_routers", None) or {}
-    router_ip, router_port = routers.get("default", (getattr(args, "sglang_router_ip", None), getattr(args, "sglang_router_port", None)))
-    if not router_ip or not router_port:
-        raise RuntimeError("SGLang router address is unavailable for SWE-agent rollout.")
-    base_url = f"http://{router_ip}:{router_port}"
-    os.environ["SEARCH_SWE_SLIME_API_BASE"] = base_url
-    os.environ["SEARCH_SWE_SLIME_API_KEY"] = "EMPTY"
-    return base_url
-
-
 def build_grpo_prompt_rows(instance_ids: list[str], subset: str, split: str) -> list[dict[str, object]]:
     return [
         {
             "input": [{"role": "user", "content": instance_id}],
-            "metadata": {"instance_id": instance_id, "subset": subset, "split": split},
+            "metadata": {
+                "instance_id": instance_id,
+                "subset": subset,
+                "split": split,
+            },
         }
         for instance_id in instance_ids
     ]
+
+
+def _collect_grpo_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
+    try:
+        bundle = collect_grpo_bundle(
+            instance_id=task["instance_id"],
+            subset=task["subset"],
+            split=task["split"],
+            output_root=task["output_root"],
+            model_name=task["model_name"],
+            workers=task["workers"],
+            **task["search_values"],
+        )
+        return {"index": task["index"], "instance_id": task["instance_id"], "bundle": bundle, "error": ""}
+    except Exception as exc:
+        return {
+            "index": task["index"],
+            "instance_id": task["instance_id"],
+            "bundle": None,
+            "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+        }
+
+
+def _collect_grpo_bundle_tasks(tasks: list[dict[str, Any]], max_workers: int) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    context_name = os.environ.get("SWE_AGENT_GRPO_MP_CONTEXT", "fork")
+    context = multiprocessing.get_context(context_name)
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=context) as executor:
+        futures = {executor.submit(_collect_grpo_bundle_task, task): task for task in tasks}
+        for future in as_completed(futures):
+            task = futures[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                results.append(
+                    {
+                        "index": task["index"],
+                        "instance_id": task["instance_id"],
+                        "bundle": None,
+                        "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                    }
+                )
+    return sorted(results, key=lambda item: item["index"])
+
 
 def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = False):
     if evaluation:
         return RolloutFnEvalOutput(data={}, metrics={})
 
     started = time.perf_counter()
-    _configure_slime_route(args)
-    tokenizer = _rollout_tokenizer(args)
     target = os.environ.get("SWE_AGENT_GRPO_TARGET", "policy")
     output_root = Path(os.environ.get("SWE_AGENT_GRPO_OUTPUT_ROOT", "/workspace/rler/agent/outputs/search_outputs/train_async_grpo"))
     model_name = os.environ.get("SWE_AGENT_GRPO_MODEL_NAME") or "Qwen/Qwen3.5-9B"
+    tokenizer = _rollout_tokenizer(args)
     all_samples: list[Sample] = []
     group_index_offset = 0
     collected_instances: list[str] = []
@@ -183,21 +223,36 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         search_values[arg_name] = int(value) if value else None
 
     prompt_groups = data_buffer.get_samples(args.rollout_batch_size)
-    for prompt_group in prompt_groups:
-        instance_id = prompt_group[0].metadata["instance_id"]
-        try:
-            bundle = collect_grpo_bundle(
-                instance_id=instance_id,
-                subset=prompt_group[0].metadata["subset"],
-                split=prompt_group[0].metadata["split"],
-                output_root=output_root / f"rollout_{rollout_id:04d}" / f"attempt_{attempt_index:02d}",
-                model_name=model_name,
-                workers=int(os.environ["SWE_AGENT_GRPO_WORKERS"]),
-                **search_values,
+    if not prompt_groups:
+        raise RuntimeError("SWE-agent GRPO rollout received an empty prompt batch.")
+    tasks: list[dict[str, Any]] = []
+    for prompt_index, prompt_group in enumerate(prompt_groups):
+        if len(prompt_group) != 1:
+            raise RuntimeError(
+                f"SWE-agent rollout expects one slime sample per prompt group; got {len(prompt_group)}. "
+                "Keep --n-samples-per-prompt 1 because SWE search creates GRPO groups internally."
             )
-        except Exception as exc:
-            failed_instances.append(f"{instance_id}: {type(exc).__name__}: {exc}")
+        metadata = prompt_group[0].metadata
+        tasks.append(
+            {
+                "index": prompt_index,
+                "instance_id": metadata["instance_id"],
+                "subset": metadata["subset"],
+                "split": metadata["split"],
+                "output_root": output_root / f"rollout_{rollout_id:04d}",
+                "model_name": model_name,
+                "workers": int(os.environ["SWE_AGENT_GRPO_WORKERS"]),
+                "search_values": search_values,
+            }
+        )
+
+    max_instance_workers = max(1, int(os.environ["SWE_AGENT_GRPO_INSTANCE_WORKERS"]))
+    for result in _collect_grpo_bundle_tasks(tasks, min(max_instance_workers, len(tasks))):
+        instance_id = result["instance_id"]
+        if result["error"]:
+            failed_instances.append(f"{instance_id}: {result['error']}")
             continue
+        bundle = result["bundle"]
         groups = bundle.policy_groups if target == "policy" else bundle.rubric_groups
         samples = build_rollout_samples(
             groups=groups,

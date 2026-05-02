@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -10,12 +11,31 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_rl import register_model_service, unregister_model_service
+from agent_rl.model_service import run_async
+from agent_rl.run_utils import ModelRouteConfig, configure_model_route, run_chat_with_route_completion_async
 from swe_agent.run.run_swe_agent import choose_gpus
 from swe_agent.serving import SGLangChatService
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 AGENT_ROOT = REPO_ROOT / "agent"
+SWE_AGENT_POLICY_SYSTEM_PROMPT = """You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.
+Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).
+
+Include a THOUGHT section before your command where you explain your reasoning process.
+Format your response as shown in <format_example>.
+
+<format_example>
+THOUGHT: Your reasoning and analysis here
+
+```mswea_bash_command
+your_command_here
+```
+</format_example>
+
+Failure to follow these rules will cause your response to be rejected."""
+
 
 @dataclass
 class ManagedServer:
@@ -39,6 +59,81 @@ def extra_mount_args(paths: list[Path]) -> list[str]:
             continue
         mounts.extend(["-v", f"{resolved}:{resolved}:ro"])
     return mounts
+
+
+def wait_for_slime_generation_ready(base_url: str, timeout: int = 900) -> None:
+    deadline = time.time() + timeout
+    normalized = base_url.rstrip("/")
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{normalized}/health_generate", timeout=10) as response:
+                if response.status == 200:
+                    return
+        except (urllib.error.URLError, TimeoutError, OSError):
+            time.sleep(5)
+    raise RuntimeError(f"slime server did not pass /health_generate within {timeout}s")
+
+
+def warmup_slime_policy_route(
+    *,
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    requests: int = 1,
+    wait_for_health: bool = False,
+    health_timeout: int = 900,
+) -> list[float]:
+    if requests <= 0:
+        return []
+    if wait_for_health:
+        wait_for_slime_generation_ready(base_url, timeout=health_timeout)
+
+    normalized_base_url = base_url.rstrip("/")
+    target_urls = [normalized_base_url] * requests
+    try:
+        with urllib.request.urlopen(f"{normalized_base_url}/workers", timeout=5) as response:
+            worker_payload = json.loads(response.read().decode("utf-8"))
+        worker_urls = [
+            str(worker["url"]).rstrip("/")
+            for worker in worker_payload.get("workers", [])
+            if isinstance(worker, dict) and worker.get("url")
+        ]
+        if worker_urls:
+            target_urls = [worker_urls[index % len(worker_urls)] for index in range(requests)]
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        pass
+
+    service_name = "_swe_agent_policy_warmup_service"
+    route_name = "_swe_agent_policy_warmup"
+    elapsed_times: list[float] = []
+    try:
+        for target_url in target_urls:
+            register_model_service(
+                service_name,
+                SGLangChatService(base_url=target_url, api_key=api_key, default_model_name=model_name),
+            )
+            configure_model_route(route_name, ModelRouteConfig(backend="service", service_name=service_name, model_name=model_name))
+            started = time.perf_counter()
+            run_async(
+                run_chat_with_route_completion_async(
+                    route_name,
+                    model_name=model_name,
+                    messages=[
+                        {"role": "system", "content": SWE_AGENT_POLICY_SYSTEM_PROMPT},
+                        {"role": "user", "content": " "},
+                    ],
+                    temperature=0.5,
+                    top_p=0.9,
+                    max_tokens=64,
+                    stop=None,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+                    drop_params=True,
+                )
+            )
+            elapsed_times.append(time.perf_counter() - started)
+    finally:
+        unregister_model_service(service_name)
+    return elapsed_times
 
 
 def start_slime_server(args: argparse.Namespace, log_path: Path) -> ManagedServer | None:

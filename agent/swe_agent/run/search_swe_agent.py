@@ -16,6 +16,7 @@ from swe_agent.run.benchmarks.swebench import (
     build_swebench_config,
     get_swebench_docker_image_name,
     get_swebench_harness_namespace,
+    load_swebench_instances_by_id,
     load_swebench_instances,
 )
 from swe_agent.run.run_swe_agent import (
@@ -109,13 +110,12 @@ def run_search(
 ) -> None:
     student_model_name = getattr(args, "student_model", None)
     model_name = _resolve_model_name(args)
-    available_instances = load_swebench_instances(args.subset, args.split)
-    by_id = {instance["instance_id"]: instance for instance in available_instances}
-    selected_ids = list(instance_ids or by_id)
-    missing = [instance_id for instance_id in selected_ids if instance_id not in by_id]
-    if missing:
-        raise RuntimeError(f"Instances not found in {args.subset}/{args.split}: {', '.join(missing)}")
-    instances = [by_id[instance_id] for instance_id in selected_ids]
+    selected_ids = list(instance_ids or [])
+    instances = (
+        load_swebench_instances_by_id(args.subset, args.split, selected_ids)
+        if selected_ids
+        else load_swebench_instances(args.subset, args.split)
+    )
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     run_root = make_run_root(
         output_root=args.output_root,
@@ -321,9 +321,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p", type=int, default=1)
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--max-active-rubrics", type=int, default=6)
-    parser.add_argument("--policy-temperature", type=float, default=0.5)
+    parser.add_argument("--policy-temperature", type=float, default=1.0)
     parser.add_argument("--policy-top-p", type=float, default=0.9)
-    parser.add_argument("--rubric-temperature", type=float, default=0.5)
+    parser.add_argument("--rubric-temperature", type=float, default=1.0)
     parser.add_argument("--rubric-top-p", type=float, default=0.9)
     parser.add_argument("--rubric-max-tokens", type=int, default=4096)
     parser.add_argument("--judge-temperature", type=float, default=0.1)

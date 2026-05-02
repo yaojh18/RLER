@@ -70,7 +70,6 @@ class RouteTextbasedModel(LitellmTextbasedModel):
             )
         except FormatError as exc:
             assistant_message["extra"]["format_error"] = True
-            setattr(exc, "assistant_message", assistant_message)
             GLOBAL_MODEL_STATS.add(completion.cost)
             raise
         GLOBAL_MODEL_STATS.add(completion.cost)
