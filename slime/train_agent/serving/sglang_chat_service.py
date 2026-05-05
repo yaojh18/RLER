@@ -3,19 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_rl import register_model_service, unregister_model_service
-from agent_rl.model_service import run_async
-from agent_rl.run_utils import ModelRouteConfig, configure_model_route, run_chat_with_route_completion_async
-from swe_agent.run.run_swe_agent import choose_gpus
-from swe_agent.serving import SGLangChatService
+from swe_agent.run.run_swe_agent import choose_gpus, query_gpu_inventory
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -61,79 +59,126 @@ def extra_mount_args(paths: list[Path]) -> list[str]:
     return mounts
 
 
-def wait_for_slime_generation_ready(base_url: str, timeout: int = 900) -> None:
-    deadline = time.time() + timeout
-    normalized = base_url.rstrip("/")
-    while time.time() < deadline:
+def _auto_gpu_count(gpu_spec: str) -> int | None:
+    spec = gpu_spec.strip().lower()
+    if not spec.startswith("auto"):
+        return None
+    if ":" not in spec:
+        return 1
+    return int(spec.split(":", 1)[1])
+
+
+def _gpu_numa_affinity() -> dict[int, str]:
+    completed = subprocess.run(["nvidia-smi", "topo", "-m"], capture_output=True, text=True, check=True)
+    rows = [
+        [cell.strip() for cell in re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", line).split("\t")]
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    ]
+    if not rows:
+        return {}
+    header = rows[0]
+    try:
+        numa_index = header.index("NUMA Affinity")
+    except ValueError:
+        return {}
+    affinity: dict[int, str] = {}
+    for row in rows[1:]:
+        if not row or not row[0].startswith("GPU") or len(row) <= numa_index:
+            continue
         try:
-            with urllib.request.urlopen(f"{normalized}/health_generate", timeout=10) as response:
-                if response.status == 200:
-                    return
-        except (urllib.error.URLError, TimeoutError, OSError):
-            time.sleep(5)
-    raise RuntimeError(f"slime server did not pass /health_generate within {timeout}s")
+            gpu_index = int(row[0][3:])
+        except ValueError:
+            continue
+        numa = row[numa_index]
+        if numa and numa != "N/A":
+            affinity[gpu_index] = numa
+    return affinity
 
 
-def warmup_slime_policy_route(
-    *,
-    base_url: str,
-    api_key: str,
-    model_name: str,
-    requests: int = 1,
-    wait_for_health: bool = False,
-    health_timeout: int = 900,
-) -> list[float]:
+def choose_search_gpus(gpu_spec: str) -> list[int]:
+    selected_gpus = choose_gpus(gpu_spec)
+    count = _auto_gpu_count(gpu_spec)
+    if count is None or count <= 1:
+        return selected_gpus
+    try:
+        free_memory = {int(record["index"]): int(record["memory_free"]) for record in query_gpu_inventory()}
+        numa_affinity = _gpu_numa_affinity()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return selected_gpus
+    groups: dict[str, list[int]] = {}
+    for gpu_index, numa in numa_affinity.items():
+        if gpu_index in free_memory:
+            groups.setdefault(numa, []).append(gpu_index)
+    candidates: list[list[int]] = []
+    for group in groups.values():
+        if len(group) < count:
+            continue
+        ranked = sorted(group, key=lambda gpu_index: free_memory[gpu_index], reverse=True)
+        candidates.append(ranked[:count])
+    if not candidates:
+        return selected_gpus
+    best = max(candidates, key=lambda group: (min(free_memory[gpu] for gpu in group), sum(free_memory[gpu] for gpu in group)))
+    return sorted(best)
+
+
+def _post_warmup_chat_completion(target_url: str, api_key: str, model_name: str) -> None:
+    payload = json.dumps(
+        {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": SWE_AGENT_POLICY_SYSTEM_PROMPT},
+                {"role": "user", "content": " "},
+            ],
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "max_tokens": 64,
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+    ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(
+        f"{target_url.rstrip('/')}/v1/chat/completions",
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            response.read()
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return
+
+
+def start_slime_policy_route_warmup(*, base_url: str, api_key: str, model_name: str, requests: int = 1) -> None:
     if requests <= 0:
-        return []
-    if wait_for_health:
-        wait_for_slime_generation_ready(base_url, timeout=health_timeout)
+        return
 
-    normalized_base_url = base_url.rstrip("/")
-    target_urls = [normalized_base_url] * requests
-    try:
-        with urllib.request.urlopen(f"{normalized_base_url}/workers", timeout=5) as response:
-            worker_payload = json.loads(response.read().decode("utf-8"))
-        worker_urls = [
-            str(worker["url"]).rstrip("/")
-            for worker in worker_payload.get("workers", [])
-            if isinstance(worker, dict) and worker.get("url")
-        ]
-        if worker_urls:
-            target_urls = [worker_urls[index % len(worker_urls)] for index in range(requests)]
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
-        pass
+    def run_warmup() -> None:
+        target_urls = [base_url.rstrip("/")] * requests
+        try:
+            with urllib.request.urlopen(f"{base_url.rstrip('/')}/workers", timeout=5) as response:
+                worker_payload = json.loads(response.read().decode("utf-8"))
+            worker_urls = [
+                str(worker["url"]).rstrip("/")
+                for worker in worker_payload.get("workers", [])
+                if isinstance(worker, dict) and worker.get("url")
+            ]
+            if worker_urls:
+                target_urls = [worker_urls[index % len(worker_urls)] for index in range(requests)]
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            pass
 
-    service_name = "_swe_agent_policy_warmup_service"
-    route_name = "_swe_agent_policy_warmup"
-    elapsed_times: list[float] = []
-    try:
         for target_url in target_urls:
-            register_model_service(
-                service_name,
-                SGLangChatService(base_url=target_url, api_key=api_key, default_model_name=model_name),
-            )
-            configure_model_route(route_name, ModelRouteConfig(backend="service", service_name=service_name, model_name=model_name))
-            started = time.perf_counter()
-            run_async(
-                run_chat_with_route_completion_async(
-                    route_name,
-                    model_name=model_name,
-                    messages=[
-                        {"role": "system", "content": SWE_AGENT_POLICY_SYSTEM_PROMPT},
-                        {"role": "user", "content": " "},
-                    ],
-                    temperature=0.5,
-                    top_p=0.9,
-                    max_tokens=64,
-                    stop=None,
-                    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
-                    drop_params=True,
-                )
-            )
-            elapsed_times.append(time.perf_counter() - started)
-    finally:
-        unregister_model_service(service_name)
-    return elapsed_times
+            threading.Thread(
+                target=_post_warmup_chat_completion,
+                kwargs={"target_url": target_url, "api_key": api_key, "model_name": model_name},
+                daemon=True,
+            ).start()
+
+    threading.Thread(target=run_warmup, daemon=True).start()
 
 
 def start_slime_server(args: argparse.Namespace, log_path: Path) -> ManagedServer | None:
@@ -143,7 +188,7 @@ def start_slime_server(args: argparse.Namespace, log_path: Path) -> ManagedServe
         return None
 
     name = f"slime-search-{int(time.time())}-{os.getpid()}"
-    selected_gpus = choose_gpus(args.search_gpus)
+    selected_gpus = choose_search_gpus(args.search_gpus)
     docker_cmd = [
         "docker", "run", "--rm", "--name", name, "--runtime", "nvidia", "--net=host", "--shm-size=64g",
         "-e", f"NVIDIA_VISIBLE_DEVICES={','.join(str(gpu) for gpu in selected_gpus)}",

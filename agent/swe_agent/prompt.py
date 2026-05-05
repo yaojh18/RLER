@@ -42,15 +42,9 @@ Never create positive/negative versions of same criterion:
 - Response penalized if it exhibits ANY negative rubric behavior
 - Focus on active mistakes vs missing features
 
-### 5. Prefer the strongest available evidence form
-Choose the rubric form that can be judged most concretely at the current agent stage:
-- When the agent is still gathering evidence, prefer action-based rubrics. Evaluate whether the agent actually did the exact key work, such as reproducing the exact issue, inspecting the right files, grounding claims in problem statement. These rubrics should be checkable from concrete actions in the trajectory.
-- When a continuation has proposed or made a fix, prefer test-based rubrics. Define targeted test cases or executable checks, then judge whether the current patch would pass or fail them without execution. Favor rubrics that make concrete pass/fail predictions over general judgments about patch quality.
-- Always prefer the most falsifiable rubric available. Strong rubrics point to specific files, commands, edits, tests, expected outputs, or pass/fail predictions. Avoid vague rubrics based mainly on impressions such as "thoughtful", "careful", or "correct".
-
 ## Selection Strategy
 
-### Quantity: 0-1 rubric total per turn, and 2-6 total rubrics in total (fewer high-quality > many generic)
+### Quantity: 0-1 rubric total per turn, and 1-5 total rubrics in total (fewer high-quality > many generic)
 - Generate exactly one rubric only if it adds meaningful new discriminative value
 - Otherwise return an empty object: {}
 

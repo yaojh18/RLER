@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import random
 import re
 import subprocess
@@ -34,18 +35,21 @@ from swe_agent.parallel_utils import (
     gap_redundancy
 )
 from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches
+from swe_agent.models.litellm_model import LitellmModel
+from swe_agent.models.utils.retry import retry
 from swe_agent.prompt import *
 
 
+logger = logging.getLogger(__name__)
 RETURN_CODE_RE = re.compile(r"<returncode>(.*?)</returncode>", re.DOTALL)
 EXCEPTION_RE = re.compile(r"<exception>(.*?)</exception>", re.DOTALL)
 OUTPUT_RE = re.compile(r"<output>\s*(.*?)</output>", re.DOTALL)
 PR_DESCRIPTION_RE = re.compile(r"<pr_description>\s*(.*?)\s*</pr_description>", re.DOTALL)
 OBSERVATION_TRUNCATION_MARKER = "\n[... Observation truncated due to length ...]\n"
-MAX_OBSERVATION_CHARS = 1024
-MIN_OBSERVATION_SECTION_CHARS = 256
-EVALUATOR_MAX_RETRIES = 4
-RUBRIC_LIST_FORMAT_MAX_RETRIES = 4
+MAX_OBSERVATION_CHARS = 512
+MIN_OBSERVATION_SECTION_CHARS = 128
+MAX_RUBRICS = 6
+MAX_RUBRIC_GENERATION_ROUNDS = 10
 JUDGE_ERROR_REWARD = -0.2
 
 
@@ -94,6 +98,7 @@ class RubricGenerationSample:
     generated: list[RubricRecord]
     messages: list[dict[str, Any]]
     format_errors: list[dict[str, Any]] | None = None
+    terminal_error: str | None = None
 
 
 @dataclass
@@ -356,25 +361,35 @@ async def _update_persistent_state(
             f"## Workspace Metadata:\n{json.dumps(workspace_meta, indent=2, ensure_ascii=False)}",
         ]
     )
-    for _ in range(EVALUATOR_MAX_RETRIES):
-        response = await run_chat_with_route_async(
-            "rubric_judge",
+    try:
+        async for attempt in retry(
+            logger=logger,
+            abort_exceptions=LitellmModel.abort_exceptions,
             model_name=model_name,
-            user_prompt=prompt,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            response_format=copy.deepcopy(PERSISTENT_STATE_RESPONSE_FORMAT),
-            enable_json_schema_validation=True,
-            **(model_kwargs or {}),
-        )
-        parsed = extract_json_from_response(response)
-        if isinstance(parsed, dict):
-            state = copy.deepcopy(previous_state)
-            for key in state:
-                if isinstance(parsed.get(key), str):
-                    state[key] = parsed[key]
-            return state
+            async_retry=True,
+        ):
+            with attempt:
+                response = await run_chat_with_route_async(
+                    "rubric_judge",
+                    model_name=model_name,
+                    user_prompt=prompt,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    response_format=copy.deepcopy(PERSISTENT_STATE_RESPONSE_FORMAT),
+                    enable_json_schema_validation=True,
+                    **(model_kwargs or {}),
+                )
+                parsed = extract_json_from_response(response)
+                if not isinstance(parsed, dict):
+                    raise ValueError("InvalidPersistentStateResponse")
+                state = copy.deepcopy(previous_state)
+                for key in state:
+                    if isinstance(parsed.get(key), str):
+                        state[key] = parsed[key]
+                return state
+    except Exception as exc:
+        logger.warning("Persistent state update failed for model %s: %s: %s", model_name, type(exc).__name__, exc)
     return copy.deepcopy(previous_state)
 
 
@@ -537,15 +552,24 @@ async def _generate_round_rubrics(
     task_text = "\n\n".join(part for part in [question.get("system_prompt", ""), question.get("user_prompt", "")] if part)
     generated: list[RubricRecord] = []
     format_errors: list[dict[str, Any]] = []
-    remaining_budget = 6
-    for idx in range(remaining_budget):
+    length_error = None
+    turn_index = 1
+    while True:
+        if turn_index > MAX_RUBRIC_GENERATION_ROUNDS:
+            length_error = f"Reached rubric generation max rounds={MAX_RUBRIC_GENERATION_ROUNDS}."
+            break
         parsed_candidate: dict[str, Any] | None = None
         parsed: dict[str, Any] | None = None
         assistant_content = ""
         assistant_content_no_thinking = ""
         last_error = ""
-        for _ in range(EVALUATOR_MAX_RETRIES):
-            try:
+        async for attempt in retry(
+            logger=logger,
+            abort_exceptions=LitellmModel.abort_exceptions,
+            model_name=model_name,
+            async_retry=True,
+        ):
+            with attempt:
                 completion = await run_chat_with_route_completion_async(
                     "rubric_generation",
                     model_name=model_name,
@@ -557,17 +581,8 @@ async def _generate_round_rubrics(
                     enable_json_schema_validation=True,
                     **(model_kwargs or {}),
                 )
-                assistant_content = completion.content or ""
-                assistant_content_no_thinking = completion.metadata.get("content_no_thinking", assistant_content)
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                continue
-            parsed_candidate = extract_json_from_response(assistant_content or "")
-            if parsed_candidate == {}:
-                break
-            if isinstance(parsed_candidate, dict):
-                parsed = _convert_generated_rubric(task_text, parsed_candidate, round_index)
-                break
+        assistant_content = completion.content or ""
+        assistant_content_no_thinking = completion.metadata.get("content_no_thinking", assistant_content)
         conversation_messages.append(
             {
                 "role": "assistant",
@@ -575,20 +590,33 @@ async def _generate_round_rubrics(
                 "content_no_thinking": assistant_content_no_thinking,
             }
         )
+        parsed_candidate = extract_json_from_response(assistant_content or "")
         if parsed_candidate == {}:
             break
+        elif parsed_candidate is None:
+            last_error = "Expected a JSON object or {}, but no JSON object could be parsed."
+        else:
+            parsed = _convert_generated_rubric(task_text, parsed_candidate, round_index)
+            if parsed is None:
+                last_error = "Expected a rubric object with polarity, title, description, and a 1-5 scale."
         if parsed is None:
-            format_errors.append({"turn_index": len(generated) + 1, "error": last_error})
-            break
+            format_errors.append({"turn_index": turn_index, "error": last_error})
+            conversation_messages.append({"role": "user", "content": last_error + f" {RUBRIC_GENERATION_CONTINUE_PROMPT}"})
+            turn_index += 1
+            continue
         generated.append(parsed)
-        if idx < remaining_budget - 1:
-            conversation_messages.append({"role": "user", "content": RUBRIC_GENERATION_CONTINUE_PROMPT})
+        if len(generated) >= MAX_RUBRICS:
+            length_error = f"Reached max rubrics={MAX_RUBRICS}."
+            break
+        conversation_messages.append({"role": "user", "content": RUBRIC_GENERATION_CONTINUE_PROMPT})
+        turn_index += 1
     return RubricGenerationSample(
         sample_index=sample_index,
         rubric_list_id=f"rubric-r{round_index:03d}-s{sample_index:02d}",
         generated=generated,
         messages=copy.deepcopy(conversation_messages),
         format_errors=format_errors,
+        terminal_error=length_error,
     )
 
 
@@ -636,35 +664,39 @@ async def _score_round(
                 response_text: str = response_text,
                 criterion: str = criterion,
             ) -> tuple[str, int, str | None]:
-                last_error = None
-                for _ in range(EVALUATOR_MAX_RETRIES):
-                    try:
-                        response = await run_chat_with_route_async(
-                            "rubric_judge",
-                            model_name=model_name,
-                            user_prompt=
-                                SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT.strip() + (
-                                f"\n\n## Question:\n{question_text}\n"
-                                f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
-                                f"## Previous Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
-                                f"## Continuation Trajectory:\n{response_text}\n"
-                                f"## Criterion:\n{criterion}"
-                            ),
-                            temperature=temperature,
-                            top_p=top_p,
-                            max_tokens=max_tokens,
-                            response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
-                            enable_json_schema_validation=True,
-                            **(model_kwargs or {}),
-                        )
-                    except Exception as exc:
-                        last_error = f"{type(exc).__name__}: {exc}"
-                        continue
-                    score_raw = _parse_judge_score(response)
-                    if score_raw is not None:
-                        return response, score_raw, None
-                    last_error = "InvalidJudgeResponse"
-                return json.dumps({"score": 1}, ensure_ascii=False), 1, last_error
+                try:
+                    async for attempt in retry(
+                        logger=logger,
+                        abort_exceptions=LitellmModel.abort_exceptions,
+                        model_name=model_name,
+                        async_retry=True,
+                    ):
+                        with attempt:
+                            response = await run_chat_with_route_async(
+                                "rubric_judge",
+                                model_name=model_name,
+                                user_prompt=
+                                    SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT.strip() + (
+                                    f"\n\n## Question:\n{question_text}\n"
+                                    f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
+                                    f"## Previous Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
+                                    f"## Continuation Trajectory:\n{response_text}\n"
+                                    f"## Criterion:\n{criterion}"
+                                ),
+                                temperature=temperature,
+                                top_p=top_p,
+                                max_tokens=max_tokens,
+                                response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
+                                enable_json_schema_validation=True,
+                                **(model_kwargs or {}),
+                            )
+                            score_raw = _parse_judge_score(response)
+                            if score_raw is None:
+                                raise ValueError("InvalidJudgeResponse")
+                            return response, score_raw, None
+                except Exception as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    return json.dumps({"score": 1}, ensure_ascii=False), 1, last_error
             calls.append(_judge_single())
             mapping.append((view_index, node_id, rubric))
     responses = await asyncio.gather(*calls)
@@ -733,34 +765,38 @@ async def _score_parent_round(
             *,
             criterion: str = criterion,
         ) -> tuple[str, int, str | None]:
-            last_error = None
-            for _ in range(EVALUATOR_MAX_RETRIES):
-                try:
-                    response = await run_chat_with_route_async(
-                        "rubric_judge",
-                        model_name=model_name,
-                        user_prompt=
-                            SWE_TRAJECTORY_RUBRIC_JUDGE_PARENT_PROMPT.strip() + (
-                            f"\n\n## Question:\n{question_text}\n"
-                            f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
-                            f"## Agent Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
-                            f"## Criterion:\n{criterion}"
-                        ),
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                        response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
-                        enable_json_schema_validation=True,
-                        **(model_kwargs or {}),
-                    )
-                except Exception as exc:
-                    last_error = f"{type(exc).__name__}: {exc}"
-                    continue
-                score_raw = _parse_judge_score(response)
-                if score_raw is not None:
-                    return response, score_raw, None
-                last_error = "InvalidJudgeResponse"
-            return json.dumps({"score": 1}, ensure_ascii=False), 1, last_error
+            try:
+                async for attempt in retry(
+                    logger=logger,
+                    abort_exceptions=LitellmModel.abort_exceptions,
+                    model_name=model_name,
+                    async_retry=True,
+                ):
+                    with attempt:
+                        response = await run_chat_with_route_async(
+                            "rubric_judge",
+                            model_name=model_name,
+                            user_prompt=
+                                SWE_TRAJECTORY_RUBRIC_JUDGE_PARENT_PROMPT.strip() + (
+                                f"\n\n## Question:\n{question_text}\n"
+                                f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
+                                f"## Agent Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
+                                f"## Criterion:\n{criterion}"
+                            ),
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_tokens=max_tokens,
+                            response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
+                            enable_json_schema_validation=True,
+                            **(model_kwargs or {}),
+                        )
+                        score_raw = _parse_judge_score(response)
+                        if score_raw is None:
+                            raise ValueError("InvalidJudgeResponse")
+                        return response, score_raw, None
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                return json.dumps({"score": 1}, ensure_ascii=False), 1, last_error
         calls.append(_judge_single())
         mapping.append(rubric)
     responses = await asyncio.gather(*calls)
@@ -1254,32 +1290,17 @@ class TrajectorySearchRunner:
             "round_index": round_index,
             "model_kwargs": self.rubric_model_kwargs,
         }
-        if self.search_config.n == 1:
-            generated_sample = await _generate_round_rubrics(
-                **rubric_generation_kwargs,
-                sample_index=0,
-            )
-            for _ in range(RUBRIC_LIST_FORMAT_MAX_RETRIES):
-                if not generated_sample.format_errors:
-                    break
-                generated_sample = await _generate_round_rubrics(
+        generated_samples = await asyncio.gather(
+            *[
+                _generate_round_rubrics(
                     **rubric_generation_kwargs,
-                    sample_index=0,
+                    sample_index=sample_index,
                 )
-            generated_samples = [generated_sample]
-        else:
-            generated_samples = await asyncio.gather(
-                *[
-                    _generate_round_rubrics(
-                        **rubric_generation_kwargs,
-                        sample_index=sample_index,
-                    )
-                    for sample_index in range(self.search_config.n)
-                ],
-            )
+                for sample_index in range(self.search_config.n)
+            ],
+        )
         rubric_samples: list[dict[str, Any]] = []
         valid_rubric_samples: list[dict[str, Any]] = []
-        rubric_generation_errors: list[dict[str, Any]] = []
         active_continuation_scores, active_continuation_errors = await _score_round(
             question=question,
             shared_context=shared_context,
@@ -1307,26 +1328,6 @@ class TrajectorySearchRunner:
             )
         active_ids = {rubric.rubric_id for rubric in self.active_bank}
         for generated_sample in generated_samples:
-            format_errors = copy.deepcopy(generated_sample.format_errors or [])
-            if format_errors:
-                error_payload = {
-                    "rubric_list_id": generated_sample.rubric_list_id,
-                    "error": "Invalid rubric generation response",
-                    "format_errors": format_errors,
-                }
-                rubric_generation_errors.append(error_payload)
-                rubric_samples.append(
-                    {
-                        "sample_index": generated_sample.sample_index,
-                        "rubric_list_id": generated_sample.rubric_list_id,
-                        "generated": generated_sample.generated,
-                        "messages": generated_sample.messages,
-                        "format_errors": format_errors,
-                        "is_valid": False,
-                        "selected": False,
-                    }
-                )
-                continue
             generated_rubrics: list[RubricRecord] = []
             seen_rubric_ids: set[str] = set()
             for rubric in generated_sample.generated:
@@ -1437,6 +1438,7 @@ class TrajectorySearchRunner:
                 "generated": generated_sample.generated,
                 "messages": generated_sample.messages,
                 "format_errors": copy.deepcopy(generated_sample.format_errors or []),
+                "terminal_error": generated_sample.terminal_error,
                 "generated_titles": [rubric.title for rubric in generated_sample.generated],
                 "active_before": copy.deepcopy(self.active_bank),
                 "active_after": active_after,
@@ -1476,7 +1478,6 @@ class TrajectorySearchRunner:
                     if rubric_id in generated_ids
                 },
                 "judge_errors": judge_errors_payload,
-                "is_valid": True,
                 "selected": False,
             }
             rubric_samples.append(sample_payload)
@@ -1485,7 +1486,6 @@ class TrajectorySearchRunner:
         if len(valid_rubric_samples) < min(2, self.search_config.n):
             return {
                 "rubric_samples": rubric_samples,
-                "rubric_generation_errors": rubric_generation_errors,
                 "stop_search": True,
             }
 
@@ -1502,7 +1502,6 @@ class TrajectorySearchRunner:
             "parent_reward": parent_reward,
             "selected_sample_index": selected_sample["sample_index"],
             "selected_sample": selected_sample,
-            "rubric_generation_errors": rubric_generation_errors,
             "stop_search": False,
         }
 
@@ -1668,38 +1667,29 @@ class TrajectorySearchRunner:
         rubric_artifact_bundles: list[RubricArtifactBundle] = []
         for sample in judged["rubric_samples"]:
             rubric_dir = self.rubrics_dir / sample["rubric_list_id"]
-            if sample.get("is_valid") is False:
-                rubric_payload = {
-                    "rubric_list_id": sample["rubric_list_id"],
-                    "parent_node_id": parent_id,
-                    "generated": [asdict(rubric) for rubric in sample["generated"]],
-                    "format_errors": copy.deepcopy(sample["format_errors"]),
-                    "is_valid": False,
-                    "selected": bool(sample["selected"]),
-                }
-            else:
-                rubric_payload = {
-                    "rubric_list_id": sample["rubric_list_id"],
-                    "parent_node_id": parent_id,
-                    "generated": [asdict(rubric) for rubric in sample["generated"]],
-                    "active_bank_before": [asdict(rubric) for rubric in sample["active_before"]],
-                    "active_bank_after": [asdict(rubric) for rubric in sample["active_after"]],
-                    "inactive_bank_after": [asdict(rubric) for rubric in sample["inactive_after"]],
-                    "variance_by_rubric": copy.deepcopy(sample["variance_by_rubric"]),
-                    "redundency_by_rubric": copy.deepcopy(sample["redundency_by_rubric"]),
-                    "judge_error_by_rubric": copy.deepcopy(sample["judge_error_by_rubric"]),
-                    "reward_by_rubric": copy.deepcopy(sample["reward_by_rubric"]),
-                    "child_score_by_rubric": copy.deepcopy(sample["child_score_by_rubric"]),
-                    "parent_score_by_rubric": copy.deepcopy(sample["parent_score_by_rubric"]),
-                    "child_rewards": copy.deepcopy(sample["child_rewards"]),
-                    "parent_reward": sample["parent_reward"],
-                    "generated_titles": list(sample["generated_titles"]),
-                    "is_valid": True,
-                    "selected": bool(sample["selected"]),
-                    "gt_by_rubric": {},
-                    "gt_reward_siblings": 0.0,
-                    "gt_reward_parent": 0.0,
-                }
+            rubric_payload = {
+                "rubric_list_id": sample["rubric_list_id"],
+                "parent_node_id": parent_id,
+                "generated": [asdict(rubric) for rubric in sample["generated"]],
+                "active_bank_before": [asdict(rubric) for rubric in sample["active_before"]],
+                "active_bank_after": [asdict(rubric) for rubric in sample["active_after"]],
+                "inactive_bank_after": [asdict(rubric) for rubric in sample["inactive_after"]],
+                "format_errors": copy.deepcopy(sample.get("format_errors", [])),
+                "terminal_error": sample.get("terminal_error"),
+                "variance_by_rubric": copy.deepcopy(sample["variance_by_rubric"]),
+                "redundency_by_rubric": copy.deepcopy(sample["redundency_by_rubric"]),
+                "judge_error_by_rubric": copy.deepcopy(sample["judge_error_by_rubric"]),
+                "reward_by_rubric": copy.deepcopy(sample["reward_by_rubric"]),
+                "child_score_by_rubric": copy.deepcopy(sample["child_score_by_rubric"]),
+                "parent_score_by_rubric": copy.deepcopy(sample["parent_score_by_rubric"]),
+                "child_rewards": copy.deepcopy(sample["child_rewards"]),
+                "parent_reward": sample["parent_reward"],
+                "generated_titles": list(sample["generated_titles"]),
+                "selected": bool(sample["selected"]),
+                "gt_by_rubric": {},
+                "gt_reward_siblings": 0.0,
+                "gt_reward_parent": 0.0,
+            }
             rubric_sample_payloads.append(rubric_payload)
             rubric_artifact_bundles.append(
                 RubricArtifactBundle(
@@ -1717,6 +1707,8 @@ class TrajectorySearchRunner:
             "selected_rubric_list_id": selected_sample["rubric_list_id"],
             "regressed": regressed,
             "generated": [asdict(rubric) for rubric in selected_sample["generated"]],
+            "format_errors": copy.deepcopy(selected_sample.get("format_errors", [])),
+            "terminal_error": selected_sample.get("terminal_error"),
             "active_bank_before": [asdict(rubric) for rubric in selected_sample["active_before"]],
             "active_bank_after": [asdict(rubric) for rubric in selected_sample["active_after"]],
             "inactive_bank_after": [asdict(rubric) for rubric in selected_sample["inactive_after"]],
@@ -1735,7 +1727,6 @@ class TrajectorySearchRunner:
             "node_scores": node_round_records,
             "judge_errors": copy.deepcopy(selected_sample["judge_errors"]),
             "policy_generation_errors": policy_generation_errors,
-            "rubric_generation_errors": judged["rubric_generation_errors"],
             "rubric_samples": rubric_sample_payloads,
         }
         self.active_bank = copy.deepcopy(selected_sample["active_after"])
@@ -1801,6 +1792,8 @@ class TrajectorySearchRunner:
                     "selected_sample_index": judged["selected_sample_index"],
                     "rubric_list_id": selected_sample["rubric_list_id"],
                     "generated": [asdict(rubric) for rubric in selected_sample["generated"]],
+                    "format_errors": copy.deepcopy(selected_sample.get("format_errors", [])),
+                    "terminal_error": selected_sample.get("terminal_error"),
                     "active_bank_before": [asdict(rubric) for rubric in selected_sample["active_before"]],
                     "active_bank_after": [asdict(rubric) for rubric in selected_sample["active_after"]],
                     "inactive_bank_after": [asdict(rubric) for rubric in selected_sample["inactive_after"]],
@@ -1897,12 +1890,9 @@ class TrajectorySearchRunner:
             for node_id in candidate_frontier_ids
             if node_id in self.nodes and self.nodes[node_id].status in {"frontier", "finished"}
         ]
-        non_gt_extra_json_writes: list[tuple[Path, Any]] = []
         gt_extra_json_writes: list[tuple[Path, Any]] = [(round_rubric_path, round_payload)]
-        for node_id in previous_frontier:
-            if node_id in self.nodes and self.nodes[node_id].status == "frontier" and node_id not in self.frontier_ids:
-                self.nodes[node_id].status = "archived"
-                non_gt_extra_json_writes.append((self.nodes_dir / node_id / "node.json", asdict(self.nodes[node_id])))
+        self.nodes[parent_id].status = "archived"
+        non_gt_extra_json_writes = [(self.nodes_dir / parent_id/ "node.json", asdict(self.nodes[parent_id]))]
         for branch in valid_branch_records:
             self._dispose_session(branch["session"])
 
@@ -2014,10 +2004,28 @@ class TrajectorySearchRunner:
             self.frontier_ids = [final_node_id]
         self._save_manifest()
 
-    def peaceful_exit(self, branch_records, parent_id: int) -> None:
+    def peaceful_exit(self, branch_records, parent_id: str) -> None:
+        error_records = [
+            {"node_id": branch.get("node_id"), "error": branch.get("error")}
+            for branch in branch_records
+            if branch.get("error")
+        ]
+        logger.warning(
+            "Peaceful exit for parent %s with %d branches (%d valid). Errors: %s",
+            parent_id,
+            len(branch_records),
+            sum(1 for branch in branch_records if branch.get("is_valid")),
+            error_records,
+        )
         for branch in branch_records:
             if branch.get("session") is not None:
                 self._dispose_session(branch["session"])
                 branch["session"] = None
-        self.best_node_id = parent_id
-        self.frontier_ids = []
+        self.nodes[parent_id].status = "archived"
+        non_gt_extra_json_writes = [(self.nodes_dir / parent_id / "node.json", asdict(self.nodes[parent_id]))]
+        self.artifact_writer.submit_round(
+            extra_json_writes=non_gt_extra_json_writes,
+            write_gt_files=False,
+        )
+        self.frontier_ids = [node_id for node_id in self.frontier_ids if node_id != parent_id]
+        self.best_node_id = self.frontier_ids[0] if self.frontier_ids else parent_id

@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from datasets import load_dataset
 
 import docker
 import typer
@@ -217,6 +218,8 @@ def _build_rebench_instance_image(instance: dict) -> None:
 def _build_rebench_base_image(base_image_name: str) -> None:
     if _local_image_exists(base_image_name):
         return
+    if _registry_image_exists(base_image_name):
+        return
     dockerfile = _resolve_rebench_base_dockerfile(base_image_name)
     subprocess.run(
         [
@@ -236,8 +239,13 @@ def _build_rebench_base_image(base_image_name: str) -> None:
 
 def _resolve_rebench_base_dockerfile(base_image_name: str) -> Path:
     dockerfiles_dir = REBENCH_VENDOR_ROOT / "base_dockerfiles"
-    image_stub = base_image_name.rsplit("/", 1)[-1].split(":", 1)[0]
+    image_name_with_tag = base_image_name.rsplit("/", 1)[-1]
+    image_stub, _, image_tag = image_name_with_tag.partition(":")
     candidates = [f"Dockerfile_{image_stub}"]
+    if image_tag:
+        candidates.append(f"Dockerfile_{image_stub}_{image_tag}")
+    if image_stub.endswith("_base"):
+        candidates.append(f"Dockerfile_{image_stub.removesuffix('_base')}")
     if image_stub.startswith("python_base_"):
         suffix = image_stub.removeprefix("python_base_")
         if suffix.isdigit() and len(suffix) in {2, 3}:
@@ -403,29 +411,22 @@ def filter_instances(
 
 
 def load_swebench_instances(subset: str, split: str) -> list[dict]:
-    from datasets import load_dataset
-
     dataset_path = DATASET_MAPPING.get(subset, subset)
     logger.info(f"Loading dataset {dataset_path}, split {split}...")
     return list(load_dataset(dataset_path, split=split))
 
 
 def load_swebench_instances_by_id(subset: str, split: str, instance_ids: list[str]) -> list[dict]:
-    from datasets import load_dataset
-
     dataset_path = DATASET_MAPPING.get(subset, subset)
     logger.info(f"Loading {len(instance_ids)} instance(s) from {dataset_path}, split {split}...")
     wanted = set(instance_ids)
-    found: dict[str, dict] = {}
-    for instance in load_dataset(dataset_path, split=split):
-        instance_id = instance["instance_id"]
-        if instance_id in wanted:
-            found[instance_id] = dict(instance)
-            if len(found) == len(wanted):
-                break
-    missing = [instance_id for instance_id in instance_ids if instance_id not in found]
-    if missing:
-        raise RuntimeError(f"Instances not found in {subset}/{split}: {', '.join(missing)}")
+    dataset = load_dataset("nebius/SWE-rebench-V2", split=split)
+    ids = dataset["instance_id"]
+    indices = [i for i, instance_id in enumerate(ids) if instance_id in wanted]
+    subset = dataset.select(indices)
+    found = {x["instance_id"]: dict(x) for x in subset}
+    if len(found) != len(instance_ids):
+        raise RuntimeError(f"Instances not found in {subset}/{split}: {', '.join(instance_ids - found.keys())}")
     return [found[instance_id] for instance_id in instance_ids]
 
 

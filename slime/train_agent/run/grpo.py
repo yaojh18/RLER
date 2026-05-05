@@ -153,10 +153,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save-dir", type=Path, required=True)
     parser.add_argument("--ref-load-dir", type=Path)
     parser.add_argument("--config-path", type=Path, default=Path("/workspace/rler/slime/train_agent/configs/grpo.sh"))
+    parser.add_argument("--rollout-function-path", default="train_agent.collect_grpo_rollout.generate_rollout")
+    parser.add_argument("--num-rollout", type=int)
     parser.add_argument("--rollout-batch-size", type=int, default=2)
     parser.add_argument("--global-batch-size", type=int)
     parser.add_argument("--actor-num-gpus", type=int, default=2)
     parser.add_argument("--rollout-num-gpus", type=int, default=2)
+    parser.add_argument("--context-parallel-size", type=int)
+    parser.add_argument("--max-tokens-per-gpu", type=int)
+    parser.add_argument("--log-probs-chunk-size", type=int)
     parser.add_argument("--rollout-instance-workers", type=int, default=2)
     parser.add_argument("--ray-num-cpus", type=int, default=32)
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
@@ -179,7 +184,16 @@ def main(argv: list[str] | None = None) -> int:
     total_gpus = args.actor_num_gpus + args.rollout_num_gpus
     ref_load_dir = args.ref_load_dir or args.load_dir
     wandb_dir = args.wandb_dir or (args.save_dir / "wandb")
-    global_batch_size = shlex.quote(str(args.global_batch_size)) if args.global_batch_size is not None else "''"
+    global_batch_size = shlex.quote(str(args.global_batch_size or args.rollout_batch_size))
+    num_rollout_args = shlex.join(["--num-rollout", str(args.num_rollout)]) if args.num_rollout is not None else ""
+    override_lines = []
+    if args.context_parallel_size is not None:
+        override_lines.append(f"GRPO_PARALLEL_ARGS+=(--context-parallel-size {args.context_parallel_size})")
+    if args.max_tokens_per_gpu is not None:
+        override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
+    if args.log_probs_chunk_size is not None:
+        override_lines.append(f"GRPO_COMMON_ARGS+=(--log-probs-chunk-size {args.log_probs_chunk_size})")
+    config_overrides = "\n".join(override_lines)
     wandb_args = ""
     if args.wandb_mode != "disabled":
         pieces = [
@@ -217,26 +231,13 @@ ray stop --force >/dev/null 2>&1 || true
 cd /workspace/rler/slime
 source /workspace/rler/slime/train_agent/configs/qwen3.5-9B.sh
 source {shlex.quote(str(args.config_path))}
+{config_overrides}
 if [ {shlex.quote(args.target)} = "rubric" ]; then
   GRPO_TARGET_ARGS=("${{GRPO_RUBRIC_ARGS[@]}}")
 else
   GRPO_TARGET_ARGS=("${{GRPO_POLICY_ARGS[@]}}")
 fi
 GLOBAL_BATCH_SIZE={global_batch_size}
-CONTEXT_PARALLEL_SIZE=""
-for ((ARG_INDEX=0; ARG_INDEX<${{#GRPO_PARALLEL_ARGS[@]}}; ARG_INDEX++)); do
-  if [ "${{GRPO_PARALLEL_ARGS[$ARG_INDEX]}}" = "--context-parallel-size" ]; then
-    CONTEXT_PARALLEL_SIZE="${{GRPO_PARALLEL_ARGS[$((ARG_INDEX + 1))]:-}}"
-  fi
-done
-: "${{CONTEXT_PARALLEL_SIZE:?GRPO_PARALLEL_ARGS must include --context-parallel-size <value>}}"
-if [ -z "${{GLOBAL_BATCH_SIZE}}" ]; then
-  if [ $(( {args.actor_num_gpus} % CONTEXT_PARALLEL_SIZE )) -ne 0 ]; then
-    echo "actor-num-gpus {args.actor_num_gpus} must be divisible by --context-parallel-size ${{CONTEXT_PARALLEL_SIZE}}" >&2
-    exit 1
-  fi
-  GLOBAL_BATCH_SIZE=$(( {args.actor_num_gpus} / CONTEXT_PARALLEL_SIZE ))
-fi
 for CHECKPOINT_DIR in {shlex.quote(str(args.load_dir))} {shlex.quote(str(ref_load_dir))}; do
   TRACKER="${{CHECKPOINT_DIR}}/latest_checkpointed_iteration.txt"
   if [ -f "${{TRACKER}}" ] && [ "$(tr -d '[:space:]' < "${{TRACKER}}")" = "0" ] && [ -d "${{CHECKPOINT_DIR}}/iter_0000000" ]; then
@@ -264,6 +265,8 @@ python3 train_async.py \\
   --global-batch-size "${{GLOBAL_BATCH_SIZE}}" \\
   --sglang-served-model-name {shlex.quote(args.student_model)} \\
   "${{GRPO_COMMON_ARGS[@]}}" \\
+  --rollout-function-path {shlex.quote(args.rollout_function_path)} \\
+  {num_rollout_args} \\
   "${{GRPO_TARGET_ARGS[@]}}" \\
   "${{GRPO_PARALLEL_ARGS[@]}}" \\
   "${{GRPO_RECOMPUTE_ARGS[@]}}" \\

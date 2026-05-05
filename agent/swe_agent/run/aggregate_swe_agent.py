@@ -9,7 +9,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import time
 import uuid
 from dataclasses import asdict
@@ -61,7 +60,7 @@ from swe_agent.run.run_swe_agent import (
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
 from swe_agent.trajectory_search import (
     EMPTY_PERSISTENT_STATE,
-    EVALUATOR_MAX_RETRIES,
+    MAX_RETRIES,
     JUDGE_RESPONSE_FORMAT,
     PERSISTENT_STATE_RESPONSE_FORMAT,
     RubricRecord,
@@ -283,7 +282,7 @@ async def _summarize_aggregate_trajectory(
             json.dumps(step_cards, indent=2, ensure_ascii=False),
         ]
     )
-    for _ in range(EVALUATOR_MAX_RETRIES):
+    for _ in range(MAX_RETRIES):
         response = await run_chat_with_route_async(
             "rubric_generation",
             model_name=model_name,
@@ -358,7 +357,7 @@ async def _generate_aggregate_rubrics(
         )
     user_prompt = "\n".join(prompt_parts)
     task_text = "\n\n".join(part for part in [question.get("system_prompt", ""), question.get("user_prompt", "")] if part)
-    for _ in range(EVALUATOR_MAX_RETRIES):
+    for _ in range(MAX_RETRIES):
         response = await run_chat_with_route_async(
             "rubric_generation",
             model_name=model_name,
@@ -429,7 +428,7 @@ async def _score_aggregate_summaries(
                         criterion,
                     ]
                 )
-                for _ in range(EVALUATOR_MAX_RETRIES):
+                for _ in range(MAX_RETRIES):
                     response = await run_chat_with_route_async(
                         "rubric_judge",
                         model_name=model_name,

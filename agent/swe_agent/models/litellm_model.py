@@ -105,7 +105,7 @@ class LitellmModel:
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
-        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
+        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions, model_name=self.config.model_name):
             with attempt:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
         cost_output = self._calculate_cost(response)

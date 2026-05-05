@@ -18,9 +18,10 @@ import swe_agent.run.search_swe_agent as search_module
 
 from train_agent.collect_sft_rollout import build_training_messages
 from train_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
-from train_agent.serving.sglang_chat_service import warmup_slime_policy_route
+from train_agent.serving.sglang_chat_service import start_slime_policy_route_warmup
 
 _TOKENIZER = None
+_ROLLOUT_WARMUP_DONE = False
 
 
 def collect_grpo_bundle(
@@ -156,6 +157,8 @@ def build_grpo_prompt_rows(instance_ids: list[str], subset: str, split: str) -> 
 
 def _collect_grpo_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
     try:
+        os.environ["SEARCH_SWE_SLIME_API_BASE"] = task["slime_api_base"]
+        os.environ["SEARCH_SWE_SLIME_API_KEY"] = task["slime_api_key"]
         bundle = collect_grpo_bundle(
             instance_id=task["instance_id"],
             subset=task["subset"],
@@ -175,7 +178,10 @@ def _collect_grpo_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def _collect_grpo_bundle_tasks(tasks: list[dict[str, Any]], max_workers: int) -> list[dict[str, Any]]:
+def _collect_grpo_bundle_tasks(
+    tasks: list[dict[str, Any]],
+    max_workers: int,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     context_name = os.environ.get("SWE_AGENT_GRPO_MP_CONTEXT", "fork")
     context = multiprocessing.get_context(context_name)
@@ -198,14 +204,26 @@ def _collect_grpo_bundle_tasks(tasks: list[dict[str, Any]], max_workers: int) ->
 
 
 def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = False):
-    if evaluation:
-        return RolloutFnEvalOutput(data={}, metrics={})
-
+    global _ROLLOUT_WARMUP_DONE
     started = time.perf_counter()
     target = os.environ.get("SWE_AGENT_GRPO_TARGET", "policy")
     output_root = Path(os.environ.get("SWE_AGENT_GRPO_OUTPUT_ROOT", "/workspace/rler/agent/outputs/search_outputs/train_async_grpo"))
     model_name = os.environ.get("SWE_AGENT_GRPO_MODEL_NAME") or "Qwen/Qwen3.5-9B"
-    tokenizer = _rollout_tokenizer(args)
+    router_ip, router_port = (getattr(args, "sglang_model_routers", None) or {}).get(
+        model_name,
+        (args.sglang_router_ip, args.sglang_router_port),
+    )
+    slime_api_base = f"http://{router_ip}:{router_port}"
+    slime_api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
+    if not _ROLLOUT_WARMUP_DONE:
+        start_slime_policy_route_warmup(
+            base_url=slime_api_base,
+            api_key=slime_api_key,
+            model_name=model_name,
+            requests=max(1, int(args.rollout_num_gpus or 1) // int(args.rollout_num_gpus_per_engine or 1)),
+        )
+        _ROLLOUT_WARMUP_DONE = True
+
     all_samples: list[Sample] = []
     group_index_offset = 0
     collected_instances: list[str] = []
@@ -225,6 +243,8 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     prompt_groups = data_buffer.get_samples(args.rollout_batch_size)
     if not prompt_groups:
         raise RuntimeError("SWE-agent GRPO rollout received an empty prompt batch.")
+
+    tokenizer = _rollout_tokenizer(args)
     tasks: list[dict[str, Any]] = []
     for prompt_index, prompt_group in enumerate(prompt_groups):
         if len(prompt_group) != 1:
@@ -243,11 +263,17 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 "model_name": model_name,
                 "workers": int(os.environ["SWE_AGENT_GRPO_WORKERS"]),
                 "search_values": search_values,
+                "slime_api_base": slime_api_base,
+                "slime_api_key": slime_api_key,
             }
         )
 
     max_instance_workers = max(1, int(os.environ["SWE_AGENT_GRPO_INSTANCE_WORKERS"]))
-    for result in _collect_grpo_bundle_tasks(tasks, min(max_instance_workers, len(tasks))):
+    bundle_results = _collect_grpo_bundle_tasks(
+        tasks,
+        min(max_instance_workers, len(tasks)),
+    )
+    for result in bundle_results:
         instance_id = result["instance_id"]
         if result["error"]:
             failed_instances.append(f"{instance_id}: {result['error']}")

@@ -20,9 +20,9 @@ from train_agent.serving.sglang_chat_service import (
     REPO_ROOT,
     extra_mount_args,
     start_slime_server,
+    start_slime_policy_route_warmup,
     stop_slime_server,
     to_container_path,
-    warmup_slime_policy_route,
 )
 
 
@@ -204,14 +204,12 @@ def main(argv: list[str] | None = None) -> int:
     else:
         try:
             server = start_slime_server(args, logs_dir / "slime_server.log")
-            warmup_times = warmup_slime_policy_route(
+            start_slime_policy_route_warmup(
                 base_url=os.environ["SEARCH_SWE_SLIME_API_BASE"],
                 api_key=os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY"),
                 model_name=args.student_model,
-                wait_for_health=True,
-                health_timeout=args.serving_timeout,
+                requests=max(1, args.rollout_gpus),
             )
-            print(json.dumps({"sft_rollout_warmup_seconds": warmup_times}, ensure_ascii=False), flush=True)
             sft_bundle = collect_teacher_student_exports(
                 instance_ids=args.instance_id,
                 output_root=args.search_output_root / "teacher_student",

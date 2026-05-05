@@ -86,6 +86,9 @@ class DefaultAgent:
             try:
                 self.step()
             except InterruptAgentFlow as e:
+                assistant_message = getattr(e, "assistant_message", None)
+                if assistant_message:
+                    self.add_messages(assistant_message)
                 self.add_messages(*e.messages)
             except Exception as e:
                 self.handle_uncaught_exception(e)

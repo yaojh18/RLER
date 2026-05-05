@@ -4,8 +4,8 @@ from typing import Any
 from agent_rl.model_service import run_async
 from agent_rl.run_utils import run_chat_with_route_completion_async
 
-from swe_agent.models import GLOBAL_MODEL_STATS
 from swe_agent.exceptions import FormatError
+from swe_agent.models import GLOBAL_MODEL_STATS
 from swe_agent.models.litellm_model import LitellmModel, logger
 from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel, LitellmTextbasedModelConfig
 from swe_agent.models.utils.actions_text import parse_regex_actions
@@ -32,7 +32,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         max_tokens = query_kwargs.pop("max_tokens", query_kwargs.pop("max_completion_tokens", 1024))
         stop = query_kwargs.pop("stop", None)
 
-        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
+        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions, model_name=self.config.model_name):
             with attempt:
                 completion = run_async(
                     run_chat_with_route_completion_async(
@@ -50,7 +50,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         content = completion.content or ""
         assistant_message = {
             "role": "assistant",
-            "content": content,
+            "content": completion.content,
             "content_no_thinking": completion.metadata.get("content_no_thinking", content),
             "extra": {
                 "actions": [],
@@ -62,6 +62,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
                 "policy_version": self.policy_version,
             },
         }
+        GLOBAL_MODEL_STATS.add(completion.cost)
         try:
             assistant_message["extra"]["actions"] = parse_regex_actions(
                 content,
@@ -70,9 +71,8 @@ class RouteTextbasedModel(LitellmTextbasedModel):
             )
         except FormatError as exc:
             assistant_message["extra"]["format_error"] = True
-            GLOBAL_MODEL_STATS.add(completion.cost)
+            setattr(exc, "assistant_message", assistant_message)
             raise
-        GLOBAL_MODEL_STATS.add(completion.cost)
         return assistant_message
 
     def get_state(self) -> dict[str, Any]:

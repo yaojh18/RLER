@@ -11,6 +11,8 @@ import numpy as np
 from swe_agent.rl_contracts import ExportGroup, ExportSample, GRPOExportBundle
 
 INVALID_SAMPLE_REWARD = -1.0
+RUBRIC_FORMAT_ERROR_REWARD = -1.0
+RUBRIC_TERMINAL_ERROR_REWARD = -0.2
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -42,6 +44,46 @@ def _normalize_messages(payload: dict[str, Any] | list[dict[str, Any]]) -> list[
 
 def _normalize_prompt(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [_normalize_message(message) for message in payload.get("messages")]
+
+
+def _rubric_turn_rewards(
+    *,
+    payload: dict[str, Any],
+    conversation: list[dict[str, Any]],
+    alpha: float,
+    gamma: float,
+    theta: float,
+) -> list[float]:
+    generated = list(payload.get("generated"))
+    variance_by_rubric = payload.get("variance_by_rubric")
+    redundency_by_rubric = payload.get("redundency_by_rubric")
+    judge_error_by_rubric = payload.get("judge_error_by_rubric")
+    generated_rewards = [
+        (
+            alpha * float(variance_by_rubric.get(rubric["rubric_id"]))
+            + gamma * float(redundency_by_rubric.get(rubric["rubric_id"]))
+            + theta * float(judge_error_by_rubric.get(rubric["rubric_id"]))
+        ) / (alpha + gamma + theta)
+        for rubric in generated
+    ]
+    format_error_turns = set()
+    for error in payload.get("format_errors") or []:
+        format_error_turns.add(int(error.get("turn_index")))
+    turn_rewards: list[float] = []
+    assistant_turn_index = 0
+    generated_index = 0
+    for message in conversation:
+        if message.get("role") != "assistant":
+            continue
+        assistant_turn_index += 1
+        if assistant_turn_index in format_error_turns:
+            turn_rewards.append(RUBRIC_FORMAT_ERROR_REWARD)
+        elif generated_index < len(generated_rewards):
+            turn_rewards.append(float(generated_rewards[generated_index]))
+            generated_index += 1
+        else:
+            turn_rewards.append(0.0)
+    return turn_rewards
 
 
 @dataclass
@@ -151,31 +193,17 @@ class GRPOCollector:
             conversation = _normalize_messages(bundle.messages_payload)
             if not rubric_list_id or not conversation:
                 continue
-            if payload.get("is_valid") is False:
-                samples.append(
-                    ExportSample(
-                        sample_id=rubric_list_id,
-                        group_id=group_id,
-                        prompt=conversation[:1],
-                        turns=conversation[1:],
-                        reward=INVALID_SAMPLE_REWARD,
-                        metadata={"turn_rewards": []},
-                    )
-                )
-                continue
-            generated = list(payload.get("generated"))
-            variance_by_rubric = payload.get("variance_by_rubric")
-            redundency_by_rubric = payload.get("redundency_by_rubric")
-            judge_error_by_rubric = payload.get("judge_error_by_rubric")
-            turn_rewards = [
-                (self.alpha * float(variance_by_rubric.get(rubric["rubric_id"]))
-                + self.gamma * float(redundency_by_rubric.get(rubric["rubric_id"]))
-                + self.theta * float(judge_error_by_rubric.get(rubric["rubric_id"], 0.0))) / (self.alpha + self.gamma + self.theta)
-                for rubric in generated
-            ]
+            turn_rewards = _rubric_turn_rewards(
+                payload=payload,
+                conversation=conversation,
+                alpha=self.alpha,
+                gamma=self.gamma,
+                theta=self.theta,
+            )
             scalar_reward = (
                 (1.0 - self.beta) * float(payload.get("gt_reward_siblings"))
                 + self.beta * float(payload.get("gt_reward_parent"))
+                + RUBRIC_TERMINAL_ERROR_REWARD if payload.get("terminal_error") else 0.0
             )
             samples.append(
                 ExportSample(
@@ -193,11 +221,11 @@ class GRPOCollector:
 
 
 def _write_base_artifacts(
-    bundles: list[NodeArtifactBundle],
+    bundles: list[NodeArtifactBundle] | None = None,
     rubric_bundles: list[RubricArtifactBundle] | None = None,
     extra_json_writes: list[tuple[Path, Any]] | None = None,
 ) -> None:
-    for bundle in bundles:
+    for bundle in bundles or []:
         bundle.node_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(bundle.node_dir / "messages.json", bundle.messages_payload)
         if bundle.snapshot_payload is not None:
@@ -215,11 +243,11 @@ def _write_base_artifacts(
 
 
 def _write_gt_artifacts(
-    bundles: list[NodeArtifactBundle],
+    bundles: list[NodeArtifactBundle] | None = None,
     rubric_bundles: list[RubricArtifactBundle] | None = None,
     extra_json_writes: list[tuple[Path, Any]] | None = None,
 ) -> None:
-    for bundle in bundles:
+    for bundle in bundles or []:
         bundle.node_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(bundle.node_dir / "judge.json", bundle.judge_payload)
     for bundle in rubric_bundles or []:
@@ -270,7 +298,7 @@ class ArtifactWriter:
 
     def submit_round(
         self,
-        bundles: list[NodeArtifactBundle],
+        bundles: list[NodeArtifactBundle] | None = None,
         rubric_bundles: list[RubricArtifactBundle] | None = None,
         extra_json_writes: list[tuple[Path, Any]] | None = None,
         *,

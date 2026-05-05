@@ -106,6 +106,8 @@ class _RunArtifacts:
         for rubric in self.rounds[round_index].values():
             if rubric.get("is_valid") is False:
                 continue
+            if rubric.get("format_errors") or rubric.get("terminal_error"):
+                continue
             if not self._rubic_judge_corr_gt(node_ids, rubric):
                 continue
             rubric_list_id = str(rubric.get("rubric_list_id") or "")
