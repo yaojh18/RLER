@@ -34,7 +34,7 @@ from swe_agent.parallel_utils import (
     _atomic_write_json,
     gap_redundancy
 )
-from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches
+from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches, make_evaluation_payload
 from swe_agent.models.litellm_model import LitellmModel
 from swe_agent.models.utils.retry import retry
 from swe_agent.prompt import *
@@ -89,6 +89,7 @@ class RubricRecord:
     weight: int
     source_round: int
     reward: float | None = None
+    metadata: dict[str, str] | None = None
 
 
 @dataclass
@@ -115,26 +116,6 @@ class SearchNode:
     exit_status: str = ""
     policy_source: Literal["teacher", "student"] = "teacher"
     policy_model_name: str = ""
-
-
-def _build_evaluation_payload(
-    *,
-    instance_id: str,
-    completed: bool,
-    resolved: bool,
-    empty_patch: bool,
-    error: bool,
-) -> dict[str, Any]:
-    return {
-        "completed_ids": [instance_id] if completed else [],
-        "incomplete_ids": [],
-        "empty_patch_ids": [instance_id] if empty_patch else [],
-        "submitted_ids": [instance_id],
-        "resolved_ids": [instance_id] if resolved else [],
-        "unresolved_ids": [instance_id] if completed and not resolved else [],
-        "error_ids": [instance_id] if error else [],
-        "schema_version": 2,
-    }
 
 
 def _truncate_middle(text: str, limit: int) -> str:
@@ -412,6 +393,10 @@ def _convert_generated_rubric(task: str, payload: dict[str, Any], round_index: i
     scale_text = {isinstance(text, str) for _, text in (item.get("scale") or {}).items()}
     if not scale_text or not all(scale_text):
         return None
+    metadata_raw = item.get("metadata") or {}
+    if not isinstance(metadata_raw, dict):
+        return None
+    metadata = {str(key): str(value) for key, value in metadata_raw.items()}
     rubric_id = hashlib.md5(
         json.dumps(
             {
@@ -419,6 +404,7 @@ def _convert_generated_rubric(task: str, payload: dict[str, Any], round_index: i
                 "direction": direction,
                 "title": title,
                 "description": description,
+                "metadata": metadata,
                 "scale": scale,
             },
             sort_keys=True,
@@ -433,6 +419,7 @@ def _convert_generated_rubric(task: str, payload: dict[str, Any], round_index: i
         scale=scale,
         weight=1 if direction == "positive" else -1,
         source_round=round_index,
+        metadata=metadata,
     )
 
 
@@ -452,6 +439,7 @@ def _build_initial_rubric_bank(task: str) -> list[RubricRecord]:
                         "4": "Most important next steps or fix proposals are explicitly tied to concrete evidence and the effect on the plan is clear",
                         "5": "Nearly every important pivot, hypothesis update, or fix proposal is explicitly anchored to concrete evidence, with a clear explanation of how that evidence drives the next move",
                     },
+                    "metadata": {}
                 }
             },
             0,
@@ -470,6 +458,7 @@ def _build_initial_rubric_bank(task: str) -> list[RubricRecord]:
                         "4": "Treats the issue as effectively resolved without a concrete deciding check or despite unresolved contrary evidence",
                         "5": "Strongly declares success or completion and proceeds as if resolved, with no concrete deciding check and no serious engagement with unresolved evidence",
                     },
+                    "metadata": {}
                 }
             },
             0,
@@ -541,7 +530,13 @@ async def _generate_round_rubrics(
             [
                 "## Existing Rubrics:",
                 json.dumps(
-                    [{"polarity": rubric.direction, "title": rubric.title, "description": rubric.description, "scale": rubric.scale} for rubric in active_bank],
+                    [{
+                        "polarity": rubric.direction, 
+                        "title": rubric.title, 
+                        "description": rubric.description, 
+                        "scale": rubric.scale, 
+                        "metadata": rubric.metadata
+                        } for rubric in active_bank],
                     ensure_ascii=False,
                     indent=2,
                 ),
@@ -656,6 +651,8 @@ async def _score_round(
                     f"Description: {rubric.description}",
                     "Scale:",
                     *[f"{score}: {rubric.scale[str(score)]}" for score in range(1, 6)],
+                    "Metadata:",
+                    json.dumps(rubric.metadata, indent=2, ensure_ascii=False)
                 ]
             )
 
@@ -712,6 +709,7 @@ async def _score_round(
                 "title": rubric.title,
                 "direction": rubric.direction,
                 "description": rubric.description,
+                "metadata": copy.deepcopy(rubric.metadata),
                 "scale": copy.deepcopy(rubric.scale),
                 "weight": rubric.weight,
                 "source_round": rubric.source_round,
@@ -758,6 +756,8 @@ async def _score_parent_round(
                 f"Description: {rubric.description}",
                 "Scale:",
                 *[f"{score}: {rubric.scale[str(score)]}" for score in range(1, 6)],
+                "Metadata:",
+                json.dumps(rubric.metadata, indent=2, ensure_ascii=False)
             ]
         )
 
@@ -812,6 +812,7 @@ async def _score_parent_round(
                 "title": rubric.title,
                 "direction": rubric.direction,
                 "description": rubric.description,
+                "metadata": copy.deepcopy(rubric.metadata),
                 "scale": copy.deepcopy(rubric.scale),
                 "weight": rubric.weight,
                 "source_round": rubric.source_round,
@@ -880,7 +881,8 @@ def _update_rubric_bank(
     max_active_rubrics: int,
 ) -> tuple[list[RubricRecord], list[RubricRecord], list[RubricRecord]]:
     deduped_by_title: dict[str, RubricRecord] = {}
-    for rubric in active_bank + generated:
+    kept_active_bank = [rubric for rubric in active_bank if rubric.reward is not None and rubric.reward > 0.0]
+    for rubric in kept_active_bank + generated:
         candidate = RubricRecord(**{**asdict(rubric), "reward": rewards.get(rubric.rubric_id, 0.0)})
         title_key = candidate.title.strip().casefold()
         existing = deduped_by_title.get(title_key)
@@ -1965,39 +1967,24 @@ class TrajectorySearchRunner:
                 if self.search_config.write_artifacts:
                     _atomic_write_json(
                         self.run_dir / "evaluation.json",
-                        _build_evaluation_payload(
-                            instance_id=self.task_id,
-                            completed=False,
-                            resolved=False,
-                            empty_patch=True,
-                            error=False,
-                        ),
+                        make_evaluation_payload("empty"),
                     )
             else:
-                error = False
                 try:
-                    reward = evaluate_swebench_instance_patches(
+                    evaluation = evaluate_swebench_instance_patches(
                         instance=self.instance,
                         patches_by_key={final_node_id: patch_text},
                         model_name=final_policy_model_name,
                         max_workers=1,
                         namespace=self.harness_namespace,
                         work_dir=self.run_dir,
-                    ).get(final_node_id)
-                except Exception:
-                    reward = 0.0
-                    error = True
-                reward = float(reward)
+                    )[final_node_id]
+                except Exception as exc:
+                    evaluation = make_evaluation_payload("error", error=exc)
                 if self.search_config.write_artifacts:
                     _atomic_write_json(
                         self.run_dir / "evaluation.json",
-                        _build_evaluation_payload(
-                            instance_id=self.task_id,
-                            completed=not error,
-                            resolved=reward >= 1.0 and not error,
-                            empty_patch=False,
-                            error=error,
-                        ),
+                        evaluation,
                     )
         self.best_node_id = final_node_id
         if final_node.status == "finished":

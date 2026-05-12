@@ -16,19 +16,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Iterator, Sequence, TextIO
 from swebench.harness import run_evaluation as swebench_run_evaluation
-from swebench.harness.constants import LOG_REPORT
+from swebench.harness.constants import LOG_REPORT, LOG_TEST_OUTPUT
 from swebench.harness.docker_build import build_instance_image
 
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 
 from swe_agent.run.benchmarks.rebench_eval import (
-    evaluate_rebench_instances as evaluate_rebench_instance_patches_backend,
     evaluate_rebench_instance as evaluate_rebench_prediction,
     is_rebench_dataset_name,
     is_rebench_instance,
@@ -60,6 +60,8 @@ DEFAULT_MODEL_CLASS = "route_textbased"
 DEFAULT_MAX_MODEL_LEN = 128000
 DEFAULT_STEP_LIMIT = 160
 DEFAULT_COMPLETION_MAX_TOKENS = 4096
+EMPTY_REWARD = 0.0
+ERROR_REWARD = 0.0
 SWE_AGENT_TEXTBASED_CONFIG = AGENT_ROOT / "swe_agent" / "config" / "benchmarks" / "swebench_backticks.yaml"
 SLIME_SERVICE_NAME = "slime"
 VLLM_SERVICE_NAME = "vllm"
@@ -106,19 +108,9 @@ def select_instances(args: argparse.Namespace) -> list[dict[str, Any]]:
 
     dataset_path = DATASET_MAPPING.get(args.subset, args.subset)
     if args.instance_id:
+        instances = load_swebench_instances(args.subset, args.split)
         wanted = set(args.instance_id)
-        found: dict[str, dict[str, Any]] = {}
-        try:
-            dataset = load_dataset(dataset_path, split=args.split, streaming=True)
-            for instance in dataset:
-                instance_id = instance["instance_id"]
-                if instance_id in wanted:
-                    found[instance_id] = dict(instance)
-                    if len(found) == len(wanted):
-                        break
-        except Exception:
-            instances = load_swebench_instances(args.subset, args.split)
-            found = {instance["instance_id"]: instance for instance in instances if instance["instance_id"] in wanted}
+        found = {instance["instance_id"]: instance for instance in instances if instance["instance_id"] in wanted}
         missing = [instance_id for instance_id in args.instance_id if instance_id not in found]
         if missing:
             raise RuntimeError(f"Instances not found in {args.subset}/{args.split}: {', '.join(missing)}")
@@ -415,33 +407,47 @@ def _append_error_to_log(log_path: Path | None, error: Exception | str) -> None:
         log_file.write(f"\n\nERROR: {error}\n")
 
 
-def _load_patch_record(run_dir: Path, instance_id: str) -> dict[str, Any]:
-    empty = {"model_name_or_path": "", "instance_id": instance_id, "model_patch": ""}
-    patch_path = run_dir / "model_patch.json"
-    return json.loads(patch_path.read_text(encoding="utf-8")).get(instance_id, empty) if patch_path.exists() else empty
+def make_evaluation_payload(
+    status: str,
+    passed_tests: Sequence[str] | None = None,
+    failed_tests: Sequence[str] | None = None,
+    output: str = "",
+    error: Exception | str | None = None,
+) -> dict[str, Any]:
+    if status not in {"resolved", "unresolved", "empty", "error"}:
+        raise ValueError(f"Unknown evaluation status: {status}")
 
+    passed = sorted({str(test) for test in (passed_tests or []) if str(test)}) if status in {"resolved", "unresolved"} else []
+    failed = sorted({str(test) for test in (failed_tests or []) if str(test)}) if status in {"resolved", "unresolved"} else []
+    if error is not None:
+        error_output = (
+            "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            if isinstance(error, Exception)
+            else str(error)
+        )
+        output = "\n".join(part for part in [output, error_output] if part)
 
-def _patch_text(run_dir: Path, instance_id: str) -> str:
-    return str(_load_patch_record(run_dir, instance_id).get("model_patch") or "")
+    if status == "empty":
+        reward = EMPTY_REWARD
+    elif status == "error":
+        reward = ERROR_REWARD
+    else:
+        total = len(set(passed) | set(failed))
+        reward = len(set(passed)) / total if total else (1.0 if status == "resolved" else 0.0)
 
-
-def _evaluation_payload(instance_id: str, *, completed: bool = False, resolved: bool = False, empty_patch: bool = False, error: bool = False) -> dict[str, Any]:
     return {
-        "completed_ids": [instance_id] if completed else [],
-        "incomplete_ids": [],
-        "empty_patch_ids": [instance_id] if empty_patch else [],
-        "submitted_ids": [instance_id],
-        "resolved_ids": [instance_id] if resolved else [],
-        "unresolved_ids": [instance_id] if completed and not resolved else [],
-        "error_ids": [instance_id] if error else [],
-        "schema_version": 2,
+        "status": status,
+        "passed_tests": passed,
+        "failed_tests": failed,
+        "reward": float(reward),
+        "metainfo": {"output": str(output)} if output else {},
     }
 
 
 def write_failure_artifacts(*, instance_id: str, run_dir: Path, error: Exception | str, log_path: Path | None = None) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     _append_error_to_log(log_path, error)
-    _json_dump(run_dir / "evaluation.json", _evaluation_payload(instance_id, empty_patch=True, error=True))
+    _json_dump(run_dir / "evaluation.json", make_evaluation_payload("error", error=error))
 
 
 def materialize_backend_run(*, model_name: str, instance_id: str, run_dir: Path, temp_output_dir: Path) -> None:
@@ -471,53 +477,39 @@ def materialize_backend_run(*, model_name: str, instance_id: str, run_dir: Path,
     )
 
 
-def _instances_by_id(dataset_name: str, split: str, instances_by_id: dict[str, dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
-    if instances_by_id is not None:
-        return instances_by_id
-    subset = next((key for key, value in DATASET_MAPPING.items() if value == dataset_name), dataset_name)
-    return {instance["instance_id"]: instance for instance in load_swebench_instances(subset, split)}
-
-
-def _evaluate_rebench(run_dirs: list[Path], *, split: str, model_name: str, dataset_name: str, log_path: Path | None, timeout: int, max_workers: int, instances_by_id: dict[str, dict[str, Any]] | None) -> None:
-    del model_name
-    by_id = _instances_by_id(dataset_name, split, instances_by_id)
-
-    def evaluate(run_dir: Path) -> tuple[Path, dict[str, Any]]:
-        instance_id = run_dir.parent.name
-        patch = _patch_text(run_dir, instance_id)
-        if not patch:
-            return run_dir, _evaluation_payload(instance_id, empty_patch=True)
-        if instance_id not in by_id:
-            return run_dir, _evaluation_payload(instance_id, error=True)
-        result = evaluate_rebench_prediction(instance=by_id[instance_id], patch_text=patch, timeout=timeout, work_dir=run_dir.resolve())
-        return run_dir, _evaluation_payload(instance_id, completed=True, resolved=bool(result["resolved"]))
-
-    with (tee_console(log_path) if log_path else contextlib.nullcontext()):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(run_dirs)))) as executor:
-            future_map = {executor.submit(evaluate, run_dir): run_dir for run_dir in run_dirs}
-            for future in concurrent.futures.as_completed(future_map):
-                run_dir = future_map[future]
-                try:
-                    result_dir, payload = future.result()
-                except Exception as exc:
-                    instance_id = run_dir.parent.name
-                    result_dir, payload = run_dir, _evaluation_payload(instance_id, error=True)
-                    _append_error_to_log(log_path, exc)
-                _json_dump(result_dir / "evaluation.json", payload)
-
-
-def _evaluate_swebench(run_dirs: list[Path], *, split: str, model_name: str, dataset_name: str, log_path: Path | None, timeout: int, max_workers: int, instances_by_id: dict[str, dict[str, Any]] | None) -> None:
-    by_id = _instances_by_id(dataset_name, split, instances_by_id)
-    del timeout
+def run_harness_evaluation(
+    *,
+    run_dirs: list[Path],
+    split: str,
+    model_name: str,
+    dataset_name: str,
+    log_path: Path | None,
+    timeout: int,
+    max_workers: int,
+    instances_by_id: dict[str, dict[str, Any]] | None = None,
+    tee_output: bool = True,
+) -> None:
+    if not run_dirs:
+        return
+    by_id = instances_by_id
+    if by_id is None:
+        subset = next((key for key, value in DATASET_MAPPING.items() if value == dataset_name), dataset_name)
+        by_id = {instance["instance_id"]: instance for instance in load_swebench_instances(subset, split)}
+    rebench = is_rebench_dataset_name(dataset_name)
 
     def evaluate(run_dir: Path) -> tuple[Path, dict[str, Any]]:
         instance_id = run_dir.parent.name
-        patch = _patch_text(run_dir, instance_id)
+        patch_path = run_dir / "model_patch.json"
+        patch_record = json.loads(patch_path.read_text(encoding="utf-8")).get(instance_id, {}) if patch_path.exists() else {}
+        patch = str(patch_record.get("model_patch") or "")
         if not patch:
-            return run_dir, _evaluation_payload(instance_id, empty_patch=True)
+            return run_dir, make_evaluation_payload("empty")
         if instance_id not in by_id:
-            return run_dir, _evaluation_payload(instance_id, error=True)
-        rewards = evaluate_swebench_instance_patches(
+            return run_dir, make_evaluation_payload("error", error=f"Instance not found: {instance_id}")
+        if rebench:
+            result = evaluate_rebench_prediction(instance=by_id[instance_id], patch_text=patch, timeout=timeout, work_dir=run_dir.resolve())
+            return run_dir, _rebench_result_payload(result)
+        evaluations = evaluate_swebench_instance_patches(
             instance=by_id[instance_id],
             patches_by_key={str(run_dir): patch},
             model_name=model_name,
@@ -525,9 +517,9 @@ def _evaluate_swebench(run_dirs: list[Path], *, split: str, model_name: str, dat
             namespace=None,
             work_dir=run_dir,
         )
-        return run_dir, _evaluation_payload(instance_id, completed=True, resolved=bool(rewards.get(str(run_dir))))
+        return run_dir, evaluations[str(run_dir)]
 
-    with (tee_console(log_path) if log_path else contextlib.nullcontext()):
+    with (tee_console(log_path) if log_path and tee_output else contextlib.nullcontext()):
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(run_dirs)))) as executor:
             future_map = {executor.submit(evaluate, run_dir): run_dir for run_dir in run_dirs}
             for future in concurrent.futures.as_completed(future_map):
@@ -535,17 +527,43 @@ def _evaluate_swebench(run_dirs: list[Path], *, split: str, model_name: str, dat
                 try:
                     result_dir, payload = future.result()
                 except Exception as exc:
-                    instance_id = run_dir.parent.name
-                    result_dir, payload = run_dir, _evaluation_payload(instance_id, error=True)
+                    result_dir, payload = run_dir, make_evaluation_payload("error", error=exc)
                     _append_error_to_log(log_path, exc)
                 _json_dump(result_dir / "evaluation.json", payload)
 
 
-def run_harness_evaluation(*, run_dirs: list[Path], split: str, model_name: str, dataset_name: str, log_path: Path | None, timeout: int, max_workers: int, instances_by_id: dict[str, dict[str, Any]] | None = None) -> None:
-    if not run_dirs:
-        return
-    evaluator = _evaluate_rebench if is_rebench_dataset_name(dataset_name) else _evaluate_swebench
-    evaluator(run_dirs, split=split, model_name=model_name, dataset_name=dataset_name, log_path=log_path, timeout=timeout, max_workers=max_workers, instances_by_id=instances_by_id)
+def _rebench_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+    expected = {str(test) for test in result.get("passed_expected", []) if str(test)}
+    passed_actual = {str(test) for test in result.get("passed_actual", []) if str(test)}
+    failed_actual = {str(test) for test in result.get("failed_actual", []) if str(test)}
+    passed_tests = sorted(passed_actual)
+    failed_tests = sorted((expected - passed_actual) | failed_actual)
+    resolved = bool(result.get("resolved"))
+    return make_evaluation_payload(
+        status="resolved" if resolved else "unresolved",
+        passed_tests=passed_tests,
+        failed_tests=failed_tests,
+        output=result.get("evaluation_output") or "",
+    )
+
+
+def _swebench_report_payload(report: dict[str, Any], instance_id: str, output: str = "") -> dict[str, Any]:
+    instance_report = report.get(instance_id, {}) if isinstance(report, dict) else {}
+    tests_status = instance_report.get("tests_status", {}) if isinstance(instance_report, dict) else {}
+    passed: list[str] = []
+    failed: list[str] = []
+    for group in tests_status.values():
+        if not isinstance(group, dict):
+            continue
+        passed.extend(str(test) for test in group.get("success", []) if str(test))
+        failed.extend(str(test) for test in group.get("failure", []) if str(test))
+    resolved = bool(instance_report.get("resolved"))
+    return make_evaluation_payload(
+        status="resolved" if resolved else "unresolved",
+        passed_tests=passed,
+        failed_tests=failed,
+        output=output,
+    )
 
 
 def evaluate_swebench_instance_patches(
@@ -556,25 +574,49 @@ def evaluate_swebench_instance_patches(
     max_workers: int,
     namespace: str | None,
     work_dir: Path,
-) -> dict[str, float]:
+) -> dict[str, dict[str, Any]]:
     if is_rebench_instance(instance):
-        return evaluate_rebench_instance_patches_backend(
-            instance=instance,
-            patches_by_key=patches_by_key,
-            max_workers=max_workers,
-            timeout=900,
-            work_dir=work_dir,
-        )
+        evaluations: dict[str, dict[str, Any]] = {}
+        unique_patches: dict[str, dict[str, Any]] = {}
+        for key, patch in patches_by_key.items():
+            patch_text = patch or ""
+            if not patch_text.strip():
+                evaluations[key] = make_evaluation_payload("empty")
+                continue
+            unique_patches.setdefault(patch_text, {"patch": patch_text, "keys": []})["keys"].append(key)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(unique_patches) or 1))) as executor:
+            future_map = {
+                executor.submit(
+                    evaluate_rebench_prediction,
+                    instance=instance,
+                    patch_text=entry["patch"],
+                    timeout=600,
+                    work_dir=Path(work_dir).resolve(),
+                ): entry["keys"]
+                for entry in unique_patches.values()
+            }
+            for future, keys in future_map.items():
+                try:
+                    payload = _rebench_result_payload(future.result())
+                except Exception as exc:
+                    payload = make_evaluation_payload("error", error=exc)
+                for key in keys:
+                    evaluations[key] = payload
+        return evaluations
 
     unique_patches: dict[str, dict[str, Any]] = {}
-    rewards = {key: 0.0 for key, patch in patches_by_key.items() if not (patch or "").strip()}
+    evaluations = {
+        key: make_evaluation_payload("empty")
+        for key, patch in patches_by_key.items()
+        if not (patch or "").strip()
+    }
     for key, patch in patches_by_key.items():
         patch_text = patch or ""
         if patch_text.strip():
             patch_hash = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
             unique_patches.setdefault(patch_hash, {"patch": patch_text, "keys": []})["keys"].append(key)
     if not unique_patches:
-        return rewards
+        return evaluations
 
     previous_eval_root = swebench_run_evaluation.RUN_EVALUATION_LOG_DIR
     with tempfile.TemporaryDirectory(prefix=".node-eval-", dir=Path(work_dir).resolve()) as tmp_dir:
@@ -605,19 +647,22 @@ def evaluate_swebench_instance_patches(
             )
 
             for keys, run_id, prediction, _ in runs:
-                report_path = eval_log_root / run_id / prediction["model_name_or_path"].replace("/", "__") / test_spec.instance_id / LOG_REPORT
+                log_dir = eval_log_root / run_id / prediction["model_name_or_path"].replace("/", "__") / test_spec.instance_id
+                report_path = log_dir / LOG_REPORT
+                output_path = log_dir / LOG_TEST_OUTPUT
+                output = output_path.read_text(encoding="utf-8", errors="replace") if output_path.exists() else ""
                 if report_path.exists():
                     try:
                         report = json.loads(report_path.read_text())
-                        resolved = bool(report[test_spec.instance_id]["resolved"])
-                    except (json.JSONDecodeError, KeyError, TypeError):
-                        resolved = False
+                        payload = _swebench_report_payload(report, test_spec.instance_id, output)
+                    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                        payload = make_evaluation_payload("error", output=output, error=exc)
                 else:
-                    resolved = False
-                rewards.update({key: 1.0 if resolved else 0.0 for key in keys})
+                    payload = make_evaluation_payload("error", output=output, error="Missing SWE-bench evaluation report")
+                evaluations.update({key: payload for key in keys})
         finally:
             swebench_run_evaluation.RUN_EVALUATION_LOG_DIR = previous_eval_root
-    return rewards
+    return evaluations
 
 
 @contextlib.contextmanager
@@ -665,46 +710,22 @@ def run_swe_instance_multi(
         split=split,
         model_name=model_name,
     )
-    with tempfile.TemporaryDirectory(prefix=".run-", dir=output_root) as tmp_dir:
-        temp_root = Path(tmp_dir)
-        run_dirs: list[Path] = []
-        run_timestamps: set[str] = set()
-        for pass_index in range(pass_n):
-            run_timestamp = timestamp if pass_index == 0 else time.strftime("%Y%m%d-%H%M%S")
-            while run_timestamp in run_timestamps:
-                time.sleep(1)
-                run_timestamp = time.strftime("%Y%m%d-%H%M%S")
-            run_timestamps.add(run_timestamp)
-            temp_output_dir = temp_root / f"batch_outputs_pass_{pass_index + 1:03d}"
-            temp_output_dir.mkdir(parents=True, exist_ok=True)
-            with tee_console(effective_run_log_path), _scoped_swe_agent_file_handlers():
-                run_swebench_instances(
-                    instances=instances,
-                    output_path=temp_output_dir,
-                    config=config,
-                    workers=workers,
-                    redo_existing=redo_existing,
-                    show_live_progress=False,
-                )
-            for instance in instances:
-                run_dir = run_root / instance["instance_id"] / run_timestamp
-                materialize_backend_run(
-                    model_name=model_name,
-                    instance_id=instance["instance_id"],
-                    run_dir=run_dir,
-                    temp_output_dir=temp_output_dir,
-                )
-                run_dirs.append(run_dir)
+    dataset_name = DATASET_MAPPING.get(benchmark_name, benchmark_name)
+    instances_by_id = {instance["instance_id"]: instance for instance in instances}
+    evaluation_errors: list[Exception] = []
+
+    def evaluate_pass(run_dirs: list[Path]) -> None:
         try:
             run_harness_evaluation(
                 run_dirs=run_dirs,
                 split=split,
                 model_name=model_name,
-                dataset_name=DATASET_MAPPING.get(benchmark_name, benchmark_name),
+                dataset_name=dataset_name,
                 log_path=effective_run_log_path,
                 timeout=eval_timeout,
                 max_workers=workers,
-                instances_by_id={instance["instance_id"]: instance for instance in instances},
+                instances_by_id=instances_by_id,
+                tee_output=False,
             )
         except Exception as exc:
             for run_dir in run_dirs:
@@ -715,6 +736,59 @@ def run_swe_instance_multi(
                     log_path=effective_run_log_path,
                 )
             raise
+
+    with (
+        tempfile.TemporaryDirectory(prefix=".run-", dir=output_root) as tmp_dir,
+        concurrent.futures.ThreadPoolExecutor(max_workers=1) as evaluation_executor,
+    ):
+        temp_root = Path(tmp_dir)
+        evaluation_futures: list[tuple[int, concurrent.futures.Future[None]]] = []
+        run_timestamps: set[str] = set()
+        try:
+            for pass_index in range(pass_n):
+                run_timestamp = timestamp if pass_index == 0 else time.strftime("%Y%m%d-%H%M%S")
+                while run_timestamp in run_timestamps:
+                    time.sleep(1)
+                    run_timestamp = time.strftime("%Y%m%d-%H%M%S")
+                run_timestamps.add(run_timestamp)
+                temp_output_dir = temp_root / f"batch_outputs_pass_{pass_index + 1:03d}"
+                temp_output_dir.mkdir(parents=True, exist_ok=True)
+                with tee_console(effective_run_log_path), _scoped_swe_agent_file_handlers():
+                    run_swebench_instances(
+                        instances=instances,
+                        output_path=temp_output_dir,
+                        config=config,
+                        workers=workers,
+                        redo_existing=redo_existing,
+                        show_live_progress=False,
+                    )
+                pass_run_dirs: list[Path] = []
+                for instance in instances:
+                    run_dir = run_root / instance["instance_id"] / run_timestamp
+                    materialize_backend_run(
+                        model_name=model_name,
+                        instance_id=instance["instance_id"],
+                        run_dir=run_dir,
+                        temp_output_dir=temp_output_dir,
+                    )
+                    pass_run_dirs.append(run_dir)
+                evaluation_futures.append(
+                    (pass_index + 1, evaluation_executor.submit(evaluate_pass, pass_run_dirs))
+                )
+        finally:
+            for pass_number, future in evaluation_futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    _append_error_to_log(
+                        effective_run_log_path,
+                        f"Evaluation for pass {pass_number} failed: {exc}",
+                    )
+                    evaluation_errors.append(exc)
+    if evaluation_errors:
+        raise RuntimeError(
+            f"{len(evaluation_errors)} pass evaluation(s) failed; see {effective_run_log_path}"
+        ) from evaluation_errors[0]
 
 
 def _qwen_model_kwargs(model_name: str) -> dict[str, Any]:
@@ -796,7 +870,7 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
             model_name=model_name,
             dataset_name=DATASET_MAPPING.get(args.subset, args.subset),
             log_path=args._run_log_path,
-            timeout=900,
+            timeout=600,
             max_workers=args.workers,
             instances_by_id=by_id,
         )
@@ -879,7 +953,7 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
                 output_root=args.output_root,
                 config=config,
                 model_name=model_name,
-                eval_timeout=900,
+                eval_timeout=600,
                 workers=args.workers,
                 pass_n=args.pass_n,
                 redo_existing=True,
@@ -918,7 +992,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sglang-api-key", default=SLIME_API_KEY)
     parser.add_argument("--sglang-image", default=os.environ.get("SEARCH_SWE_SLIME_IMAGE", DEFAULT_SGLANG_IMAGE))
     parser.add_argument("--use-existing-sglang-server", action="store_true")
-    parser.add_argument("--server-timeout", type=int, default=900)
+    parser.add_argument("--server-timeout", type=int, default=600)
     parser.add_argument("--temperature", "--tempeterature", dest="temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     return parser
@@ -947,6 +1021,8 @@ def main(argv: list[str] | None = None) -> int:
         for instance_id in instance_ids:
             run_dir = run_root / instance_id / args._run_timestamp
             if not (run_dir / "messages.json").exists() and not (run_dir / "model_patch.json").exists():
+                continue
+            if (run_dir / "evaluation.json").exists():
                 continue
             try:
                 write_failure_artifacts(

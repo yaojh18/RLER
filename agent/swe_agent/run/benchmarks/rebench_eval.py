@@ -137,9 +137,7 @@ def evaluate_rebench_instance(
         "passed_actual": passed,
         "failed_actual": failed,
         "passed_expected": expected_passed,
-        "log_path": None,
-        "parser_name": parser_name,
-        "image_name": image_name,
+        "evaluation_output": output,
     }
 
 

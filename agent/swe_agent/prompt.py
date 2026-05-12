@@ -11,6 +11,7 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
 - **Title**: Concise abstract label (general, not task-specific)
 - **Scale**: A five-point scale from 1 to 5 with concrete anchors for this rubric
 - **Polarity**: Either `"positive"` or `"negative"`
+- **Metadata**: A structured evidence payload for style-specific extra content. Use string fields such as `stage`, `oracle_test`, `code_review`, `privileged_reference_summary`, `judge_focus`, or `failure_mode`. Put complete test snippets, review reasoning, or reference-derived behavioral oracles here instead of overloading the title or scale.
 
 ## Categories
 A rubric may be either:
@@ -67,6 +68,9 @@ Never create positive/negative versions of same criterion:
     "polarity": "<positive|negative>",
     "description": "<detailed excellence/failure description>",
     "title": "<abstract label>",
+    "metadata": {
+      <a dict of any other relevant structured context, evidence, focus, process needed for judging, including but not limited to behavioral oracles, code review, targeted unit test or pseudo-test, etc.>
+    },
     "scale": {
       "1": "<worst case anchor>",
       "2": "<weak/minor issue anchor>",
@@ -97,7 +101,9 @@ If no new high-impact, non-redundant rubric should be added, output:
 - Quality over quantity: 1 excellent rubric > multiple mediocre ones
 - The shared context is common to all continuations. Focus the rubric on differences between the continuations themselves
 - Do not return empty lists when there are visible differences in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
-- Output in the requried format. Do not restate the question, previous state, agent tracjectories, or existing rubrics in the response.
+- If the rubric style is provided, you are highly encouraged to generate style-specific rubrics instead of generic process-focused rubrics.
+- When the rubric style asks for a complete test, code review, reference summary, or other detailed evidence, place that content in `metadata`.
+- Output in the required format. Do not restate the question, previous state, agent trajectories, or existing rubrics in the response.
 
 Generate only the most impactful, non-redundant rubrics revealing meaningful quality differences.
 """
@@ -253,6 +259,7 @@ RUBRIC_ITEM_JSON_SCHEMA = {
     "properties": {
         "title": {"type": "string"},
         "description": {"type": "string"},
+        "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
         "scale": RUBRIC_SCALE_JSON_SCHEMA,
     },
     "required": ["title", "description", "scale"],
@@ -288,9 +295,10 @@ RUBRIC_GENERATION_RESPONSE_FORMAT = {
                         "polarity": {"type": "string", "enum": ["positive", "negative"]},
                         "title": {"type": "string"},
                         "description": {"type": "string"},
+                        "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
                         "scale": RUBRIC_SCALE_JSON_SCHEMA,
                     },
-                    "required": ["polarity", "title", "description", "scale"],
+                    "required": ["polarity", "title", "description", "metadata", "scale"],
                 },
             },
         },

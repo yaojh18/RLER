@@ -205,7 +205,7 @@ def start_slime_server(args: argparse.Namespace, log_path: Path) -> ManagedServe
                 "--host 127.0.0.1",
                 "--port", str(args.slime_port),
                 "--tensor-parallel-size", str(len(selected_gpus)),
-                "--context-length 80960",
+                "--context-length 128000",
                 "--served-model-name", shlex.quote(args.student_model),
                 "--reasoning-parser qwen3",
                 "--disable-radix-cache",

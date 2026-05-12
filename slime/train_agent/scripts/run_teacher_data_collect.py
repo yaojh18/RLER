@@ -448,7 +448,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--instance-start-delay-seconds",
         type=float,
-        default=300.0,
+        default=120.0,
         help="Delay between launching consecutive instance workers in concurrent mode.",
     )
     parser.add_argument("--skip-prepare-instance-images", action="store_true")
@@ -794,88 +794,14 @@ def run_concurrent_instances(
     return successful_instances
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    if args.summary_path is None:
-        args.summary_path = args.artifact_root / "summary.json"
-    args.search_output_root.mkdir(parents=True, exist_ok=True)
-    args.artifact_root.mkdir(parents=True, exist_ok=True)
-    args.summary_path.parent.mkdir(parents=True, exist_ok=True)
-
-    required_env = infer_litellm_api_env(args.teacher_model) if args.teacher_backend == "openai" else None
-    if required_env and not args.teacher_api_key:
-        raise RuntimeError(f"{required_env} is required for teacher model {args.teacher_model}.")
-
-    instances = select_rebench_instances(
-        subset=args.subset,
-        split=args.split,
-        instance_ids=list(args.instance_id) if args.instance_id else None,
-        offset=args.offset,
-        limit=args.limit,
-    )
-    instance_ids = [str(instance["instance_id"]) for instance in instances]
-    summary: dict[str, Any] = {
-        "settings": {
-            "subset": args.subset,
-            "split": args.split,
-            "offset": args.offset,
-            "limit": args.limit,
-            "teacher_model": args.teacher_model,
-            "teacher_backend": args.teacher_backend,
-            "student_model": args.student_model,
-            "search": {
-                "m": args.search_m,
-                "n": args.search_n,
-                "p": args.search_p,
-                "k": args.search_k,
-                "max_rounds": args.search_max_rounds,
-                "step_limit": args.search_step_limit,
-                "calculate_ground_truth": True,
-            },
-            "search_gpus": args.search_gpus,
-            "prepare_instance_images": not args.skip_prepare_instance_images,
-            "image_prepare_workers": args.image_prepare_workers,
-            "slime_lifecycle": "check_before_each_instance_restart_on_unhealthy",
-            "slime_keepalive_interval_seconds": args.slime_keepalive_interval_seconds,
-            "instance_workers": args.instance_workers,
-            "instance_start_delay_seconds": args.instance_start_delay_seconds,
-            "search_output_root": str(args.search_output_root),
-            "artifact_root": str(args.artifact_root),
-        },
-        "instances": instance_ids,
-        "results": [],
-        "accepted_sft_length_records": [],
-        "length_records": [],
-        "length_record_errors": [],
-        "length_summary": {},
-    }
-    write_summary(args.summary_path, summary)
-
-    logs_dir = args.summary_path.parent / "logs"
-    if not args.skip_prepare_instance_images:
-        summary["image_prepare"] = prepare_instance_images(
-            instances,
-            log_path=logs_dir / "image_prepare.log",
-            workers=args.image_prepare_workers,
-        )
-        write_summary(args.summary_path, summary)
-
-    started = time.perf_counter()
-    if args.instance_workers > 1 and len(instance_ids) > 1:
-        successful_instances = run_concurrent_instances(
-            args=args,
-            logs_dir=logs_dir,
-            instance_ids=instance_ids,
-            summary=summary,
-            started=started,
-        )
-        update_summary_progress(summary, started=started, successful_instances=successful_instances)
-        write_summary(args.summary_path, summary)
-        if successful_instances == 0:
-            raise RuntimeError("all instances failed; see summary results for per-instance errors.")
-        print(json.dumps({"summary_path": str(args.summary_path), "length_summary": summary["length_summary"]}, indent=2, ensure_ascii=False))
-        return 1 if summary.get("failed_instances") else 0
-
+def run_serial_instances(
+    *,
+    args: argparse.Namespace,
+    logs_dir: Path,
+    instance_ids: list[str],
+    summary: dict[str, Any],
+    started: float,
+) -> int:
     successful_instances = 0
     server = None
     try:
@@ -953,9 +879,96 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         stop_slime_server(server)
 
+    return successful_instances
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.summary_path is None:
+        args.summary_path = args.artifact_root / "summary.json"
+    args.search_output_root.mkdir(parents=True, exist_ok=True)
+    args.artifact_root.mkdir(parents=True, exist_ok=True)
+    args.summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    required_env = infer_litellm_api_env(args.teacher_model) if args.teacher_backend == "openai" else None
+    if required_env and not args.teacher_api_key:
+        raise RuntimeError(f"{required_env} is required for teacher model {args.teacher_model}.")
+
+    instances = select_rebench_instances(
+        subset=args.subset,
+        split=args.split,
+        instance_ids=list(args.instance_id) if args.instance_id else None,
+        offset=args.offset,
+        limit=args.limit,
+    )
+    instance_ids = [str(instance["instance_id"]) for instance in instances]
+    summary: dict[str, Any] = {
+        "settings": {
+            "subset": args.subset,
+            "split": args.split,
+            "offset": args.offset,
+            "limit": args.limit,
+            "teacher_model": args.teacher_model,
+            "teacher_backend": args.teacher_backend,
+            "student_model": args.student_model,
+            "search": {
+                "m": args.search_m,
+                "n": args.search_n,
+                "p": args.search_p,
+                "k": args.search_k,
+                "max_rounds": args.search_max_rounds,
+                "step_limit": args.search_step_limit,
+                "calculate_ground_truth": True,
+            },
+            "search_gpus": args.search_gpus,
+            "prepare_instance_images": not args.skip_prepare_instance_images,
+            "image_prepare_workers": args.image_prepare_workers,
+            "slime_lifecycle": "check_before_each_instance_restart_on_unhealthy",
+            "slime_keepalive_interval_seconds": args.slime_keepalive_interval_seconds,
+            "instance_workers": args.instance_workers,
+            "instance_start_delay_seconds": args.instance_start_delay_seconds,
+            "search_output_root": str(args.search_output_root),
+            "artifact_root": str(args.artifact_root),
+        },
+        "instances": instance_ids,
+        "results": [],
+        "accepted_sft_length_records": [],
+        "length_records": [],
+        "length_record_errors": [],
+        "length_summary": {},
+    }
+    write_summary(args.summary_path, summary)
+
+    logs_dir = args.summary_path.parent / "logs"
+    if not args.skip_prepare_instance_images:
+        summary["image_prepare"] = prepare_instance_images(
+            instances,
+            log_path=logs_dir / "image_prepare.log",
+            workers=args.image_prepare_workers,
+        )
+        write_summary(args.summary_path, summary)
+
+    started = time.perf_counter()
+    if args.instance_workers > 1 and len(instance_ids) > 1:
+        successful_instances = run_concurrent_instances(
+            args=args,
+            logs_dir=logs_dir,
+            instance_ids=instance_ids,
+            summary=summary,
+            started=started,
+        )
+    else:
+        successful_instances = run_serial_instances(
+            args=args,
+            logs_dir=logs_dir,
+            instance_ids=instance_ids,
+            summary=summary,
+            started=started,
+        )
+    update_summary_progress(summary, started=started, successful_instances=successful_instances)
+    write_summary(args.summary_path, summary)
     if successful_instances == 0:
         raise RuntimeError("all instances failed; see summary results for per-instance errors.")
-    write_summary(args.summary_path, summary)
     print(json.dumps({"summary_path": str(args.summary_path), "length_summary": summary["length_summary"]}, indent=2, ensure_ascii=False))
     return 1 if summary.get("failed_instances") else 0
 

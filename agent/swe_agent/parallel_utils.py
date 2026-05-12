@@ -328,7 +328,7 @@ class PatchEvalManager:
         model_name: str,
         namespace: str | None,
         work_dir: Path,
-        evaluate_patches_fn: Callable[..., dict[str, float]],
+        evaluate_patches_fn: Callable[..., dict[str, dict[str, Any]]],
         collector: GRPOCollector | None = None,
         write_artifacts: bool = True,
         max_workers: int = 1,
@@ -350,7 +350,7 @@ class PatchEvalManager:
         rubric_bundles: list[RubricArtifactBundle] | None,
         extra_json_writes: list[tuple[Path, Any]] | None,
         previous_future: Future | None,
-    ) -> dict[str, float]:
+    ) -> dict[str, dict[str, Any]]:
         if previous_future is not None:
             previous_future.result()
 
@@ -361,9 +361,9 @@ class PatchEvalManager:
             patch = bundle.terminal_patch_payload.get(self.task_id, {}).get("model_patch") or ""
             patches_by_node_id[bundle.node_id] = patch
 
-        rewards: dict[str, float] = {}
+        evaluations: dict[str, dict[str, Any]] = {}
         if patches_by_node_id:
-            rewards = self.evaluate_patches_fn(
+            evaluations = self.evaluate_patches_fn(
                 instance=self.instance,
                 patches_by_key=patches_by_node_id,
                 model_name=self.model_name,
@@ -372,10 +372,15 @@ class PatchEvalManager:
                 work_dir=self.work_dir,
             )
         for bundle in bundles:
-            if bundle.node_id in rewards:
-                bundle.judge_payload["ground_truth_reward"] = rewards[bundle.node_id]
+            if bundle.node_id in evaluations:
+                bundle.judge_payload["ground_truth_reward"] = float(evaluations[bundle.node_id].get("reward", 0.0))
 
-        gt_by_node_id = dict(rewards)
+        eval_extra_writes = [
+            (bundle.node_dir / "terminal_evalution.json", evaluations[bundle.node_id])
+            for bundle in bundles
+            if bundle.node_id in evaluations
+        ]
+        gt_by_node_id = {node_id: float(payload.get("reward", 0.0)) for node_id, payload in evaluations.items()}
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
             parent_node_id = payload.get("parent_node_id")
@@ -419,8 +424,8 @@ class PatchEvalManager:
             parent_id = bundles[0].node_payload.get("parent_id")
             self.collector.collect(bundles, rubric_bundles or [], parent_id)
         if self.write_artifacts:
-            _write_gt_artifacts(bundles, rubric_bundles, extra_json_writes)
-        return rewards
+            _write_gt_artifacts(bundles, rubric_bundles, (extra_json_writes or []) + eval_extra_writes)
+        return evaluations
 
     def submit_round(
         self,

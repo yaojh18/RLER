@@ -21,17 +21,13 @@ from swe_agent.run.benchmarks.swebench import (
 )
 from swe_agent.run.run_swe_agent import (
     DEFAULT_COMPLETION_MAX_TOKENS,
-    DEFAULT_ENV_TIMEOUT,
-    DEFAULT_EVAL_TIMEOUT,
     DEFAULT_LOG_ROOT,
     DEFAULT_MAX_MODEL_LEN,
     DEFAULT_MODEL_CLASS,
     DEFAULT_OUTPUT_ROOT,
-    DEFAULT_PULL_TIMEOUT,
     DEFAULT_STEP_LIMIT,
     DEFAULT_SUBSET,
     DEFAULT_SPLIT,
-    DEFAULT_VLLM_PORT,
     DEFAULT_SERVE_MODEL,
     SLIME_SERVICE_NAME,
     VLLM_SERVICE_NAME,
@@ -302,11 +298,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-run-dir", type=Path, default=None)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--step-limit", type=int, default=DEFAULT_STEP_LIMIT)
-    parser.add_argument("--environment-timeout", type=int, default=DEFAULT_ENV_TIMEOUT)
-    parser.add_argument("--pull-timeout", type=int, default=DEFAULT_PULL_TIMEOUT)
-    parser.add_argument("--eval-timeout", type=int, default=DEFAULT_EVAL_TIMEOUT)
+    parser.add_argument("--environment-timeout", type=int, default=120)
+    parser.add_argument("--pull-timeout", type=int, default=600)
+    parser.add_argument("--eval-timeout", type=int, default=600)
     parser.add_argument("--gpu-id", default="auto:2")
-    parser.add_argument("--vllm-port", type=int, default=DEFAULT_VLLM_PORT)
+    parser.add_argument("--vllm-port", type=int, default=8011)
     parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--allow-long-max-model-len", action="store_true")
