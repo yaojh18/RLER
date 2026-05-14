@@ -45,6 +45,7 @@ from swe_agent.run.run_swe_agent import (
     _resolve_model_name
 )
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
+from swe_agent.rubric_bank import ExperienceRubricBank
 from swe_agent.trajectory_search import SearchConfig, TrajectorySearchRunner
 from swe_agent.serving import SGLangChatService
 
@@ -61,6 +62,7 @@ def _run_single_instance(
     rubric_model_kwargs: dict[str, Any],
     judge_model_kwargs: dict[str, Any],
     search_config: SearchConfig,
+    rubric_bank: ExperienceRubricBank | None,
     resume: bool,
 ) -> None:
     instance_config = copy.deepcopy(config)
@@ -85,6 +87,7 @@ def _run_single_instance(
         rubric_model_kwargs=rubric_model_kwargs,
         judge_model_kwargs=judge_model_kwargs,
         harness_namespace=get_swebench_harness_namespace(instance),
+        rubric_bank=rubric_bank,
         resume=resume,
     )
     try:
@@ -247,11 +250,17 @@ def run_search(
             export_grpo_bundles=args.export_grpo_bundles,
             write_artifacts=args.write_artifacts,
             strategy=args.strategy,
+            rubric_bank_strategy=args.rubric_bank_strategy,
         )
         rubric_model_name = args.rubric_model or model_name
         judge_model_name = args.judge_model or model_name
         rubric_model_kwargs = dict(shared_model_kwargs)
         judge_model_kwargs = dict(shared_model_kwargs)
+        rubric_bank = (
+            ExperienceRubricBank(bank_path=run_root / "rubric_bank.json")
+            if search_config.rubric_bank_strategy == "experience"
+            else None
+        )
         with temporary_env({"MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": str(args.model_retry_attempts), "LITELLM_LOG": "ERROR"}):
             with tee_console(run_log_path):
                 for instance in instances:
@@ -269,6 +278,7 @@ def run_search(
                             rubric_model_kwargs=rubric_model_kwargs,
                             judge_model_kwargs=judge_model_kwargs,
                             search_config=search_config,
+                            rubric_bank=rubric_bank,
                             resume=bool(args.resume_run_dir),
                         )
                     except Exception as exc:
@@ -330,6 +340,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--calculate-gt-reward", action="store_true", default=True)
     parser.add_argument("--strategy", choices=["best", "probability", "random"], default="random")
+    parser.add_argument("--rubric-bank-strategy", choices=["score", "experience"], default="score")
     parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
     parser.add_argument("--student-model", default=None)
     parser.add_argument("--evaluate-final-patch", action="store_true", default=True)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 import numpy as np
-from swe_agent.rl_contracts import ExportGroup, ExportSample, GRPOExportBundle
+from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
 
 INVALID_SAMPLE_REWARD = -1.0
 RUBRIC_FORMAT_ERROR_REWARD = -1.0
@@ -104,6 +104,7 @@ class RubricArtifactBundle:
     rubric_dir: Path
     rubric_payload: dict[str, Any]
     messages_payload: dict[str, Any]
+    retrieve_messages_payload: list[dict[str, Any]] | None = None
     round_summary_path: Path | None = None
     selected_for_round_summary: bool = False
 
@@ -238,6 +239,8 @@ def _write_base_artifacts(
     for bundle in rubric_bundles or []:
         bundle.rubric_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(bundle.rubric_dir / "messages.json", bundle.messages_payload)
+        if bundle.retrieve_messages_payload is not None:
+            _atomic_write_json(bundle.rubric_dir / "retrieve_message.json", bundle.retrieve_messages_payload)
     for path, payload in extra_json_writes or []:
         _atomic_write_json(path, payload)
 

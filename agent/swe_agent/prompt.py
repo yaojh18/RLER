@@ -1,3 +1,9 @@
+from __future__ import annotations
+
+import copy
+from typing import Any
+
+
 SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT = """
 You are an expert evaluator generating adaptive rubrics to assess agent trajectory continuations.
 
@@ -69,14 +75,14 @@ Never create positive/negative versions of same criterion:
     "description": "<detailed excellence/failure description>",
     "title": "<abstract label>",
     "metadata": {
-      <a dict of any other relevant structured context, evidence, focus, process needed for judging, including but not limited to behavioral oracles, code review, targeted unit test or pseudo-test, etc.>
+      <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
     },
     "scale": {
-      "1": "<worst case anchor>",
-      "2": "<weak/minor issue anchor>",
-      "3": "<partial/moderate anchor>",
-      "4": "<strong/serious issue anchor>",
-      "5": "<best case/severe issue anchor>"
+      "1": "<the anchor that most violates the rubric>",
+      "2": "<the anchor that somewhat violates the rubric>",
+      "3": "<the moderate anchor>",
+      "4": "<the anchor that somewhat aligns with the rubric>",
+      "5": "<the anchor that most aligns with the rubric>"
     }
   }
 }
@@ -320,3 +326,520 @@ JUDGE_RESPONSE_FORMAT = {
         },
     },
 }
+
+RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT = """
+You are retrieving prior rubric-generation experiences to help generate adaptive rubrics for SWE-agent trajectory continuations.
+
+## Task
+Select the experience titles whose lessons should be appended to the rubric generation prompt before generating the next rubric.
+The downstream rubric generator will identify the single most discriminative, non-redundant criterion separating the current continuation samples. Retrieve experiences only when they can concretely help that decision.
+
+## Retrieval Targets
+Retrieve an experience including but not limited to the following types of lessons:
+
+1. **Related instance or related problem**
+   - Same repository, library family, framework, task type, API surface, compatibility issue, build/configuration issue, workspace layout issue, or localization pattern.
+   - Use this when the prior experience contains a task-specific boundary that may transfer to the current rubric decision.
+
+2. **Related evaluation difficulty**
+   - The current continuations are hard to rank for a reason seen before: visible process quality conflicts with semantic correctness, tests may encode obsolete behavior, a workaround may pass the real oracle, or a broad refactor may hide the actual compatibility boundary.
+   - Use this when the prior experience helps decide what evidence the rubric should privilege under uncertainty.
+
+3. **Historical counterexample to a likely rubric-model mistake**
+   - Retrieve prior cases where the rubric model made a high-frequency error that is likely to recur now, such as rewarding generic test running over semantic coverage, punishing a valid compatibility-preserving revert, treating any reproduction project as a solution, over-penalizing messy but oracle-correct code, or generating a process/editing rubric when the samples differ by functional behavior.
+   - Use this to warn the rubric generator away from a tempting but wrong criterion.
+
+## Inputs
+1. **Experience Index**: Existing experience titles with descriptions. Titles are the only retrieval handles.
+2. **Current Round Context**: The current problem, previous persistent state, latest shared trajectory segment, and candidate continuations.
+
+## Selection Rules
+- Do not retrieve an experience solely because it shares broad words like "tests", "verification", "refactor", "search", or "compatibility"; the current continuation behavior must match the prior lesson.
+- Do not retrieve an experience solely because it shares a repository name if the evaluation difficulty is different.
+- Return an empty list when the index contains no experience with a concrete target match.
+- Do not output or invent internal IDs. Operate only on titles.
+
+## Output Format
+```json
+{
+  "titles": ["..."]
+}
+```
+"""
+
+RUBRIC_EXPERIENCE_UPDATE_PROMPT = """
+You are maintaining a compact rubric-generation experience bank for SWE-agent search.
+
+## Task
+Update the experience bank using previous rubric generation attempts from the completed instance.
+Store only durable lessons that improve future rubric generation. Do not create a per-instance log.
+
+## Available Actions
+- **retrieve**: request full existing experiences before deciding whether to update or delete them if you are uncertain.
+- **add**: add one new reusable experience.
+- **update**: replace one existing experience with a clearer or more general version.
+- **delete**: remove one redundant, misleading, or low-value experience.
+
+## Input Explanation
+- `generation_context`: the context that was shown to the rubric generator, including the current history and sample behavior distribution.
+- `retrieved`: historical experiences retrieved before this rubric generation attempt.
+- `generated_rubrics`: the full rubric list generated in that attempt.
+- `gt_skeleton`: the ground-truth patch skeleton for this instance.
+- `generated_rubric_scores`: scores judged by the generated rubric list of each sample in `generation_context` in the same order.
+- `gt_scores`: ground-truth scores of each sample in `generation_context` in the same order.
+
+## Output Explanation
+Output is a retrieve/add/update/delete action on the experience bank with the following fields:
+- **title**: short reusable retrieval label. Name the evaluation lesson, not just the repository. It must agree with the description, context, and score pattern.
+- **description**: concise summary of when this experience should be retrieved.
+- **context**: (when to apply) current judging state summary, including history state, current agent goal and focus and the behavior differences and distribution across samples.
+- **experience**: (how to avoid) actionable rubric-generation lesson. State what the previous rubrics generated, why they are correct or wrong, what the better rubric should focus on, and what tempting wrong criterion should be avoided.
+- **metadata.analysis**: (why it happens) concise evidence analysis explaining the reason for the lesson, grounded by evidence from generated rubrics, GT skeleton, and generated rubric accuracy.
+- **metadata.reference_golden_rubrics**: (what to do) a list of best rubric(s) that should have been generated.
+
+## Guidelines
+- Add or update only high-impact experiences likely to improve future rubric generation.
+- Use delete only for experiences that are redundant, misleading, or unsafe to retrieve.
+- If you need full context for existing experiences before updating or deleting them, output a retrieve action first using their titles.
+- Return an empty object `{}` when no high-impact reusable experience can be generated.
+- Prefer quality over quantity: one reusable experience is better than several narrow instance notes.
+- `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton` or `gt_scores`. Put GT-based justification only in `metadata.analysis`.
+- Do not save lessons whose operational instruction is merely "follow the ground truth" or "prefer the GT patch." If the hidden GT reveals that the PR text, majority solution, or generated rubric was misleading, explain the observable warning sign and the better rubric focus.
+- Existing experience titles are unique handles. For add, the new `experience.title` must not match any current bank title. For update, `target_title` must select the existing experience; the replacement `experience.title` may keep that title or use a new title that does not match any other current bank title.
+- Base `metadata.analysis`, `context`, and `experience` only on the current update input and any retrieved existing experiences. Do not cite external reports, source files, or prior analyses unless they are explicitly present in the input.
+- In each response, return either one retrieve/add/update/delete action, or an empty dict representing the end of session. Do not return multiple actions.
+
+## Output Format
+Return only JSON in the following format:
+```json
+{
+    "action": "retrieve",
+    "titles": ["existing experience titles"],
+}
+```
+
+For add:
+```json
+{
+    "action": "add",
+    "experience": {
+    "title": "a new unique experience title",
+    "description": "...",
+    "context": "...",
+    "experience": "...",
+    "metadata": {
+        "analysis": "...",
+        "reference_golden_rubrics": []
+    }
+    }
+}
+```
+
+For update:
+```json
+{
+    "action": "update",
+    "target_title": "an existing experience title",
+    "experience": {
+    "title": "the existing experience title or a new unique title",
+    "description": "...",
+    "context": "...",
+    "experience": "...",
+    "metadata": {
+        "analysis": "...",
+        "reference_golden_rubrics": []
+    }
+    },
+}
+```
+
+For delete:
+```json
+{
+    "action": "delete",
+    "title": "an existing experience title",
+}
+```
+
+## Reference Golden Rubrics Output Format
+```json
+[
+    {
+        "rubric": {
+            "polarity": "<positive|negative>",
+            "description": "<detailed excellence/failure description>",
+            "title": "<abstract label>",
+            "metadata": {
+            <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
+            },
+            "scale": {
+                "1": "<the anchor that most violates the rubric>",
+                "2": "<the anchor that somewhat violates the rubric>",
+                "3": "<the moderate anchor>",
+                "4": "<the anchor that somewhat aligns with the rubric>",
+                "5": "<the anchor that most aligns with the rubric>"
+            }
+        }
+    }
+]
+```
+"""
+
+RUBRIC_EXPERIENCE_RETRIEVAL_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "rubric_experience_retrieval",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "titles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["titles"],
+        },
+    },
+}
+
+RUBRIC_EXPERIENCE_UPDATE_RESPONSE_FORMAT = {"type": "json_object"}
+
+
+def _seed_experiences() -> list[dict[str, Any]]:
+    selective_compatibility_boundary = {
+        "rubric": {
+            "polarity": "positive",
+            "title": "Selective Compatibility Boundary",
+            "description": (
+                "Scores whether the continuation identifies and preserves the task-specific boundary between behavior that should change "
+                "and behavior that must remain backward-compatible, instead of treating every failing test or every desired feature as globally authoritative."
+            ),
+            "metadata": {
+                "stage": "refinement",
+                "focus": "terminal diff and tests around field defaults, validator flags, and compatibility cases",
+                "test_code": (
+                    "Python pseudo-test: define fields using Length and NumberRange validators; render them; assert expected HTML5 attributes where required; "
+                    "also assert a compatibility-sensitive field keeps its legacy input type or unset flag behavior."
+                ),
+                "code_review": (
+                    "Owner: WTForms field/widget and flag generation. Invariant: new HTML5 behavior must not erase public compatibility cases. "
+                    "Failure mode: blanket conversion or blanket reversion hides the actual API boundary."
+                ),
+            },
+            "scale": {
+                "1": "Blindly changes or reverts behavior without identifying any compatibility boundary.",
+                "2": "Mentions compatibility but applies it to the wrong API surface or inconsistently.",
+                "3": "Handles the main behavior but misses one important compatibility exception.",
+                "4": "Mostly preserves the correct boundary with minor omissions.",
+                "5": "Clearly implements the intended behavior while preserving the compatibility-sensitive cases supported by evidence.",
+            },
+        },
+    }
+    fabricated_workspace_patch = {
+        "rubric": {
+            "polarity": "negative",
+            "title": "Fabricated Workspace Patch",
+            "description": (
+                "Penalizes continuations that create or modify a synthetic project or dummy files and present that work as the solution, rather than grounding "
+                "the patch in the actual target repository or explicitly treating the synthetic project only as a disposable reproduction."
+            ),
+            "metadata": {
+                "stage": "localization",
+                "focus": "created files, terminal patch paths, and claims that synthetic files solve the task",
+                "test_code": (
+                    "Shell pseudo-check: inspect git diff --name-status and repository root; fail if the submitted patch consists only of newly created toy "
+                    "project files that are not part of the target checkout."
+                ),
+                "code_review": (
+                    "Owner: repository targeting. Invariant: final patches must modify code hidden tests import or execute. "
+                    "Failure mode: synthetic reproduction files are submitted as the real fix."
+                ),
+            },
+            "scale": {
+                "1": "Targets the real repository and keeps any synthetic reproduction clearly separate.",
+                "2": "Creates disposable repro artifacts but does not patch them as the solution.",
+                "3": "Mixes real and synthetic targets, leaving ownership ambiguous.",
+                "4": "Primarily patches generated dummy files while showing some awareness of the real task.",
+                "5": "Submits a solution built on fabricated files or a synthetic project as if it were the target repository.",
+            },
+        },
+    }
+    post_modification_regression_testing = {
+        "rubric": {
+            "polarity": "positive",
+            "title": "Post-Modification Regression Testing",
+            "description": (
+                "The agent validates its codebase modifications by actively running the project's official, built-in test suite (e.g., `pytest`, `unittest`) "
+                "to catch regressions. Excellence is shown by relying on comprehensive existing tests to verify correctness and guide subsequent fixes, rather "
+                "than depending solely on basic syntax checks or writing limited custom test scripts that miss broader system impacts."
+            ),
+            "metadata": {},
+            "scale": {
+                "1": "Applies modifications without executing any subsequent tests, syntax checks, or validations, assuming the edits are correct.",
+                "2": "Performs only superficial checks after modifying code, such as basic syntax verification or checking that a module imports without crashing.",
+                "3": "Writes and executes a narrow custom script to verify the immediate change, but fails to leverage the project's existing test suite to catch broader, unintended regressions.",
+                "4": "Actively invokes the project's official test suite to validate changes, using the test output to identify broken functionality or regressions.",
+                "5": "Methodically and iteratively runs the project's official test suite after making changes, successfully using test failures to pinpoint regressions and driving the subsequent fix process entirely through test feedback.",
+            },
+        },
+    }
+    destructive_test_appeasement = {
+        "rubric": {
+            "polarity": "negative",
+            "title": "Destructive Test Appeasement",
+            "description": (
+                "Evaluates whether the agent erroneously reverts valid, requested source code modifications to appease outdated tests. A poor continuation treats all "
+                "test failures as source code regressions, failing to recognize when a test fails precisely because it strictly asserts the old behavior that the "
+                "prompt explicitly asked to change. This results in the agent reverting or deleting its correct implementation just to make an obsolete test pass, "
+                "thereby failing the task objective."
+            ),
+            "metadata": {},
+            "scale": {
+                "1": "The agent correctly recognizes that the test failure is due to the test asserting outdated behavior. It preserves the valid source code changes, choosing to either update the obsolete test or safely ignore the expected failure.",
+                "2": "The agent briefly investigates the test failure as a potential regression before correctly concluding that the test is outdated, leaving the correct source code modifications intact.",
+                "3": "The agent is confused by the test failure and wastes effort trying to debug the source code, but ultimately stops short of reverting the valid feature changes.",
+                "4": "The agent partially degrades the requested feature, adding hacky workarounds or reverting minor parts of the correct implementation in an attempt to pacify the outdated test.",
+                "5": "The agent explicitly and completely reverts its valid, required feature modifications in the source code solely to make the obsolete test pass, fundamentally failing the task objective.",
+            },
+        },
+    }
+    targeting_fabricated_code = {
+        "rubric": {
+            "polarity": "negative",
+            "title": "Targeting Fabricated Code",
+            "description": (
+                "The agent applies proposed fixes to a dummy project or synthetic files it created from scratch (often derived from the issue description's "
+                "reproduction steps) instead of locating and modifying the actual target repository. This reflects a severe failure in environment navigation "
+                "and task comprehension."
+            ),
+            "metadata": {},
+            "scale": {
+                "1": "The agent correctly locates the real codebase and exclusively targets it for any proposed fixes.",
+                "2": "The agent creates synthetic files for reproduction or testing, but clearly distinguishes them from the real codebase and applies fixes correctly.",
+                "3": "The agent creates a synthetic project and mistakenly attempts to apply some fixes to it, but shows some awareness that it is not the actual repository.",
+                "4": "The agent focuses heavily on fixing a fabricated project and drafts patches for the synthetic code, indicating deep confusion about the target repository.",
+                "5": "The agent completely fails to locate or ignores the real repository, builds a synthetic project from scratch, applies a fix to the fabricated files, and generates a patch against its own creation.",
+            },
+        },
+    }
+    wtforms_gt_skeleton = """diff --git a/CHANGES.rst b/CHANGES.rst
+CHANGES.rst: @@ -34,7 +34,7 @@ Unreleased
++ - Flags can take non-boolean values. :issue:`406` :pr:`467`
+diff --git a/docs/fields.rst b/docs/fields.rst
+docs/fields.rst: @@ -182,10 +182,10 @@ The Field base class
+- An object containing boolean flags set either by the field itself, or
++ An object containing flags set either by the field itself, or
+- An unset flag will result in :const:`False`.
++ An unset flag will result in :const:`None`.
+docs/fields.rst: @@ -220,10 +220,14 @@ refer to a single input from the form.
+- For better date/time fields, see the :mod:`dateutil extension <wtforms.ext.dateutil.fields>`
++ .. autoclass:: DateTimeLocalField(default field arguments, format='%Y-%m-%d %H:%M:%S')
++ .. autoclass:: DecimalRangeField(default field arguments)
++ .. autoclass:: EmailField(default field arguments)
+docs/fields.rst: @@ -252,6 +256,8 @@ refer to a single input from the form.
++ .. autoclass:: IntegerRangeField(default field arguments)
+docs/fields.rst: @@ -323,6 +329,8 @@ refer to a single input from the form.
++ .. autoclass:: SearchField(default field arguments)
+docs/fields.rst: @@ -338,6 +346,13 @@ refer to a single input from the form.
++ .. autoclass:: TelField(default field arguments)
++ .. autoclass:: TimeField(default field arguments, format='%H:%M')
++ .. autoclass:: URLField(default field arguments)
+docs/fields.rst: @@ -559,40 +574,3 @@ Additional Helper Classes
+- HTML5 Fields
+- In addition to basic HTML fields, WTForms also supplies fields for the HTML5
+- standard. These fields can be accessed under the :mod:`wtforms.fields.html5` namespace.
+- In reality, these fields are just convenience fields that extend basic fields
+- and implement HTML5 specific widgets. These widgets are located in the :mod:`wtforms.widgets.html5`
+- namespace and can be overridden or modified just like any other widget.
+- .. module:: wtforms.fields.html5
+- .. autoclass:: SearchField(default field arguments)
+- .. autoclass:: TelField(default field arguments)
+- .. autoclass:: URLField(default fie
+...[truncated]...
+- input_type = "number"
+- def __init__(self, step=None, min=None, max=None):
+- self.step = step
+- self.min = min
+- self.max = max
+- def __call__(self, field, **kwargs):
+- if self.step is not None:
+- kwargs.setdefault("step", self.step)
+- if self.min is not None:
+- kwargs.setdefault("min", self.min)
+- if self.max is not None:
+- kwargs.setdefault("max", self.max)
+- return super().__call__(field, **kwargs)
+- class RangeInput(Input):
+- \"\"\"
+- Renders an input with type "range".
+- \"\"\"
+- input_type = "range"
+- def __init__(self, step=None):
+- self.step = step
+- def __call__(self, field, **kwargs):
+- if self.step is not None:
+- kwargs.setdefault("step", self.step)
+- return super().__call__(field, **kwargs)
+- class ColorInput(Input):
+- \"\"\"
+- Renders an input with type "color".
+- \"\"\"
+- input_type = "color\""""
+    gradle_gt_skeleton = """diff --git a/build.gradle.kts b/build.gradle.kts
+build.gradle.kts: @@ -36,8 +36,8 @@ kotlin {
+- @Suppress("DEPRECATION") // TODO: bump apiVersion to 2.0 to match Gradle 9.0
+- apiVersion = KotlinVersion.KOTLIN_1_8
++ apiVersion = KotlinVersion.KOTLIN_2_0
++ languageVersion = apiVersion
+diff --git a/docs/changes/README.md b/docs/changes/README.md
+docs/changes/README.md: @@ -2,6 +2,11 @@
++ **Fixed**
++ - Pin the plugin's Kotlin language level on 2.0. ([#1448](https://github.com/GradleUp/shadow/pull/1448))
++ The language level used in `9.0.0-beta14` is 2.2, which may cause compatibility issues for the plugins depending on
++ Shadow.
+diff --git a/src/main/kotlin/com/github/jengelman/gradle/plugins/shadow/transformers/PropertiesFileTransformer.kt b/src/main/kotlin/com/github/jengelman/gradle/plugins/shadow/transformers/PropertiesFileTransformer.kt
+src/main/kotlin/com/github/jengelman/gradle/plugins/shadow/transformers/PropertiesFileTransformer.kt: @@ -238,7 +238,6 @@ public open class PropertiesFileTransformer @Inject constructor(
+- @OptIn(ExperimentalStdlibApi::class)"""
+    wtforms_r2_metadata = {
+        "generated_rubrics": [copy.deepcopy(post_modification_regression_testing)],
+        "gt_skeleton": wtforms_gt_skeleton,
+        "generated_rubric_scores": [1.000, 0.250, 0.000, 1.000, 0.500, 0.000, 0.500, 0.000],
+        "gt_scores": [0.977, 0.977, 0.981, 0.981, 0.000, 0.000, 0.000, 0.000],
+        "analysis": (
+            "Source: agent/search_outputs/analysis/reports/ROUND23_LOW_ACC_RUBRIC_FAILURE_REVIEW.md, wtforms__wtforms-614 round 2. "
+            "The generated process rubric rewarded official regression testing with child scores [1.000, 0.250, 0.000, 1.000, 0.500, 0.000, 0.500, 0.000], "
+            "while GT rewards [0.977, 0.977, 0.981, 0.981, 0.000, 0.000, 0.000, 0.000] depended on semantic HTML5 namespace/widget/flag behavior. "
+            "The better reflection is to generate a compatibility-boundary rubric."
+        ),
+        "reference_golden_rubrics": [copy.deepcopy(selective_compatibility_boundary)],
+    }
+    wtforms_r3_metadata = {
+        "generated_rubrics": [copy.deepcopy(destructive_test_appeasement)],
+        "gt_skeleton": wtforms_gt_skeleton,
+        "generated_rubric_scores": [1.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000],
+        "gt_scores": [0.981, 0.977, 0.977, 0.977, 0.977, 0.977, 0.977, 0.977],
+        "analysis": (
+            "Source: agent/search_outputs/analysis/reports/ROUND23_LOW_ACC_RUBRIC_FAILURE_REVIEW.md and UPDATED_METRIC_PC_SIBLING_FAILURE_REVIEW.md, "
+            "wtforms__wtforms-614 round 3. Destructive Test Appeasement scored the first child as maximally bad [1.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000], "
+            "while that child had the best GT reward in [0.981, 0.977, 0.977, 0.977, 0.977, 0.977, 0.977, 0.977]. "
+            "The mistake was failing to distinguish obsolete tests from intentional compatibility constraints."
+        ),
+        "reference_golden_rubrics": [copy.deepcopy(selective_compatibility_boundary)],
+    }
+    gradle_r1_metadata = {
+        "generated_rubrics": [copy.deepcopy(targeting_fabricated_code)],
+        "gt_skeleton": gradle_gt_skeleton,
+        "generated_rubric_scores": [0.250, 0.000, 0.000, 0.000, 0.000, 1.000, 0.000, 0.000],
+        "gt_scores": [0.952, 0.000, 0.000, 0.000, 0.000, 0.000, 0.952, 0.952],
+        "analysis": (
+            "Source: agent/search_outputs/analysis/results/updated_metric_low_group_case_packets.md, CASE 11 adaptive_grounded "
+            "gradleup__shadow-1448 round 1. The generated rubric gave its highest fabricated-code score to the sixth child, whose GT was 0.000, while the "
+            "first, seventh, and eighth children had GT 0.952 because they patched the real repository. The golden rewrite keeps the same evidence but phrases "
+            "it as a grounded repository-targeting criterion."
+        ),
+        "reference_golden_rubrics": [copy.deepcopy(fabricated_workspace_patch)],
+    }
+    return [
+        {
+            "title": "WTForms Process Rubric Mismatch",
+            "description": "Do not use a process-only testing rubric when WTForms samples are separated by HTML5 namespace/widget/flag compatibility behavior.",
+            "context": (
+                "WTForms round 2 continuations share a history where HTML5 field/widget migration and validator-derived flags are already visible. Scores are "
+                "ordered by the eight child samples. The first sample broadly moves HTML5 fields/widgets into core and manually fixes a missing range field; "
+                "it gets generated testing score 1.000 and GT 0.977. The second sample performs a similar broad refactor with import/deprecation cleanup; score "
+                "0.250, GT 0.977. The third sample does a large scripted migration of HTML5 widgets and fields; score 0.000, GT 0.981. The fourth sample keeps "
+                "the broad migration but removes a warning that breaks local tests; score 1.000, GT 0.981. The fifth, sixth, seventh, and eighth samples only "
+                "make partial widget/default changes such as changing FloatField, appending large chunks of core fields, fixing StringField after a bad replace, "
+                "or adding Date/Time widget overrides; their GT scores are all 0.000 even when the testing rubric gives 0.500 to some of them."
+            ),
+            "experience": (
+                "The prior generated choice was `Post-Modification Regression Testing`, and it was the wrong lesson for this context. The best replacement is "
+                "`Selective Compatibility Boundary`: the group is separated by whether the continuation identifies which WTForms behavior should change and "
+                "which public compatibility cases must remain, not by whether it runs broader tests. A wrong approach is to reward generic regression testing, "
+                "reward blanket HTML5 conversion, or punish every rollback before checking whether it preserves an intentional API boundary."
+            ),
+            "metadata": copy.deepcopy(wtforms_r2_metadata),
+        },
+        {
+            "title": "Fabricated Target Repository",
+            "description": "Use an active negative rubric when samples in a confusing or empty workspace fabricate a project and submit created files as the solution.",
+            "context": (
+                "Gradle Shadow round 1 continuations start from a confusing workspace. Scores are ordered by the eight child samples. The first child creates a "
+                "temporary reproduction but still patches the real repository and reaches GT 0.952; the fabricated-code rubric gives it 0.250 because the repro "
+                "is visible. The second, third, and fourth children patch real build.gradle.kts variants that do not match the GT patch and receive GT 0.000. "
+                "The fifth child mostly investigates real Kotlin source and does not land a useful patch, also GT 0.000. The sixth child creates files under a "
+                "synthetic /testbed workspace and submits that fabricated patch; the rubric correctly scores it 1.000 and GT is 0.000. The seventh and eighth "
+                "children patch the real build script in ways close to the golden version and receive GT 0.952 with fabricated-code scores 0.000."
+            ),
+            "experience": (
+                "The prior generated choice `Targeting Fabricated Code` captured the useful failure mode: the bad sample actively patches created dummy files "
+                "instead of code hidden tests will import. The best golden rewrite is `Fabricated Workspace Patch`, which keeps the criterion grounded in created "
+                "files, terminal patch paths, and claims that the synthetic project is the solution. A wrong approach is to reward having any reproduction project, "
+                "score generic localization thoroughness, or ignore whether the final patch lands in the real repository."
+            ),
+            "metadata": copy.deepcopy(gradle_r1_metadata),
+        },
+        {
+            "title": "Avoid Obsolete-Test Overcorrection",
+            "description": "Do not generate a destructive-test-appeasement rubric when the real missing distinction is WTForms compatibility boundary reasoning.",
+            "context": (
+                "WTForms round 3 continuations have already moved much of the HTML5 field/widget code toward the main namespace. Scores are ordered by the eight "
+                "child samples. The first sample reverts `FloatField` after old tests fail while keeping the broader migration; the destructive-test rubric gives "
+                "it 1.000 badness, but its GT is the best at 0.981. The second through sixth samples submit similar broad HTML5 refactors without that specific "
+                "compatibility revert and all score 0.000 on the destructive-test rubric with GT 0.977. The seventh sample runs broad tests, observes the legacy "
+                "FloatField expectation, and treats it as outdated rather than preserving it; score 0.000, GT 0.977. The eighth sample verifies HTML5 defaults "
+                "with a custom script and submits the broad refactor; score 0.000, GT 0.977."
+            ),
+            "experience": (
+                "The prior bad choice was the negative rubric `Destructive Test Appeasement`; it was plausible but wrong for this context. The better choice is to "
+                "generate a rubric like `Selective Compatibility Boundary`, because the judge needs to distinguish obsolete tests from intentional compatibility "
+                "constraints before penalizing a revert. If generating again, prefer a rubric that asks whether the continuation preserves the correct API boundary. "
+                "The wrong approach is to assume every legacy-test-driven rollback is destructive, which can punish the best continuation when it keeps the migration "
+                "while preserving a compatibility-sensitive exception."
+            ),
+            "metadata": copy.deepcopy(wtforms_r3_metadata),
+        },
+    ]
+
+
+def _seed_rubrics() -> list[dict[str, Any]]:
+    return [
+        {
+            "rubric": {
+                "polarity": "positive",
+                "title": "Evidence-to-Decision Traceability",
+                "description": (
+                    "Ties major next steps or fix proposals to concrete evidence already surfaced in the trajectory-such as an observed failure, command/check "
+                    "output, file or function inspection, a named code location, or a test result-and makes clear how that evidence changes the plan."
+                ),
+                "scale": {
+                    "1": "Major decisions are not tied to any concrete evidence already surfaced in the trajectory",
+                    "2": "Mentions concrete evidence, but the link from evidence to the chosen next step is mostly implicit or weak",
+                    "3": "At least one important next step is explicitly justified by concrete evidence, but other key decisions remain weakly supported",
+                    "4": "Most important next steps or fix proposals are explicitly tied to concrete evidence and the effect on the plan is clear",
+                    "5": "Nearly every important pivot, hypothesis update, or fix proposal is explicitly anchored to concrete evidence, with a clear explanation of how that evidence drives the next move",
+                },
+                "metadata": {},
+            }
+        },
+        {
+            "rubric": {
+                "polarity": "negative",
+                "title": "Closure Without a Decisive Check",
+                "description": (
+                    "Claims or strongly implies that the issue is fixed, understood, or ready to close without naming a concrete check or test that would decide "
+                    "the claim, or despite already available evidence that leaves the claim unresolved."
+                ),
+                "scale": {
+                    "1": "No closure claim is made without a concrete deciding check",
+                    "2": "Slight overconfidence, but the continuation stays tentative or names a plausible confirming check",
+                    "3": "Makes a noticeable completion or success claim while the decisive confirming check is missing or underspecified",
+                    "4": "Treats the issue as effectively resolved without a concrete deciding check or despite unresolved contrary evidence",
+                    "5": "Strongly declares success or completion and proceeds as if resolved, with no concrete deciding check and no serious engagement with unresolved evidence",
+                },
+                "metadata": {},
+            }
+        },
+    ]

@@ -231,3 +231,4 @@ agent/logs
 agent/search_outputs
 agent/aggregate_outputs
 .vscode
+.agents
