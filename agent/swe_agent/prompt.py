@@ -15,7 +15,7 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
 ## Output Components
 - **Description**: Detailed, specific description of what makes a continuation excellent/problematic
 - **Title**: Concise abstract label (general, not task-specific)
-- **Scale**: A five-point scale from 1 to 5 with concrete anchors for this rubric
+- **Scale**: A five-point scale from 1 to 5 with concrete anchors for this rubric. The scale must follow the rubric polarity: for a positive rubric, 1 is the weakest evidence and 5 is the strongest evidence; for a negative rubric, 1 is no/least evidence of the flaw and 5 is the most severe evidence of the flaw.
 - **Polarity**: Either `"positive"` or `"negative"`
 - **Metadata**: A structured evidence payload for style-specific extra content. Use string fields such as `stage`, `oracle_test`, `code_review`, `privileged_reference_summary`, `judge_focus`, or `failure_mode`. Put complete test snippets, review reasoning, or reference-derived behavioral oracles here instead of overloading the title or scale.
 
@@ -32,22 +32,37 @@ Represent this choice using the `polarity` field in the rubric object.
 - Each rubric must distinguish between otherwise similar continuations from the same shared prefix
 - Exclude generic criteria applying equally to all continuations
 
-### 2. Novelty & Non-Redundancy
-With existing rubrics:
-- Never duplicate overlapping rubrics in meaning/scope
+### 2. Grounded Current Distinction
+- Focus the rubric on the differences between the continuations, not on the shared context
+- If continuations differ in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files, score that concrete process evidence
+- If continuations differ in source changes, score the observable patch behavior: changed files, symbols, API contracts, data flow, compatibility boundaries, edge cases, or tests
+- Do not reward majority behavior just because most continuations share it; reward the behavior best supported by the visible evidence
+- Avoid vague criteria such as "thoroughness", "correctness", "best practice", or "complete implementation" unless the rubric defines the concrete evidence being scored
+
+### 3. Novelty & Non-Redundancy
+- Never duplicate existing or generated rubrics in meaning/scope
 - Identify uncovered quality dimensions
 - Add granular criteria if existing rubrics are broad
 - Return empty lists if existing rubrics are comprehensive
-
-### 3. Avoid Mirror Rubrics
-Never create positive/negative versions of same criterion:
-- ❌ "Runs targeted validation" + "Does not run targeted validation"
-- ✅ Choose only the more discriminative direction
+- Do not generate both "Runs targeted validation" and "Does not run targeted validation"
+- Choose only the more discriminative direction
 
 ### 4. Conservative Negative Rubrics
 - Identify clear failure modes, not absence of excellence
-- Response penalized if it exhibits ANY negative rubric behavior
-- Focus on active mistakes vs missing features
+- A negative rubric should describe an observable harmful behavior, incorrect assumption, misleading edit, or unsupported claim
+- Do not create a negative rubric merely because a continuation lacks a desirable behavior
+- For negative rubrics, every scale anchor must measure severity of the flaw: 1 means the flaw is absent or minimal, and 5 means the flaw is clearly and severely present. Never write a negative rubric whose scale rewards the good behavior at 5.
+
+### 5. Rubric Style (Optional)
+- This guideline applies only when an additional rubric style section is provided
+- Follow the requested style when choosing the criterion and writing `metadata`, while still satisfying the core requirements above
+- When the rubric style asks for a complete test, code review, reference summary, or other detailed evidence, place that content in `metadata`
+
+### 6. Previous Generated Rubrics & Experiences (Optional)
+- This guideline applies only when exisiting, previous generated rubrics or retrieved rubric experiences are provided
+- Use previous rubrics to understand what is already covered, then add only a non-redundant uncovered criterion
+- Treat retrieved rubric experiences as optional hypotheses. Use them only when the current continuations match the prior lesson
+- If a previous rubric or experience would turn a precise current distinction into a broad generic rubric, ignore it
 
 ## Selection Strategy
 
@@ -78,11 +93,11 @@ Never create positive/negative versions of same criterion:
       <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
     },
     "scale": {
-      "1": "<the anchor that most violates the rubric>",
-      "2": "<the anchor that somewhat violates the rubric>",
+      "1": "<positive rubric: weakest evidence / negative rubric: flaw absent or minimal>",
+      "2": "<positive rubric: weak evidence / negative rubric: minor evidence of the flaw>",
       "3": "<the moderate anchor>",
-      "4": "<the anchor that somewhat aligns with the rubric>",
-      "5": "<the anchor that most aligns with the rubric>"
+      "4": "<positive rubric: strong evidence / negative rubric: clear evidence of the flaw>",
+      "5": "<positive rubric: strongest evidence / negative rubric: most severe evidence of the flaw>"
     }
   }
 }
@@ -107,8 +122,6 @@ If no new high-impact, non-redundant rubric should be added, output:
 - Quality over quantity: 1 excellent rubric > multiple mediocre ones
 - The shared context is common to all continuations. Focus the rubric on differences between the continuations themselves
 - Do not return empty lists when there are visible differences in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
-- If the rubric style is provided, you are highly encouraged to generate style-specific rubrics instead of generic process-focused rubrics.
-- When the rubric style asks for a complete test, code review, reference summary, or other detailed evidence, place that content in `metadata`.
 - Output in the required format. Do not restate the question, previous state, agent trajectories, or existing rubrics in the response.
 
 Generate only the most impactful, non-redundant rubrics revealing meaningful quality differences.
@@ -356,6 +369,9 @@ Retrieve an experience including but not limited to the following types of lesso
 ## Selection Rules
 - Do not retrieve an experience solely because it shares broad words like "tests", "verification", "refactor", "search", or "compatibility"; the current continuation behavior must match the prior lesson.
 - Do not retrieve an experience solely because it shares a repository name if the evaluation difficulty is different.
+- Retrieve an experience only if its stated applicability condition matches the current continuation distribution.
+- Do not retrieve an experience that would relax or ignore a distinction that is task-defining in the current samples. A prior lesson about harmless implementation variation applies only when the visible differences are actually semantically equivalent for this task.
+- Do not retrieve an early-stage process lesson when the current samples already contain enough terminal code or patch evidence to judge the implementation directly, unless the same process failure is still visibly causing the bad implementation. Vice versa.
 - Return an empty list when the index contains no experience with a concrete target match.
 - Do not output or invent internal IDs. Operate only on titles.
 
@@ -396,7 +412,7 @@ Store only durable lessons that improve future rubric generation. Do not create 
 - If high-GT and low-GT samples differ mainly in terminal diffs, generate an experience that pushes future rubrics toward semantic code review, API/compatibility boundaries, owner logic, and executable/behavioral tests. Do not save another generic process lesson such as "runs more tests" or "edits carefully."
 - If retrieved or active rubrics were stale, the experience should say when to stop reusing that rubric style and what new evidence should replace it. 
 - If a rubric merely rewards the majority behavior, but the minority samples have better GT scores, save a corrective lesson about the observable minority signal that should have been evaluated.
-- Store the future-reusable experience without, not the hidden GT fact. The retrievable `title`, `description`, `context`, and `experience` must describe non-privileged warning signs visible to a future rubric generator. Put GT-based justification and exact accuracy evidence only serve for analysis and diagnosis. You should also delete or update previous experience if they use GT information in`title`, `description`, `context`, or `experience`.
+- Store the future-reusable experience as an observable judging lesson, not as a hidden-GT fact. The retrievable `title`, `description`, `context`, and `experience` must describe non-privileged warning signs visible to a future rubric generator. These fields must not use words such as `GT`, `ground truth`, `reward`, `score`, `accuracy`, `high-scoring`, or `low-scoring`; describe observable behavior clusters instead, such as "samples that located the local repository" or "samples that edited only a scratch test." Put GT-based justification and exact accuracy evidence only in `metadata.analysis` for diagnosis. You should also delete or update previous experiences if they use GT information in `title`, `description`, `context`, or `experience`.
 - `metadata.reference_golden_rubrics` should contain the rubric(s) that would have matched the score distribution: concrete, grounded, and judgeable, not a generic instruction to follow the reference patch.
 
 ## Output Explanation
@@ -414,7 +430,8 @@ Output is a retrieve/add/update/delete action on the experience bank with the fo
 - If you need full context for existing experiences before updating or deleting them, output a retrieve action first using their titles.
 - Return an empty object `{}` when no high-impact reusable experience can be generated.
 - Prefer quality over quantity: one reusable experience is better than several narrow instance notes.
-- `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton`, `gt_scores`, or exact accuracy values. Put GT-based justification only in `metadata.analysis`.
+- `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton`, `gt_scores`, exact accuracy values, or phrases such as "ground truth evaluates", "high-scoring sample", or "low-scoring sample." Put GT-based justification only in `metadata.analysis`.
+- Before returning an add/update action, rewrite the retrievable fields as behavior clusters, not score clusters. Bad: "High-scoring samples implement X while low-scoring samples do Y." Good: "One cluster implements X in the source files; another cluster leaves no source patch or only edits a scratch script." If you cannot state the lesson without score or GT language in retrievable fields, return `{}` instead of adding/updating an experience.
 - Do not save lessons whose operational instruction is merely "follow the ground truth" or "prefer the GT patch." If the hidden GT reveals that the PR text, majority solution, or generated rubric was misleading, explain the observable warning sign and the better rubric focus.
 - Existing experience titles are unique handles. For add, the new `experience.title` must not match any current bank title. For update, `target_title` must select the existing experience; the replacement `experience.title` may keep that title or use a new title that does not match any other current bank title.
 - Base `metadata.analysis`, `context`, and `experience` only on the current update input and any retrieved existing experiences. Do not cite external reports, source files, or prior analyses unless they are explicitly present in the input.
@@ -484,11 +501,11 @@ For delete:
             <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
             },
             "scale": {
-                "1": "<the anchor that most violates the rubric>",
-                "2": "<the anchor that somewhat violates the rubric>",
+                "1": "<positive rubric: weakest evidence / negative rubric: flaw absent or minimal>",
+                "2": "<positive rubric: weak evidence / negative rubric: minor evidence of the flaw>",
                 "3": "<the moderate anchor>",
-                "4": "<the anchor that somewhat aligns with the rubric>",
-                "5": "<the anchor that most aligns with the rubric>"
+                "4": "<positive rubric: strong evidence / negative rubric: clear evidence of the flaw>",
+                "5": "<positive rubric: strongest evidence / negative rubric: most severe evidence of the flaw>"
             }
         }
     }

@@ -80,7 +80,7 @@ def _experience_id(payload: dict[str, Any]) -> str:
 
 
 def _rounded_score_list(scores: dict[str, Any], ordered_ids: list[str]) -> list[float]:
-    return [round(_safe_float(scores.get(node_id), 0.0), 3) for node_id in ordered_ids]
+    return [round(float(scores.get(node_id, 0.0)), 3) for node_id in ordered_ids]
 
 
 def _public_experience(experience: RubricExperience | dict[str, Any]) -> dict[str, Any]:
