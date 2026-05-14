@@ -385,8 +385,19 @@ Store only durable lessons that improve future rubric generation. Do not create 
 - `retrieved`: historical experiences retrieved before this rubric generation attempt.
 - `generated_rubrics`: the full rubric list generated in that attempt.
 - `gt_skeleton`: the ground-truth patch skeleton for this instance.
-- `generated_rubric_scores`: scores judged by the generated rubric list of each sample in `generation_context` in the same order.
+- `generated_rubric_accuracy`: per-rubric alignment diagnostics in the form `{"rubric title": {"overall_accuracy": float, "judging_diff_per_sample": [float]}}`. `overall_accuracy` is pairwise accuracy between that rubric's judge scores and GT scores. `judging_diff_per_sample` is the signed per-sample error list, computed as judge score minus GT score, the closer to zero the better, in the same sample order as `generation_context`.
 - `gt_scores`: ground-truth scores of each sample in `generation_context` in the same order.
+
+## Experience Update Strategy
+- Update the bank only from attempts where `gt_scores` vary visibly across samples; otherwise there is no reliable reward signal and an empty `{}` is usually best.
+- First compare each generated rubric's `overall_accuracy` and `judging_diff_per_sample` with the visible continuation distribution. High-accuracy rubrics can become positive reusable patterns; low-accuracy rubrics should usually become corrective lessons about which tempting criterion to avoid.
+- Do not summarize a low-accuracy rubric as a good experience just because it sounds plausible. A rubric is useful only if its score ordering matches the GT ordering for the current samples.
+- When a low-accuracy rubric fails, identify the observable reason: stale active rubric, majority-answer bias, over-rewarding process when patch semantics matter, treating obsolete tests as authoritative, or rewarding no-signal distinctions.
+- If high-GT and low-GT samples differ mainly in terminal diffs, generate an experience that pushes future rubrics toward semantic code review, API/compatibility boundaries, owner logic, and executable/behavioral tests. Do not save another generic process lesson such as "runs more tests" or "edits carefully."
+- If retrieved or active rubrics were stale, the experience should say when to stop reusing that rubric style and what new evidence should replace it. 
+- If a rubric merely rewards the majority behavior, but the minority samples have better GT scores, save a corrective lesson about the observable minority signal that should have been evaluated.
+- Store the future-reusable experience without, not the hidden GT fact. The retrievable `title`, `description`, `context`, and `experience` must describe non-privileged warning signs visible to a future rubric generator. Put GT-based justification and exact accuracy evidence only serve for analysis and diagnosis. You should also delete or update previous experience if they use GT information in`title`, `description`, `context`, or `experience`.
+- `metadata.reference_golden_rubrics` should contain the rubric(s) that would have matched the score distribution: concrete, grounded, and judgeable, not a generic instruction to follow the reference patch.
 
 ## Output Explanation
 Output is a retrieve/add/update/delete action on the experience bank with the following fields:
@@ -394,7 +405,7 @@ Output is a retrieve/add/update/delete action on the experience bank with the fo
 - **description**: concise summary of when this experience should be retrieved.
 - **context**: (when to apply) current judging state summary, including history state, current agent goal and focus and the behavior differences and distribution across samples.
 - **experience**: (how to avoid) actionable rubric-generation lesson. State what the previous rubrics generated, why they are correct or wrong, what the better rubric should focus on, and what tempting wrong criterion should be avoided.
-- **metadata.analysis**: (why it happens) concise evidence analysis explaining the reason for the lesson, grounded by evidence from generated rubrics, GT skeleton, and generated rubric accuracy.
+- **metadata.analysis**: (why it happens) concise evidence analysis explaining the reason for the lesson, grounded by evidence from generated rubrics, GT skeleton, and `generated_rubric_accuracy`.
 - **metadata.reference_golden_rubrics**: (what to do) a list of best rubric(s) that should have been generated.
 
 ## Guidelines
@@ -403,7 +414,7 @@ Output is a retrieve/add/update/delete action on the experience bank with the fo
 - If you need full context for existing experiences before updating or deleting them, output a retrieve action first using their titles.
 - Return an empty object `{}` when no high-impact reusable experience can be generated.
 - Prefer quality over quantity: one reusable experience is better than several narrow instance notes.
-- `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton` or `gt_scores`. Put GT-based justification only in `metadata.analysis`.
+- `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton`, `gt_scores`, or exact accuracy values. Put GT-based justification only in `metadata.analysis`.
 - Do not save lessons whose operational instruction is merely "follow the ground truth" or "prefer the GT patch." If the hidden GT reveals that the PR text, majority solution, or generated rubric was misleading, explain the observable warning sign and the better rubric focus.
 - Existing experience titles are unique handles. For add, the new `experience.title` must not match any current bank title. For update, `target_title` must select the existing experience; the replacement `experience.title` may keep that title or use a new title that does not match any other current bank title.
 - Base `metadata.analysis`, `context`, and `experience` only on the current update input and any retrieved existing experiences. Do not cite external reports, source files, or prior analyses unless they are explicitly present in the input.
@@ -705,12 +716,18 @@ src/main/kotlin/com/github/jengelman/gradle/plugins/shadow/transformers/Properti
     wtforms_r2_metadata = {
         "generated_rubrics": [copy.deepcopy(post_modification_regression_testing)],
         "gt_skeleton": wtforms_gt_skeleton,
-        "generated_rubric_scores": [1.000, 0.250, 0.000, 1.000, 0.500, 0.000, 0.500, 0.000],
+        "generated_rubric_accuracy": {
+            "Post-Modification Regression Testing": {
+                "overall_accuracy": 0.589,
+                "judging_diff_per_sample": [0.023, -0.727, -0.981, 0.019, 0.500, 0.000, 0.500, 0.000],
+            }
+        },
         "gt_scores": [0.977, 0.977, 0.981, 0.981, 0.000, 0.000, 0.000, 0.000],
         "analysis": (
-            "Source: agent/search_outputs/analysis/reports/ROUND23_LOW_ACC_RUBRIC_FAILURE_REVIEW.md, wtforms__wtforms-614 round 2. "
-            "The generated process rubric rewarded official regression testing with child scores [1.000, 0.250, 0.000, 1.000, 0.500, 0.000, 0.500, 0.000], "
-            "while GT rewards [0.977, 0.977, 0.981, 0.981, 0.000, 0.000, 0.000, 0.000] depended on semantic HTML5 namespace/widget/flag behavior. "
+            "Source: persisted large_scale_experiment_results.jsonl, gemini_disk vanilla_generated, "
+            "wtforms__wtforms-614::20260505-235109::round_002, rubric_id f3fd402b88bf. "
+            "The generated process rubric had overall_accuracy 0.589 and large negative signed errors on high-GT children, while GT rewards "
+            "[0.977, 0.977, 0.981, 0.981, 0.000, 0.000, 0.000, 0.000] depended on semantic HTML5 namespace/widget/flag behavior. "
             "The better reflection is to generate a compatibility-boundary rubric."
         ),
         "reference_golden_rubrics": [copy.deepcopy(selective_compatibility_boundary)],
@@ -718,11 +735,17 @@ src/main/kotlin/com/github/jengelman/gradle/plugins/shadow/transformers/Properti
     wtforms_r3_metadata = {
         "generated_rubrics": [copy.deepcopy(destructive_test_appeasement)],
         "gt_skeleton": wtforms_gt_skeleton,
-        "generated_rubric_scores": [1.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000],
+        "generated_rubric_accuracy": {
+            "Destructive Test Appeasement": {
+                "overall_accuracy": 0.375,
+                "judging_diff_per_sample": [-0.981, 0.023, 0.023, 0.023, 0.023, 0.023, 0.023, 0.023],
+            }
+        },
         "gt_scores": [0.981, 0.977, 0.977, 0.977, 0.977, 0.977, 0.977, 0.977],
         "analysis": (
-            "Source: agent/search_outputs/analysis/reports/ROUND23_LOW_ACC_RUBRIC_FAILURE_REVIEW.md and UPDATED_METRIC_PC_SIBLING_FAILURE_REVIEW.md, "
-            "wtforms__wtforms-614 round 3. Destructive Test Appeasement scored the first child as maximally bad [1.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000], "
+            "Source: persisted large_scale_experiment_results.jsonl, gemini_disk vanilla_generated, "
+            "wtforms__wtforms-614::20260505-235109::round_003, rubric_id 4a10209ceeba. "
+            "Destructive Test Appeasement had overall_accuracy 0.375 and a large negative signed error on the first child, "
             "while that child had the best GT reward in [0.981, 0.977, 0.977, 0.977, 0.977, 0.977, 0.977, 0.977]. "
             "The mistake was failing to distinguish obsolete tests from intentional compatibility constraints."
         ),
@@ -731,13 +754,19 @@ src/main/kotlin/com/github/jengelman/gradle/plugins/shadow/transformers/Properti
     gradle_r1_metadata = {
         "generated_rubrics": [copy.deepcopy(targeting_fabricated_code)],
         "gt_skeleton": gradle_gt_skeleton,
-        "generated_rubric_scores": [0.250, 0.000, 0.000, 0.000, 0.000, 1.000, 0.000, 0.000],
+        "generated_rubric_accuracy": {
+            "Targeting Fabricated Code": {
+                "overall_accuracy": 0.482,
+                "judging_diff_per_sample": [-0.202, 1.000, 1.000, 1.000, 1.000, 0.000, 0.048, 0.048],
+            }
+        },
         "gt_scores": [0.952, 0.000, 0.000, 0.000, 0.000, 0.000, 0.952, 0.952],
         "analysis": (
-            "Source: agent/search_outputs/analysis/results/updated_metric_low_group_case_packets.md, CASE 11 adaptive_grounded "
-            "gradleup__shadow-1448 round 1. The generated rubric gave its highest fabricated-code score to the sixth child, whose GT was 0.000, while the "
-            "first, seventh, and eighth children had GT 0.952 because they patched the real repository. The golden rewrite keeps the same evidence but phrases "
-            "it as a grounded repository-targeting criterion."
+            "Source: persisted large_scale_experiment_results.jsonl, gemini_disk vanilla_generated, "
+            "gradleup__shadow-1448::20260506-011019::round_001, rubric_id abbf836c4765. "
+            "The generated rubric had overall_accuracy 0.482 and wrongly aligned fabricated-workspace evidence with the sixth child, "
+            "whose GT was 0.000, while the first, seventh, and eighth children had GT 0.952 because they patched the real repository. The golden rewrite keeps "
+            "the same evidence but phrases it as a grounded repository-targeting criterion."
         ),
         "reference_golden_rubrics": [copy.deepcopy(fabricated_workspace_patch)],
     }

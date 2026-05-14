@@ -80,7 +80,7 @@ def _experience_id(payload: dict[str, Any]) -> str:
 
 
 def _rounded_score_list(scores: dict[str, Any], ordered_ids: list[str]) -> list[float]:
-    return [round(float(scores.get(node_id, 0.0) or 0.0), 3) for node_id in ordered_ids]
+    return [round(_safe_float(scores.get(node_id), 0.0), 3) for node_id in ordered_ids]
 
 
 def _public_experience(experience: RubricExperience | dict[str, Any]) -> dict[str, Any]:
@@ -205,7 +205,7 @@ def _convert_experience(payload: dict[str, Any], experience_id: str | None = Non
     required_metadata_types = {
         "generated_rubrics": list,
         "gt_skeleton": str,
-        "generated_rubric_scores": list,
+        "generated_rubric_accuracy": dict,
         "gt_scores": list,
         "analysis": str,
         "reference_golden_rubrics": list,
@@ -303,7 +303,7 @@ def _convert_action(
     experience_payload["metadata"] = {
         "generated_rubrics": copy.deepcopy(attempt_evidence["generated_rubrics"]),
         "gt_skeleton": attempt_evidence["gt_skeleton"],
-        "generated_rubric_scores": copy.deepcopy(attempt_evidence["generated_rubric_scores"]),
+        "generated_rubric_accuracy": copy.deepcopy(attempt_evidence["generated_rubric_accuracy"]),
         "gt_scores": copy.deepcopy(attempt_evidence["gt_scores"]),
         "analysis": analysis,
         "reference_golden_rubrics": copy.deepcopy(reference_golden_rubrics),
@@ -315,6 +315,60 @@ def _convert_action(
     if action == "update":
         converted["target_title"] = target_title
     return converted
+
+
+def _pairwise_accuracy(scores: dict[str, float], gt_scores: dict[str, float], node_ids: list[str]) -> float:
+    correct = 0.0
+    total = 0
+    for left_index in range(len(node_ids)):
+        for right_index in range(left_index + 1, len(node_ids)):
+            left = node_ids[left_index]
+            right = node_ids[right_index]
+            if left not in scores or right not in scores or left not in gt_scores or right not in gt_scores:
+                continue
+            score_delta = float(scores[left]) - float(scores[right])
+            gt_delta = float(gt_scores[left]) - float(gt_scores[right])
+            total += 1
+            if abs(gt_delta) <= 1e-9 or abs(score_delta) <= 1e-9:
+                correct += 0.5
+            elif score_delta * gt_delta > 0:
+                correct += 1.0
+    return correct / total if total else 0.5
+
+
+def _has_reward_variance(scores: dict[str, float], node_ids: list[str]) -> bool:
+    values = [float(scores[node_id]) for node_id in node_ids if node_id in scores]
+    return len(values) >= 2 and max(values) - min(values) > 1e-9
+
+
+def _rubric_accuracy_payload(
+    *,
+    generated: list[dict[str, Any]],
+    score_by_rubric: dict[str, dict[str, float]],
+    gt_scores: dict[str, float],
+    ordered_node_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    accuracy: dict[str, dict[str, Any]] = {}
+    for rubric in generated:
+        rubric_id = rubric.get("rubric_id")
+        title = rubric.get("title")
+        raw_scores = score_by_rubric.get(rubric_id)
+        if not raw_scores:
+            continue
+        direction = rubric.get("direction")
+        aligned_scores = {
+            node_id: (1.0 - float(raw_scores.get(node_id)) if direction == "negative" else float(raw_scores.get(node_id)))
+            for node_id in ordered_node_ids
+            if node_id in raw_scores
+        }
+        accuracy[title] = {
+            "overall_accuracy": round(_pairwise_accuracy(aligned_scores, gt_scores, ordered_node_ids), 3),
+            "judging_diff_per_sample": [
+                round(aligned_scores.get(node_id) - gt_scores.get(node_id), 3)
+                for node_id in ordered_node_ids
+            ],
+        }
+    return accuracy
 
 
 def _seed_experience_records() -> dict[str, RubricExperience]:
@@ -652,9 +706,15 @@ class ExperienceRubricBank:
         attempts = []
         for payload in rubric_payloads:
             generation_context = _extract_generation_context_from_messages(payload.get("messages"))
-            child_rewards = payload["child_rewards"]
+            child_rewards = payload.get("child_rewards", {})
             ordered_node_ids = [str(node_id) for node_id in child_rewards]
             generated = payload.get("generated", [])
+            ground_truth_by_node = (
+                payload.get("gt_by_rubric", {}).get(str(generated[0].get("rubric_id")), {}).get("ground_truth_by_node", {})
+                if generated else {}
+            )
+            if not _has_reward_variance(ground_truth_by_node, ordered_node_ids):
+                continue
             generated_rubrics = [
                 {
                     "rubric": {
@@ -667,9 +727,15 @@ class ExperienceRubricBank:
                 }
                 for rubric in generated
             ]
-            ground_truth_by_node = (
-                payload["gt_by_rubric"][str(generated[0]["rubric_id"])]["ground_truth_by_node"]
-                if generated else {}
+            generated_rubric_accuracy = _rubric_accuracy_payload(
+                generated=generated,
+                score_by_rubric={
+                    str(rubric_id): {str(node_id): float(score) for node_id, score in node_scores.items()}
+                    for rubric_id, node_scores in (payload.get("child_score_by_rubric") or {}).items()
+                    if isinstance(node_scores, dict)
+                },
+                gt_scores=ground_truth_by_node,
+                ordered_node_ids=ordered_node_ids,
             )
             attempts.append(
                 {
@@ -677,8 +743,8 @@ class ExperienceRubricBank:
                     "retrieved_experience": [_public_experience(item) for item in payload.get("retrieved", [])],
                     "generated_rubrics": generated_rubrics,
                     "gt_skeleton": gt_skeleton,
-                    "generated_rubric_scores": _rounded_score_list(child_rewards, ordered_node_ids),
                     "gt_scores": _rounded_score_list(ground_truth_by_node, ordered_node_ids),
+                    "generated_rubric_accuracy": generated_rubric_accuracy,
                 }
             )
         return {
