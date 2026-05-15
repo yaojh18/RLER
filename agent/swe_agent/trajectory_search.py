@@ -83,7 +83,7 @@ class SearchConfig:
     export_grpo_bundles: bool = True
     write_artifacts: bool = True
     strategy: Literal["best", "probability", "random"] = "best"
-    rubric_bank_strategy: Literal["score", "experience"] = "score"
+    rubric_bank_strategy: Literal["score", "experience", "both"] = "score"
 
 
 @dataclass
@@ -775,7 +775,7 @@ class TrajectorySearchRunner:
         rubric_model_kwargs: dict[str, Any] | None = None,
         judge_model_kwargs: dict[str, Any] | None = None,
         harness_namespace: str | None = None,
-        rubric_bank: ScoreRubricBank | ExperienceRubricBank | None = None,
+        rubric_bank: ExperienceRubricBank | None = None,
         resume: bool = False,
     ) -> None:
         self.instance = copy.deepcopy(instance)
@@ -808,11 +808,20 @@ class TrajectorySearchRunner:
         self.base_image_id = base_image_lookup.stdout.strip() or None if base_image_lookup.returncode == 0 else None
         self.nodes: dict[str, SearchNode] = {}
         self.frontier_ids: list[str] = []
-        if self.search_config.rubric_bank_strategy == "experience":
-            self.rubric_bank = rubric_bank if isinstance(rubric_bank, ExperienceRubricBank) else ExperienceRubricBank()
-        else:
+        uses_experience_bank = self.search_config.rubric_bank_strategy in {"experience", "both"}
+        uses_score_bank = self.search_config.rubric_bank_strategy in {"score", "both"}
+        if uses_score_bank:
             self.rubric_bank = ScoreRubricBank(max_active_rubrics=self.search_config.max_active_rubrics)
-        self.uses_experience_bank = isinstance(self.rubric_bank, ExperienceRubricBank)
+        else:
+            self.rubric_bank = None
+        if uses_experience_bank:
+            self.experience_bank = (
+                rubric_bank
+                if isinstance(rubric_bank, ExperienceRubricBank)
+                else ExperienceRubricBank(write_artifacts=self.search_config.write_artifacts)
+            )
+        else:
+            self.experience_bank = None
         self.current_round = 0
         self.system_prompt = ""
         self.user_prompt = ""
@@ -862,13 +871,13 @@ class TrajectorySearchRunner:
                     break
                 self.current_round += 1
                 round_rubric_records = self._run_round(self.frontier_ids[0], self.current_round)
-                if self.uses_experience_bank:
+                if self.experience_bank is not None:
                     rubric_update_records.extend(round_rubric_records)
                 self._save_manifest()
             self.artifact_writer.wait()
             if self.patch_eval_manager is not None:
                 self.patch_eval_manager.wait()
-            if self.uses_experience_bank and self.search_config.write_artifacts:
+            if self.experience_bank is not None:
                 rubric_payloads = [
                     {
                         **record["rubric_payload"],
@@ -878,7 +887,7 @@ class TrajectorySearchRunner:
                     if isinstance(record.get("rubric_payload"), dict)
                 ]
                 asyncio.run(
-                    self.rubric_bank.update_after_instance(
+                    self.experience_bank.update_after_instance(
                         run_dir=self.run_dir,
                         instance=self.instance,
                         rubric_payloads=rubric_payloads,
@@ -923,9 +932,9 @@ class TrajectorySearchRunner:
             "user_prompt": self.user_prompt,
             "node_ids": sorted(self.nodes),
         }
-        if self.uses_experience_bank:
-            manifest_payload["rubric_bank"] = self.rubric_bank.to_list()
-        else:
+        if self.experience_bank is not None:
+            manifest_payload["rubric_bank"] = self.experience_bank.to_list()
+        if self.rubric_bank is not None:
             manifest_payload["active_bank"] = [asdict(rubric) for rubric in self.rubric_bank.active_bank]
             manifest_payload["inactive_bank"] = [asdict(rubric) for rubric in self.rubric_bank.inactive_bank]
         node_index_text = "\n".join(
@@ -955,7 +964,7 @@ class TrajectorySearchRunner:
         self.current_round = int(manifest.get("current_round", 0))
         self.system_prompt = manifest.get("system_prompt", "")
         self.user_prompt = manifest.get("user_prompt", "")
-        if not self.uses_experience_bank:
+        if self.rubric_bank is not None:
             active_bank = [RubricRecord(**rubric) for rubric in manifest.get("active_bank", [])]
             inactive_bank = [RubricRecord(**rubric) for rubric in manifest.get("inactive_bank", [])]
             self.rubric_bank.set_state(active_bank=active_bank, inactive_bank=inactive_bank)
@@ -1036,9 +1045,19 @@ class TrajectorySearchRunner:
         messages = snapshot["agent"]["state"].get("messages", [])
         self.system_prompt = messages[0].get("content", "") if messages else ""
         self.user_prompt = messages[1].get("content", "") if len(messages) > 1 else self.task
-        initial_task_text = "\n\n".join(part for part in [self.system_prompt, self.user_prompt] if part)
-        if not self.uses_experience_bank:
+        initial_task_text = "\n\n".join(part for part in [self.system_prompt, self.user_prompt] if part)  
+        root_rubric_round = {"generated": []}
+        if self.experience_bank is not None:
+            root_rubric_round["retrieved"] = []
+        if self.rubric_bank is not None:
             self.rubric_bank.initialize(initial_task_text or self.task)
+            root_rubric_round.update(
+                {
+                    "active_bank_before": [],
+                    "active_bank_after": [asdict(rubric) for rubric in self.rubric_bank.active_bank],
+                    "inactive_bank_after": [],
+                }
+            )
         root_node = SearchNode(
             node_id="root",
             parent_id=None,
@@ -1055,19 +1074,7 @@ class TrajectorySearchRunner:
             "persistent_state": copy.deepcopy(EMPTY_PERSISTENT_STATE),
             "recent_segments": [],
             "workspace_meta": workspace_meta,
-            "rubric_round": (
-                {
-                    "generated": [],
-                    "retrieved": [],
-                }
-                if self.uses_experience_bank
-                else {
-                    "generated": [],
-                    "active_bank_before": [],
-                    "active_bank_after": [asdict(rubric) for rubric in self.rubric_bank.active_bank],
-                    "inactive_bank_after": [],
-                }
-            ),
+            "rubric_round": root_rubric_round,
             "overall_reward": 0.0,
             "ground_truth_reward": 0.0,
             "baseline_parent_reward": None,
@@ -1170,18 +1177,29 @@ class TrajectorySearchRunner:
                 "trajectory_continuation": copy.deepcopy(branch["recent_segments"][-1]) if branch["recent_segments"] else None,
             }
             continuations.append(branch["continuation_view"])
-        bank_context = await self.rubric_bank.build_generation_context(
-            question={**question, "instance_id": self.task_id},
-            previous_state=updated_parent_state,
-            latest_shared_segment=latest_shared_segment,
-            continuations=continuations,
-            model_name=self.rubric_model_name,
-            temperature=self.search_config.rubric_temperature,
-            top_p=self.search_config.rubric_top_p,
-            max_tokens=self.search_config.rubric_max_tokens,
-            model_kwargs=self.rubric_model_kwargs,
-        )
-        generation_existing_rubrics = bank_context.existing_rubrics
+        existing_rubrics: list[RubricRecord] = []
+        extra_prompt_sections: list[str] = []
+        retrieved_experiences = []
+        retrieve_messages: list[dict[str, Any]] = []
+        if self.rubric_bank is not None and self.rubric_bank.active_bank:
+            score_context = self.rubric_bank.build_generation_context()
+            existing_rubrics = score_context.existing_rubrics
+            extra_prompt_sections.extend(score_context.extra_prompt_sections)
+        if self.experience_bank is not None and self.experience_bank.experiences:
+            experience_context = await self.experience_bank.build_generation_context(
+                question={**question, "instance_id": self.task_id},
+                previous_state=updated_parent_state,
+                latest_shared_segment=latest_shared_segment,
+                continuations=continuations,
+                model_name=self.rubric_model_name,
+                temperature=self.search_config.rubric_temperature,
+                top_p=self.search_config.rubric_top_p,
+                max_tokens=self.search_config.rubric_max_tokens,
+                model_kwargs=self.rubric_model_kwargs,
+            )
+            extra_prompt_sections.extend(experience_context.extra_prompt_sections)
+            retrieved_experiences = copy.deepcopy(experience_context.retrieved)
+            retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
         rubric_generation_kwargs = {
             "question": {**question, "instance_id": self.task_id},
             "previous_state": updated_parent_state,
@@ -1193,7 +1211,7 @@ class TrajectorySearchRunner:
             "max_tokens": self.search_config.rubric_max_tokens,
             "round_index": round_index,
             "model_kwargs": self.rubric_model_kwargs,
-            "extra_prompt_sections": bank_context.extra_prompt_sections,
+            "extra_prompt_sections": extra_prompt_sections,
         }
         generated_samples = await asyncio.gather(
             *[
@@ -1210,7 +1228,7 @@ class TrajectorySearchRunner:
             question=question,
             shared_context=shared_context,
             continuations=continuations,
-            rubrics=generation_existing_rubrics,
+            rubrics=existing_rubrics,
             model_name=self.judge_model_name,
             temperature=self.search_config.judge_temperature,
             top_p=self.search_config.judge_top_p,
@@ -1223,7 +1241,7 @@ class TrajectorySearchRunner:
             active_parent_scores, active_parent_errors = await _score_parent_round(
                 question=question,
                 shared_context=shared_context,
-                rubrics=generation_existing_rubrics,
+                rubrics=existing_rubrics,
                 model_name=self.judge_model_name,
                 temperature=self.search_config.judge_temperature,
                 top_p=self.search_config.judge_top_p,
@@ -1231,7 +1249,7 @@ class TrajectorySearchRunner:
                 node_id=parent_node.node_id,
                 model_kwargs=self.judge_model_kwargs,
             )
-        active_ids = {rubric.rubric_id for rubric in generation_existing_rubrics}
+        active_ids = {rubric.rubric_id for rubric in existing_rubrics}
         for generated_sample in generated_samples:
             generated_rubrics: list[RubricRecord] = []
             seen_rubric_ids: set[str] = set()
@@ -1240,7 +1258,7 @@ class TrajectorySearchRunner:
                     continue
                 seen_rubric_ids.add(rubric.rubric_id)
                 generated_rubrics.append(rubric)
-            scoring_rubrics = generation_existing_rubrics + generated_rubrics
+            scoring_rubrics = existing_rubrics + generated_rubrics
             if generated_rubrics:
                 generated_continuation_scores, continuation_errors = await _score_round(
                     question=question,
@@ -1316,10 +1334,13 @@ class TrajectorySearchRunner:
                     + judge_error_by_rubric.get(rubric.rubric_id, 0.0)
                 )
                 previous_score_vectors.append(vector)
-            bank_update = self.rubric_bank.update_after_round(
-                generated=generated_sample.generated,
-                rewards=reward_by_rubric,
-            )
+            if self.rubric_bank is not None:
+                bank_update = self.rubric_bank.update_after_round(
+                    generated=generated_sample.generated,
+                    rewards=reward_by_rubric,
+                )
+            else:
+                bank_update = generated_sample.generated
             bank_scoring_rubrics = bank_update.rubrics
             parent_reward = 0.0
             if compare_parent and bank_scoring_rubrics:
@@ -1379,13 +1400,17 @@ class TrajectorySearchRunner:
                 "judge_errors": judge_errors_payload,
                 "selected": False,
             }
-            if self.uses_experience_bank:
-                sample_payload["retrieved"] = [asdict(experience) for experience in bank_context.retrieved]
-                sample_payload["retrieve_messages"] = copy.deepcopy(bank_context.retrieve_messages)
-            else:
+            if self.experience_bank is not None:
                 sample_payload.update(
                     {
-                        "active_before": copy.deepcopy(generation_existing_rubrics),
+                        "retrieved": [asdict(experience) for experience in retrieved_experiences],
+                        "retrieve_messages": copy.deepcopy(retrieve_messages),
+                    }
+                )
+            if self.rubric_bank is not None:
+                sample_payload.update(
+                    {
+                        "active_before": copy.deepcopy(existing_rubrics),
                         "active_after": bank_update.active_after,
                         "inactive_after": bank_update.inactive_after,
                     }
@@ -1416,16 +1441,23 @@ class TrajectorySearchRunner:
         }
 
     def _rubric_bank_payload_fields(self, sample: dict[str, Any]) -> dict[str, Any]:
-        if self.uses_experience_bank:
-            return {
-                "retrieved": copy.deepcopy(sample.get("retrieved", [])),
-                "retrieve_messages": copy.deepcopy(sample.get("retrieve_messages", [])),
-            }
-        return {
-            "active_bank_before": [asdict(rubric) for rubric in sample["active_before"]],
-            "active_bank_after": [asdict(rubric) for rubric in sample["active_after"]],
-            "inactive_bank_after": [asdict(rubric) for rubric in sample["inactive_after"]],
-        }
+        payload: dict[str, Any] = {}
+        if self.experience_bank is not None:
+            payload.update(
+                {
+                    "retrieved": copy.deepcopy(sample.get("retrieved", [])),
+                    "retrieve_messages": copy.deepcopy(sample.get("retrieve_messages")),
+                }
+            )
+        if self.rubric_bank is not None:
+            payload.update(
+                {
+                    "active_bank_before": [asdict(rubric) for rubric in sample["active_before"]],
+                    "active_bank_after": [asdict(rubric) for rubric in sample["active_after"]],
+                    "inactive_bank_after": [asdict(rubric) for rubric in sample["inactive_after"]],
+                }
+            )
+        return payload
 
     def _rubric_round_payload(self, sample: dict[str, Any]) -> dict[str, Any]:
         payload = {
@@ -1467,7 +1499,7 @@ class TrajectorySearchRunner:
         parent_snapshot = copy.deepcopy(self._node_snapshot_cache[parent_id])
         parent_judge = copy.deepcopy(self._node_judge_cache[parent_id])
         parent_rubric_round = parent_judge.get("rubric_round", {})
-        if not self.uses_experience_bank:
+        if self.rubric_bank is not None:
             active_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("active_bank_after", [])]
             if parent_id == "root" and not active_bank:
                 raise RuntimeError("Root rubric bank was not initialized in _initialize_root")
@@ -1653,7 +1685,7 @@ class TrajectorySearchRunner:
             "policy_generation_errors": policy_generation_errors,
             "rubric_samples": rubric_sample_payloads,
         }
-        if not self.uses_experience_bank:
+        if self.rubric_bank is not None:
             self.rubric_bank.set_state(
                 active_bank=copy.deepcopy(selected_sample["active_after"]),
                 inactive_bank=copy.deepcopy(selected_sample["inactive_after"]),

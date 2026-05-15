@@ -257,8 +257,8 @@ def run_search(
         rubric_model_kwargs = dict(shared_model_kwargs)
         judge_model_kwargs = dict(shared_model_kwargs)
         rubric_bank = (
-            ExperienceRubricBank(bank_path=run_root / "rubric_bank.json")
-            if search_config.rubric_bank_strategy == "experience"
+            ExperienceRubricBank(bank_path=run_root / "rubric_bank.json", write_artifacts=args.write_artifacts)
+            if search_config.rubric_bank_strategy in {"experience", "both"}
             else None
         )
         with temporary_env({"MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": str(args.model_retry_attempts), "LITELLM_LOG": "ERROR"}):
@@ -340,7 +340,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--calculate-gt-reward", action="store_true", default=True)
     parser.add_argument("--strategy", choices=["best", "probability", "random"], default="random")
-    parser.add_argument("--rubric-bank-strategy", choices=["score", "experience"], default="score")
+    parser.add_argument("--rubric-bank-strategy", choices=["score", "experience", "both"], default="score")
     parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
     parser.add_argument("--student-model", default=None)
     parser.add_argument("--evaluate-final-patch", action="store_true", default=True)

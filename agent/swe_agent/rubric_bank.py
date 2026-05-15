@@ -164,6 +164,9 @@ def _extract_generation_context_from_messages(messages: Any) -> dict[str, Any]:
     retrieved = _json_from_section(prompt, "## Retrieved Rubric Experiences:")
     if isinstance(retrieved, list):
         context["retrieved_rubric_experiences"] = retrieved
+    previous_generated_rubrics = _json_from_section(prompt, "## Existing Rubrics:")
+    if isinstance(previous_generated_rubrics, list):
+        context["previous_generated_rubrics"] = previous_generated_rubrics
     return context
 
 
@@ -446,7 +449,7 @@ class ScoreRubricBank:
         self.active_bank = copy.deepcopy(active_bank)
         self.inactive_bank = copy.deepcopy(inactive_bank)
 
-    async def build_generation_context(self, **_: Any) -> RubricBankGenerationContext:
+    def build_generation_context(self, **_: Any) -> RubricBankGenerationContext:
         sections = []
         if self.active_bank:
             sections.append(
@@ -496,14 +499,12 @@ class ScoreRubricBank:
             inactive_after=inactive_after,
         )
 
-    async def update_after_instance(self, **_: Any) -> dict[str, Any]:
-        return {"before": [], "actions": [], "after": []}
-
 
 class ExperienceRubricBank:
-    def __init__(self, *, bank_path: Path | None = None, retrieve_top_k: int = 4) -> None:
+    def __init__(self, *, bank_path: Path | None = None, retrieve_top_k: int = 4, write_artifacts: bool = True) -> None:
         self.bank_path = Path(bank_path) if bank_path is not None else None
         self.retrieve_top_k = retrieve_top_k
+        self.write_artifacts = write_artifacts
         self.experiences: dict[str, RubricExperience] = (
             self.load() if self.bank_path and self.bank_path.exists() else _seed_experience_records()
         )
@@ -646,18 +647,6 @@ class ExperienceRubricBank:
             )
         return [self.experiences[title] for title in requested_titles], messages
 
-    def update_after_round(
-        self,
-        *,
-        generated: list[RubricRecord],
-        rewards: dict[str, float],
-    ) -> RubricBankRoundUpdate:
-        return RubricBankRoundUpdate(
-            rubrics=copy.deepcopy(generated),
-            active_after=[],
-            inactive_after=[],
-        )
-
     async def update_after_instance(
         self,
         *,
@@ -684,7 +673,7 @@ class ExperienceRubricBank:
         else:
             applied = []
             update_messages = []
-        if self.bank_path is not None:
+        if self.write_artifacts and self.bank_path is not None:
             _atomic_write_json(self.bank_path, {"experiences": self.to_list()})
         payload = {
             "before": before,
@@ -692,8 +681,9 @@ class ExperienceRubricBank:
             "after": self.to_list(),
             "messages": update_messages,
         }
-        _atomic_write_json(Path(run_dir) / "rubric_bank.json", payload)
-        _atomic_write_json(Path(run_dir) / "rubric_bank_message.json", update_messages)
+        if self.write_artifacts:
+            _atomic_write_json(Path(run_dir) / "rubric_bank.json", payload)
+            _atomic_write_json(Path(run_dir) / "rubric_bank_message.json", update_messages)
         return payload
 
     def _build_instance_evidence(

@@ -397,7 +397,7 @@ Store only durable lessons that improve future rubric generation. Do not create 
 - **delete**: remove one redundant, misleading, or low-value experience.
 
 ## Input Explanation
-- `generation_context`: the context that was shown to the rubric generator, including the current history and sample behavior distribution.
+- `generation_context`: the context that was shown to the rubric generator, including problem statement, the current history, previous generated rubrics and sampled agent continuations.
 - `retrieved`: historical experiences retrieved before this rubric generation attempt.
 - `generated_rubrics`: the full rubric list generated in that attempt.
 - `gt_skeleton`: the ground-truth patch skeleton for this instance.
@@ -412,6 +412,8 @@ Store only durable lessons that improve future rubric generation. Do not create 
 - If high-GT and low-GT samples differ mainly in terminal diffs, generate an experience that pushes future rubrics toward semantic code review, API/compatibility boundaries, owner logic, and executable/behavioral tests. Do not save another generic process lesson such as "runs more tests" or "edits carefully."
 - If retrieved or active rubrics were stale, the experience should say when to stop reusing that rubric style and what new evidence should replace it. 
 - If a rubric merely rewards the majority behavior, but the minority samples have better GT scores, save a corrective lesson about the observable minority signal that should have been evaluated.
+- Before saving a lesson, check whether the apparent failure is caused by judge instability rather than a durable rubric-generation mistake. This often happens when the rubric is too narrow, over-specific, or tied to one surface form, so equivalent implementation variants receive inconsistent scores. In that case, the experience should teach a broader observable criterion or recommend not reusing that narrow rubric style.
+- Check whether retrieved experiences influenced the generated rubrics. If a retrieved experience came from a materially different context, update that experience with clearer applicability boundaries or add a lesson about context matching; do not turn the mismatch into a new instance-specific rule.
 - Store the future-reusable experience as an observable judging lesson, not as a hidden-GT fact. The retrievable `title`, `description`, `context`, and `experience` must describe non-privileged warning signs visible to a future rubric generator. These fields must not use words such as `GT`, `ground truth`, `reward`, `score`, `accuracy`, `high-scoring`, or `low-scoring`; describe observable behavior clusters instead, such as "samples that located the local repository" or "samples that edited only a scratch test." Put GT-based justification and exact accuracy evidence only in `metadata.analysis` for diagnosis. You should also delete or update previous experiences if they use GT information in `title`, `description`, `context`, or `experience`.
 - `metadata.reference_golden_rubrics` should contain the rubric(s) that would have matched the score distribution: concrete, grounded, and judgeable, not a generic instruction to follow the reference patch.
 
