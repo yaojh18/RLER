@@ -6,6 +6,7 @@
 import concurrent.futures
 import contextlib
 import json
+import os
 import random
 import re
 import subprocess
@@ -168,9 +169,64 @@ def _local_image_exists(image_name: str) -> bool:
         client.close()
 
 
+# Per-image locks + global concurrency semaphore for lustre tarball loads.
+# Multiple agents racing for the same image must coalesce; lustre I/O is shared
+# across all 8 GPUs on the node, so we cap parallel loads to avoid saturating it.
+_LUSTRE_LOAD_LOCKS: dict[str, threading.Lock] = {}
+_LUSTRE_LOAD_LOCKS_GUARD = threading.Lock()
+_LUSTRE_LOAD_SEM = threading.Semaphore(int(os.environ.get("DOCKER_LUSTRE_LOAD_PARALLEL", "8")))
+
+
+def _per_image_lock(image_name: str) -> threading.Lock:
+    with _LUSTRE_LOAD_LOCKS_GUARD:
+        lock = _LUSTRE_LOAD_LOCKS.get(image_name)
+        if lock is None:
+            lock = threading.Lock()
+            _LUSTRE_LOAD_LOCKS[image_name] = lock
+        return lock
+
+
+def _try_load_from_lustre_tarball(image_name: str) -> bool:
+    """Mirror of bin/docker shim logic at the Python level.
+
+    swe_agent's Python SDK calls (client.images.get / get_registry_data) bypass
+    the CLI shim. Without this fallback, on a fresh node every instance hits
+    Docker Hub for the registry probe + base-image build, exhausting the
+    unauthenticated pull rate limit within seconds when 100+ agents start
+    concurrently.
+    """
+    tardir = os.environ.get("DOCKER_LUSTRE_TARDIR")
+    if not tardir:
+        return False
+    short = image_name.removeprefix("docker.io/")
+    safe = short.replace("/", "_").replace(":", "_")
+    tarball = Path(tardir) / f"{safe}.tar"
+    if not tarball.exists():
+        return False
+    with _per_image_lock(image_name):
+        if _local_image_exists(image_name):
+            return True
+        with _LUSTRE_LOAD_SEM:
+            if _local_image_exists(image_name):
+                return True
+            try:
+                subprocess.run(
+                    ["docker", "load", "-i", str(tarball)],
+                    check=True,
+                    capture_output=True,
+                    timeout=600,
+                )
+            except Exception as e:
+                logger.error(f"docker load failed for {image_name} from {tarball}: {e}")
+                return False
+        return _local_image_exists(image_name)
+
+
 def _resolve_rebench_image(instance: dict) -> tuple[str, str | None]:
     image_name = instance["image_name"]
     if _local_image_exists(image_name):
+        return image_name, None
+    if _try_load_from_lustre_tarball(image_name):
         return image_name, None
     if _registry_image_exists(image_name):
         return image_name, None

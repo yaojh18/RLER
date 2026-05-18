@@ -1,5 +1,5 @@
 GRPO_COMMON_ARGS=(
-  --save-interval 1
+  --save-interval 10
   --no-load-optim
   --no-load-rng
   --finetune
@@ -8,7 +8,7 @@ GRPO_COMMON_ARGS=(
   --rollout-function-path train_agent.collect_grpo_rollout.generate_rollout
   --input-key input
   --metadata-key metadata
-  --n-samples-per-prompt 1
+  --n-samples-per-prompt 8
   --num-rollout 1
   --custom-convert-samples-to-train-data-path train_agent.run.grpo.convert_samples_to_train_data
   --loss-mask-type qwen3_5
@@ -64,13 +64,24 @@ GRPO_OPTIMIZER_ARGS=(
 GRPO_SGLANG_ARGS=(
   --sglang-context-length 80960
   --sglang-reasoning-parser qwen3
-  --sglang-disable-radix-cache
+  # Radix cache enabled — slime calls engine.flush_cache.remote() inside
+  # update_weight_from_distributed.py on every policy weight update, so
+  # stale KV from old weights gets invalidated cleanly.
+  # Without radix cache, agent multi-turn sessions on the same instance
+  # re-prefill the entire history every turn (huge waste at ~80K context).
   --sglang-watchdog-timeout 3600
 )
 
 GRPO_MISC_ARGS=(
   --use-dynamic-batch-size
-  --max-tokens-per-gpu 32768
+  # Per-sample cap = max_tokens_per_gpu * cp_size. We need this >= sglang's
+  # context_length (80960) since the token-in/token-out path's full sequence
+  # = last_assistant.prompt_token_ids + last_assistant.token_ids, bounded by
+  # sglang's own input+output cap. 32768 (= 131072/sample) OOM'd on backward
+  # under CP=4 packing (commit 47d170e); 16384 (= 65536/sample) was safe but
+  # too small for healthy long rollouts. 22528 gives ~90k per-sample cap —
+  # comfortably above sglang's 80960 ceiling, well below the OOM zone.
+  --max-tokens-per-gpu 22528
   --attention-dropout 0.0
   --hidden-dropout 0.0
   --accumulate-allreduce-grads-in-fp32

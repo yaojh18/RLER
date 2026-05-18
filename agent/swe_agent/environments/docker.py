@@ -1,4 +1,5 @@
 import logging
+import time
 import os
 import platform
 import shlex
@@ -86,13 +87,15 @@ class DockerEnvironment:
             "-d",
             "--name",
             container_name,
-            "-w",
-            self.config.cwd,
+        ]
+        if self.config.cwd:
+            cmd.extend(["-w", self.config.cwd])
+        cmd.extend([
             *self.config.run_args,
             self.config.image,
             "sleep",
             self.config.container_timeout,
-        ]
+        ])
         self.logger.debug(f"Starting container with command: {shlex.join(cmd)}")
         result = subprocess.run(
             cmd,
@@ -111,7 +114,9 @@ class DockerEnvironment:
         cwd = cwd or self.config.cwd
         assert self.container_id, "Container not started"
 
-        cmd = [self.config.executable, "exec", "-w", cwd]
+        cmd = [self.config.executable, "exec"]
+        if cwd:
+            cmd.extend(["-w", cwd])
         for key in self.config.forward_env:
             if (value := os.getenv(key)) is not None:
                 cmd.extend(["-e", f"{key}={value}"])
@@ -119,6 +124,7 @@ class DockerEnvironment:
             cmd.extend(["-e", f"{key}={value}"])
         cmd.extend([self.container_id, *self.config.interpreter, command])
 
+        _t_exec_start = time.perf_counter()
         try:
             result = subprocess.run(
                 cmd,
@@ -130,6 +136,11 @@ class DockerEnvironment:
                 stderr=subprocess.STDOUT,
             )
             output = {"output": result.stdout, "returncode": result.returncode, "exception_info": ""}
+            _dt = time.perf_counter() - _t_exec_start
+            if _dt >= 0.5:
+                _cid = (self.container_id or "")[:12]
+                _cmd_short = (command or "").splitlines()[0][:80] if command else ""
+                self.logger.info(f"[TIMING] docker_exec took={_dt:.2f}s container={_cid} cmd={_cmd_short!r}")
         except Exception as e:
             raw_output = getattr(e, "output", None)
             raw_output = (
@@ -183,4 +194,13 @@ class DockerEnvironment:
         container_id = state.get("container_id")
         if container_id:
             self.container_id = container_id
-        self._owns_container = state.get("owns_container", False)
+        # IMPORTANT: do NOT overwrite _owns_container from `state`. Ownership is
+        # a fact about THIS process (did *we* run `docker run`?) — not metadata
+        # to be cloned across snapshots. When PDS forks M branches from the
+        # same parent snapshot, all of them used to inherit owns=True from the
+        # parent's state. Then the first branch to GC fired cleanup() (async
+        # `docker stop ... &`) on the PARENT's container, and every still-live
+        # branch + descendant round started getting "No such container" errors.
+        # Init has already correctly set _owns_container based on whether
+        # _start_container ran (owns=True) or reuse_container_id was used
+        # (owns=False); leave it alone.

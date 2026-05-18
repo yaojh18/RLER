@@ -201,6 +201,36 @@ def run_search(
         configure_model_route("policy", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
         configure_model_route("rubric_generation", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
         configure_model_route("rubric_judge", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
+
+    # Optional: route the judge to a separate sglang server (e.g. DeepSeek-V4-Pro on a different node).
+    # Probes the endpoint at startup so we fail loudly if the Qwen node can't reach the judge node.
+    if args.judge_base_url:
+        import urllib.request, urllib.error, json as _json
+        judge_service_name = "judge_remote"
+        judge_model = args.judge_model or args.judge_served_model
+        if judge_model is None:
+            raise RuntimeError("--judge-base-url requires --judge-model (or --judge-served-model) to be set")
+        try:
+            with urllib.request.urlopen(args.judge_base_url.rstrip("/").rsplit("/v1", 1)[0] + "/health", timeout=10) as resp:
+                _ = resp.read(64)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+            raise RuntimeError(
+                f"Cannot reach judge endpoint at {args.judge_base_url} from this node "
+                f"(host={os.uname().nodename}). Verify the judge sglang server is up, the port is open, "
+                f"and intra-cluster networking allows it. Underlying error: {type(exc).__name__}: {exc}"
+            )
+        register_model_service(
+            judge_service_name,
+            SGLangChatService(
+                base_url=args.judge_base_url,
+                api_key=args.judge_api_key,
+                default_model_name=judge_model,
+            ),
+        )
+        configure_model_route(
+            "rubric_judge",
+            ModelRouteConfig(backend="service", service_name=judge_service_name, model_name=judge_model),
+        )
     errors: list[str] = []
     try:
         config = build_swebench_config(
@@ -346,6 +376,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evaluate-final-patch", action="store_true", default=True)
     parser.add_argument("--export-grpo-bundles", action="store_true", default=True)
     parser.add_argument("--write-artifacts", action="store_true", default=True)
+    parser.add_argument(
+        "--judge-base-url",
+        default=None,
+        help="If set, route rubric_judge calls to a separate sglang server at this OpenAI-compatible base URL "
+             "(e.g. http://metavmds1-a4-91:8888/v1). Use to put a stronger judge on a separate node.",
+    )
+    parser.add_argument(
+        "--judge-api-key",
+        default="EMPTY",
+        help="API key for --judge-base-url. Default 'EMPTY' works for an unauthenticated sglang server.",
+    )
+    parser.add_argument(
+        "--judge-served-model",
+        default=None,
+        help="If --judge-model is unset but --judge-base-url is set, use this as the served-model name on the judge endpoint.",
+    )
     return parser
 
 

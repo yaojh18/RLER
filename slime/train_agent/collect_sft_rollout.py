@@ -179,10 +179,18 @@ def collect_teacher_student_exports(
     )
 
 
+_QWEN_CHAT_TEMPLATE_ROLES = {"system", "user", "assistant", "tool"}
+
+
 def build_training_messages(prompt: list[dict[str, Any]], turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for message in prompt + turns:
         role = str(message.get("role"))
+        # Drop synthetic control roles like mini-swe-agent's "exit" terminal
+        # marker — qwen3.5's chat template raises 'Unexpected message role'
+        # for anything outside system/user/assistant/tool.
+        if role not in _QWEN_CHAT_TEMPLATE_ROLES:
+            continue
         messages.append(
             {
                 "role": role,

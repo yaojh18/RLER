@@ -145,12 +145,22 @@ def _harvest_ready(
         if task["rollout_id"] < current_rollout_id - 1:
             _STALE_DROPPED_GROUPS += len(groups)
             continue
+        # Drop samples > slime's per-partition budget (max_tokens_per_gpu * cp).
+        max_sample_tokens: int | None = None
+        try:
+            mt = int(getattr(args, "max_tokens_per_gpu", 0) or 0)
+            cp = int(getattr(args, "context_parallel_size", 1) or 1)
+            if mt > 0:
+                max_sample_tokens = mt * cp
+        except Exception:
+            max_sample_tokens = None
         for group in groups:
-            samples = build_rollout_samples(
+            samples, _dropped = build_rollout_samples(
                 groups=[group],
                 tokenizer=tokenizer,
                 loss_mask_type=getattr(args, "loss_mask_type", "qwen3_5"),
                 include_turn_rewards=target == "rubric",
+                max_sample_tokens=max_sample_tokens,
             )
             policy_version = f"rollout-{task['rollout_id']}"
             for sample in samples:
