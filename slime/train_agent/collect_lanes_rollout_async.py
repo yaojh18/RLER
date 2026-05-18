@@ -180,19 +180,50 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         bundle = instance_record_to_bundle(
             record, policy_reward_alpha=task.get("policy_reward_alpha", 1.0),
         )
-        return {
+        result = {
             "index": task["index"],
             "instance_id": instance_id,
             "bundle": bundle,
             "error": "",
         }
     except Exception as exc:
-        return {
+        result = {
             "index": task.get("index", -1),
             "instance_id": task.get("instance_id", "?"),
             "bundle": None,
             "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
         }
+    finally:
+        # Per-task subprocess cleanup to bound RAM growth in a persistent
+        # ProcessPoolExecutor worker (52084 leaked ~25 GB/task → OOM at step 42).
+        # Drop refs to the heaviest per-task locals BEFORE returning so the
+        # subprocess can release pages back to the OS via malloc_trim.
+        try: del record
+        except UnboundLocalError: pass
+        try: del runner
+        except UnboundLocalError: pass
+        try: del backend
+        except UnboundLocalError: pass
+        try: del instance
+        except UnboundLocalError: pass
+        try: del instances
+        except UnboundLocalError: pass
+        try: del config
+        except UnboundLocalError: pass
+        try: del cfg
+        except UnboundLocalError: pass
+        try: del base_config
+        except UnboundLocalError: pass
+        try: del overrides
+        except UnboundLocalError: pass
+        import gc as _gc
+        _gc.collect()
+        try:
+            import ctypes as _ctypes
+            _ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -226,11 +257,21 @@ class _LanesNodeWorker:
     Identical pattern to v0's _PDSNodeWorker but atomic-only (no streaming
     queue → no multiprocessing.Manager involved → no initializer needed)."""
 
-    def __init__(self, name: str = "", max_workers: int = 8):
+    def __init__(self, name: str = "", max_workers: int = 8, max_tasks_per_child: int = 5):
         self.name = name
         self.max_workers = max_workers
+        self.max_tasks_per_child = max_tasks_per_child
         from concurrent.futures import ProcessPoolExecutor
-        self._executor = ProcessPoolExecutor(max_workers=max_workers)
+        # max_tasks_per_child recycles each subprocess after N tasks. Bounds
+        # any cross-task RAM leak (52084 grew ~25 GB/task → OOM at step 42).
+        try:
+            self._executor = ProcessPoolExecutor(
+                max_workers=max_workers,
+                max_tasks_per_child=max_tasks_per_child,
+            )
+        except TypeError:
+            # Python < 3.11 fallback
+            self._executor = ProcessPoolExecutor(max_workers=max_workers)
         import socket
         self.ip = socket.gethostbyname(socket.gethostname())
         logger.info(
