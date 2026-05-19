@@ -1056,6 +1056,62 @@ class TrajectorySearchParallelRunner:
         chunks_emitted = 0
         cumulative_steps = 0
         last_result: dict[str, Any] | None = None
+
+        # Always emit an EXTRA MidCp at idx=0 from the bare initial state
+        # (system+user only, zero asst turns) so Lane B forks m branches
+        # from the problem statement itself, in addition to the Lane A
+        # chunked MidCps (which then get idx=1, 2, ...). Motivated by 52826
+        # where ~17% of rubric calls 400'd because Lane A's prefix at late
+        # mid_cps pushed the rubric input past sglang's 80960 context:
+        # a root-fork branch keeps that input bounded to system+user + 8
+        # short Lane B tails.
+        mid_cp_idx_offset = 0
+        ctx_root_snap = contextvars.copy_context()
+        try:
+            root_snap = await loop.run_in_executor(
+                lane_a_pool,
+                lambda s=session, c=ctx_root_snap: c.run(
+                    lambda: s.snapshot().model_dump(mode="json")
+                ),
+            )
+            ctx_root_commit = contextvars.copy_context()
+            root_image_tag = await loop.run_in_executor(
+                lane_a_pool,
+                lambda s=session, c=ctx_root_commit: c.run(
+                    self._commit_container, s, "mid-root"
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] root fork emit FAILED (skipping root branch): %s",
+                self.task_id, exc,
+            )
+            root_image_tag = None
+        if root_image_tag is not None:
+            root_mid_cp = MidCp(
+                idx=0,
+                asst_step=0,
+                image_tag=root_image_tag,
+                snapshot=copy.deepcopy(root_snap),
+                parent_message_count=all_msgs_count,
+                parent_event_count=all_events_count,
+                parent_turn_count=all_turns_count,
+                emitted_at=time.perf_counter(),
+            )
+            lane_a.mid_cps.append(root_mid_cp)
+            logger.info(
+                "[%s] lane_a mid_cp emitted idx=0 image=%s asst_step=0 (ROOT)",
+                self.task_id, root_image_tag,
+            )
+            if on_mid_cp is not None:
+                try:
+                    on_mid_cp(root_mid_cp)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] on_mid_cp(root) raised: %s", self.task_id, exc,
+                    )
+            mid_cp_idx_offset = 1
+
         try:
             while cumulative_steps < cfg.step_limit:
                 remaining = cfg.step_limit - cumulative_steps
@@ -1146,12 +1202,16 @@ class TrajectorySearchParallelRunner:
                             self._would_fork_overflow, s
                         ),
                     )
+                    # Shifted idx: when fork_from_root emitted a root MidCp at
+                    # idx=0, chunked MidCps start at idx=1. max_mid_cps still
+                    # caps chunk emissions independently.
+                    mid_cp_idx = chunks_emitted + mid_cp_idx_offset
                     if would_overflow:
                         logger.info(
                             "[%s] lane_a mid_cp emit SKIPPED idx=%d: "
                             "Lane B fork would overflow sglang context "
                             "(asst_step=%d)",
-                            self.task_id, chunks_emitted, cumulative_steps,
+                            self.task_id, mid_cp_idx, cumulative_steps,
                         )
                         # Count this as a chunk emission so max_mid_cps cap
                         # advances; this also means Lane A keeps growing
@@ -1161,7 +1221,7 @@ class TrajectorySearchParallelRunner:
                         continue
                     image_tag = await loop.run_in_executor(
                         lane_a_pool,
-                        lambda s=session, tk=f"mid-{chunks_emitted:03d}", c=contextvars.copy_context(): c.run(
+                        lambda s=session, tk=f"mid-{mid_cp_idx:03d}", c=contextvars.copy_context(): c.run(
                             self._commit_container, s, tk
                         ),
                     )
@@ -1170,11 +1230,11 @@ class TrajectorySearchParallelRunner:
                             "[%s] lane_a mid_cp idx=%d: docker commit returned None, "
                             "skipping fork-group emit",
                             self.task_id,
-                            chunks_emitted,
+                            mid_cp_idx,
                         )
                     else:
                         mid_cp = MidCp(
-                            idx=chunks_emitted,
+                            idx=mid_cp_idx,
                             asst_step=cumulative_steps,
                             image_tag=image_tag,
                             snapshot=copy.deepcopy(snap),

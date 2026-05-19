@@ -205,8 +205,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Skip the inline 'ray start --head' (cluster is "
                         "brought up externally, e.g. by SLURM srun).")
     parser.add_argument("--context-parallel-size", type=int)
+    parser.add_argument("--tensor-model-parallel-size", type=int)
     parser.add_argument("--max-tokens-per-gpu", type=int)
     parser.add_argument("--log-probs-chunk-size", type=int)
+    parser.add_argument("--sglang-context-length", type=int)
     parser.add_argument("--rollout-instance-workers", type=int, default=2)
     parser.add_argument("--ray-num-cpus", type=int, default=32)
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
@@ -275,10 +277,14 @@ def main(argv: list[str] | None = None) -> int:
     override_lines = []
     if args.context_parallel_size is not None:
         override_lines.append(f"GRPO_PARALLEL_ARGS+=(--context-parallel-size {args.context_parallel_size})")
+    if args.tensor_model_parallel_size is not None:
+        override_lines.append(f"GRPO_PARALLEL_ARGS+=(--tensor-model-parallel-size {args.tensor_model_parallel_size})")
     if args.max_tokens_per_gpu is not None:
         override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
     if args.log_probs_chunk_size is not None:
         override_lines.append(f"GRPO_COMMON_ARGS+=(--log-probs-chunk-size {args.log_probs_chunk_size})")
+    if args.sglang_context_length is not None:
+        override_lines.append(f"GRPO_SGLANG_ARGS+=(--sglang-context-length {args.sglang_context_length})")
     config_overrides = "\n".join(override_lines)
     wandb_args = ""
     if args.wandb_mode != "disabled":

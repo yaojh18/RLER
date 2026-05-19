@@ -9,10 +9,10 @@ v0 7.6B-loss bug and is independent of the search topology. We re-implement
 locally (rather than import) so the v1 path has zero runtime dependency on
 v0's bundle module, but the semantics are byte-equal.
 
-Rubric-training bundles (rubric_groups) are NOT generated in v1 first pass
-— the GRPO --target=policy launcher only consumes policy_groups. Adding
-rubric_groups would require a cross-group baseline that's nontrivial in
-the lane scheme; defer until needed.
+Rubric-training bundles (rubric_groups) are NOT generated. True rubric-
+model training is a separate design — see docs/rubric_rl.md. The lanes
+bundle path here is policy-only; launching with --target=rubric will
+yield no training data (empty buffer), fail-loud by design.
 """
 
 from __future__ import annotations
@@ -353,8 +353,8 @@ def instance_record_to_bundle(
     forked from the same Lane A MidCp). Lane A's trajectory is never
     emitted as a sample.
 
-    rubric_groups: empty in v1 first pass (no rubric-target training in
-    the lane scheme yet)."""
+    rubric_groups: always empty — true rubric-model training is a
+    separate piece of work (see docs/rubric_rl.md)."""
     policy_groups: list[ExportGroup] = []
     for group in record.groups:
         eg = fork_group_to_export_group(
