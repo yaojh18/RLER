@@ -46,7 +46,7 @@ from swe_agent.rubric_bank import (
 )
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("swe_agent.trajectory_search")
 RETURN_CODE_RE = re.compile(r"<returncode>(.*?)</returncode>", re.DOTALL)
 EXCEPTION_RE = re.compile(r"<exception>(.*?)</exception>", re.DOTALL)
 OUTPUT_RE = re.compile(r"<output>\s*(.*?)</output>", re.DOTALL)
@@ -1220,14 +1220,6 @@ class TrajectorySearchRunner:
             "model_kwargs": self.rubric_model_kwargs,
             "extra_prompt_sections": extra_prompt_sections,
         }
-        _t_rub_start = time.perf_counter()
-        try:
-            logging.getLogger("swe_agent.trajectory_search").info(
-                "[TIMING] rubric_gen.start round=%d n_samples=%d active=%d"
-                % (round_index, self.search_config.n, len(self.active_bank))
-            )
-        except Exception:
-            pass
         generated_samples = await asyncio.gather(
             *[
                 _generate_round_rubrics(
@@ -1237,23 +1229,8 @@ class TrajectorySearchRunner:
                 for sample_index in range(self.search_config.n)
             ],
         )
-        try:
-            logging.getLogger("swe_agent.trajectory_search").info(
-                "[TIMING] rubric_gen.end   round=%d took=%.1fs samples=%d"
-                % (round_index, time.perf_counter()-_t_rub_start, len(generated_samples))
-            )
-        except Exception:
-            pass
         rubric_samples: list[dict[str, Any]] = []
         valid_rubric_samples: list[dict[str, Any]] = []
-        _t_jud_start = time.perf_counter()
-        try:
-            logging.getLogger("swe_agent.trajectory_search").info(
-                "[TIMING] judge_active.start round=%d branches=%d rubrics=%d"
-                % (round_index, len(continuations), len(self.active_bank))
-            )
-        except Exception:
-            pass
         active_continuation_scores, active_continuation_errors = await _score_round(
             question=question,
             shared_context=shared_context,
@@ -1265,13 +1242,6 @@ class TrajectorySearchRunner:
             max_tokens=self.search_config.judge_max_tokens,
             model_kwargs=self.judge_model_kwargs,
         )
-        try:
-            logging.getLogger("swe_agent.trajectory_search").info(
-                "[TIMING] judge_active.end   round=%d took=%.1fs scores=%d errs=%d"
-                % (round_index, time.perf_counter()-_t_jud_start, len(active_continuation_scores), len(active_continuation_errors))
-            )
-        except Exception:
-            pass
         active_parent_scores: list[dict[str, Any]] = []
         active_parent_errors: list[dict[str, str]] = []
         if compare_parent:
@@ -1562,13 +1532,10 @@ class TrajectorySearchRunner:
             sample_index, (policy_source, policy_model_name) = sample_index_and_plan
             node_id = f"node-r{round_index:03d}-s{sample_index:02d}-{uuid.uuid4().hex[:6]}"
             _t_br_start = time.perf_counter()
-            try:
-                logging.getLogger("swe_agent.trajectory_search").info(
-                    "[TIMING] branch.start round=%d sample=%d node=%s k=%d"
-                    % (round_index, sample_index, node_id, self.search_config.k)
-                )
-            except Exception:
-                pass
+            logger.info(
+                "[TIMING] branch.start round=%d sample=%d node=%s k=%d"
+                % (round_index, sample_index, node_id, self.search_config.k)
+            )
             resumed_snapshot = copy.deepcopy(parent_snapshot)
             resumed_snapshot["session_id"] = f"{node_id}-session"
             resumed_snapshot["spec"]["session_id"] = resumed_snapshot["session_id"]
@@ -1608,14 +1575,11 @@ class TrajectorySearchRunner:
                     "is_valid": False,
                 }
                 self._dispose_session(session)
-                try:
-                    _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
-                    logging.getLogger("swe_agent.trajectory_search").info(
-                        "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d (ERR)"
-                        % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
-                    )
-                except Exception:
-                    pass
+                _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
+                logger.info(
+                    "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d (ERR)"
+                    % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
+                )
                 return rec, error_text
             snapshot_after = session.snapshot().model_dump(mode="json")
             workspace_meta = _collect_workspace_meta(session.agent.env)
@@ -1647,14 +1611,11 @@ class TrajectorySearchRunner:
                 "recent_segments": recent_segments,
                 "is_valid": True,
             }
-            try:
-                _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
-                logging.getLogger("swe_agent.trajectory_search").info(
-                    "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d"
-                    % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
-                )
-            except Exception:
-                pass
+            _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
+            logger.info(
+                "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d"
+                % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
+            )
             return rec, None
 
         with ThreadPoolExecutor(max_workers=max(1, len(sample_plan)), thread_name_prefix="search-branch") as _branch_pool:
@@ -1943,14 +1904,6 @@ class TrajectorySearchRunner:
             )
         self._sweep_checkpoint_images()
         return rubric_update_records
-
-        try:
-            logging.getLogger("swe_agent.trajectory_search").info(
-                "[TIMING] run_round.end   round=%d took=%.1fs frontier=%d best=%s"
-                % (round_index, time.perf_counter()-_t_round_start, len(self.frontier_ids), str(self.best_node_id))
-            )
-        except Exception:
-            pass
 
     def _finalize_outputs(self) -> None:
         def _cached_overall_reward(node_id: str) -> float:
