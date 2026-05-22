@@ -1,3 +1,12 @@
+"""Legacy OpenAI-compatible chat service wrapper.
+
+The current search/policy path uses sglang `/generate` through
+agent_rl.run_utils.run_generate_with_route_async for token-in/token-out calls.
+This wrapper is kept only for legacy OpenAI-compatible chat fallback and as
+the existing route registry's endpoint container (`_base_url`, `_api_key`,
+`default_model_name`) until routes store those fields directly.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -30,6 +39,7 @@ class SGLangChatService:
                 key: value
                 for key, value in message.items()
                 if key not in {"metadata", "source", "trainable", "extra", "content_no_thinking"}
+                and key not in {"prompt_token_ids", "token_ids", "logprobs", "usage"}
             }
             for message in messages
         ]

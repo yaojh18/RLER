@@ -269,7 +269,6 @@ def _start_sglang_server(args: argparse.Namespace, log_path: Path) -> tuple[str,
                 "--context-length", str(args.max_model_len),
                 "--served-model-name", shlex.quote(args.sglang_model),
                 "--reasoning-parser qwen3",
-                "--disable-radix-cache",
                 "--watchdog-timeout 3600",
             ]
         ),
@@ -338,7 +337,12 @@ def tee_console(log_path: Path) -> Iterator[None]:
             yield
 
 
-def parse_trajectory_message(message: dict[str, Any], *, model_name: str) -> dict[str, Any] | None:
+def parse_trajectory_message(
+    message: dict[str, Any],
+    *,
+    model_name: str,
+    preserve_token_fields: bool = False,
+) -> dict[str, Any] | None:
     role = message.get("role")
     if role not in {"assistant", "user", "exit"}:
         return None
@@ -355,12 +359,31 @@ def parse_trajectory_message(message: dict[str, Any], *, model_name: str) -> dic
         if text is None:
             text = message.get("content", message.get("message", "")) or ""
         tool_calls = []
-    return {
+    parsed = {
         "role": role,
         "message": text,
         "tool_calls": tool_calls,
         "parser_model": model_name,
     }
+    if preserve_token_fields and role == "assistant":
+        for key in (
+            "content",
+            "prompt_token_ids",
+            "token_ids",
+            "logprobs",
+            "usage",
+        ):
+            if key in message:
+                parsed[key] = message[key]
+        if "content_no_thinking" in message:
+            parsed["content_no_thinking"] = message["content_no_thinking"]
+        elif "content" in parsed:
+            content = str(parsed["content"])
+            closing_tag = "</think>"
+            closing_index = content.rfind(closing_tag)
+            if closing_index >= 0:
+                parsed["content_no_thinking"] = content[closing_index + len(closing_tag):].lstrip("\r\n")
+    return parsed
 
 
 def build_messages(
@@ -368,10 +391,15 @@ def build_messages(
     *,
     model_name: str,
     trajectory_format: str | None = "mini-swe-agent-1.1",
+    preserve_token_fields: bool = False,
 ) -> dict[str, Any]:
     messages = []
     for index, message in enumerate(messages_payload):
-        parsed = parse_trajectory_message(message, model_name=model_name)
+        parsed = parse_trajectory_message(
+            message,
+            model_name=model_name,
+            preserve_token_fields=preserve_token_fields,
+        )
         if parsed is None:
             continue
         parsed["index"] = index

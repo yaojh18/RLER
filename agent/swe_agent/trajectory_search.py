@@ -16,11 +16,7 @@ from statistics import pvariance
 from typing import Any, Literal
 import numpy as np
 
-from agent_rl.run_utils import (
-    extract_json_from_response,
-    run_chat_with_route_async,
-    run_chat_with_route_completion_async,
-)
+from agent_rl.run_utils import extract_json_from_response, route_completion_message
 
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
 from swe_agent.backend import SWEAgentRolloutBackend
@@ -31,7 +27,7 @@ from swe_agent.parallel_utils import (
     PatchEvalManager,
     RubricArtifactBundle,
     _atomic_write_json,
-    gap_redundancy
+    gap_redundancy,
 )
 from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches, make_evaluation_payload
 from swe_agent.models.litellm_model import LitellmModel
@@ -228,12 +224,22 @@ import os
 import pathlib
 import subprocess
 
-cwd = {json.dumps(cwd)}
-os.chdir(cwd)
+requested_cwd = {json.dumps(cwd)}
 
 def run(cmd):
     completed = subprocess.run(cmd, shell=True, text=True, capture_output=True)
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
+
+cwd = requested_cwd
+for candidate in (requested_cwd, "/testbed", os.getcwd()):
+    if candidate and os.path.isdir(candidate):
+        cwd = candidate
+        break
+os.chdir(cwd)
+git_root_ok, git_root, _ = run("git rev-parse --show-toplevel")
+if git_root_ok == 0 and git_root and os.path.isdir(git_root):
+    cwd = git_root
+    os.chdir(cwd)
 
 payload = {{
     "cwd": cwd,
@@ -316,7 +322,7 @@ async def _update_persistent_state(
     model_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if evicted_step_cards is None:
-        return copy.deepcopy(previous_state)
+        return {"state": copy.deepcopy(previous_state), "messages": []}
     prompt = "\n\n".join(
         [
             PERSISTENT_STATE_UPDATE_PROMPT.strip(),
@@ -326,36 +332,33 @@ async def _update_persistent_state(
             f"## Workspace Metadata:\n{json.dumps(workspace_meta, indent=2, ensure_ascii=False)}",
         ]
     )
-    try:
-        async for attempt in retry(
-            logger=logger,
-            abort_exceptions=LitellmModel.abort_exceptions,
-            model_name=model_name,
-            async_retry=True,
-        ):
-            with attempt:
-                response = await run_chat_with_route_async(
-                    "rubric_judge",
-                    model_name=model_name,
-                    user_prompt=prompt,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens,
-                    response_format=copy.deepcopy(PERSISTENT_STATE_RESPONSE_FORMAT),
-                    enable_json_schema_validation=True,
-                    **(model_kwargs or {}),
-                )
-                parsed = extract_json_from_response(response)
-                if not isinstance(parsed, dict):
-                    raise ValueError("InvalidPersistentStateResponse")
-                state = copy.deepcopy(previous_state)
-                for key in state:
-                    if isinstance(parsed.get(key), str):
-                        state[key] = parsed[key]
-                return state
-    except Exception as exc:
-        logger.warning("Persistent state update failed for model %s: %s: %s", model_name, type(exc).__name__, exc)
-    return copy.deepcopy(previous_state)
+    async for attempt in retry(
+        logger=logger,
+        abort_exceptions=LitellmModel.abort_exceptions,
+        model_name=model_name,
+        async_retry=True,
+    ):
+        with attempt:
+            messages = [{"role": "user", "content": prompt}]
+            assistant_message = await route_completion_message(
+                route_name="rubric_judge",
+                model_name=model_name,
+                messages=messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                response_format=copy.deepcopy(PERSISTENT_STATE_RESPONSE_FORMAT),
+                model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
+            )
+            parsed = extract_json_from_response(assistant_message.get("content_no_thinking"))
+            if not isinstance(parsed, dict):
+                raise ValueError("InvalidPersistentStateResponse")
+            state = copy.deepcopy(previous_state)
+            for key in state:
+                if isinstance(parsed.get(key), str):
+                    state[key] = parsed[key]
+            return {"state": state, "messages": copy.deepcopy(messages + [assistant_message])}
+    raise RuntimeError("Persistent state update retry loop exited without result")
 
 
 def _parse_judge_score(response: str) -> int | None:
@@ -433,7 +436,6 @@ async def _generate_round_rubrics(
         parsed_candidate: dict[str, Any] | None = None
         parsed: dict[str, Any] | None = None
         assistant_content = ""
-        assistant_content_no_thinking = ""
         last_error = ""
         async for attempt in retry(
             logger=logger,
@@ -442,27 +444,19 @@ async def _generate_round_rubrics(
             async_retry=True,
         ):
             with attempt:
-                completion = await run_chat_with_route_completion_async(
-                    "rubric_generation",
+                assistant_message = await route_completion_message(
+                    route_name="rubric_generation",
                     model_name=model_name,
                     messages=conversation_messages,
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
                     response_format=copy.deepcopy(RUBRIC_GENERATION_RESPONSE_FORMAT),
-                    enable_json_schema_validation=True,
-                    **(model_kwargs or {}),
+                    model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
                 )
-        assistant_content = completion.content or ""
-        assistant_content_no_thinking = completion.metadata.get("content_no_thinking", assistant_content)
-        conversation_messages.append(
-            {
-                "role": "assistant",
-                "content": assistant_content,
-                "content_no_thinking": assistant_content_no_thinking,
-            }
-        )
-        parsed_candidate = extract_json_from_response(assistant_content or "")
+        assistant_content = assistant_message.get("content_no_thinking")
+        conversation_messages.append(assistant_message)
+        parsed_candidate = extract_json_from_response(assistant_content)
         if parsed_candidate == {}:
             break
         elif parsed_candidate is None:
@@ -537,47 +531,43 @@ async def _score_round(
                 *,
                 response_text: str = response_text,
                 criterion: str = criterion,
-            ) -> tuple[str, int, str | None]:
-                try:
-                    async for attempt in retry(
-                        logger=logger,
-                        abort_exceptions=LitellmModel.abort_exceptions,
-                        model_name=model_name,
-                        async_retry=True,
-                    ):
-                        with attempt:
-                            response = await run_chat_with_route_async(
-                                "rubric_judge",
-                                model_name=model_name,
-                                user_prompt=
-                                    SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT.strip() + (
-                                    f"\n\n## Question:\n{question_text}\n"
-                                    f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
-                                    f"## Previous Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
-                                    f"## Continuation Trajectory:\n{response_text}\n"
-                                    f"## Criterion:\n{criterion}"
-                                ),
-                                temperature=temperature,
-                                top_p=top_p,
-                                max_tokens=max_tokens,
-                                response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
-                                enable_json_schema_validation=True,
-                                **(model_kwargs or {}),
-                            )
-                            score_raw = _parse_judge_score(response)
-                            if score_raw is None:
-                                raise ValueError("InvalidJudgeResponse")
-                            return response, score_raw, None
-                except Exception as exc:
-                    last_error = f"{type(exc).__name__}: {exc}"
-                    return json.dumps({"score": 1}, ensure_ascii=False), 1, last_error
+            ) -> tuple[str, int, str | None, dict[str, Any]]:
+                async for attempt in retry(
+                    logger=logger,
+                    abort_exceptions=LitellmModel.abort_exceptions,
+                    model_name=model_name,
+                    async_retry=True,
+                ):
+                    with attempt:
+                        prompt = SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT.strip() + (
+                            f"\n\n## Question:\n{question_text}\n"
+                            f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
+                            f"## Previous Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
+                            f"## Continuation Trajectory:\n{response_text}\n"
+                            f"## Criterion:\n{criterion}"
+                        )
+                        assistant_message = await route_completion_message(
+                            route_name="rubric_judge",
+                            model_name=model_name,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_tokens=max_tokens,
+                            response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
+                            model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
+                        )
+                        score_raw = _parse_judge_score(assistant_message.get("content_no_thinking"))
+                        if score_raw is None:
+                            return 1, "InvalidJudgeResponse", assistant_message
+                        return score_raw, None, assistant_message
+                raise RuntimeError("Judge retry loop exited without result")
             calls.append(_judge_single())
             mapping.append((view_index, node_id, rubric))
     responses = await asyncio.gather(*calls)
     per_view_scores: list[list[dict[str, Any]]] = [[] for _ in continuations]
     errors: list[dict[str, str]] = []
     for (view_index, node_id, rubric), response in zip(mapping, responses):
-        judge_response, score_raw, error = response
+        score_raw, error, judge_message = response
         normalized = max(0.0, min(1.0, (score_raw - 1.0) / 4.0))
         record = {
             "rubric_id": rubric.rubric_id,
@@ -594,7 +584,7 @@ async def _score_round(
             "score_raw": score_raw,
             "score_normalized": normalized,
             "weighted_score": float(rubric.weight) * normalized,
-            "judge_response": judge_response,
+            "judge_message": judge_message,
         }
         per_view_scores[view_index].append(record)
         if error is not None:
@@ -641,46 +631,42 @@ async def _score_parent_round(
         async def _judge_single(
             *,
             criterion: str = criterion,
-        ) -> tuple[str, int, str | None]:
-            try:
-                async for attempt in retry(
-                    logger=logger,
-                    abort_exceptions=LitellmModel.abort_exceptions,
-                    model_name=model_name,
-                    async_retry=True,
-                ):
-                    with attempt:
-                        response = await run_chat_with_route_async(
-                            "rubric_judge",
-                            model_name=model_name,
-                            user_prompt=
-                                SWE_TRAJECTORY_RUBRIC_JUDGE_PARENT_PROMPT.strip() + (
-                                f"\n\n## Question:\n{question_text}\n"
-                                f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
-                                f"## Agent Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
-                                f"## Criterion:\n{criterion}"
-                            ),
-                            temperature=temperature,
-                            top_p=top_p,
-                            max_tokens=max_tokens,
-                            response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
-                            enable_json_schema_validation=True,
-                            **(model_kwargs or {}),
-                        )
-                        score_raw = _parse_judge_score(response)
-                        if score_raw is None:
-                            raise ValueError("InvalidJudgeResponse")
-                        return response, score_raw, None
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                return json.dumps({"score": 1}, ensure_ascii=False), 1, last_error
+        ) -> tuple[str, int, str | None, dict[str, Any]]:
+            async for attempt in retry(
+                logger=logger,
+                abort_exceptions=LitellmModel.abort_exceptions,
+                model_name=model_name,
+                async_retry=True,
+            ):
+                with attempt:
+                    prompt = SWE_TRAJECTORY_RUBRIC_JUDGE_PARENT_PROMPT.strip() + (
+                        f"\n\n## Question:\n{question_text}\n"
+                        f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
+                        f"## Agent Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
+                        f"## Criterion:\n{criterion}"
+                    )
+                    assistant_message = await route_completion_message(
+                        route_name="rubric_judge",
+                        model_name=model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens,
+                        response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
+                        model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
+                    )
+                    score_raw = _parse_judge_score(assistant_message.get("content_no_thinking"))
+                    if score_raw is None:
+                        return 1, "InvalidJudgeResponse", assistant_message
+                    return score_raw, None, assistant_message
+            raise RuntimeError("Parent judge retry loop exited without result")
         calls.append(_judge_single())
         mapping.append(rubric)
     responses = await asyncio.gather(*calls)
     score_records: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for rubric, response in zip(mapping, responses):
-        judge_response, score_raw, error = response
+        score_raw, error, judge_message = response
         normalized = max(0.0, min(1.0, (score_raw - 1.0) / 4.0))
         record = {
             "rubric_id": rubric.rubric_id,
@@ -697,7 +683,7 @@ async def _score_parent_round(
             "score_raw": score_raw,
             "score_normalized": normalized,
             "weighted_score": float(rubric.weight) * normalized,
-            "judge_response": judge_response,
+            "judge_message": judge_message,
         }
         score_records.append(record)
         if error is not None:
@@ -749,7 +735,13 @@ def _sample_by_strategy(
     return [items[i] for i in indices]
 
 
-def _docker_commit(executable: str, container_id: str, image_tag: str) -> tuple[str, str]:
+def _docker_commit(
+    executable: str,
+    container_id: str,
+    image_tag: str,
+    *,
+    inspect_image: bool = True,
+) -> tuple[str, str]:
     # --pause=false: containers can leak in 'paused' state under high commit
     # load. Safe here because we only commit after run_until_pause() returns,
     # i.e. when the agent step has finished and no in-container command is in
@@ -758,6 +750,8 @@ def _docker_commit(executable: str, container_id: str, image_tag: str) -> tuple[
         [executable, "commit", "--pause=false", container_id, image_tag],
         check=True, capture_output=True, text=True,
     )
+    if not inspect_image:
+        return image_tag, ""
     image_id = subprocess.run(
         [executable, "image", "inspect", image_tag, "--format", "{{.Id}}"],
         check=True,
@@ -765,6 +759,38 @@ def _docker_commit(executable: str, container_id: str, image_tag: str) -> tuple[
         text=True,
     ).stdout.strip()
     return image_tag, image_id
+
+
+def _resume_snapshot_payload(
+    snapshot: dict[str, Any],
+    *,
+    image_tag: str,
+    image_id: str,
+) -> dict[str, Any]:
+    payload = {
+        "session_id": snapshot["session_id"],
+        "status": snapshot["status"],
+        "spec": copy.deepcopy(snapshot["spec"]),
+        "agent": copy.deepcopy(snapshot["agent"]),
+        "model": copy.deepcopy(snapshot["model"]),
+        "environment": {
+            **copy.deepcopy(snapshot["environment"]),
+            "config": {
+                **copy.deepcopy(snapshot["environment"]["config"]),
+                "image": image_tag,
+            },
+            "state": {"owns_container": True},
+        },
+        "last_step_index": snapshot.get("last_step_index", -1),
+        "last_event_id": None,
+        "metadata": {
+            "checkpoint_image_id": image_id,
+            "checkpoint_image_tag": image_tag,
+        },
+    }
+    if snapshot.get("memory") is not None:
+        payload["memory"] = copy.deepcopy(snapshot["memory"])
+    return payload
 
 
 class TrajectorySearchRunner:
@@ -1087,22 +1113,11 @@ class TrajectorySearchRunner:
             "baseline_parent_reward": None,
             "regressed_vs_parent": False,
         }
-        root_snapshot = {
-            **copy.deepcopy(snapshot),
-            "environment": {
-                **copy.deepcopy(snapshot["environment"]),
-                "config": {
-                    **copy.deepcopy(snapshot["environment"]["config"]),
-                    "image": self.base_image,
-                },
-                "state": {"owns_container": True},
-            },
-            "metadata": {
-                **copy.deepcopy(snapshot.get("metadata", {})),
-                "checkpoint_image_id": self.base_image_id,
-                "checkpoint_image_tag": self.base_image,
-            },
-        }
+        root_snapshot = _resume_snapshot_payload(
+            snapshot,
+            image_tag=self.base_image,
+            image_id=self.base_image_id,
+        )
         self.nodes[root_node.node_id] = root_node
         self._node_judge_cache[root_node.node_id] = copy.deepcopy(root_judge)
         self._node_snapshot_cache[root_node.node_id] = copy.deepcopy(root_snapshot)
@@ -1110,7 +1125,7 @@ class TrajectorySearchRunner:
             node_id=root_node.node_id,
             node_dir=self.nodes_dir / root_node.node_id,
             node_payload=asdict(root_node),
-            messages_payload=build_messages([], model_name=self.policy_model_name),
+            messages_payload=build_messages([], model_name=self.policy_model_name, preserve_token_fields=True),
             prompt_payload={"messages": copy.deepcopy(messages)},
             judge_payload=root_judge,
             snapshot_payload=root_snapshot,
@@ -1144,21 +1159,19 @@ class TrajectorySearchRunner:
                 grandparent_judge = self._node_judge_cache.get(parent_node.parent_id)
                 if grandparent_judge is not None:
                     evicted_workspace_meta = copy.deepcopy(grandparent_judge.get("workspace_meta", evicted_workspace_meta))
-            try:
-                updated_parent_state = await _update_persistent_state(
-                    system_prompt=self.system_prompt,
-                    user_prompt=self.task,
-                    previous_state=parent_state,
-                    evicted_step_cards=evicted_step_cards,
-                    workspace_meta=evicted_workspace_meta,
-                    model_name=self.rubric_model_name,
-                    temperature=self.search_config.rubric_temperature,
-                    top_p=self.search_config.rubric_top_p,
-                    max_tokens=self.search_config.rubric_max_tokens,
-                    model_kwargs=self.rubric_model_kwargs,
-                )
-            except Exception:
-                updated_parent_state = copy.deepcopy(parent_state)
+            update_payload = await _update_persistent_state(
+                system_prompt=self.system_prompt,
+                user_prompt=self.task,
+                previous_state=parent_state,
+                evicted_step_cards=evicted_step_cards,
+                workspace_meta=evicted_workspace_meta,
+                model_name=self.rubric_model_name,
+                temperature=self.search_config.rubric_temperature,
+                top_p=self.search_config.rubric_top_p,
+                max_tokens=self.search_config.rubric_max_tokens,
+                model_kwargs=self.rubric_model_kwargs,
+            )
+            updated_parent_state = copy.deepcopy(update_payload["state"])
         question = {"system_prompt": self.system_prompt, "user_prompt": self.task}
         shared_context = {
             "previous_persistent_state": updated_parent_state,
@@ -1571,7 +1584,7 @@ class TrajectorySearchRunner:
                     "policy_model_name": policy_model_name,
                     "error": error_text,
                     "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
-                    "message_payload": build_messages(message_payload, model_name=policy_model_name),
+                    "message_payload": build_messages(message_payload, model_name=policy_model_name, preserve_token_fields=True),
                     "is_valid": False,
                 }
                 self._dispose_session(session)
@@ -1605,7 +1618,7 @@ class TrajectorySearchRunner:
                 "policy_model_name": policy_model_name,
                 "workspace_meta": workspace_meta,
                 "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
-                "message_payload": build_messages(message_payload, model_name=policy_model_name),
+                "message_payload": build_messages(message_payload, model_name=policy_model_name, preserve_token_fields=True),
                 "step_start": step_start,
                 "step_end": step_end,
                 "recent_segments": recent_segments,
@@ -1808,15 +1821,23 @@ class TrajectorySearchRunner:
                 terminal_messages = build_messages(
                     terminal_snapshot["agent"]["state"].get("messages", []),
                     model_name=branch["policy_model_name"],
+                    preserve_token_fields=True,
                 )
                 _patch = (terminal_result.get("submission", "") or "").strip()
                 if not _patch:
                     # Agent didn't explicitly submit (ran out of step budget mid-edit).
                     # Fall back to the actual git diff inside the docker container so we
-                    # don't lose real intermediate work.
+                    # don't lose real intermediate work. Some ReBench images do not mount
+                    # the repository at /testbed, so discover the git root when needed.
                     try:
                         _diff = branch["session"].agent.env.execute(
-                            {"command": "cd /testbed && git add -N . >/dev/null 2>&1; git diff"},
+                            {
+                                "command": (
+                                    'repo=$(git -C /testbed rev-parse --show-toplevel 2>/dev/null '
+                                    '|| git rev-parse --show-toplevel 2>/dev/null || pwd); '
+                                    'cd "$repo" && git add -N . >/dev/null 2>&1; git diff'
+                                )
+                            },
                             timeout=30,
                         )
                         _patch = (_diff.get("output") or "").strip()
@@ -1831,22 +1852,11 @@ class TrajectorySearchRunner:
                     }
                 }
             snapshot_payload = (
-                {
-                    **copy.deepcopy(branch["snapshot_after"]),
-                    "environment": {
-                        **copy.deepcopy(branch["snapshot_after"]["environment"]),
-                        "config": {
-                            **copy.deepcopy(branch["snapshot_after"]["environment"]["config"]),
-                            "image": branch["image_tag"],
-                        },
-                        "state": {"owns_container": True},
-                    },
-                    "metadata": {
-                        **copy.deepcopy(branch["snapshot_after"].get("metadata", {})),
-                        "checkpoint_image_id": branch["image_id"],
-                        "checkpoint_image_tag": branch["image_tag"],
-                    },
-                }
+                _resume_snapshot_payload(
+                    branch["snapshot_after"],
+                    image_tag=branch["image_tag"],
+                    image_id=branch["image_id"],
+                )
                 if branch["keep_snapshot"]
                 else None
             )
@@ -1936,6 +1946,7 @@ class TrajectorySearchRunner:
                 build_messages(
                     snapshot["agent"]["state"].get("messages", []),
                     model_name=final_policy_model_name,
+                    preserve_token_fields=True,
                 ),
             )
             _atomic_write_json(

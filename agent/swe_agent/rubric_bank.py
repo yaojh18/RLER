@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from agent_rl.run_utils import extract_json_from_response, run_chat_with_route_async
+from agent_rl.run_utils import extract_json_from_response, route_completion_message
 
 from swe_agent.models.litellm_model import LitellmModel
 from swe_agent.models.utils.retry import retry
@@ -240,6 +240,8 @@ def _convert_action(
     if not isinstance(payload, dict):
         return None
     action = payload.get("action")
+    if not isinstance(action, str):
+        return None
     if action == "retrieve":
         if {"action", "titles"} - set(payload):
             return None
@@ -614,19 +616,18 @@ class ExperienceRubricBank:
                 async_retry=True,
             ):
                 with attempt:
-                    response = await run_chat_with_route_async(
-                        "rubric_generation",
+                    assistant_message = await route_completion_message(
+                        route_name="rubric_generation",
                         model_name=model_name,
-                        user_prompt=messages[-1]["content"] if len(messages) == 1 else None,
-                        messages=messages if len(messages) > 1 else None,
+                        messages=messages,
                         temperature=temperature,
                         top_p=top_p,
                         max_tokens=max_tokens,
                         response_format=copy.deepcopy(RUBRIC_EXPERIENCE_RETRIEVAL_RESPONSE_FORMAT),
-                        enable_json_schema_validation=True,
-                        **(model_kwargs or {}),
+                        model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
                     )
-            messages.append({"role": "assistant", "content": response or ""})
+            response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
+            messages.append(assistant_message)
             parsed = extract_json_from_response(response or "")
             if isinstance(parsed, dict) and isinstance(parsed.get("titles"), list):
                 requested_titles = [title for title in parsed["titles"][: self.retrieve_top_k] if title in self.experiences]
@@ -660,9 +661,121 @@ class ExperienceRubricBank:
         model_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         before = self.to_list()
-        evidence = self._build_instance_evidence(instance=instance, rubric_payloads=rubric_payloads or [])
+        grouped_payloads = self._group_payloads_by_index(rubric_payloads or [])
+        if grouped_payloads is None:
+            update = await self._update_from_payloads(
+                instance=instance,
+                rubric_payloads=rubric_payloads or [],
+                model_name=model_name,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                model_kwargs=model_kwargs,
+            )
+            payload = {
+                "before": before,
+                "actions": update["actions"],
+                "after": update["after"],
+                "messages": update["messages"],
+            }
+        else:
+            group_updates: list[dict[str, Any]] = []
+            actions: list[dict[str, Any]] = []
+            messages: list[dict[str, Any]] = []
+            for group_index, group_payloads in grouped_payloads:
+                update = await self._update_from_payloads(
+                    instance=instance,
+                    rubric_payloads=group_payloads,
+                    model_name=model_name,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    model_kwargs=model_kwargs,
+                )
+                if not update["has_evidence"]:
+                    continue
+                group_update = {
+                    "group_index": group_index,
+                    "before": update["before"],
+                    "actions": update["actions"],
+                    "after": update["after"],
+                    "messages": update["messages"],
+                }
+                group_updates.append(group_update)
+                actions.extend(
+                    {
+                        **copy.deepcopy(action),
+                        "group_index": group_index,
+                    }
+                    for action in update["actions"]
+                )
+                messages.append(
+                    {
+                        "group_index": group_index,
+                        "messages": copy.deepcopy(update["messages"]),
+                    }
+                )
+            payload = {
+                "before": before,
+                "actions": actions,
+                "after": self.to_list(),
+                "messages": messages,
+                "groups": group_updates,
+            }
+        if self.write_artifacts and self.bank_path is not None:
+            _atomic_write_json(self.bank_path, {"experiences": self.to_list()})
+        if self.write_artifacts:
+            _atomic_write_json(
+                Path(run_dir) / "rubric_bank.json",
+                {
+                    "before": before,
+                    "after": payload["after"],
+                },
+            )
+        return payload
+
+    @staticmethod
+    def _group_payloads_by_index(
+        rubric_payloads: list[dict[str, Any]],
+    ) -> list[tuple[int, list[dict[str, Any]]]] | None:
+        if not rubric_payloads:
+            return None
+        has_group_index = ["group_index" in payload for payload in rubric_payloads]
+        if not any(has_group_index):
+            return None
+        if not all(has_group_index):
+            raise ValueError("rubric_payloads must either all include group_index or none include group_index")
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        order: list[int] = []
+        for payload in rubric_payloads:
+            group_index = int(payload["group_index"])
+            if group_index not in grouped:
+                grouped[group_index] = []
+                order.append(group_index)
+            grouped[group_index].append(
+                {
+                    key: copy.deepcopy(value)
+                    for key, value in payload.items()
+                    if key != "group_index"
+                }
+            )
+        return [(group_index, grouped[group_index]) for group_index in order]
+
+    async def _update_from_payloads(
+        self,
+        *,
+        instance: dict[str, Any],
+        rubric_payloads: list[dict[str, Any]],
+        model_name: str,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+        model_kwargs: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        before = self.to_list()
+        evidence = self._build_instance_evidence(instance=instance, rubric_payloads=rubric_payloads)
         if evidence.get("rubric_attempts"):
-            applied, update_messages = await self._update_bank_from_evidence(
+            actions, messages = await self._update_bank_from_evidence(
                 evidence=evidence,
                 model_name=model_name,
                 temperature=temperature,
@@ -671,20 +784,15 @@ class ExperienceRubricBank:
                 model_kwargs=model_kwargs,
             )
         else:
-            applied = []
-            update_messages = []
-        if self.write_artifacts and self.bank_path is not None:
-            _atomic_write_json(self.bank_path, {"experiences": self.to_list()})
-        payload = {
+            actions = []
+            messages = []
+        return {
             "before": before,
-            "actions": applied,
+            "actions": actions,
             "after": self.to_list(),
-            "messages": update_messages,
+            "messages": messages,
+            "has_evidence": bool(evidence.get("rubric_attempts")),
         }
-        if self.write_artifacts:
-            _atomic_write_json(Path(run_dir) / "rubric_bank.json", payload)
-            _atomic_write_json(Path(run_dir) / "rubric_bank_message.json", update_messages)
-        return payload
 
     def _build_instance_evidence(
         self,
@@ -729,6 +837,7 @@ class ExperienceRubricBank:
             )
             attempts.append(
                 {
+                    "rubric_list_id": payload.get("rubric_list_id"),
                     "generation_context": copy.deepcopy(generation_context),
                     "retrieved_experience": [_public_experience(item) for item in payload.get("retrieved", [])],
                     "generated_rubrics": generated_rubrics,
@@ -781,20 +890,18 @@ class ExperienceRubricBank:
                     async_retry=True,
                 ):
                     with attempt:
-                        response = await run_chat_with_route_async(
-                            "rubric_generation",
+                        assistant_message = await route_completion_message(
+                            route_name="rubric_generation",
                             model_name=model_name,
-                            user_prompt=messages[-1]["content"] if len(messages) == 1 else None,
-                            messages=messages if len(messages) > 1 else None,
+                            messages=messages,
                             temperature=temperature,
                             top_p=top_p,
                             max_tokens=max_tokens,
                             response_format=copy.deepcopy(RUBRIC_EXPERIENCE_UPDATE_RESPONSE_FORMAT),
-                            enable_json_schema_validation=False,
-                            **(model_kwargs or {}),
+                            model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": False},
                         )
-                response = response or ""
-                messages.append({"role": "assistant", "content": response})
+                response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
+                messages.append(assistant_message)
                 parsed = extract_json_from_response(response)
                 if parsed == {}:
                     break

@@ -152,7 +152,7 @@ def build_rollout_samples(
             # Propagate ExportSample.metadata onto Sample.metadata so
             # downstream metric aggregation in the rollout-fn metrics dict
             # (e.g. swe_agent/sample_cont_steps_mean) can read per-sample
-            # fields that lane_to_grpo_bundle._build_branch_sample stashes
+            # fields that the SWE search exporter stashes
             # there: n_continuation_steps, n_parent_steps, n_full_trace_steps,
             # raw_gt_score, raw_rubric_score, terminated_early, is_dummy, etc.
             if export_sample.metadata:

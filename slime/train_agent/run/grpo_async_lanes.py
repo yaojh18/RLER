@@ -11,7 +11,7 @@ Usage:
         --policy-ports 30000,30001,30002,30003,30004,30005 \\
         --rubric-ports 30006,30007 \\
         --lanes-instance-workers 8 \\
-        --lanes-m 8 --lanes-max-mid-cps 6 ...
+        --lanes-m 8 --lanes-n 1 --lanes-k 20 --lanes-p 1 --lanes-max-rounds 5 ...
 """
 
 from __future__ import annotations
@@ -33,11 +33,13 @@ def _parse_lanes_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--lanes-wait-timeout", type=int, default=10800)
     p.add_argument("--lanes-output-root", default="")
     p.add_argument("--lanes-m", type=int, default=8)
-    p.add_argument("--lanes-max-mid-cps", type=int, default=6)
-    p.add_argument("--lanes-steps-per-round", type=int, default=20)
-    p.add_argument("--lanes-step-limit", type=int, default=120)
+    p.add_argument("--lanes-n", type=int, default=1)
+    p.add_argument("--lanes-k", type=int, default=20)
+    p.add_argument("--lanes-p", type=int, default=1)
+    p.add_argument("--lanes-max-rounds", type=int, default=5)
+    p.add_argument("--lanes-step-limit", type=int, default=100)
+    p.add_argument("--lanes-max-active-rubrics", type=int, default=6)
     p.add_argument("--lanes-completion-max-tokens", type=int, default=4096)
-    p.add_argument("--lanes-seed", type=int, default=0)
     p.add_argument("--lanes-gt-eval-workers", type=int, default=8)
     p.add_argument("--lanes-lane-b-pool-size", type=int, default=0)
     p.add_argument("--lanes-policy-alpha", type=float, default=1.0)
@@ -72,15 +74,16 @@ def _export_lanes_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_LANES_WAIT_TIMEOUT"] = str(ns.lanes_wait_timeout)
 
     os.environ["SWE_AGENT_LANES_M"] = str(ns.lanes_m)
-    os.environ["SWE_AGENT_LANES_MAX_MID_CPS"] = str(ns.lanes_max_mid_cps)
-    os.environ["SWE_AGENT_LANES_STEPS_PER_ROUND"] = str(ns.lanes_steps_per_round)
+    os.environ["SWE_AGENT_LANES_N"] = str(ns.lanes_n)
+    os.environ["SWE_AGENT_LANES_K"] = str(ns.lanes_k)
+    os.environ["SWE_AGENT_LANES_P"] = str(ns.lanes_p)
+    os.environ["SWE_AGENT_LANES_MAX_ROUNDS"] = str(ns.lanes_max_rounds)
     os.environ["SWE_AGENT_LANES_STEP_LIMIT"] = str(ns.lanes_step_limit)
+    os.environ["SWE_AGENT_LANES_MAX_ACTIVE_RUBRICS"] = str(ns.lanes_max_active_rubrics)
     os.environ["SWE_AGENT_LANES_COMPLETION_MAX_TOKENS"] = str(ns.lanes_completion_max_tokens)
     os.environ["SWE_AGENT_LANES_GT_EVAL_WORKERS"] = str(ns.lanes_gt_eval_workers)
     if ns.lanes_lane_b_pool_size:
         os.environ["SWE_AGENT_LANES_LANE_B_POOL_SIZE"] = str(ns.lanes_lane_b_pool_size)
-    if ns.lanes_seed:
-        os.environ["SWE_AGENT_LANES_SEED"] = str(ns.lanes_seed)
     os.environ["SWE_AGENT_LANES_POLICY_ALPHA"] = str(ns.lanes_policy_alpha)
     os.environ["SWE_AGENT_LANES_POLICY_TEMPERATURE"] = str(ns.lanes_policy_temperature)
     os.environ["SWE_AGENT_LANES_POLICY_TOP_P"] = str(ns.lanes_policy_top_p)

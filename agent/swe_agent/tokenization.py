@@ -29,44 +29,55 @@ from transformers import AutoTokenizer
 
 
 _TOKENIZER = None
+_TOKENIZER_PATH = None
 _TOKENIZER_LOCK = threading.Lock()
-_DEFAULT_MODEL_PATH = os.environ.get(
-    "SWE_AGENT_TOKENIZER_PATH",
-    "/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-9B",
-)
+
+
+def _resolve_tokenizer_path(model_path: str | None = None) -> str:
+    path = model_path or os.environ.get("SWE_AGENT_TOKENIZER_PATH") or os.environ.get("SWE_AGENT_GRPO_MODEL_NAME")
+    if not path:
+        raise RuntimeError("Tokenizer path is required; pass model_path or set SWE_AGENT_TOKENIZER_PATH/SWE_AGENT_GRPO_MODEL_NAME.")
+    for prefix in ("openai/", "azure/", "anthropic/"):
+        if path.startswith(prefix):
+            return path[len(prefix):]
+    return path
 
 
 def get_tokenizer(model_path: str | None = None):
     """Lazy-load the shared tokenizer. Reused across all PDS workers."""
-    global _TOKENIZER
+    global _TOKENIZER, _TOKENIZER_PATH, _ASST_GEN_PROMPT_IDS, _NEWLINE_IDS, _IM_END_ID
+    path = _resolve_tokenizer_path(model_path)
     with _TOKENIZER_LOCK:
-        if _TOKENIZER is None:
-            path = model_path or _DEFAULT_MODEL_PATH
+        if _TOKENIZER is None or _TOKENIZER_PATH != path:
             _TOKENIZER = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+            _TOKENIZER_PATH = path
+            _ASST_GEN_PROMPT_IDS = None
+            _NEWLINE_IDS = None
+            _IM_END_ID = None
     return _TOKENIZER
 
 
 # Cached token-id sequences for the role markers / boundaries used by the
 # splice-based renderer below. Populated lazily by _ensure_special_tokens().
-_ASST_GEN_PROMPT_IDS: list[int] | None = None  # `<|im_start|>assistant\n<think>\n`
+_ASST_GEN_PROMPT_IDS: list[int] | None = None  # `<|im_start|>assistant\n`
 _NEWLINE_IDS: list[int] | None = None           # `\n` (boundary between messages)
 _IM_END_ID: int | None = None                   # `<|im_end|>`
 
 
-def _ensure_special_tokens() -> None:
+def _ensure_special_tokens(model_path: str | None = None) -> None:
     """Populate the cached id sequences once (idempotent)."""
     global _ASST_GEN_PROMPT_IDS, _NEWLINE_IDS, _IM_END_ID
     if _IM_END_ID is not None:
         return
-    tok = get_tokenizer()
-    _ASST_GEN_PROMPT_IDS = tok.encode("<|im_start|>assistant\n<think>\n", add_special_tokens=False)
+    tok = get_tokenizer(model_path)
+    _ASST_GEN_PROMPT_IDS = tok.encode("<|im_start|>assistant\n", add_special_tokens=False)
     _NEWLINE_IDS = tok.encode("\n", add_special_tokens=False)
     _IM_END_ID = int(tok.convert_tokens_to_ids("<|im_end|>"))
 
 
-def _encode_text_piece(text: str) -> list[int]:
+def _encode_text_piece(text: str, *, model_path: str | None = None) -> list[int]:
     """Tokenize a literal text piece with no special-token augmentation."""
-    return list(get_tokenizer().encode(text, add_special_tokens=False))
+    return list(get_tokenizer(model_path).encode(text, add_special_tokens=False))
 
 
 def tokenize_messages_with_template(
@@ -74,6 +85,7 @@ def tokenize_messages_with_template(
     *,
     add_generation_prompt: bool = False,
     enable_thinking: bool = True,
+    model_path: str | None = None,
 ) -> list[int]:
     """Render a chat-style message list to token IDs via PURE SPLICING.
 
@@ -93,20 +105,20 @@ def tokenize_messages_with_template(
       - tool    -> `<|im_start|>user\\n<tool_response>\\n{content}\\n</tool_response><|im_end|>\\n`
       - asst:
           - if message has `token_ids` (PDS rollout path): splice those
-            tokens, sandwiched by `<|im_start|>assistant\\n<think>\\n` and
+            tokens, sandwiched by `<|im_start|>assistant\\n` and
             `\\n`. If `token_ids` doesn't already end with `<|im_end|>`
             (sglang truncated), append one before the trailing `\\n` so
             the turn is properly closed.
           - else (eval / non-PDS): tokenize the text content wrapped as
-            `<|im_start|>assistant\\n<think>\\n{content}<|im_end|>\\n`.
+            `<|im_start|>assistant\\n{content}<|im_end|>\\n`.
       - end:   if `add_generation_prompt`, append
-            `<|im_start|>assistant\\n<think>\\n` (the gen prompt).
+            `<|im_start|>assistant\\n` (the gen prompt).
 
-    `enable_thinking` is ignored — we always render asst with the <think>
-    wrapper, mirroring how sglang generated each turn.
+    `enable_thinking` is ignored here: if a thinking model is used, the
+    generated assistant content itself must include `<think>...</think>`.
     """
     del enable_thinking
-    _ensure_special_tokens()
+    _ensure_special_tokens(model_path)
     result: list[int] = []
     for i, msg in enumerate(messages):
         role = msg.get("role") or "assistant"
@@ -114,12 +126,13 @@ def tokenize_messages_with_template(
         if role == "system":
             if i != 0:
                 raise ValueError("System message must be at the beginning.")
-            result.extend(_encode_text_piece(f"<|im_start|>system\n{content}<|im_end|>\n"))
+            result.extend(_encode_text_piece(f"<|im_start|>system\n{content}<|im_end|>\n", model_path=model_path))
         elif role == "user":
-            result.extend(_encode_text_piece(f"<|im_start|>user\n{content}<|im_end|>\n"))
+            result.extend(_encode_text_piece(f"<|im_start|>user\n{content}<|im_end|>\n", model_path=model_path))
         elif role == "tool":
             result.extend(_encode_text_piece(
-                f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n"
+                f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n",
+                model_path=model_path,
             ))
         elif role == "assistant":
             stored = msg.get("token_ids")
@@ -140,7 +153,8 @@ def tokenize_messages_with_template(
                 # splice path would have produced if we'd run the content
                 # text through the model — wrap with the same prefix/suffix.
                 result.extend(_encode_text_piece(
-                    f"<|im_start|>assistant\n<think>\n{content}<|im_end|>\n"
+                    f"<|im_start|>assistant\n{content}<|im_end|>\n",
+                    model_path=model_path,
                 ))
         else:
             raise ValueError(f"Unexpected message role: {role!r}")
@@ -149,7 +163,7 @@ def tokenize_messages_with_template(
     return result
 
 
-def get_stop_token_ids() -> list[int]:
+def get_stop_token_ids(model_path: str | None = None) -> list[int]:
     """Token ids that should terminate /generate calls for this model.
 
     Chat completions endpoint auto-derives these from the chat template; the
@@ -160,7 +174,7 @@ def get_stop_token_ids() -> list[int]:
     Includes both <|im_end|> (chat-template turn terminator) and the
     tokenizer's configured eos_token_id (generation_config default).
     """
-    tok = get_tokenizer()
+    tok = get_tokenizer(model_path)
     ids: list[int] = []
     im_end = tok.convert_tokens_to_ids("<|im_end|>")
     if isinstance(im_end, int) and im_end >= 0:
@@ -171,18 +185,11 @@ def get_stop_token_ids() -> list[int]:
     return ids
 
 
-def tokenize_text(text: str, *, add_special_tokens: bool = False) -> list[int]:
-    """Tokenize a raw text fragment (no chat template wrapping). Used for
-    tool observations the agent inserts mid-conversation that should be
-    treated as opaque text from the model's POV.
-    """
-    return get_tokenizer()(text, add_special_tokens=add_special_tokens)["input_ids"]
-
-
 def compute_loss_mask_for_messages(
     messages: list[dict[str, Any]],
     *,
     enable_thinking: bool = True,
+    model_path: str | None = None,
 ) -> tuple[list[int], list[int]]:
     """Tokenize `messages` and return (token_ids, loss_mask) where loss_mask
     is 1 for tokens that fall inside an assistant turn's response payload
@@ -195,7 +202,10 @@ def compute_loss_mask_for_messages(
     positions as trainable.
     """
     full_ids = tokenize_messages_with_template(
-        messages, add_generation_prompt=False, enable_thinking=enable_thinking,
+        messages,
+        add_generation_prompt=False,
+        enable_thinking=enable_thinking,
+        model_path=model_path,
     )
     loss_mask = [0] * len(full_ids)
     # Walk message by message and mark assistant ranges.
@@ -205,6 +215,7 @@ def compute_loss_mask_for_messages(
             messages[: i + 1],
             add_generation_prompt=False,
             enable_thinking=enable_thinking,
+            model_path=model_path,
         )
         cur_len = len(prefix_ids)
         if messages[i].get("role") == "assistant":

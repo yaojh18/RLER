@@ -11,9 +11,10 @@ Selects target='policy' (rubric_groups not generated in v1 first pass).
 ENV CONTRACT (set by slime/train_agent/run/grpo_async_lanes.py to match
 the SLURM script's tunables):
   SWE_AGENT_LANES_M                  int    forks per mid_cp (default 8)
-  SWE_AGENT_LANES_MAX_MID_CPS        int    mid_cps cap per instance (default 6)
-  SWE_AGENT_LANES_STEPS_PER_ROUND    int    asst turns between mid_cps (default 20)
-  SWE_AGENT_LANES_STEP_LIMIT         int    hard cap per Lane B branch (default 120)
+	  SWE_AGENT_LANES_MAX_ROUNDS         int    fork-group cap per instance, root counts (default 5)
+	  SWE_AGENT_LANES_K                  int    asst turns between mid_cps (default 20)
+	  SWE_AGENT_LANES_P                  int    active parents, currently must be 1
+  SWE_AGENT_LANES_STEP_LIMIT         int    hard cap for the whole trajectory (default 100)
   SWE_AGENT_LANES_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
   SWE_AGENT_LANES_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
   SWE_AGENT_LANES_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 4096)
@@ -74,7 +75,6 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         # Imports inside the subprocess so env-var-dependent module init runs
         # AFTER we've set the slime API base.
         from swe_agent.backend import SWEAgentRolloutBackend
-        from swe_agent.lane_to_grpo_bundle import instance_record_to_bundle
         from swe_agent.run.benchmarks.swebench import (
             build_swebench_config,
             get_swebench_docker_image_name,
@@ -83,6 +83,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         )
         from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
         from swe_agent.trajectory_search_parallel import (
+            LaneGRPOCollector,
             ParallelSearchConfig,
             TrajectorySearchParallelRunner,
         )
@@ -143,12 +144,14 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
 
         cfg = ParallelSearchConfig(
             m=task["m"],
-            max_mid_cps=task["max_mid_cps"],
-            steps_per_round=task["steps_per_round"],
+            n=task["n"],
+            k=task["k"],
+            p=task["p"],
+            max_rounds=task["max_rounds"],
             step_limit=task["step_limit"],
-            seed=task.get("seed"),
+            max_active_rubrics=task["max_active_rubrics"],
             gt_eval_workers=task.get("gt_eval_workers", 8),
-            lane_b_pool_size=task.get("lane_b_pool_size") or (task["m"] * task["max_mid_cps"]),
+            lane_b_pool_size=task.get("lane_b_pool_size") or (task["m"] * task["max_rounds"]),
             keep_images=False,
             policy_temperature=task.get("policy_temperature", 1.0),
             policy_top_p=task.get("policy_top_p", 0.95),
@@ -177,9 +180,9 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             api_key=api_key,
         )
         record = asyncio.run(runner.run())
-        bundle = instance_record_to_bundle(
-            record, policy_reward_alpha=task.get("policy_reward_alpha", 1.0),
-        )
+        bundle = LaneGRPOCollector(
+            policy_reward_alpha=task.get("policy_reward_alpha", 1.0),
+        ).instance_record_to_bundle(record)
         result = {
             "index": task["index"],
             "instance_id": instance_id,
@@ -373,10 +376,12 @@ def _lanes_values_from_env() -> dict[str, Any]:
 
     return {
         "m": _int("SWE_AGENT_LANES_M", 8),
-        "max_mid_cps": _int("SWE_AGENT_LANES_MAX_MID_CPS", 6),
-        "steps_per_round": _int("SWE_AGENT_LANES_STEPS_PER_ROUND", 20),
-        "step_limit": _int("SWE_AGENT_LANES_STEP_LIMIT", 120),
-        "seed": _int("SWE_AGENT_LANES_SEED"),
+        "n": _int("SWE_AGENT_LANES_N", 1),
+        "k": _int("SWE_AGENT_LANES_K", 20),
+        "p": _int("SWE_AGENT_LANES_P", 1),
+        "max_rounds": _int("SWE_AGENT_LANES_MAX_ROUNDS", 5),
+        "step_limit": _int("SWE_AGENT_LANES_STEP_LIMIT", 100),
+        "max_active_rubrics": _int("SWE_AGENT_LANES_MAX_ACTIVE_RUBRICS", 6),
         "gt_eval_workers": _int("SWE_AGENT_LANES_GT_EVAL_WORKERS", 8),
         "lane_b_pool_size": _int("SWE_AGENT_LANES_LANE_B_POOL_SIZE"),
         "completion_max_tokens": _int("SWE_AGENT_LANES_COMPLETION_MAX_TOKENS", 4096),
@@ -712,7 +717,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         sample.index = index
 
     # --- per-batch metrics aggregated from sample.metadata + sample fields ---
-    # Stashed by lane_to_grpo_bundle._build_branch_sample:
+    # Stashed by LaneGRPOCollector._build_branch_sample:
     #   n_continuation_steps, n_parent_steps, n_full_trace_steps,
     #   raw_gt_score, terminated_early, instance_id, is_dummy
     def _safe_mean(xs: list[float]) -> float:
@@ -768,7 +773,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         _safe_mean([c // m for c in inst_group_count.values()])
         if inst_group_count else 0.0
     )
-    # Truncation rate: fraction of samples whose status reached the per-branch
+    # Truncation rate: fraction of samples whose status reached the trajectory
     # step_limit without submitting (slime sets Sample.Status.TRUNCATED in that
     # case; we approximate from .status if available).
     try:

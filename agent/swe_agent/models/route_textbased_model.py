@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 from agent_rl.model_service import run_async
-from agent_rl.run_utils import run_generate_with_route_async
+from agent_rl.run_utils import compact_completion_response, run_generate_with_route_async
 
 from swe_agent.exceptions import FormatError
 from swe_agent.models import GLOBAL_MODEL_STATS
@@ -47,8 +47,9 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         stop = query_kwargs.pop("stop", None)
         api_base = query_kwargs.pop("api_base", None)
         api_key = query_kwargs.pop("api_key", "EMPTY")
-        # extra_body may carry chat_template_kwargs (e.g. enable_thinking) that
-        # the local tokenizer needs to mirror.
+        # extra_body may carry legacy chat_template_kwargs. The local
+        # token-in/out renderer does not prefill thinking tags; thinking
+        # models must generate `<think>...</think>` in output_ids.
         extra_body = query_kwargs.pop("extra_body", {}) or {}
         chat_template_kwargs = extra_body.get("chat_template_kwargs", {}) if isinstance(extra_body, dict) else {}
         enable_thinking = bool(chat_template_kwargs.get("enable_thinking", True))
@@ -74,7 +75,10 @@ class RouteTextbasedModel(LitellmTextbasedModel):
                 item["token_ids"] = m["token_ids"]
             normalized.append(item)
         input_ids = tokenize_messages_with_template(
-            normalized, add_generation_prompt=True, enable_thinking=enable_thinking,
+            normalized,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
+            model_path=self.config.model_name,
         )
         # === PREFIX INVARIANT CHECK ===
         # The custom chat template in swe_agent.tokenization is designed so that
@@ -130,7 +134,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
             # like /v1/chat/completions does. Without this, the model emits its
             # real response, hits <|im_end|>, and then keeps generating until
             # max_new_tokens — we observed an infinite <think></think> tail.
-            "stop_token_ids": get_stop_token_ids(),
+            "stop_token_ids": get_stop_token_ids(model_path=self.config.model_name),
         }
         if stop:
             sampling_params["stop"] = stop
@@ -193,7 +197,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
             "logprobs": list(completion.output_logprobs),
             "extra": {
                 "actions": [],
-                "response": completion.raw_response,
+                "response": compact_completion_response(completion),
                 "cost": completion.cost,
                 "timestamp": completion.metadata.get("timestamp", time.time()),
                 "finish_reason": completion.finish_reason,

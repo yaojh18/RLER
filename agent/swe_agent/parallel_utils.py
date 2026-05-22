@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
-import logging
 import os
-import re
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -13,28 +9,68 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-import openai
-from agent_rl.run_utils import extract_json_from_response
 from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
-from swe_agent.prompt import (
-    EMPTY_PERSISTENT_STATE,
-    JUDGE_RESPONSE_FORMAT,
-    PERSISTENT_STATE_RESPONSE_FORMAT,
-    PERSISTENT_STATE_UPDATE_PROMPT,
-    RUBRIC_GENERATION_CONTINUE_PROMPT,
-    RUBRIC_GENERATION_RESPONSE_FORMAT,
-    SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
-    SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
-)
-
-logger = logging.getLogger("swe_agent.parallel_utils")
+from swe_agent.prompt import SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT
 
 INVALID_SAMPLE_REWARD = -1.0
 RUBRIC_FORMAT_ERROR_REWARD = -1.0
 RUBRIC_TERMINAL_ERROR_REWARD = -0.2
 
-MAX_RUBRICS = 6
-MAX_RUBRIC_GENERATION_ROUNDS = 10
+
+_COMPACT_JSON_ARRAY_KEYS = {
+    "prompt_token_ids",
+    "token_ids",
+    "logprobs",
+    "output_token_ids",
+    "output_logprobs",
+    "input_token_ids",
+    "loss_mask",
+    "rollout_logprobs",
+}
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _dumps_readable_json(data: Any, *, indent: int = 2) -> str:
+    def render(value: Any, level: int, key: str | None = None) -> str:
+        if isinstance(value, dict):
+            if not value:
+                return "{}"
+            lines = ["{"]
+            items = list(value.items())
+            for index, (item_key, item_value) in enumerate(items):
+                comma = "," if index < len(items) - 1 else ""
+                rendered = render(item_value, level + 1, item_key)
+                lines.append(
+                    " " * (indent * (level + 1))
+                    + json.dumps(str(item_key), ensure_ascii=False)
+                    + ": "
+                    + rendered
+                    + comma
+                )
+            lines.append(" " * (indent * level) + "}")
+            return "\n".join(lines)
+        if isinstance(value, list):
+            if key in _COMPACT_JSON_ARRAY_KEYS and all(not isinstance(item, (dict, list)) for item in value):
+                return json.dumps([_json_safe(item) for item in value], ensure_ascii=False, separators=(",", ":"))
+            if not value:
+                return "[]"
+            lines = ["["]
+            for index, item in enumerate(value):
+                comma = "," if index < len(value) - 1 else ""
+                rendered = render(item, level + 1)
+                lines.append(" " * (indent * (level + 1)) + rendered + comma)
+            lines.append(" " * (indent * level) + "]")
+            return "\n".join(lines)
+        return json.dumps(_json_safe(value), ensure_ascii=False)
+
+    return render(data, 0) + "\n"
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -42,7 +78,7 @@ def _atomic_write_json(path: Path, data: Any) -> None:
     fd, temp_path = tempfile.mkstemp(suffix=".tmp", prefix=f"{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, ensure_ascii=False, default=str)
+            handle.write(_dumps_readable_json(data))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
@@ -52,10 +88,13 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         raise
 
 def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
-    return {
+    item = {
         "role": message["role"],
-        "content": message.get("content", message.get("message")),
+        "content": message.get("content", message.get("message", "")) or "",
     }
+    if "content_no_thinking" in message:
+        item["content_no_thinking"] = message["content_no_thinking"]
+    return item
 
 def _normalize_messages(payload: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_messages = payload if isinstance(payload, list) else payload.get("messages")
@@ -262,7 +301,7 @@ def _write_base_artifacts(
         bundle.rubric_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(bundle.rubric_dir / "messages.json", bundle.messages_payload)
         if bundle.retrieve_messages_payload is not None:
-            _atomic_write_json(bundle.rubric_dir / "retrieve_message.json", bundle.retrieve_messages_payload)
+            _atomic_write_json(bundle.rubric_dir / "rubric_retrieve_message.json", bundle.retrieve_messages_payload)
     for path, payload in extra_json_writes or []:
         _atomic_write_json(path, payload)
 
@@ -484,8 +523,7 @@ class PatchEvalManager:
 
 
 # ===========================================================================
-# Shared lane/PDS helpers — sglang chat, hash routing, PSU/rubric/judge calls
-# (Originally extracted from the v0 PDS runner; reused by Lane-based v1.)
+# Shared lane/PDS helpers
 # ===========================================================================
 
 
@@ -497,28 +535,6 @@ class TurnTokenInfo:
     completion_tokens: int
     output_token_ids: list[int]
     output_logprobs: list[float]
-
-
-# Hash routing — keeps every call for one instance on the same sglang engine
-# so radix prefix cache (system + task prompt) is reused across branches.
-
-
-def hash_instance_to_port(instance_id: str, ports: list[int]) -> int:
-    digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()
-    return ports[int(digest, 16) % len(ports)]
-
-
-# Token-level fields the sglang token-in/token-out path attaches to each
-# assistant message; we drop them in human-readable dumps but keep them in
-# *_raw dumps used to rebuild training samples.
-_RAW_ONLY_KEYS = ("prompt_token_ids", "token_ids", "logprobs", "extra", "usage", "content_no_thinking")
-
-
-def _strip_token_fields(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for m in messages:
-        out.append({k: v for k, v in m.items() if k not in _RAW_ONLY_KEYS})
-    return out
 
 
 def _stamp_steps(
@@ -541,24 +557,6 @@ def _stamp_steps(
     return stamped, step
 
 
-# Direct sglang openai-compatible chat (per-call URL override)
-
-
-def _make_async_client(base_url: str, api_key: str = "EMPTY") -> openai.AsyncOpenAI:
-    base_url = base_url.rstrip("/")
-    if not base_url.endswith("/v1"):
-        base_url = base_url + "/v1"
-    return openai.AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=600.0, max_retries=0)
-
-
-def _strip_litellm_prefix(model_name: str) -> str:
-    """sglang's served model name has no provider prefix."""
-    for prefix in ("openai/", "azure/", "anthropic/"):
-        if model_name.startswith(prefix):
-            return model_name[len(prefix):]
-    return model_name
-
-
 def _ensure_litellm_prefix(model_name: str) -> str:
     """litellm.completion() routes by provider prefix — bare 'Qwen/...' raises
     BadRequestError. Prefix with 'openai/' so litellm uses the OpenAI-compatible
@@ -567,98 +565,6 @@ def _ensure_litellm_prefix(model_name: str) -> str:
         if model_name.startswith(prefix):
             return model_name
     return "openai/" + model_name
-
-
-async def _chat_completion(
-    *,
-    client: openai.AsyncOpenAI,
-    model_name: str,
-    messages: list[dict[str, Any]],
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-    response_format: dict[str, Any] | None = None,
-    extra_body: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": temperature,
-        "top_p": top_p,
-        "max_tokens": max_tokens,
-    }
-    if response_format is not None:
-        kwargs["response_format"] = response_format
-    if extra_body is not None:
-        kwargs["extra_body"] = extra_body
-    response = await client.chat.completions.create(**kwargs)
-    choice = response.choices[0]
-    content = choice.message.content or ""
-    usage = getattr(response, "usage", None)
-    return {
-        "content": content,
-        "finish_reason": choice.finish_reason,
-        "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
-        "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
-        "raw": response.model_dump() if hasattr(response, "model_dump") else {},
-    }
-
-
-def _strip_thinking(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-
-# Lane C: persistent-state update (PSU)
-
-
-async def _do_psu(
-    *,
-    client: openai.AsyncOpenAI,
-    model_name: str,
-    system_prompt: str,
-    user_prompt: str,
-    previous_state: dict[str, Any],
-    evicted_step_cards: list[dict[str, Any]] | None,
-    workspace_meta: dict[str, Any],
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-) -> dict[str, Any]:
-    if not evicted_step_cards:
-        return copy.deepcopy(previous_state)
-    prompt_text = "\n\n".join(
-        [
-            PERSISTENT_STATE_UPDATE_PROMPT.strip(),
-            f"\n\n## Question:\n System Prompt:\n{system_prompt}\n User Prompt:\n{user_prompt}",
-            f"## Previous Persistent State:\n{json.dumps(previous_state, indent=2, ensure_ascii=False)}",
-            f"## Evicted Older Trajectory:\n{json.dumps(evicted_step_cards, indent=2, ensure_ascii=False)}",
-            f"## Workspace Metadata:\n{json.dumps(workspace_meta, indent=2, ensure_ascii=False)}",
-        ]
-    )
-    try:
-        result = await _chat_completion(
-            client=client,
-            model_name=model_name,
-            messages=[{"role": "user", "content": prompt_text}],
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            response_format=copy.deepcopy(PERSISTENT_STATE_RESPONSE_FORMAT),
-        )
-        parsed = extract_json_from_response(_strip_thinking(result["content"]))
-        if not isinstance(parsed, dict):
-            raise ValueError("PSU response is not a JSON object")
-        merged = copy.deepcopy(previous_state)
-        for key in EMPTY_PERSISTENT_STATE:
-            if isinstance(parsed.get(key), str):
-                merged[key] = parsed[key]
-        return merged
-    except Exception as exc:
-        logger.warning("PSU failed (%s): %s", type(exc).__name__, exc)
-        return copy.deepcopy(previous_state)
-
-
-# Lane C: rubric generation + judge scoring
 
 
 def _build_rubric_prompt(
@@ -701,114 +607,3 @@ def _build_rubric_prompt(
             ]
         )
     return "\n".join(parts)
-
-
-async def _do_rubric_gen(
-    *,
-    client: openai.AsyncOpenAI,
-    model_name: str,
-    prompt: str,
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-) -> dict[str, Any]:
-    conversation: list[dict[str, str]] = [{"role": "user", "content": prompt}]
-    rubrics: list[dict[str, Any]] = []
-    format_errors: list[dict[str, Any]] = []
-    terminal_error: str | None = None
-    for turn in range(1, MAX_RUBRIC_GENERATION_ROUNDS + 1):
-        try:
-            result = await _chat_completion(
-                client=client,
-                model_name=model_name,
-                messages=conversation,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                response_format=copy.deepcopy(RUBRIC_GENERATION_RESPONSE_FORMAT),
-            )
-        except Exception as exc:
-            terminal_error = f"{type(exc).__name__}: {exc}"
-            break
-        content = result["content"]
-        clean = _strip_thinking(content)
-        conversation.append({"role": "assistant", "content": content})
-        parsed = extract_json_from_response(clean)
-        if parsed == {} or parsed is None and clean.strip() in ("{}", ""):
-            break
-        if isinstance(parsed, dict) and parsed.get("rubric"):
-            rubrics.append(parsed["rubric"])
-            if len(rubrics) >= MAX_RUBRICS:
-                terminal_error = f"Reached max rubrics={MAX_RUBRICS}"
-                break
-            conversation.append({"role": "user", "content": RUBRIC_GENERATION_CONTINUE_PROMPT})
-            continue
-        format_errors.append({"turn_index": turn, "error": "Could not parse rubric JSON"})
-        conversation.append(
-            {
-                "role": "user",
-                "content": "Expected a JSON object with a 'rubric' field. " + RUBRIC_GENERATION_CONTINUE_PROMPT,
-            }
-        )
-    return {
-        "generated_rubrics": rubrics,
-        "messages": conversation,
-        "format_errors": format_errors,
-        "terminal_error": terminal_error,
-    }
-
-
-async def _do_judge_one(
-    *,
-    client: openai.AsyncOpenAI,
-    model_name: str,
-    system_prompt: str,
-    user_prompt: str,
-    previous_state: dict[str, Any],
-    latest_shared_segment: dict[str, Any] | None,
-    continuation: dict[str, Any],
-    rubric: dict[str, Any],
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-) -> dict[str, Any]:
-    rubric_block = "\n".join(
-        [
-            f"Title: {rubric.get('title', '')}",
-            f"Type: {rubric.get('polarity', '')}",
-            f"Description: {rubric.get('description', '')}",
-            "Scale:",
-            *[f"{score}: {(rubric.get('scale') or {}).get(str(score), '')}" for score in range(1, 6)],
-        ]
-    )
-    response_text = json.dumps(
-        {"summary": continuation.get("summary", {}), "trajectory_continuation": continuation.get("trajectory_continuation")},
-        indent=2,
-        ensure_ascii=False,
-    )
-    prompt = "\n\n".join(
-        [
-            SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT.strip(),
-            f"## Question:\nSystem Prompt:\n{system_prompt}\n\nUser Prompt:\n{user_prompt}",
-            f"## Previous Persistent State:\n{json.dumps(previous_state, indent=2, ensure_ascii=False)}",
-            f"## Latest Agent Trajectory:\n{json.dumps(latest_shared_segment, indent=2, ensure_ascii=False) if latest_shared_segment else 'None'}",
-            f"## Agent Trajectory Continuation:\n{response_text}",
-            f"## Criterion:\n{rubric_block}",
-        ]
-    )
-    try:
-        result = await _chat_completion(
-            client=client,
-            model_name=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
-        )
-        parsed = extract_json_from_response(_strip_thinking(result["content"]))
-        score = float(parsed.get("score", 0.0)) if isinstance(parsed, dict) else 0.0
-        normalized = (score - 1.0) / 4.0
-        return {"score": score, "score_normalized": normalized, "raw": result["content"]}
-    except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}"}

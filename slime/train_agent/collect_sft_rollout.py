@@ -191,13 +191,14 @@ def build_training_messages(prompt: list[dict[str, Any]], turns: list[dict[str, 
         # for anything outside system/user/assistant/tool.
         if role not in _QWEN_CHAT_TEMPLATE_ROLES:
             continue
-        messages.append(
-            {
-                "role": role,
-                "content": str(message.get("content")),
-                "step_loss_mask": 1 if role == "assistant" else 0,
-            }
-        )
+        item = {
+            "role": role,
+            "content": str(message.get("content")),
+            "step_loss_mask": 1 if role == "assistant" else 0,
+        }
+        if "content_no_thinking" in message:
+            item["content_no_thinking"] = str(message.get("content_no_thinking"))
+        messages.append(item)
     return messages
 
 

@@ -1,15 +1,16 @@
-import json
 import asyncio
-import weakref
+import copy
+import json
 import logging
 import os
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, Literal
 
 import jsonlines
 import litellm
-from agent_rl import ChatCompletion, ChatSamplingParams, call_model_service_async
+from agent_rl import ChatCompletion, ChatSamplingParams, call_model_service_async, get_model_service
 
 # Configure LiteLLM to drop unsupported parameters instead of raising errors
 litellm.drop_params = True
@@ -102,7 +103,9 @@ def _build_service_sampling(chat_kwargs: Dict[str, Any]) -> ChatSamplingParams:
 
 
 def _split_inline_thinking_content(content: str) -> tuple[str, str]:
-    if not isinstance(content, str) or not content.startswith("<think>"):
+    if not isinstance(content, str):
+        return content, content
+    if not content.startswith("<think>"):
         return content, content
     closing_tag = "</think>"
     closing_index = content.find(closing_tag)
@@ -260,7 +263,8 @@ async def run_generate_with_route_async(
       - input_token_ids      = echo of the input_ids we sent
       - usage                = {prompt_tokens, completion_tokens}
       - finish_reason        = inferred from sglang meta_info
-      - raw_response         = the full sglang JSON for debugging
+      - raw_response         = compact response metadata; token/logprob arrays
+                               live in the dedicated fields below
     """
     import aiohttp  # local import — only token-IO path needs aiohttp
     if sampling_params is None:
@@ -317,6 +321,7 @@ async def run_generate_with_route_async(
     #     }
     #   }
     text = data.get("text", "") or ""
+    content, content_no_thinking = _split_inline_thinking_content(text)
     output_ids = list(data.get("output_ids") or [])
     meta = data.get("meta_info") or {}
     finish_info = meta.get("finish_reason") or {}
@@ -342,24 +347,200 @@ async def run_generate_with_route_async(
                 output_logprobs.append(float(entry["logprob"]))
             except (TypeError, ValueError):
                 pass
+    compact_raw_response = {
+        "endpoint": "generate",
+        "finish_reason": finish_info,
+        "usage": usage,
+        "input_token_count": len(input_ids),
+        "output_token_count": len(output_ids),
+        "output_logprob_count": len(output_logprobs),
+        "has_output_logprobs": bool(output_logprobs),
+        "meta_info_keys": sorted(meta.keys()),
+    }
     return ChatCompletion(
-        content=text,
+        content=content,
         finish_reason=finish_reason,
         model_name=route_name,
         cost=0.0,
         usage=usage,
-        raw_response=data,
+        raw_response=compact_raw_response,
         metadata={
             "timestamp": time.time(),
-            # No <think>/</think> stripping here — sglang already returns the
-            # decoded text including thinking content; downstream agents do
-            # their own parsing on `content`.
-            "content_no_thinking": text,
+            # Keep full decoded text in `content`; expose stripped text through
+            # `content_no_thinking` for JSON parsing and artifact consumers.
+            "content_no_thinking": content_no_thinking,
             "endpoint": "generate",
         },
         output_token_ids=output_ids,
         output_logprobs=output_logprobs,
         input_token_ids=list(input_ids),
+    )
+
+
+def _response_format_json_schema(response_format: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if not isinstance(response_format, dict):
+        return None
+    if response_format.get("type") == "json_schema":
+        schema = response_format.get("json_schema", {}).get("schema")
+        if not isinstance(schema, dict):
+            raise ValueError("response_format json_schema has no dict schema")
+        return schema
+    if response_format.get("type") == "json_object":
+        return {"type": "object"}
+    return None
+
+
+def _strip_chat_only_message_fields(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    stripped: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise TypeError(f"message must be dict, got {type(message).__name__}")
+        item = {
+            "role": message.get("role", "assistant") or "assistant",
+            "content": message.get("content", "") or "",
+        }
+        if "tool_calls" in message:
+            item["tool_calls"] = message["tool_calls"]
+        stripped.append(item)
+    return stripped
+
+
+def _normalize_messages_for_generate(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise TypeError(f"message must be dict, got {type(message).__name__}")
+        role = message.get("role", "assistant") or "assistant"
+        item: Dict[str, Any] = {"role": role, "content": message.get("content", "") or ""}
+        if role == "assistant" and message.get("token_ids"):
+            item["token_ids"] = list(message["token_ids"])
+        normalized.append(item)
+    return normalized
+
+
+def compact_completion_response(completion: Any) -> Dict[str, Any]:
+    raw = completion.raw_response if isinstance(completion.raw_response, dict) else {}
+    return {
+        "endpoint": completion.metadata.get("endpoint") or raw.get("endpoint"),
+        "finish_reason": completion.finish_reason,
+        "usage": dict(completion.usage) if completion.usage else {},
+        "input_token_count": len(completion.input_token_ids or []),
+        "output_token_count": len(completion.output_token_ids or []),
+        "output_logprob_count": len(completion.output_logprobs or []),
+        "has_output_logprobs": bool(completion.output_logprobs),
+    }
+
+
+def _completion_to_assistant_message(
+    completion: Any,
+) -> Dict[str, Any]:
+    content = completion.content or ""
+    assistant_message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": content,
+        "content_no_thinking": completion.metadata.get("content_no_thinking", content),
+        "usage": dict(completion.usage) if completion.usage else {},
+    }
+    if completion.input_token_ids:
+        assistant_message["prompt_token_ids"] = list(completion.input_token_ids)
+    if completion.output_token_ids:
+        assistant_message["token_ids"] = list(completion.output_token_ids)
+    if completion.output_logprobs:
+        assistant_message["logprobs"] = list(completion.output_logprobs)
+    return assistant_message
+
+
+def _route_service_base(
+    route_name: str,
+    model_name: str,
+    api_key: str,
+) -> tuple[str | None, str, str]:
+    route = get_model_route(route_name)
+    effective_model = route.model_name if route is not None and route.model_name else model_name
+    if route is None or route.backend != "service" or not route.service_name:
+        return None, api_key, effective_model
+    service = get_model_service(route.service_name)
+    api_base = getattr(service, "_base_url", None)
+    if not api_base:
+        raise RuntimeError(f"service route {route_name!r} has no base url")
+    return (
+        api_base,
+        getattr(service, "_api_key", api_key),
+        route.model_name or getattr(service, "default_model_name", None) or model_name,
+    )
+
+
+async def route_completion_message(
+    *,
+    route_name: str,
+    model_name: str,
+    messages: List[Dict[str, Any]],
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    response_format: Dict[str, Any] | None = None,
+    model_kwargs: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    kwargs = copy.deepcopy(model_kwargs or {})
+    api_base = kwargs.pop("api_base", None)
+    api_key = kwargs.pop("api_key", "EMPTY")
+    extra_body = kwargs.get("extra_body", {}) if isinstance(kwargs.get("extra_body"), dict) else {}
+    if api_base is None:
+        api_base, api_key, effective_model = _route_service_base(route_name, model_name, api_key)
+    else:
+        effective_model = model_name
+
+    if api_base:
+        from swe_agent.tokenization import get_stop_token_ids, tokenize_messages_with_template
+
+        normalized = _normalize_messages_for_generate(messages)
+        input_ids = tokenize_messages_with_template(
+            normalized,
+            add_generation_prompt=True,
+            enable_thinking=bool(
+                (extra_body.get("chat_template_kwargs") or {}).get("enable_thinking", True)
+            ),
+            model_path=effective_model,
+        )
+        sampling_params: Dict[str, Any] = {
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "max_new_tokens": int(max_tokens),
+            "stop_token_ids": get_stop_token_ids(model_path=effective_model),
+        }
+        schema = _response_format_json_schema(response_format)
+        if schema is not None:
+            sampling_params["json_schema"] = json.dumps(schema, ensure_ascii=False)
+        for key in ("top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "seed"):
+            if key in kwargs:
+                sampling_params[key] = kwargs[key]
+        completion = await run_generate_with_route_async(
+            route_name=route_name,
+            input_ids=input_ids,
+            api_base=api_base,
+            api_key=api_key,
+            sampling_params=sampling_params,
+            return_logprobs=True,
+        )
+        error = completion.metadata.get("error")
+        if error is not None:
+            raise RuntimeError(f"{route_name} token-in/out generation failed: {error}")
+        return _completion_to_assistant_message(
+            completion,
+        )
+
+    completion = await run_chat_with_route_completion_async(
+        route_name,
+        model_name=model_name,
+        messages=_strip_chat_only_message_fields(messages),
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        response_format=response_format,
+        **kwargs,
+    )
+    return _completion_to_assistant_message(
+        completion,
     )
 
 
