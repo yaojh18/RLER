@@ -13,7 +13,6 @@ from agent_rl.run_utils import extract_json_from_response, route_completion_mess
 
 from swe_agent.models.litellm_model import LitellmModel
 from swe_agent.models.utils.retry import retry
-from swe_agent.parallel_utils import _atomic_write_json
 from swe_agent.prompt import (
     RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
     RUBRIC_EXPERIENCE_RETRIEVAL_RESPONSE_FORMAT,
@@ -71,6 +70,7 @@ class RubricBankGenerationContext:
 @dataclass
 class RubricBankRoundUpdate:
     rubrics: list[RubricRecord]
+    active_before: list[RubricRecord]
     active_after: list[RubricRecord]
     inactive_after: list[RubricRecord]
 
@@ -157,8 +157,8 @@ def _extract_generation_context_from_messages(messages: Any) -> dict[str, Any]:
         return {}
     context: dict[str, Any] = {
         "question": _section_text(prompt, "## Question:", "## Previous Persistent State:"),
-        "previous_state": _json_from_section(prompt, "## Previous Persistent State:", "## Latest Agent Trajectory:"),
-        "latest_shared_segment": _json_from_section(prompt, "## Latest Agent Trajectory:", "## Agent Trajectory Continuations:"),
+        "previous_state": _json_from_section(prompt, "## Previous Persistent State:", "## Parent Trajectory:"),
+        "latest_shared_segment": _json_from_section(prompt, "## Parent Trajectory:", "## Agent Trajectory Continuations:"),
         "continuations": _extract_continuations_from_prompt(prompt),
     }
     retrieved = _json_from_section(prompt, "## Retrieved Rubric Experiences:")
@@ -376,10 +376,10 @@ def _rubric_accuracy_payload(
     return accuracy
 
 
-def _seed_experience_records() -> dict[str, RubricExperience]:
+def _seed_experience_records(scope: str = "siblings") -> dict[str, RubricExperience]:
     return {
         experience.title: experience
-        for seed in _seed_experiences()
+        for seed in _seed_experiences(scope=scope)
         if (experience := _convert_experience(seed)) is not None
     }
 
@@ -433,18 +433,19 @@ def _convert_generated_rubric(task: str, payload: dict[str, Any], round_index: i
     )
 
 
-def _seed_rubric_records(task: str) -> list[RubricRecord]:
-    return [rubric for seed in _seed_rubrics() if (rubric := _convert_generated_rubric(task, seed, 0)) is not None]
+def _seed_rubric_records(task: str, scope: str = "siblings") -> list[RubricRecord]:
+    return [rubric for seed in _seed_rubrics(scope=scope) if (rubric := _convert_generated_rubric(task, seed, 0)) is not None]
 
 
 class ScoreRubricBank:
-    def __init__(self, *, max_active_rubrics: int) -> None:
+    def __init__(self, *, max_active_rubrics: int, scope: str = "siblings") -> None:
         self.max_active_rubrics = max_active_rubrics
+        self.scope = scope
         self.active_bank: list[RubricRecord] = []
         self.inactive_bank: list[RubricRecord] = []
 
     def initialize(self, task: str) -> None:
-        self.active_bank = _seed_rubric_records(task)
+        self.active_bank = _seed_rubric_records(task, scope=self.scope)
         self.inactive_bank = []
 
     def set_state(self, *, active_bank: list[RubricRecord], inactive_bank: list[RubricRecord]) -> None:
@@ -480,10 +481,11 @@ class ScoreRubricBank:
         generated: list[RubricRecord],
         rewards: dict[str, float],
     ) -> RubricBankRoundUpdate:
+        active_before = copy.deepcopy(self.active_bank)
         deduped_by_title: dict[str, RubricRecord] = {}
         kept_active_bank = [rubric for rubric in self.active_bank if rubric.reward is not None and rubric.reward > 0.0]
         for rubric in kept_active_bank + generated:
-            candidate = RubricRecord(**{**asdict(rubric), "reward": rewards.get(rubric.rubric_id, 0.0)})
+            candidate = RubricRecord(**{**asdict(rubric), "reward": rewards.get(rubric.rubric_id, rubric.reward or 0.0)})
             title_key = candidate.title.strip().casefold()
             existing = deduped_by_title.get(title_key)
             if existing is None or (candidate.reward or 0.0) > (existing.reward or 0.0) or (
@@ -497,30 +499,44 @@ class ScoreRubricBank:
         inactive_after = [rubric for rubric in ranked + self.inactive_bank if rubric.rubric_id not in active_ids]
         return RubricBankRoundUpdate(
             rubrics=active_after,
+            active_before=active_before,
             active_after=active_after,
             inactive_after=inactive_after,
         )
 
 
 class ExperienceRubricBank:
-    def __init__(self, *, bank_path: Path | None = None, retrieve_top_k: int = 4, write_artifacts: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        bank_path: Path | None = None,
+        retrieve_top_k: int = 4,
+        retrieval_prompt: str = RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
+        update_prompt: str = RUBRIC_EXPERIENCE_UPDATE_PROMPT,
+        scope: str = "siblings",
+    ) -> None:
         self.bank_path = Path(bank_path) if bank_path is not None else None
         self.retrieve_top_k = retrieve_top_k
-        self.write_artifacts = write_artifacts
+        self.retrieval_prompt = retrieval_prompt
+        self.update_prompt = update_prompt
+        self.scope = scope
         self.experiences: dict[str, RubricExperience] = (
-            self.load() if self.bank_path and self.bank_path.exists() else _seed_experience_records()
+            self.load() if self.bank_path and self.bank_path.exists() else _seed_experience_records(scope=self.scope)
         )
 
     def load(self) -> dict[str, RubricExperience]:
         payload = json.loads(self.bank_path.read_text(encoding="utf-8")) if self.bank_path is not None else {}
-        items = payload.get("experiences", payload) if isinstance(payload, dict) else payload
+        if isinstance(payload, dict):
+            items = payload.get("experiences") or payload.get("after") or payload
+        else:
+            items = payload
         experiences = {}
         for item in items if isinstance(items, list) else []:
             if isinstance(item, dict):
                 experience = _convert_experience(item, str(item.get("experience_id") or "") or None)
                 if experience is not None:
                     experiences[experience.title] = experience
-        return experiences or _seed_experience_records()
+        return experiences or _seed_experience_records(scope=self.scope)
 
     def to_list(self) -> list[dict[str, Any]]:
         return [asdict(experience) for experience in self.experiences.values()]
@@ -588,7 +604,7 @@ class ExperienceRubricBank:
             return [], []
         prompt = "\n\n".join(
             [
-                RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT.strip(),
+                self.retrieval_prompt.strip(),
                 "## Experience Short-view:",
                 json.dumps([
                     {
@@ -601,7 +617,7 @@ class ExperienceRubricBank:
                 json.dumps({
                     "question": question,
                     "previous_state": previous_state,
-                    "latest_shared_segment": latest_shared_segment,
+                    "parent trajectory": latest_shared_segment,
                     "continuations": continuations,
                 })
             ]
@@ -651,7 +667,6 @@ class ExperienceRubricBank:
     async def update_after_instance(
         self,
         *,
-        run_dir: Path,
         instance: dict[str, Any],
         rubric_payloads: list[dict[str, Any]] | None = None,
         model_name: str,
@@ -679,10 +694,11 @@ class ExperienceRubricBank:
                 "messages": update["messages"],
             }
         else:
+            index_key, grouped_items = grouped_payloads
             group_updates: list[dict[str, Any]] = []
             actions: list[dict[str, Any]] = []
             messages: list[dict[str, Any]] = []
-            for group_index, group_payloads in grouped_payloads:
+            for group_index, group_payloads in grouped_items:
                 update = await self._update_from_payloads(
                     instance=instance,
                     rubric_payloads=group_payloads,
@@ -695,7 +711,7 @@ class ExperienceRubricBank:
                 if not update["has_evidence"]:
                     continue
                 group_update = {
-                    "group_index": group_index,
+                    index_key: group_index,
                     "before": update["before"],
                     "actions": update["actions"],
                     "after": update["after"],
@@ -705,13 +721,13 @@ class ExperienceRubricBank:
                 actions.extend(
                     {
                         **copy.deepcopy(action),
-                        "group_index": group_index,
+                        index_key: group_index,
                     }
                     for action in update["actions"]
                 )
                 messages.append(
                     {
-                        "group_index": group_index,
+                        index_key: group_index,
                         "messages": copy.deepcopy(update["messages"]),
                     }
                 )
@@ -722,33 +738,28 @@ class ExperienceRubricBank:
                 "messages": messages,
                 "groups": group_updates,
             }
-        if self.write_artifacts and self.bank_path is not None:
-            _atomic_write_json(self.bank_path, {"experiences": self.to_list()})
-        if self.write_artifacts:
-            _atomic_write_json(
-                Path(run_dir) / "rubric_bank.json",
-                {
-                    "before": before,
-                    "after": payload["after"],
-                },
-            )
         return payload
 
     @staticmethod
     def _group_payloads_by_index(
         rubric_payloads: list[dict[str, Any]],
-    ) -> list[tuple[int, list[dict[str, Any]]]] | None:
+    ) -> tuple[str, list[tuple[int, list[dict[str, Any]]]]] | None:
         if not rubric_payloads:
             return None
-        has_group_index = ["group_index" in payload for payload in rubric_payloads]
-        if not any(has_group_index):
+        index_key = None
+        for candidate in ("group_index", "round_index"):
+            has_index = [candidate in payload for payload in rubric_payloads]
+            if any(has_index):
+                if not all(has_index):
+                    raise ValueError(f"rubric_payloads must either all include {candidate} or none include {candidate}")
+                index_key = candidate
+                break
+        if index_key is None:
             return None
-        if not all(has_group_index):
-            raise ValueError("rubric_payloads must either all include group_index or none include group_index")
         grouped: dict[int, list[dict[str, Any]]] = {}
         order: list[int] = []
         for payload in rubric_payloads:
-            group_index = int(payload["group_index"])
+            group_index = int(payload[index_key])
             if group_index not in grouped:
                 grouped[group_index] = []
                 order.append(group_index)
@@ -756,10 +767,10 @@ class ExperienceRubricBank:
                 {
                     key: copy.deepcopy(value)
                     for key, value in payload.items()
-                    if key != "group_index"
+                    if key != index_key
                 }
             )
-        return [(group_index, grouped[group_index]) for group_index in order]
+        return index_key, [(group_index, grouped[group_index]) for group_index in order]
 
     async def _update_from_payloads(
         self,
@@ -804,8 +815,8 @@ class ExperienceRubricBank:
         attempts = []
         for payload in rubric_payloads:
             generation_context = _extract_generation_context_from_messages(payload.get("messages"))
-            child_rewards = payload.get("child_rewards", {})
-            ordered_node_ids = [str(node_id) for node_id in child_rewards]
+            avg_scores = payload.get("avg_scores", {})
+            ordered_node_ids = [str(node_id) for node_id in avg_scores]
             generated = payload.get("generated", [])
             ground_truth_by_node = (
                 payload.get("gt_by_rubric", {}).get(str(generated[0].get("rubric_id")), {}).get("ground_truth_by_node", {})
@@ -829,7 +840,7 @@ class ExperienceRubricBank:
                 generated=generated,
                 score_by_rubric={
                     str(rubric_id): {str(node_id): float(score) for node_id, score in node_scores.items()}
-                    for rubric_id, node_scores in (payload.get("child_score_by_rubric") or {}).items()
+                    for rubric_id, node_scores in (payload.get("score_by_rubric") or {}).items()
                     if isinstance(node_scores, dict)
                 },
                 gt_scores=ground_truth_by_node,
@@ -837,12 +848,12 @@ class ExperienceRubricBank:
             )
             attempts.append(
                 {
-                    "rubric_list_id": payload.get("rubric_list_id"),
                     "generation_context": copy.deepcopy(generation_context),
                     "retrieved_experience": [_public_experience(item) for item in payload.get("retrieved", [])],
                     "generated_rubrics": generated_rubrics,
                     "gt_skeleton": gt_skeleton,
                     "gt_scores": _rounded_score_list(ground_truth_by_node, ordered_node_ids),
+                    "average_rubric_judged_scores": _rounded_score_list(avg_scores, ordered_node_ids),
                     "generated_rubric_accuracy": generated_rubric_accuracy,
                 }
             )
@@ -866,7 +877,7 @@ class ExperienceRubricBank:
         for attempt_evidence in evidence["rubric_attempts"]:
             initial_prompt = "\n\n".join(
                 [
-                    RUBRIC_EXPERIENCE_UPDATE_PROMPT.strip(),
+                    self.update_prompt.strip(),
                     "## Current Rubric Bank:",
                     json.dumps([
                         {"title": item.title, "description": item.description}
@@ -898,7 +909,7 @@ class ExperienceRubricBank:
                             top_p=top_p,
                             max_tokens=max_tokens,
                             response_format=copy.deepcopy(RUBRIC_EXPERIENCE_UPDATE_RESPONSE_FORMAT),
-                            model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": False},
+                            model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
                         )
                 response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
                 messages.append(assistant_message)

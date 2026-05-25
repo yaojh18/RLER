@@ -45,6 +45,7 @@ from swe_agent.run.run_swe_agent import (
     _resolve_model_name
 )
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
+from swe_agent.prompt import PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT, PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT
 from swe_agent.rubric_bank import ExperienceRubricBank
 from swe_agent.trajectory_search import SearchConfig, TrajectorySearchRunner
 from swe_agent.serving import SGLangChatService
@@ -63,6 +64,7 @@ def _run_single_instance(
     judge_model_kwargs: dict[str, Any],
     search_config: SearchConfig,
     rubric_bank: ExperienceRubricBank | None,
+    experience_banks: dict[str, ExperienceRubricBank] | None,
     resume: bool,
 ) -> None:
     instance_config = copy.deepcopy(config)
@@ -88,6 +90,7 @@ def _run_single_instance(
         judge_model_kwargs=judge_model_kwargs,
         harness_namespace=get_swebench_harness_namespace(instance),
         rubric_bank=rubric_bank,
+        experience_banks=experience_banks,
         resume=resume,
     )
     try:
@@ -286,11 +289,21 @@ def run_search(
         judge_model_name = args.judge_model or model_name
         rubric_model_kwargs = dict(shared_model_kwargs)
         judge_model_kwargs = dict(shared_model_kwargs)
-        rubric_bank = (
-            ExperienceRubricBank(bank_path=run_root / "rubric_bank.json", write_artifacts=args.write_artifacts)
-            if search_config.rubric_bank_strategy in {"experience", "both"}
-            else None
-        )
+        rubric_bank = None
+        experience_banks = None
+        if search_config.rubric_bank_strategy in {"experience", "both"}:
+            experience_banks = {
+                "siblings": ExperienceRubricBank(
+                    bank_path=run_root / "siblings_rubric_bank.json",
+                    scope="siblings",
+                ),
+                "pc": ExperienceRubricBank(
+                    bank_path=run_root / "pc_rubric_bank.json",
+                    retrieval_prompt=PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
+                    update_prompt=PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
+                    scope="pc",
+                ),
+            }
         with temporary_env({"MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": str(args.model_retry_attempts), "LITELLM_LOG": "ERROR"}):
             with tee_console(run_log_path):
                 for instance in instances:
@@ -309,6 +322,7 @@ def run_search(
                             judge_model_kwargs=judge_model_kwargs,
                             search_config=search_config,
                             rubric_bank=rubric_bank,
+                            experience_banks=experience_banks,
                             resume=bool(args.resume_run_dir),
                         )
                     except Exception as exc:

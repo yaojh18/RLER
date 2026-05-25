@@ -12,9 +12,43 @@ from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
 from slime.backends.megatron_utils.loss import policy_loss_function
 
 
+def _apply_deferred_experience_update_rewards(samples) -> None:
+    rewards_by_scope_and_instance: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    deferred_by_scope: dict[str, list] = defaultdict(list)
+    for sample in samples:
+        metadata = sample.metadata or {}
+        scope = metadata.get("scope")
+        stage = metadata.get("stage")
+        deferred_kind = metadata.get("deferred_reward_kind")
+        instance_id = metadata.get("instance_id") or metadata.get("source_instance_id") or "unknown"
+        if deferred_kind:
+            if isinstance(scope, str):
+                deferred_by_scope[scope].append(sample)
+            continue
+        if isinstance(scope, str) and stage in {"retrieve", "generate"}:
+            rewards_by_scope_and_instance[scope][str(instance_id)].append(float(sample.reward or 0.0))
+
+    for scope, deferred_samples in deferred_by_scope.items():
+        per_instance_means = [
+            sum(values) / len(values)
+            for values in rewards_by_scope_and_instance.get(scope, {}).values()
+            if values
+        ]
+        if not per_instance_means:
+            continue
+        deferred_reward = float(sum(per_instance_means) / len(per_instance_means))
+        for sample in deferred_samples:
+            metadata = dict(sample.metadata or {})
+            metadata["raw_deferred_reward"] = float(sample.reward or 0.0)
+            metadata["resolved_deferred_reward"] = deferred_reward
+            sample.metadata = metadata
+            sample.reward = deferred_reward
+
+
 def convert_samples_to_train_data(args, samples):
     if samples and isinstance(samples[0], list):
         samples = [sample for group in samples for sample in group]
+    _apply_deferred_experience_update_rewards(samples)
     grouped_indices = defaultdict(list)
     for index, sample in enumerate(samples):
         group_key = sample.group_index if sample.group_index is not None else index

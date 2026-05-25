@@ -9,14 +9,14 @@ You are an expert evaluator generating adaptive rubrics to assess agent trajecto
 
 ## Task
 Identify the single most discriminative criterion that distinguishes high-quality from low-quality agent trajectory continuations and is not already covered by the existing rubrics. Capture subtle quality differences that existing rubrics miss.
-This is a multi-turn rubric generation setting. At each turn, generate at most one new rubric. The user may ask to continue in later turns. Existing Rubrics contains previously generated rubrics and should be used to understand the current evaluation gap and avoid redundancy.
+This is a multi-turn rubric generation setting. At each turn, generate at most one new rubric. Existing Rubrics contains previously generated rubrics and should be used to understand the current evaluation gap and avoid redundancy.
 If no additional high-impact, non-redundant rubric remains, return an empty JSON object: {}.
 
 ## Output Components
-- **Description**: Detailed, specific description of what makes a continuation excellent/problematic
 - **Title**: Concise abstract label (general, not task-specific)
+- **Description**: Detailed, specific description of what makes a continuation excellent/problematic
 - **Scale**: A five-point scale from 1 to 5 with concrete anchors for this rubric. The scale must follow the rubric polarity: for a positive rubric, 1 is the weakest evidence and 5 is the strongest evidence; for a negative rubric, 1 is no/least evidence of the flaw and 5 is the most severe evidence of the flaw.
-- **Polarity**: Either `"positive"` or `"negative"`
+- **Polarity**: Either `"positive"` or `"negative"`.
 - **Metadata**: A structured evidence payload for style-specific extra content. Use string fields such as `stage`, `oracle_test`, `code_review`, `privileged_reference_summary`, `judge_focus`, or `failure_mode`. Put complete test snippets, review reasoning, or reference-derived behavioral oracles here instead of overloading the title or scale.
 
 ## Categories
@@ -44,7 +44,7 @@ Represent this choice using the `polarity` field in the rubric object.
 - Identify uncovered quality dimensions
 - Add granular criteria if existing rubrics are broad
 - Return empty lists if existing rubrics are comprehensive
-- Do not generate both "Runs targeted validation" and "Does not run targeted validation"
+- Do not generate semantically equivalent rubrics, e.g., "Runs targeted validation" as a positive rubric and "Does not run targeted validation" as a negative rubric.
 - Choose only the more discriminative direction
 
 ### 4. Conservative Negative Rubrics
@@ -53,12 +53,7 @@ Represent this choice using the `polarity` field in the rubric object.
 - Do not create a negative rubric merely because a continuation lacks a desirable behavior
 - For negative rubrics, every scale anchor must measure severity of the flaw: 1 means the flaw is absent or minimal, and 5 means the flaw is clearly and severely present. Never write a negative rubric whose scale rewards the good behavior at 5.
 
-### 5. Rubric Style (Optional)
-- This guideline applies only when an additional rubric style section is provided
-- Follow the requested style when choosing the criterion and writing `metadata`, while still satisfying the core requirements above
-- When the rubric style asks for a complete test, code review, reference summary, or other detailed evidence, place that content in `metadata`
-
-### 6. Previous Generated Rubrics & Experiences (Optional)
+### 5. Previous Generated Rubrics & Experiences (Optional)
 - This guideline applies only when exisiting, previous generated rubrics or retrieved rubric experiences are provided
 - Use previous rubrics to understand what is already covered, then add only a non-redundant uncovered criterion
 - Treat retrieved rubric experiences as optional hypotheses. Use them only when the current continuations match the prior lesson
@@ -93,7 +88,7 @@ Represent this choice using the `polarity` field in the rubric object.
       <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
     },
     "scale": {
-      "1": "<positive rubric: weakest evidence / negative rubric: flaw absent or minimal>",
+      "1": "<positive rubric: weakest evidence / negative rubric: no evidence of the flaw>",
       "2": "<positive rubric: weak evidence / negative rubric: minor evidence of the flaw>",
       "3": "<the moderate anchor>",
       "4": "<positive rubric: strong evidence / negative rubric: clear evidence of the flaw>",
@@ -110,7 +105,7 @@ If no new high-impact, non-redundant rubric should be added, output:
 ## Inputs
 1. **Question**: Original system and user prompt containing code problem statement
 2. **Previous Persistent State**: Current memory state with summary of past findings and milestones
-3. **Latest Agent Trajectory**: The most recent agent trajectory
+3. **Parent Trajectory**: The most recent agent trajectory
 4. **Agent Trajectory Continuations**: Multiple agent trajectories continued from the latest trajectory (Continuation 1, Continuation 2, etc.)
 5. **Existing Rubrics** (optional): Previously generated rubrics
 
@@ -130,7 +125,7 @@ Generate only the most impactful, non-redundant rubrics revealing meaningful qua
 RUBRIC_GENERATION_CONTINUE_PROMPT = "Generate the next best rubric or return an empty object."
 
 SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT = """
-You are an expert evaluator scoring one agent trajectory continuation against one rubric.
+You are an expert evaluator scoring one agent trajectory continuation given one rubric.
 
 ## Task
 Evaluate the provided continuation trajectory using the provided criterion and the shared context.
@@ -153,42 +148,325 @@ Evaluate the provided continuation trajectory using the provided criterion and t
 ## Inputs
 1. **Question**: Original system and user prompt containing code problem statement
 2. **Previous Persistent State**: Current memory state with summary of past findings and milestones
-3. **Latest Agent Trajectory**: The most recent agent trajectory
+3. **Parent Trajectory**: The most recent agent trajectory
 4. **Continuation Trajectory**: A agent trajectory continued from the latest trajectory
-5. **Criterion**: The specific aspect to evaluate
+5. **Criterion**: The specific criterion to evaluate
 
 Return only the JSON object.
 """
 
-SWE_TRAJECTORY_RUBRIC_JUDGE_PARENT_PROMPT = """
-You are an expert evaluator scoring one agent trajectory against one rubric.
+PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT = """
+You are an expert evaluator generating adaptive rubrics to assess agent progress for SWE tasks.
 
 ## Task
-Evaluate the provided agent trajectory using the provided criterion and the shared context.
+Generate the single most useful criterion for judging whether each continuation improves, stays equivalent, or regresses relative to the provided parent trajectory and is not already covered by the existing rubrics. Capture subtle quality differences that existing rubrics miss.
+This is a multi-turn rubric generation setting. At each turn, generate at most one new rubric. Existing Rubrics contains previously generated parent-child rubrics and should be used to understand the current evaluation gap and avoid redundancy.
+If no additional high-impact, non-redundant rubric remains, return an empty JSON object: {}.
+
+## Output Components
+- **Title**: Concise abstract label (general, not task-specific)
+- **Description**: A specific relative progress evaluation criterion grounded in observable trajectory or patch evidence.
+- **Scale**: A five-point scale from 1 to 5 with concrete anchors for this rubric. The scale must follow the rubric polarity: for a positive rubric, 1 is the weakest evidence and 5 is the strongest evidence; for a negative rubric, 1 is no/least evidence of the flaw and 5 is the most severe evidence of the flaw.
+- **Polarity**: Either `"positive"` or `"negative"`.
+- **Metadata**: A structured evidence payload for style-specific extra content. Use string fields such as `stage`, `oracle_test`, `code_review`, `privileged_reference_summary`, `judge_focus`, or `failure_mode`. Put complete test snippets, review reasoning, or reference-derived behavioral oracles here instead of overloading the title or scale.
 
 ## Core Guidelines
-- Judge only the specified criterion, not general quality
-- Use the rubric's scale exactly as written. For negative rubrics, do not invert the scale
-- Score the agent trajectory itself, not the underlying task or bug in the abstract
-- Use only evidence visible in the trajectory. Do not hallucinate or infer unstated facts
-- Use the previous persistent state only when it is needed to interpret the tracjectory
-Output only score in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response
+
+### 1. Calibrate The Parent Before Writing The Criterion
+- Infer what the parent trajectory already achieved, what remains missing, and whether the parent is no-op/wrong, partial, near-correct, or already correct for the visible task objective.
+- The criterion must score the child delta relative to that parent baseline. The criterion should not score the child as a standalone trajectory or score the child by its relative progress compared to siblings.
+- For a positive rubric, a child should score high only when it adds behaviorally significant progress over the parent or it corrects a mistake/wrong attempt made by the parent. A child should score near the middle when it is moving towards the same target as the parent. A child should score low when it loses useful parent behavior, submits no useful patch where the parent had useful work, or moves to an irrelevant/synthetic target. Verse versa for a negative rubric.
+
+### 2. Prefer Grounded Delta Over Process Delta
+- Prefer evidence from terminal diffs, source behavior, API contracts, state mutation, lifecycle ordering, schema/interface adherence, compatibility boundaries, persistence paths, and hidden-test-like edge cases.
+- Use process evidence such as testing, validation loops, editing method, or exploration only when terminal semantics are not visible or when that process directly changes confidence about parent-relative progress.
+- Do not let extra validation, cleaner style, longer explanation, or a skeleton-looking patch make an equivalent child beat a correct or near-correct parent.
+- Avoid vague criteria such as "thoroughness", "correctness", "best practice", or "complete implementation" unless the rubric defines the concrete evidence being scored
+
+### 3. Preserve Ties And Penalize Real Regressions
+- If the parent and child satisfy the same visible behavior for the criterion, write a scale that keeps the child near the equivalence anchor (scale 3) instead of inventing ranking differences from workflow or wording, especially when the parent is already correct or near-correct. Do not let a child beat a correct parent just by being more polished, better explained, or more test-focused if it does not add real behavior progress.
+- If the parent is wrong or empty and a child adds the core semantic fix, the child must be able to score as clear progress even without a polished verification loop.
+- Treat empty patches, fake summary patches, fabricated repository targets, synthetic-only fixes, and loss of parent-correct behavior as regression signals when they are visible. These behaviors should be explicitly punished by the rubric.
+
+### 4. Novelty & Non-Redundancy
+- Never duplicate existing or generated rubrics in meaning/scope
+- Identify uncovered quality dimensions
+- Add granular criteria if existing rubrics are broad
+- Return empty lists if existing rubrics are comprehensive
+- Do not generate semantically equivalent rubrics, e.g., "Runs targeted validation" as a positive rubric and "Does not run targeted validation" as a negative rubric.
+- Use previous rubrics to understand what is already covered, then add only a non-redundant uncovered parent-relative criterion.
+
+### 5. Conservative Negative Rubrics
+- Identify clear failure modes, not absence of excellence
+- A negative rubric should describe an observable harmful behavior, incorrect assumption, misleading edit, or unsupported claim
+- Do not create a negative rubric merely because a continuation lacks a desirable behavior
+- For negative rubrics, every scale anchor must measure severity of the flaw: 1 means the flaw is absent or minimal, and 5 means the flaw is clearly and severely present. Never write a negative rubric whose scale rewards the good behavior at 5.
+
+### 6. Previous Generated Rubrics & Experiences (Optional)
+- This guideline applies only when exisiting, previous generated rubrics or retrieved rubric experiences are provided
+- Use previous rubrics to understand what is already covered, then add only a non-redundant uncovered criterion
+- Treat retrieved rubric experiences as optional hypotheses. Use them only when the current parent baseline, child delta type, and evidence type match the prior lesson.
+- If a previous rubric or experience would turn a precise current distinction into a broad generic rubric, ignore it
 
 
 ## Output Format
 ```json
 {
-  "score": <a score on a scale of 1 to 5 indicating how appropriate the continuation is based on the scale of the given criterion>
+  "rubric": {
+    "polarity": "<positive|negative>",
+    "description": "<detailed parent-child progress criterion>",
+    "title": "<abstract label>",
+    "metadata": {
+      <structured evidence needed for parent-relative judging>
+    },
+    "scale": {
+      "1": "<positive rubric: weakest progress evidence / negative rubric: no evidence of the flaw or regression>",
+      "2": "<positive rubric: weak progress evidence / negative rubric: minor evidence of the flaw or regression>",
+      "3": "<the moderate anchor for equivalent parent-child behavior>",
+      "4": "<positive rubric: strong progress evidence / negative rubric: clear evidence of the flaw or regression>",
+      "5": "<positive rubric: strongest progress evidence / negative rubric: most severe evidence of the flaw or regression>"
+    }
+  }
+}
+```
+If no new high-impact, non-redundant rubric should be added, output:
+```json
+{}
+```
+
+## Inputs
+1. **Question**: Original system and user prompt containing code problem statement
+2. **Previous Persistent State**: Current memory state with summary of past findings and milestones
+3. **Parent Trajectory**: The most recent agent trajectory
+4. **Agent Trajectory Continuations**: Multiple agent trajectories continued from the latest trajectory (Continuation 1, Continuation 2, etc.)
+5. **Existing Rubrics** (optional): Previously generated rubrics
+
+## Critical Reminders
+- Each rubric must distinguish meaningful parent-relative progress, equivalence, or regression in the actual provided continuations
+- Exclude rubrics that apply equally to the parent and all continuations
+- Prefer `{}` over redundancy when existing rubrics are comprehensive
+- Focus on observable, objective, actionable criteria
+- Quality over quantity: 1 excellent rubric > multiple mediocre ones
+- The parent trajectory is the baseline. Focus the rubric on child deltas over that baseline
+- Do not return `{}` when there are visible differences in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
+- Output in the required format. Do not restate the question, previous state, agent trajectories, or existing rubrics in the response.
+
+Generate only the most impactful, non-redundant rubric revealing meaningful parent-child progress differences.
+"""
+
+PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT = """
+You are an expert evaluator scoring one trajectory continuation against one parent-child rubric.
+
+## Task
+Evaluate the continuation against the parent trajectory using the provided criterion.
+
+## Core Guidelines
+- Judge only the specified criterion, not general quality
+- Use the rubric's scale exactly as being required. For negative rubrics, the scale is inverted (e.g. worst case should receive 5 while best case should receive 1)
+- Compare the parent and continuation only through the aspect named by the criterion.
+- Use the parent trajectory, continuation trajectory, previous persistent state, and shared context only as evidence for the specified criterion.
+- If evidence is mixed or incomplete, choose the scale anchor best supported by the visible evidence rather than adding a new criterion.
+- Do not hallucinate hidden facts, unstated test results, or repository behavior not supported by the provided trajectories.
+- Output only score in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response.
+
+## Output Format
+```json
+{
+  "score": <integer from 1 to 5>
 }
 ```
 
 ## Inputs
 1. **Question**: Original system and user prompt containing code problem statement
 2. **Previous Persistent State**: Current memory state with summary of past findings and milestones
-3. **Agent Trajectory**: The most recent agent trajectory
-5. **Criterion**: The specific aspect to evaluate
+3. **Parent Trajectory**: The most recent agent trajectory
+4. **Continuation Trajectory**: A agent trajectory continued from the parent trajectory to compare
+5. **Criterion**: The specific parent-child progress criterion to evaluate
 
 Return only the JSON object.
+"""
+
+PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT = """
+You are retrieving prior rubric-generation experiences to help generate adaptive parent-child progress rubrics for SWE-agent search.
+
+## Task
+Select the experience titles whose lessons should be appended to the rubric generation prompt before generating the next rubric.
+The downstream rubric generator will identify the single most discriminative, non-redundant criterion that judges whether continuations improved, stayed equivalent, or regressed relative to the parent trajectory. Retrieve experiences only when they can concretely help that decision.
+
+## Retrieval Targets
+Retrieve an experience only when it can help choose a parent-relative rubric for one of these evidence patterns:
+
+1. **Related instance or related problem**
+   - Same repository, library family, framework, task type, API surface, compatibility issue, build/configuration issue, workspace layout issue, or localization pattern.
+   - Use this when the prior experience contains a task-specific boundary that may transfer to the current rubric decision.
+
+2. **Parent-relative delta calibration**
+   - The prior lesson matches the current parent baseline and child delta: wrong/no-op parent plus real semantic fix, partial parent plus missing-piece fix, near-correct parent plus equivalent variants, or useful parent plus child regression.
+   - Use it when the lesson helps set the correct parent-child order, not merely the best child among siblings.
+
+3. **Evidence-priority conflict**
+   - The prior lesson resolves a conflict likely to recur here, such as process quality versus terminal semantics, obsolete tests versus intended behavior, broad refactor versus precise compatibility boundary, harmless variation versus task-defining difference, or majority behavior versus minority-correct behavior.
+   - Use it when the generator is uncertain and needs guidance about which visible evidence should dominate the PC rubric.
+
+4. **Invalid artifact or stale-rubric trap**
+   - The prior lesson identifies a recurring PC failure: empty/no-op patch, fake summary patch, fabricated or wrong repository target, synthetic-only fix, loss of useful parent work, stale active rubric, or sibling-ranking rubric that ignores the parent baseline.
+   - Use it when the same trap is visible enough to affect parent-child progress judging.
+
+## Selection Rules
+- Retrieve only when the parent baseline, child delta type, and available evidence type all match the lesson. Shared broad words like "tests", "verification", "refactor", "search", or "compatibility" are not enough.
+- Do not retrieve an experience solely because it shares repository names, languages, or broad task categories if the evaluation difficulty is different.
+- Retrieve task/domain experiences only when the transferred boundary is visible in the current trajectories and behaviorally relevant to progress, equivalence, or regression.
+- Retrieve harmless-variation lessons only when parent and children already implement the same core behavior; do not use them when the visible difference may define the task.
+- Retrieve sibling-ranking lessons only when they explicitly explain how a child compares with the parent. A lesson about which child is best is insufficient.
+- Match retrieval to the parent state: wrong/no-op parent needs semantic-progress lessons; near-correct or correct parent needs tie-preservation or small-delta lessons; useful parent with invalid child artifacts needs regression lessons.
+- Do not retrieve an experience that would relax or ignore a distinction that is task-defining in the current samples. A prior lesson about harmless implementation variation applies only when the visible differences are actually semantically equivalent for this task.
+- Prefer an empty list over a broad, stale, or context-mismatched experience that could pull the generator away from the current parent-relative delta.
+- Do not output or invent internal IDs. Operate only on titles.
+
+## Output Format
+```json
+{
+  "titles": ["..."]
+}
+```
+"""
+
+PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT = """
+You are maintaining a compact rubric-generation experience bank for SWE-agent.
+
+## Task
+Update the experience bank using previous rubric generation attempts from the completed instance.
+Store only durable lessons that improve future agent progress rubric generation. Do not create a per-instance log.
+
+## Available Actions
+- **retrieve**: request full existing experiences before deciding whether to update or delete them if you are uncertain.
+- **add**: add one new reusable experience.
+- **update**: replace one existing experience with a clearer or more general version.
+- **delete**: remove one redundant, misleading, or low-value experience.
+
+## Input Explanation
+- `generation_context`: the context that was shown to the rubric generator, including problem statement, the current history, previous generated rubrics and sampled agent continuations.
+- `retrieved`: historical experiences retrieved before this rubric generation attempt.
+- `generated_rubrics`: the full rubric list generated in that attempt.
+- `gt_skeleton`: ground-truth patch skeleton for diagnosis only.
+- `generated_rubric_accuracy`: per-rubric alignment diagnostics in the form `{"rubric title": {"overall_accuracy": float, "judging_diff_per_sample": [float]}}`. `overall_accuracy` is pairwise accuracy between that rubric's normalized parent-child judge scores and `gt_scores`. `judging_diff_per_sample` is the signed per-sample error list, computed as judge score minus GT score, the closer to zero the better, in the same child order as `generation_context`.
+- `average_rubric_judged_scores`: model judged scores average across all rubrics of each sample in `generation_context` in the same order. Use it to see the current rubric model's judging preference and compare to understand the misalignment with ground-truth parent-child progress labels.
+- `gt_scores`: ground-truth parent-child progress labels of each sample in `generation_context` in the same order, indicating whether each child trajectory is an improvement, equivalent, or regression relative to the parent trajectory.
+
+## Output Explanation
+Output is a retrieve/add/update/delete action on the experience bank with the following fields:
+- **title**: short reusable retrieval label. Name the evaluation lesson, not just the repository. It must agree with the description, context, and score pattern.
+- **description**: concise summary of when this experience should be retrieved, including the parent state, child delta pattern, and evidence type that must match.
+- **context**: (when to apply) observable progress judging state summary, including the parent trajectory state, current agent goal, and whether each child shows progress, equivalence, or regression signals.
+- **experience**: (how to avoid) actionable rubric-generation lesson. State what the previous rubric focused on, why it did or did not calibrate children against the parent, what the better parent-relative criterion should focus on, and what tempting wrong criterion should be avoided.
+- **metadata.analysis**: (why it happens) concise diagnosis grounded by generated rubrics, GT skeleton, rubric accuracy, aggregate judged scores, and GT labels.
+- **metadata.reference_golden_rubrics**: (what to do) a list of best rubric(s) that should have been generated to judge improvement, equivalence, or regression relative to the parent.
+
+## Experience Update Strategy
+- Update only when parent-child GT labels vary visibly or generated scores clearly mishandle progress, equivalence, or regression; otherwise there is no reliable reward signal and an empty `{}` is usually best.
+- First compare each generated rubric's `overall_accuracy` and `judging_diff_per_sample`, plus the aggregate `average_rubric_judged_scores`, with the visible parent-child continuation distribution. High-accuracy rubrics can become successful reusable patterns; low-accuracy rubrics should usually become corrective lessons about which tempting criterion to avoid.
+- Good experiences teach the mapping from parent baseline to child delta: when to preserve ties, when a child must beat a wrong parent, and when a child should not beat an already correct or near-correct parent.
+- Identify whether the failed rubric was too narrow, too process-focused, too path/shape-focused, or unstable because it judged a cue that did not match the actual parent-child delta.
+- Do not summarize a low-accuracy rubric as a good experience just because it sounds plausible. A rubric is useful only if it matches the GT progress, equivalence, or regression relation between the parent and current children.
+- When a low-accuracy rubric fails, identify the observable reason: stale active rubric, majority-answer bias, over-rewarding process when patch semantics matter, treating obsolete tests as authoritative, or rewarding no-signal distinctions.
+- If different parent-child GT labels are mainly explained by terminal diffs, generate an experience that pushes future rubrics toward semantic code review, API/compatibility boundaries, owner logic, and executable/behavioral tests. Do not save another generic process lesson such as "runs more tests" or "edits carefully."
+- If retrieved or active rubrics were stale, the experience should say when to stop reusing that rubric style and what new evidence should replace it. 
+- If a rubric merely rewards the majority child behavior, but a minority child delta better explains parent-relative progress, save a corrective lesson about the observable minority signal that should have been evaluated.
+- Before saving a lesson, check whether the apparent failure is caused by judge instability rather than a durable rubric-generation mistake. This often happens when the rubric is too narrow, over-specific, or tied to one surface form, so equivalent implementation variants receive inconsistent scores. In that case, the experience should teach a broader observable criterion or recommend not reusing that narrow rubric style.
+- Check whether retrieved experiences influenced the generated rubrics. If a retrieved experience came from a materially different context, update that experience with clearer applicability boundaries or add a lesson about context matching; do not turn the mismatch into a new instance-specific rule.
+- Store the future-reusable experience as an observable judging lesson, not as a hidden-GT fact. The retrievable `title`, `description`, `context`, and `experience` must describe non-privileged warning signs visible to a future rubric generator. These fields must not use words such as `GT`, `ground truth`, `reward`, `score`, `accuracy`, `high-scoring`, or `low-scoring`; describe observable behavior clusters instead, such as "samples that located the local repository" or "samples that edited only a scratch test." Put GT-based justification and exact accuracy evidence only in `metadata.analysis` for diagnosis. You should also delete or update previous experiences if they use GT information in `title`, `description`, `context`, or `experience`.
+- Avoid lessons that merely say to follow GT, exact files, exact patch shape, or a hidden reference.
+- `metadata.reference_golden_rubrics` should contain the rubric(s) that would have matched the score distribution: concrete, grounded, and judgeable, not a generic instruction to follow the reference patch.
+
+
+## Guidelines
+- Add or update only high-impact experiences likely to improve future rubric generation.
+- Use delete only for experiences that are redundant, misleading, or unsafe to retrieve.
+- If you need full context for existing experiences before updating or deleting them, output a retrieve action first using their titles.
+- Return an empty object `{}` when no high-impact reusable experience can be generated.
+- Prefer quality over quantity: one reusable experience is better than several narrow instance notes.
+- `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton`, `gt_scores`, exact accuracy values, or phrases such as "ground truth evaluates", "high-scoring sample", or "low-scoring sample." Put GT-based justification only in `metadata.analysis`.
+- Before returning an add/update action, rewrite the retrievable fields as behavior clusters, not score clusters. Bad: "High-scoring samples implement X while low-scoring samples do Y." Good: "One cluster implements X in the source files; another cluster leaves no source patch or only edits a scratch script." If you cannot state the lesson without score or GT language in retrievable fields, return `{}` instead of adding/updating an experience.
+- Do not save lessons whose operational instruction is merely "follow the ground truth" or "prefer the GT patch."
+- Do not preserve sibling-only ranking lessons unless they also explain how a child should compare to the parent.
+- Existing experience titles are unique handles. For add, the new `experience.title` must not match any current bank title. For update, `target_title` must select the existing experience; the replacement `experience.title` may keep that title or use a new title that does not match any other current bank title.
+- Base `metadata.analysis`, `context`, and `experience` only on the current update input and any retrieved existing experiences. Do not cite external reports, source files, or prior analyses unless they are explicitly present in the input.
+- In each response, return either one retrieve/add/update/delete action, or an empty dict representing the end of session. Do not return multiple actions.
+
+## Output Format
+Return only JSON in the following format:
+```json
+{
+    "action": "retrieve",
+    "titles": ["existing experience titles"],
+}
+```
+
+For add:
+```json
+{
+    "action": "add",
+    "experience": {
+    "title": "a new unique experience title",
+    "description": "...",
+    "context": "...",
+    "experience": "...",
+    "metadata": {
+        "analysis": "...",
+        "reference_golden_rubrics": []
+    }
+    }
+}
+```
+
+For update:
+```json
+{
+    "action": "update",
+    "target_title": "an existing experience title",
+    "experience": {
+    "title": "the existing experience title or a new unique title",
+    "description": "...",
+    "context": "...",
+    "experience": "...",
+    "metadata": {
+        "analysis": "...",
+        "reference_golden_rubrics": []
+    }
+    },
+}
+```
+
+For delete:
+```json
+{
+    "action": "delete",
+    "title": "an existing experience title",
+}
+```
+
+## Reference Golden Rubrics Output Format
+```json
+[
+    {
+        "rubric": {
+            "polarity": "<positive|negative>",
+            "description": "<detailed excellence/failure description>",
+            "title": "<abstract label>",
+            "metadata": {
+            <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
+            },
+            "scale": {
+                "1": "<positive rubric: weakest progress evidence / negative rubric: no evidence of the flaw or regression>",
+                "2": "<positive rubric: weak progress evidence / negative rubric: minor evidence of the flaw or regression>",
+                "3": "<the moderate anchor for equivalent parent-child behavior>",
+                "4": "<positive rubric: strong progress evidence / negative rubric: clear evidence of the flaw or regression>",
+                "5": "<positive rubric: strongest progress evidence / negative rubric: most severe evidence of the flaw or regression>"
+            }
+        }
+    }
+]
+```
 """
 
 PERSISTENT_STATE_UPDATE_PROMPT = """
@@ -368,7 +646,7 @@ Retrieve an experience including but not limited to the following types of lesso
 
 ## Selection Rules
 - Do not retrieve an experience solely because it shares broad words like "tests", "verification", "refactor", "search", or "compatibility"; the current continuation behavior must match the prior lesson.
-- Do not retrieve an experience solely because it shares a repository name if the evaluation difficulty is different.
+- Do not retrieve an experience solely because it shares repository names, languages, or broad task categories if the evaluation difficulty is different.
 - Retrieve an experience only if its stated applicability condition matches the current continuation distribution.
 - Do not retrieve an experience that would relax or ignore a distinction that is task-defining in the current samples. A prior lesson about harmless implementation variation applies only when the visible differences are actually semantically equivalent for this task.
 - Do not retrieve an early-stage process lesson when the current samples already contain enough terminal code or patch evidence to judge the implementation directly, unless the same process failure is still visibly causing the bad implementation. Vice versa.
@@ -384,7 +662,7 @@ Retrieve an experience including but not limited to the following types of lesso
 """
 
 RUBRIC_EXPERIENCE_UPDATE_PROMPT = """
-You are maintaining a compact rubric-generation experience bank for SWE-agent search.
+You are maintaining a compact rubric-generation experience bank for SWE-agent.
 
 ## Task
 Update the experience bank using previous rubric generation attempts from the completed instance.
@@ -398,15 +676,26 @@ Store only durable lessons that improve future rubric generation. Do not create 
 
 ## Input Explanation
 - `generation_context`: the context that was shown to the rubric generator, including problem statement, the current history, previous generated rubrics and sampled agent continuations.
-- `retrieved`: historical experiences retrieved before this rubric generation attempt.
+- `retrieved_experience`: historical experiences retrieved before this rubric generation attempt.
 - `generated_rubrics`: the full rubric list generated in that attempt.
-- `gt_skeleton`: the ground-truth patch skeleton for this instance.
+- `gt_skeleton`: ground-truth patch skeleton for diagnosis only.
 - `generated_rubric_accuracy`: per-rubric alignment diagnostics in the form `{"rubric title": {"overall_accuracy": float, "judging_diff_per_sample": [float]}}`. `overall_accuracy` is pairwise accuracy between that rubric's judge scores and GT scores. `judging_diff_per_sample` is the signed per-sample error list, computed as judge score minus GT score, the closer to zero the better, in the same sample order as `generation_context`.
+- `average_rubric_judged_scores`: model judged scores average across all rubrics of each sample in `generation_context` in the same order. Use it to see the current rubric model's judging preference and compare to understand the misalignment with ground-truths.
 - `gt_scores`: ground-truth scores of each sample in `generation_context` in the same order.
+
+
+## Output Explanation
+Output is a retrieve/add/update/delete action on the experience bank with the following fields:
+- **title**: short reusable retrieval label. Name the evaluation lesson, not just the repository. It must agree with the description, context, and score pattern.
+- **description**: concise summary of when this experience should be retrieved.
+- **context**: (when to apply) current judging state summary, including history state, current agent goal and focus and the behavior differences and distribution across samples.
+- **experience**: (how to avoid) actionable rubric-generation lesson. State what the previous rubrics generated, why they are correct or wrong, what the better rubric should focus on, and what tempting wrong criterion should be avoided.
+- **metadata.analysis**: (why it happens) concise evidence analysis explaining the reason for the lesson, grounded by evidence from generated rubrics, GT skeleton, rubric accuracy, aggregate judged scores, and GT labels.
+- **metadata.reference_golden_rubrics**: (what to do) a list of best rubric(s) that should have been generated.
 
 ## Experience Update Strategy
 - Update the bank only from attempts where `gt_scores` vary visibly across samples; otherwise there is no reliable reward signal and an empty `{}` is usually best.
-- First compare each generated rubric's `overall_accuracy` and `judging_diff_per_sample` with the visible continuation distribution. High-accuracy rubrics can become positive reusable patterns; low-accuracy rubrics should usually become corrective lessons about which tempting criterion to avoid.
+- First compare each generated rubric's `overall_accuracy` and `judging_diff_per_sample`, plus the aggregate `average_rubric_judged_scores`, with the visible continuation distribution. High-accuracy rubrics can become positive reusable patterns; low-accuracy rubrics should usually become corrective lessons about which tempting criterion to avoid.
 - Do not summarize a low-accuracy rubric as a good experience just because it sounds plausible. A rubric is useful only if its score ordering matches the GT ordering for the current samples.
 - When a low-accuracy rubric fails, identify the observable reason: stale active rubric, majority-answer bias, over-rewarding process when patch semantics matter, treating obsolete tests as authoritative, or rewarding no-signal distinctions.
 - If high-GT and low-GT samples differ mainly in terminal diffs, generate an experience that pushes future rubrics toward semantic code review, API/compatibility boundaries, owner logic, and executable/behavioral tests. Do not save another generic process lesson such as "runs more tests" or "edits carefully."
@@ -415,16 +704,8 @@ Store only durable lessons that improve future rubric generation. Do not create 
 - Before saving a lesson, check whether the apparent failure is caused by judge instability rather than a durable rubric-generation mistake. This often happens when the rubric is too narrow, over-specific, or tied to one surface form, so equivalent implementation variants receive inconsistent scores. In that case, the experience should teach a broader observable criterion or recommend not reusing that narrow rubric style.
 - Check whether retrieved experiences influenced the generated rubrics. If a retrieved experience came from a materially different context, update that experience with clearer applicability boundaries or add a lesson about context matching; do not turn the mismatch into a new instance-specific rule.
 - Store the future-reusable experience as an observable judging lesson, not as a hidden-GT fact. The retrievable `title`, `description`, `context`, and `experience` must describe non-privileged warning signs visible to a future rubric generator. These fields must not use words such as `GT`, `ground truth`, `reward`, `score`, `accuracy`, `high-scoring`, or `low-scoring`; describe observable behavior clusters instead, such as "samples that located the local repository" or "samples that edited only a scratch test." Put GT-based justification and exact accuracy evidence only in `metadata.analysis` for diagnosis. You should also delete or update previous experiences if they use GT information in `title`, `description`, `context`, or `experience`.
+- Avoid lessons that merely say to follow GT, exact files, exact patch shape, or a hidden reference.
 - `metadata.reference_golden_rubrics` should contain the rubric(s) that would have matched the score distribution: concrete, grounded, and judgeable, not a generic instruction to follow the reference patch.
-
-## Output Explanation
-Output is a retrieve/add/update/delete action on the experience bank with the following fields:
-- **title**: short reusable retrieval label. Name the evaluation lesson, not just the repository. It must agree with the description, context, and score pattern.
-- **description**: concise summary of when this experience should be retrieved.
-- **context**: (when to apply) current judging state summary, including history state, current agent goal and focus and the behavior differences and distribution across samples.
-- **experience**: (how to avoid) actionable rubric-generation lesson. State what the previous rubrics generated, why they are correct or wrong, what the better rubric should focus on, and what tempting wrong criterion should be avoided.
-- **metadata.analysis**: (why it happens) concise evidence analysis explaining the reason for the lesson, grounded by evidence from generated rubrics, GT skeleton, and `generated_rubric_accuracy`.
-- **metadata.reference_golden_rubrics**: (what to do) a list of best rubric(s) that should have been generated.
 
 ## Guidelines
 - Add or update only high-impact experiences likely to improve future rubric generation.
@@ -434,7 +715,7 @@ Output is a retrieve/add/update/delete action on the experience bank with the fo
 - Prefer quality over quantity: one reusable experience is better than several narrow instance notes.
 - `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton`, `gt_scores`, exact accuracy values, or phrases such as "ground truth evaluates", "high-scoring sample", or "low-scoring sample." Put GT-based justification only in `metadata.analysis`.
 - Before returning an add/update action, rewrite the retrievable fields as behavior clusters, not score clusters. Bad: "High-scoring samples implement X while low-scoring samples do Y." Good: "One cluster implements X in the source files; another cluster leaves no source patch or only edits a scratch script." If you cannot state the lesson without score or GT language in retrievable fields, return `{}` instead of adding/updating an experience.
-- Do not save lessons whose operational instruction is merely "follow the ground truth" or "prefer the GT patch." If the hidden GT reveals that the PR text, majority solution, or generated rubric was misleading, explain the observable warning sign and the better rubric focus.
+- Do not save lessons whose operational instruction is merely "follow the ground truth" or "prefer the GT patch."
 - Existing experience titles are unique handles. For add, the new `experience.title` must not match any current bank title. For update, `target_title` must select the existing experience; the replacement `experience.title` may keep that title or use a new title that does not match any other current bank title.
 - Base `metadata.analysis`, `context`, and `experience` only on the current update input and any retrieved existing experiences. Do not cite external reports, source files, or prior analyses unless they are explicitly present in the input.
 - In each response, return either one retrieve/add/update/delete action, or an empty dict representing the end of session. Do not return multiple actions.
@@ -537,7 +818,231 @@ RUBRIC_EXPERIENCE_RETRIEVAL_RESPONSE_FORMAT = {
 RUBRIC_EXPERIENCE_UPDATE_RESPONSE_FORMAT = {"type": "json_object"}
 
 
-def _seed_experiences() -> list[dict[str, Any]]:
+def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
+    if scope == "pc":
+        parent_relative_semantic_progress = {
+            "rubric": {
+                "polarity": "positive",
+                "title": "Parent-Relative Semantic Progress",
+                "description": (
+                    "Scores whether the continuation adds task-relevant semantic behavior that the parent trajectory lacked, while treating behaviorally "
+                    "equivalent changes as no meaningful progress."
+                ),
+                "metadata": {
+                    "parent_baseline": "identify whether the parent is wrong/no-op, partial, near-correct, or already correct",
+                    "semantic_delta": "compare API contract, state mutation, lifecycle, schema, compatibility, or terminal diff behavior against the parent",
+                    "tie_condition": "score near the middle when child and parent satisfy the same visible behavior",
+                },
+                "scale": {
+                    "1": "The child loses useful parent behavior or moves farther from the task objective.",
+                    "2": "The child mostly preserves the parent but adds confusing or likely harmful changes.",
+                    "3": "The child is semantically equivalent to the parent for the criterion.",
+                    "4": "The child adds a partial but behaviorally relevant improvement over the parent.",
+                    "5": "The child clearly fixes a parent-missing behavior or closes the main parent defect.",
+                },
+            }
+        }
+        parent_equivalence_preservation = {
+            "rubric": {
+                "polarity": "positive",
+                "title": "Parent Equivalence Preservation",
+                "description": (
+                    "Scores whether the continuation preserves an already correct or near-correct parent state without inventing progress from validation style, "
+                    "extra explanation, or harmless implementation variation."
+                ),
+                "metadata": {
+                    "parent_baseline": "near-correct or already-correct parent trajectory",
+                    "judge_focus": "distinguish real semantic improvement/regression from equivalent patch variants",
+                    "tie_condition": "equivalent child should remain close to the middle progress anchor",
+                },
+                "scale": {
+                    "1": "The child breaks or removes behavior the parent already handled.",
+                    "2": "The child introduces risky unrelated changes while preserving some parent behavior.",
+                    "3": "The child is behaviorally equivalent to the near-correct or correct parent.",
+                    "4": "The child preserves the parent and fixes a small remaining visible defect.",
+                    "5": "The child preserves parent correctness and clearly closes an important remaining gap.",
+                },
+            }
+        }
+        invalid_artifact_or_parent_work_loss = {
+            "rubric": {
+                "polarity": "negative",
+                "title": "Invalid Artifact Or Parent Work Loss",
+                "description": (
+                    "Penalizes continuations that lose useful parent work or replace it with no-op, fake, summary-only, synthetic, or wrong-repository patches."
+                ),
+                "metadata": {
+                    "regression_signal": "empty patch, fake summary patch, synthetic-only fix, wrong target, or loss of useful parent diff",
+                    "evidence": "terminal patch files, diff stat, submitted patch artifact, and commands creating synthetic targets",
+                },
+                "scale": {
+                    "1": "No evidence of artifact failure or loss of useful parent work.",
+                    "2": "Minor artifact or targeting concern, but the useful parent work is mostly preserved.",
+                    "3": "Ambiguous artifact validity or partial loss of useful parent work.",
+                    "4": "Clear loss of useful parent work, wrong-target edits, or mostly invalid patch artifacts.",
+                    "5": "Severe regression: empty/no-op patch, fake summary patch, synthetic-only fix, or complete loss of useful parent work.",
+                },
+            }
+        }
+        return [
+            {
+                "title": "Semantic Delta Beats Process When Parent Is Wrong",
+                "description": (
+                    "Retrieve when the parent lacks the core fix and some continuations add real terminal source behavior, while tempting rubrics focus on "
+                    "validation loops, editing style, or generic testing."
+                ),
+                "context": (
+                    "A wrong or no-op parent is followed by children with visible source patches. Some children modify the actual task behavior, while other "
+                    "children only show process differences or partial edits. The judging risk is letting process style hide the fact that a child fixed a "
+                    "parent-missing behavior."
+                ),
+                "experience": (
+                    "Generate a parent-relative semantic rubric. First state what the parent is missing, then score whether the child adds that behavior in "
+                    "the terminal patch. Do not require a polished validation loop when the terminal diff already shows the core progress. Avoid process-only "
+                    "rubrics such as regression-testing thoroughness or iterative refinement unless they decide the semantic delta."
+                ),
+                "metadata": {
+                    "generated_rubrics": [
+                        {
+                            "rubric": {
+                                "polarity": "positive",
+                                "title": "Post-Modification Regression Testing",
+                                "description": "Rewards running the official test suite after code changes.",
+                                "metadata": {},
+                                "scale": {
+                                    "1": "No validation.",
+                                    "2": "Superficial validation.",
+                                    "3": "Narrow custom validation.",
+                                    "4": "Runs official tests.",
+                                    "5": "Iteratively uses official tests to drive fixes.",
+                                },
+                            }
+                        }
+                    ],
+                    "gt_skeleton": (
+                        "WTForms r2 / Elastic r4 pattern: parent has no effective fix; high-progress children modify real source behavior such as HTML field/widget "
+                        "migration or runner hook error propagation."
+                    ),
+                    "generated_rubric_accuracy": {
+                        "Post-Modification Regression Testing": {
+                            "overall_accuracy": 0.312,
+                            "judging_diff_per_sample": [-0.977, -1.165, -1.106, -1.169, 0.062, -0.375, 0.0, 0.0],
+                        }
+                    },
+                    "gt_scores": [1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 0.5],
+                    "analysis": (
+                        "Source: WTForms round_002 vanilla PC review. Parent GT was 0.0, teacher children were about 0.98, but process rubrics gave several "
+                        "teacher children no improvement or negative delta while one zero-GT student child scored above parent. The durable lesson is semantic "
+                        "delta over parent, not testing-process quality."
+                    ),
+                    "reference_golden_rubrics": [copy.deepcopy(parent_relative_semantic_progress)],
+                },
+            },
+            {
+                "title": "Preserve Ties Around Near-Correct Parents",
+                "description": (
+                    "Retrieve when the parent is already correct or near-correct and many continuations appear to be equivalent variants, with at most small "
+                    "semantic improvements or one clear regression."
+                ),
+                "context": (
+                    "A strong parent is followed by children that mostly keep the same visible behavior. Some children may run different tests, edit with a "
+                    "different style, or submit an equivalent patch. The judging risk is manufacturing progress/regression from workflow differences."
+                ),
+                "experience": (
+                    "Generate a tie-preserving parent-child rubric. Make score 3 the default for behaviorally equivalent children. Only score above the parent "
+                    "when the child fixes a visible remaining defect, and only score below when it loses parent behavior or submits an invalid artifact. Avoid "
+                    "rubrics that punish the child for process behavior that the parent never had a chance to exhibit."
+                ),
+                "metadata": {
+                    "generated_rubrics": [
+                        {
+                            "rubric": {
+                                "polarity": "negative",
+                                "title": "Destructive Test Appeasement",
+                                "description": "Penalizes reverting source changes to satisfy stale tests.",
+                                "metadata": {},
+                                "scale": {
+                                    "1": "No destructive appeasement.",
+                                    "2": "Minor confusion about stale tests.",
+                                    "3": "Wastes effort on stale tests.",
+                                    "4": "Partially degrades the feature.",
+                                    "5": "Fully reverts required changes for stale tests.",
+                                },
+                            }
+                        }
+                    ],
+                    "gt_skeleton": (
+                        "WTForms r3 / Crawler r3 pattern: parent is already near-correct or correct; most children are equivalent, while one child may have a "
+                        "small improvement or a no-patch regression."
+                    ),
+                    "generated_rubric_accuracy": {
+                        "Destructive Test Appeasement": {
+                            "overall_accuracy": 0.438,
+                            "judging_diff_per_sample": [-1.004, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        }
+                    },
+                    "gt_scores": [1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+                    "analysis": (
+                        "Source: WTForms round_003 vanilla/adaptive PC review and Crawler round_003 vanilla PC review. Near-correct parents were compared with "
+                        "mostly equivalent children, but process or stale-test rubrics pushed equivalent children below the parent. The durable lesson is to "
+                        "preserve ties unless a visible semantic delta exists."
+                    ),
+                    "reference_golden_rubrics": [copy.deepcopy(parent_equivalence_preservation)],
+                },
+            },
+            {
+                "title": "No-Op Artifacts Are Regressions From Useful Parents",
+                "description": (
+                    "Retrieve when a parent has useful real-repository progress and one or more continuations produce empty patches, fake summaries, synthetic "
+                    "projects, wrong-target edits, or lose the parent diff."
+                ),
+                "context": (
+                    "The parent or several children contain useful target-repository work, but a continuation ends with no patch, a summary masquerading as a "
+                    "patch, a synthetic reproduction patch, or only scratch files. The judging risk is treating that child as equivalent because it has similar "
+                    "reasoning text or because the rubric focuses on process."
+                ),
+                "experience": (
+                    "Generate a PC rubric that checks useful work continuity. A child that drops real parent progress or submits invalid artifacts should score "
+                    "as regression. A child that replaces an invalid parent with a real target-repository patch should score as progress. The criterion should "
+                    "look at submitted patch artifact, changed files, and whether changes land in the real repository."
+                ),
+                "metadata": {
+                    "generated_rubrics": [
+                        {
+                            "rubric": {
+                                "polarity": "negative",
+                                "title": "Patch Generation and Verification Failure",
+                                "description": "Penalizes failing to produce a valid final patch after working on a task.",
+                                "metadata": {},
+                                "scale": {
+                                    "1": "Valid final patch.",
+                                    "2": "Minor patch-generation issue.",
+                                    "3": "Ambiguous final patch.",
+                                    "4": "Invalid or incomplete patch artifact.",
+                                    "5": "No useful final patch.",
+                                },
+                            }
+                        }
+                    ],
+                    "gt_skeleton": (
+                        "WTForms r4 / Elastic r3 / Crawler r3 pattern: one child has no useful final patch or artifact while parent or sibling children contain "
+                        "real target-repository progress."
+                    ),
+                    "generated_rubric_accuracy": {
+                        "Patch Generation and Verification Failure": {
+                            "overall_accuracy": 0.562,
+                            "judging_diff_per_sample": [0.0, 0.0, 0.0, 0.0, -0.5, -0.023, 0.0, 0.0],
+                        }
+                    },
+                    "gt_scores": [0.5, 0.5, 0.5, 0.5, 0.5, 0.0, 0.5, 0.5],
+                    "analysis": (
+                        "Source: WTForms round_004 vanilla/experience PC review and Elastic round_003 experience PC review. Artifact/no-op failures were the "
+                        "main visible child-parent regression. This is a reusable PC base case because invalid patch artifacts should not tie useful parent work."
+                    ),
+                    "reference_golden_rubrics": [copy.deepcopy(invalid_artifact_or_parent_work_loss)],
+                },
+            },
+        ]
     selective_compatibility_boundary = {
         "rubric": {
             "polarity": "positive",
@@ -852,7 +1357,72 @@ src/main/kotlin/com/github/jengelman/gradle/plugins/shadow/transformers/Properti
     ]
 
 
-def _seed_rubrics() -> list[dict[str, Any]]:
+def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
+    if scope == "pc":
+        return [
+            {
+                "rubric": {
+                    "polarity": "positive",
+                    "title": "Parent-Relative Semantic Progress",
+                    "description": (
+                        "Scores whether the continuation adds task-relevant semantic behavior that the parent trajectory lacked, rather than merely looking "
+                        "better as a standalone trajectory."
+                    ),
+                    "scale": {
+                        "1": "The continuation loses useful parent behavior or moves farther from the task objective.",
+                        "2": "The continuation mostly preserves the parent but adds likely harmful or irrelevant changes.",
+                        "3": "The continuation is behaviorally equivalent to the parent for the visible task objective.",
+                        "4": "The continuation adds a partial but meaningful semantic improvement over the parent.",
+                        "5": "The continuation clearly fixes a parent-missing behavior or closes the main visible parent defect.",
+                    },
+                    "metadata": {
+                        "parent_baseline": "wrong/no-op, partial, near-correct, or already-correct",
+                        "judge_focus": "terminal semantic delta over parent",
+                    },
+                }
+            },
+            {
+                "rubric": {
+                    "polarity": "positive",
+                    "title": "Parent Equivalence Preservation",
+                    "description": (
+                        "Scores whether the continuation correctly stays tied with an already correct or near-correct parent unless it has a real semantic "
+                        "improvement or regression."
+                    ),
+                    "scale": {
+                        "1": "The continuation breaks or removes behavior the parent already handled.",
+                        "2": "The continuation introduces risky unrelated changes while preserving some parent behavior.",
+                        "3": "The continuation is semantically equivalent to the correct or near-correct parent.",
+                        "4": "The continuation preserves parent behavior and fixes a small remaining visible defect.",
+                        "5": "The continuation preserves parent correctness and clearly closes an important remaining gap.",
+                    },
+                    "metadata": {
+                        "parent_baseline": "near-correct or already-correct parent",
+                        "tie_condition": "do not use validation style, explanation length, or harmless patch variation as progress",
+                    },
+                }
+            },
+            {
+                "rubric": {
+                    "polarity": "negative",
+                    "title": "Invalid Artifact Or Parent Work Loss",
+                    "description": (
+                        "Penalizes continuations that lose useful parent work or replace it with empty, fake, summary-only, synthetic, or wrong-target patches."
+                    ),
+                    "scale": {
+                        "1": "No evidence of artifact failure or loss of useful parent work.",
+                        "2": "Minor artifact or targeting concern, but the useful parent work is mostly preserved.",
+                        "3": "Ambiguous artifact validity or partial loss of useful parent work.",
+                        "4": "Clear loss of useful parent work, wrong-target edits, or mostly invalid patch artifacts.",
+                        "5": "Severe regression: empty/no-op patch, fake summary patch, synthetic-only fix, or complete loss of useful parent work.",
+                    },
+                    "metadata": {
+                        "regression_signal": "empty patch, fake summary patch, synthetic-only fix, wrong target, or lost parent diff",
+                        "evidence": "terminal patch files, diff stat, submitted artifact, and created scratch/synthetic files",
+                    },
+                }
+            },
+        ]
     return [
         {
             "rubric": {

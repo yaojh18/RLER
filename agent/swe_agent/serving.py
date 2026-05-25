@@ -59,7 +59,6 @@ class SGLangChatService:
                 "frequency_penalty",
                 "presence_penalty",
                 "n",
-                "seed",
                 "top_k",
                 "min_p",
                 "logprobs",

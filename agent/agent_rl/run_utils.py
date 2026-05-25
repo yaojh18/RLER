@@ -245,6 +245,7 @@ async def run_generate_with_route_async(
     api_key: str = "EMPTY",
     sampling_params: Optional[Dict[str, Any]] = None,
     return_logprobs: bool = True,
+    require_reasoning: bool = False,
     request_timeout: float = 600.0,
 ) -> ChatCompletion:
     """Token-in / token-out call against sglang's `/generate` endpoint.
@@ -284,6 +285,8 @@ async def run_generate_with_route_async(
         "logprob_start_len": -1,
         "stream": False,
     }
+    if require_reasoning:
+        payload["require_reasoning"] = True
     headers = {"Content-Type": "application/json"}
     if api_key and api_key != "EMPTY":
         headers["Authorization"] = f"Bearer {api_key}"
@@ -484,6 +487,7 @@ async def route_completion_message(
     kwargs = copy.deepcopy(model_kwargs or {})
     api_base = kwargs.pop("api_base", None)
     api_key = kwargs.pop("api_key", "EMPTY")
+    enable_json_schema_validation = bool(kwargs.pop("enable_json_schema_validation", True))
     extra_body = kwargs.get("extra_body", {}) if isinstance(kwargs.get("extra_body"), dict) else {}
     if api_base is None:
         api_base, api_key, effective_model = _route_service_base(route_name, model_name, api_key)
@@ -494,12 +498,13 @@ async def route_completion_message(
         from swe_agent.tokenization import get_stop_token_ids, tokenize_messages_with_template
 
         normalized = _normalize_messages_for_generate(messages)
+        enable_thinking = bool(
+            (extra_body.get("chat_template_kwargs") or {}).get("enable_thinking", True)
+        )
         input_ids = tokenize_messages_with_template(
             normalized,
             add_generation_prompt=True,
-            enable_thinking=bool(
-                (extra_body.get("chat_template_kwargs") or {}).get("enable_thinking", True)
-            ),
+            enable_thinking=enable_thinking,
             model_path=effective_model,
         )
         sampling_params: Dict[str, Any] = {
@@ -509,9 +514,9 @@ async def route_completion_message(
             "stop_token_ids": get_stop_token_ids(model_path=effective_model),
         }
         schema = _response_format_json_schema(response_format)
-        if schema is not None:
+        if schema is not None and enable_json_schema_validation:
             sampling_params["json_schema"] = json.dumps(schema, ensure_ascii=False)
-        for key in ("top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "seed"):
+        for key in ("top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty"):
             if key in kwargs:
                 sampling_params[key] = kwargs[key]
         completion = await run_generate_with_route_async(
@@ -521,6 +526,7 @@ async def route_completion_message(
             api_key=api_key,
             sampling_params=sampling_params,
             return_logprobs=True,
+            require_reasoning=bool(enable_thinking and schema is not None),
         )
         error = completion.metadata.get("error")
         if error is not None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -15,6 +16,26 @@ from swe_agent.prompt import SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT
 INVALID_SAMPLE_REWARD = -1.0
 RUBRIC_FORMAT_ERROR_REWARD = -1.0
 RUBRIC_TERMINAL_ERROR_REWARD = -0.2
+
+
+# NOTE: I am not sure if current reward design is approciate, we can iterate on this later.
+def progress_reward(
+    labels: list[float],
+    predictions: list[float],
+) -> float:
+    label_values = [float(value) for value in labels]
+    prediction_values = [float(value) for value in predictions]
+    if len(label_values) != len(prediction_values):
+        raise ValueError("labels and predictions must have the same length")
+    if not label_values:
+        return 0.0
+    rewards = []
+    for label, prediction in zip(label_values, prediction_values):
+        if label > 0.5:
+            rewards.append(prediction - 0.5)
+        elif label < 0.5:
+            rewards.append(0.5 - prediction)        
+    return float(sum(rewards) / len(rewards))
 
 
 _COMPACT_JSON_ARRAY_KEYS = {
@@ -115,16 +136,19 @@ def _rubric_turn_rewards(
     gamma: float,
     theta: float,
 ) -> list[float]:
-    generated = list(payload.get("generated"))
-    variance_by_rubric = payload.get("variance_by_rubric")
-    redundency_by_rubric = payload.get("redundency_by_rubric")
-    judge_error_by_rubric = payload.get("judge_error_by_rubric")
+    generated = list(payload.get("generated") or [])
+    variance_by_rubric = payload.get("variance_by_rubric") or {}
+    redundency_by_rubric = payload.get("redundency_by_rubric") or {}
+    judge_error_by_rubric = payload.get("judge_error_by_rubric") or {}
+    denominator = alpha + gamma + theta
+    if denominator == 0:
+        denominator = 1.0
     generated_rewards = [
         (
-            alpha * float(variance_by_rubric.get(rubric["rubric_id"]))
-            + gamma * float(redundency_by_rubric.get(rubric["rubric_id"]))
-            + theta * float(judge_error_by_rubric.get(rubric["rubric_id"]))
-        ) / (alpha + gamma + theta)
+            alpha * float(variance_by_rubric.get(rubric["rubric_id"], 0.0))
+            + gamma * float(redundency_by_rubric.get(rubric["rubric_id"], 0.0))
+            + theta * float(judge_error_by_rubric.get(rubric["rubric_id"], 0.0))
+        ) / denominator
         for rubric in generated
     ]
     format_error_turns = set()
@@ -168,6 +192,7 @@ class RubricArtifactBundle:
     retrieve_messages_payload: list[dict[str, Any]] | None = None
     round_summary_path: Path | None = None
     selected_for_round_summary: bool = False
+    scope: str = "siblings"
 
 
 class GRPOCollector:
@@ -176,17 +201,13 @@ class GRPOCollector:
         *,
         instance_id: str,
         run_dir: Path,
-        alpha: float = 1.0,
-        beta: float = 0.5,
         gamma: float = 1.0,
         theta: float = 1.0,
     ) -> None:
         self.instance_id = instance_id
         self.run_dir = run_dir
-        self.alpha = alpha
         self.gamma = gamma
         self.theta = theta
-        self.beta = beta
         self.bundle = GRPOExportBundle(
             instance_id=instance_id,
             run_dir=str(run_dir),
@@ -251,22 +272,32 @@ class GRPOCollector:
         samples: list[ExportSample] = []
         for bundle in rubric_bundles:
             payload = bundle.rubric_payload
-            rubric_list_id = str(payload.get("rubric_list_id") or bundle.rubric_dir.name)
+            rubric_list_id = str(
+                payload.get("sample_id")
+                or payload.get("rubric_list_id")
+                or bundle.rubric_dir.name
+            )
             conversation = _normalize_messages(bundle.messages_payload)
             if not rubric_list_id or not conversation:
                 continue
+            if bundle.scope == "siblings":
+                reward_key = "gt_reward_siblings"
+                turn_reward_alpha = 1.0
+            elif bundle.scope == "pc":
+                reward_key = "gt_reward_pc"
+                turn_reward_alpha = 0.0
+            else:
+                raise ValueError(f"Unsupported rubric scope: {bundle.scope}")
             turn_rewards = _rubric_turn_rewards(
                 payload=payload,
                 conversation=conversation,
-                alpha=self.alpha,
+                alpha=turn_reward_alpha,
                 gamma=self.gamma,
                 theta=self.theta,
             )
-            scalar_reward = (
-                (1.0 - self.beta) * float(payload.get("gt_reward_siblings"))
-                + self.beta * float(payload.get("gt_reward_parent"))
-                + RUBRIC_TERMINAL_ERROR_REWARD if payload.get("terminal_error") else 0.0
-            )
+            scalar_reward = float(payload.get(reward_key, 0.0))
+            if payload.get("terminal_error"):
+                scalar_reward += RUBRIC_TERMINAL_ERROR_REWARD
             samples.append(
                 ExportSample(
                     sample_id=rubric_list_id,
@@ -327,21 +358,19 @@ def _pairwise_diff(x):
     return x[i] - x[j]
 
 
+# NOTE: I am not sure if current reward design is approciate, we can iterate on this later.
 def gap_corr(a, b):
     da, db = _pairwise_diff(a), _pairwise_diff(b)
     if len(da) == 0:
         return 0.0
-    return 1.0 - np.mean(np.abs(da - db))
+    return float(1.0 - np.mean(np.abs(da - db)))
 
 
 def gap_redundancy(a, b):
     da, db = _pairwise_diff(a), _pairwise_diff(b)
     if len(da) == 0:
         return 0.0
-    return 1.0 - min(
-        np.mean(np.abs(da - db)),
-        np.mean(np.abs(da + db)),
-    )
+    return float(1.0 - min(np.mean(np.abs(da - db)), np.mean(np.abs(da + db))))
 
 
 class ArtifactWriter:
@@ -455,42 +484,44 @@ class PatchEvalManager:
         gt_by_node_id = {node_id: float(payload.get("reward", 0.0)) for node_id, payload in evaluations.items()}
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
-            parent_node_id = payload.get("parent_node_id")
-            parent_gt = 0.0
-            if parent_node_id:
-                parent_judge_path = self.work_dir / "nodes" / str(parent_node_id) / "judge.json"
-                if parent_judge_path.exists():
+            avg_scores = payload["avg_scores"]
+            score_by_rubric = payload["score_by_rubric"]
+            ordered_node_ids = sorted(node_id for node_id in avg_scores if node_id in gt_by_node_id)
+            gt_by_ordered_node_id = {node_id: gt_by_node_id[node_id] for node_id in ordered_node_ids}
+            if bundle.scope == "siblings":
+                ground_truth_by_node = gt_by_ordered_node_id
+            elif bundle.scope == "pc":
+                parent_node_id = str(payload["parent_node_id"])
+                parent_gt = 0.0
+                if parent_node_id != "root":
+                    parent_judge_path = self.work_dir / "nodes" / parent_node_id / "judge.json"
                     parent_gt_value = json.loads(parent_judge_path.read_text(encoding="utf-8")).get("ground_truth_reward")
-                    if parent_gt_value is not None:
-                        parent_gt = float(parent_gt_value)
-                    elif parent_node_id != "root":
+                    if parent_gt_value is None:
                         raise RuntimeError(f"parent node {parent_node_id} has no ground_truth_reward")
-            ordered_node_ids = sorted(str(node_id) for node_id in payload.get("child_rewards", {}))
-            sibling_scores = [float(payload["child_rewards"][node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
-            sibling_gt = [float(gt_by_node_id[node_id]) for node_id in ordered_node_ids if node_id in gt_by_node_id]
-            gt_reward_siblings = gap_corr(sibling_scores, sibling_gt)
-            parent_reward = payload.get("parent_reward", 0.0)
-            parent_child_diffs = [
-                1.0 - abs(float(payload["child_rewards"][node_id]) - float(parent_reward) - float(gt_by_node_id[node_id]) + float(parent_gt))
-                for node_id in ordered_node_ids if node_id in gt_by_node_id
-            ]
-            gt_reward_parent = float(np.mean(parent_child_diffs)) if parent_child_diffs else 0.0
-            payload["gt_reward_siblings"] = float(gt_reward_siblings)
-            payload["gt_reward_parent"] = float(gt_reward_parent)
+                    parent_gt = float(parent_gt_value)
+                ground_truth_by_node = {
+                    node_id: 1.0 if child_gt > parent_gt else 0.0 if child_gt < parent_gt else 0.5
+                    for node_id, child_gt in gt_by_ordered_node_id.items()
+                }
+            else:
+                raise ValueError(f"Unsupported rubric scope: {bundle.scope}")
             payload["gt_by_rubric"] = {
                 rubric_id: {
-                    "parent_score": payload.get("parent_score_by_rubric", {}).get(rubric_id),
-                    "child_scores": payload.get("child_score_by_rubric", {}).get(rubric_id, {}),
-                    "ground_truth_by_node": (
-                        ({str(parent_node_id): parent_gt} if parent_node_id is not None else {})
-                        | {node_id: gt_by_node_id[node_id] for node_id in ordered_node_ids if node_id in gt_by_node_id}
-                    ),
+                    "child_scores": {
+                        node_id: float(scores.get(node_id, 0.0))
+                        for node_id in ordered_node_ids
+                    },
+                    "ground_truth_by_node": ground_truth_by_node,
                 }
-                for rubric_id in sorted(
-                    set(payload.get("parent_score_by_rubric", {}))
-                    | set(payload.get("child_score_by_rubric", {}))
-                )
+                for rubric_id, scores in sorted(score_by_rubric.items())
             }
+            predicted_scores = [float(avg_scores.get(node_id, 0.0)) for node_id in ordered_node_ids]
+            gt_scores = [ground_truth_by_node.get(node_id, 0.0) for node_id in ordered_node_ids]
+            if bundle.scope == "siblings":
+                payload["reward"] = gap_corr(predicted_scores, gt_scores)
+            else:
+                payload["reward"] = progress_reward(gt_scores, predicted_scores)
+
 
         if self.collector is not None:
             parent_id = bundles[0].node_payload.get("parent_id")
@@ -574,10 +605,11 @@ def _build_rubric_prompt(
     previous_state: dict[str, Any],
     latest_shared_segment: dict[str, Any] | None,
     continuations: list[dict[str, Any]],
+    generation_prompt: str = SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
 ) -> str:
     latest_text = json.dumps(latest_shared_segment, indent=2, ensure_ascii=False) if latest_shared_segment else "None"
     parts = [
-        SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT.strip(),
+        generation_prompt.strip(),
         "\n\n## Question:",
         f"System Prompt:\n{system_prompt}",
         "",
@@ -586,7 +618,7 @@ def _build_rubric_prompt(
         "## Previous Persistent State:",
         json.dumps(previous_state, ensure_ascii=False, indent=2),
         "",
-        "## Latest Agent Trajectory:",
+        "## Parent Trajectory:",
         latest_text,
         "",
         "## Agent Trajectory Continuations:",

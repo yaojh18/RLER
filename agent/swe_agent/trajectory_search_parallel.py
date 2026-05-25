@@ -8,21 +8,25 @@ Flat Lane A / Lane B / Lane C scheme, three concurrent lanes per instance:
     emit a MidCp = {idx, image_tag, snapshot, asst_step}. Purely a fork-point
     provider — its trajectory is NOT included in any training group.
 
-* Lane B (M forks per mid_cp, sampling temperature = lane_b_temperature)
-    For each mid_cp Lane A emits, fork M agents from that docker snapshot.
-    Each Lane B branch runs independently to its own termination. The
-    branches forked from mid_cp_i form fork-group i.
+* Lane B (M policy forks + one deterministic parent baseline per mid_cp)
+    For each mid_cp Lane A emits, fork M policy agents from that docker
+    snapshot plus one judge-parameter parent baseline branch used only for
+    parent-child rubric labels. Each policy branch runs independently to
+    termination/limit and may switch generation parameters after the first
+    budget window. The baseline branch is not exported as a policy sample.
 
-* Lane C (async rubric + judge per fork-group)
+* Lane C (summary + sibling/parent-child rubric and judge per fork-group)
     Trigger: when all Lane B branches in group i have run to terminal/limit.
-    Lane C then dispatches summary/rubric_gen/judge on the shared parent state
-    + each branch's first-`k` continuation steps. Lane C is serialized only for
-    rubric-bank state; it does not block Lane A or other groups' Lane B rollout.
+    Lane C extracts the shared parent state/recent parent segment, then runs
+    sibling and parent-child rubric retrieve/generate/judge concurrently within
+    the group. Lane C is serialized only for rubric-bank state; it does not
+    block Lane A or other groups' Lane B rollout.
 
 GRPO bundle per fork-group: M trajectories sharing prompt = Lane A history
 up to mid_cp_i, each with its own continuation to termination. Per-branch
-reward = gt_score * fallback_penalty + rubric_judge_score; advantage = reward
-- mean across the group (standard GRPO baseline).
+reward is the configured weighted average of GT, sibling rubric, and
+parent-child rubric signals; GT weight defaults to zero. Downstream GRPO
+computes group-relative advantages from these exported rewards.
 """
 
 from __future__ import annotations
@@ -39,7 +43,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from statistics import pvariance
 from typing import Any
 
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
@@ -50,20 +53,32 @@ from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
 # judge, and persistent-state implementations so the parallel path stays
 # aligned with the non-parallel search semantics.
 from swe_agent.parallel_utils import (
+    _rubric_turn_rewards,
     _build_rubric_prompt,
     _ensure_litellm_prefix,
     _stamp_steps,
     _atomic_write_json,
+    progress_reward,
+    gap_corr,
     TurnTokenInfo,
 )
-from swe_agent.prompt import EMPTY_PERSISTENT_STATE, EMPTY_WORKSPACE_META
+from swe_agent.prompt import (
+    EMPTY_PERSISTENT_STATE,
+    EMPTY_WORKSPACE_META,
+    PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
+    PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
+    PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
+    PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+    SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
+    SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+)
 from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches
 from swe_agent.rubric_bank import ExperienceRubricBank, ScoreRubricBank
 from swe_agent.trajectory_search import (
-    JUDGE_ERROR_REWARD,
-    _generate_round_rubrics,
-    _redundancy_reward,
-    _score_round,
+    _avg_scores_from_rubrics,
+    _generate_and_score_rubric_batch,
+    _rubric_metrics_payload,
+    _rubric_sample_evaluation,
     _update_persistent_state,
     _build_step_cards,
     _collect_workspace_meta,
@@ -95,6 +110,16 @@ def _clone_without_heavy_token_fields(value: Any) -> Any:
     if isinstance(value, list):
         return [_clone_without_heavy_token_fields(item) for item in value]
     return copy.deepcopy(value)
+
+
+def _pc_progress_label(*, child_gt: float | None, parent_gt: float | None) -> float:
+    child = float(child_gt or 0.0)
+    parent = float(parent_gt or 0.0)
+    if child > parent:
+        return 1.0
+    if child < parent:
+        return 0.0
+    return 0.5
 
 
 def _build_parent_messages_payload(messages: list[dict[str, Any]], *, model_name: str) -> dict[str, Any]:
@@ -179,11 +204,27 @@ class ParallelSearchConfig:
     # Same recipe as v0: multiplicative penalty when the agent never invoked
     # the formal submit command and we fell back to `git diff` of the
     # working copy.
-    fallback_patch_penalty: float = 0.5
+    fallback_patch_penalty: float = 1.0
 
     def __post_init__(self) -> None:
         if self.p != 1:
             raise ValueError("trajectory_search_parallel currently supports p=1 only.")
+        if self.m <= 0:
+            raise ValueError("trajectory_search_parallel requires m > 0.")
+        if self.n <= 0:
+            raise ValueError("trajectory_search_parallel requires n > 0.")
+        if self.k <= 0:
+            raise ValueError("trajectory_search_parallel requires k > 0.")
+        if self.max_rounds <= 0:
+            raise ValueError("trajectory_search_parallel requires max_rounds > 0.")
+        if self.step_limit <= 0:
+            raise ValueError("trajectory_search_parallel requires step_limit > 0.")
+        if self.gt_eval_workers <= 0:
+            raise ValueError("trajectory_search_parallel requires gt_eval_workers > 0.")
+        if self.lane_a_pool_size <= 0:
+            raise ValueError("trajectory_search_parallel requires lane_a_pool_size > 0.")
+        if self.lane_b_pool_size is not None and self.lane_b_pool_size <= 0:
+            raise ValueError("trajectory_search_parallel requires lane_b_pool_size > 0 when set.")
 
 
 @dataclass
@@ -241,6 +282,7 @@ class LaneBBranch:
     gt_payload: dict[str, Any] | None = None
     started_at: float = 0.0
     finished_at: float = 0.0
+    is_parent_baseline: bool = False
 
 
 @dataclass
@@ -255,13 +297,20 @@ class ForkGroup:
     group_index: int  # = mid_cp.idx
     mid_cp: MidCp
     branches: list[LaneBBranch] = field(default_factory=list)
+    parent_branch: LaneBBranch | None = None
     rubric_prompt: str = ""
     rubric_model_response: dict[str, Any] = field(default_factory=dict)
     rubric_samples: list[dict[str, Any]] = field(default_factory=list)
     judge_response: dict[str, Any] = field(default_factory=dict)
+    pc_rubric_prompt: str = ""
+    pc_rubric_model_response: dict[str, Any] = field(default_factory=dict)
+    pc_rubric_samples: list[dict[str, Any]] = field(default_factory=list)
+    pc_judge_response: dict[str, Any] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
     experience_bank_update: dict[str, Any] = field(default_factory=dict)
     experience_bank_message: list[dict[str, Any]] = field(default_factory=list)
+    pc_experience_bank_update: dict[str, Any] = field(default_factory=dict)
+    pc_experience_bank_message: list[dict[str, Any]] = field(default_factory=list)
     persisted_parent_state: dict[str, Any] = field(default_factory=dict)
     lane_c_started_at: float = 0.0
     lane_c_done_at: float = 0.0
@@ -281,7 +330,7 @@ class LaneAState:
     error: str | None = None
     started_at: float = 0.0
     finished_at: float = 0.0
-    total_tokens: dict[str, int] = field(default_factory=dict)
+    total_tokens: dict[str, int] = field(default_factory=lambda: {"prompt": 0, "completion": 0})
 
 
 @dataclass
@@ -302,21 +351,28 @@ class InstanceRecord:
 
 
 class LaneGRPOCollector:
-    DEFAULT_POLICY_REWARD_ALPHA = 1.0
+    DEFAULT_GT_WEIGHT = 0.0
+    DEFAULT_SIBLINGS_WEIGHT = 0.5
+    DEFAULT_PC_WEIGHT = 0.5
 
-    def __init__(self, *, policy_reward_alpha: float = DEFAULT_POLICY_REWARD_ALPHA) -> None:
-        self.policy_reward_alpha = float(policy_reward_alpha)
+    def __init__(
+        self,
+        *,
+        policy_gt_weight: float = DEFAULT_GT_WEIGHT,
+        policy_siblings_weight: float = DEFAULT_SIBLINGS_WEIGHT,
+        policy_pc_weight: float = DEFAULT_PC_WEIGHT,
+    ) -> None:
+        self.policy_gt_weight = float(policy_gt_weight)
+        self.policy_siblings_weight = float(policy_siblings_weight)
+        self.policy_pc_weight = float(policy_pc_weight)
 
     @staticmethod
-    def _branch_overall_rubric_score(branch: LaneBBranch, judge_response: dict[str, Any]) -> float | None:
+    def _branch_overall_rubric_score(branch: LaneBBranch, samples: list[dict[str, Any]]) -> float | None:
         scores: list[float] = []
-        for branch_map in (judge_response or {}).values():
-            record = (branch_map or {}).get(branch.node_id)
-            if record is None or "error" in record:
-                continue
-            score = record.get("score_normalized")
-            if score is not None:
-                scores.append(float(score))
+        for sample in samples:
+            avg_scores = sample["avg_scores"]
+            if branch.node_id in avg_scores:
+                scores.append(float(avg_scores[branch.node_id]))
         if not scores:
             return None
         return float(sum(scores) / len(scores))
@@ -324,8 +380,8 @@ class LaneGRPOCollector:
     @staticmethod
     def _export_message(message: dict[str, Any]) -> dict[str, Any]:
         item = {
-            "role": message.get("role", "assistant") or "assistant",
-            "content": message.get("content", message.get("message", "")) or "",
+            "role": message["role"],
+            "content": message["content"],
         }
         if "content_no_thinking" in message:
             item["content_no_thinking"] = message["content_no_thinking"]
@@ -337,10 +393,22 @@ class LaneGRPOCollector:
         if branch.error is not None:
             return 0.0
         gt = float(branch.gt_score) if branch.gt_score is not None else 0.0
-        rubric = self._branch_overall_rubric_score(branch, group.judge_response)
-        if self.policy_reward_alpha == 1.0 or rubric is None or math.isnan(rubric):
+        siblings = self._branch_overall_rubric_score(branch, group.rubric_samples)
+        pc = self._branch_overall_rubric_score(branch, group.pc_rubric_samples)
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        if self.policy_gt_weight > 0.0:
+            weighted_sum += self.policy_gt_weight * gt
+            weight_sum += self.policy_gt_weight
+        if siblings is not None and not math.isnan(siblings) and self.policy_siblings_weight > 0.0:
+            weighted_sum += self.policy_siblings_weight * siblings
+            weight_sum += self.policy_siblings_weight
+        if pc is not None and not math.isnan(pc) and self.policy_pc_weight > 0.0:
+            weighted_sum += self.policy_pc_weight * pc
+            weight_sum += self.policy_pc_weight
+        if weight_sum == 0.0:
             return gt
-        reward = self.policy_reward_alpha * gt + (1.0 - self.policy_reward_alpha) * rubric
+        reward = weighted_sum / weight_sum
         if math.isnan(reward):
             return 0.0
         return float(reward)
@@ -350,9 +418,9 @@ class LaneGRPOCollector:
 
         branch_step_cards = _build_step_cards(branch.events, branch.parent_asst_step)
         parent_messages = list(
-            (group.mid_cp.snapshot.get("agent", {}).get("state", {}) or {}).get("messages", [])
+            group.mid_cp.snapshot["agent"]["state"]["messages"]
         )
-        branch_messages = list(branch.messages or [])
+        branch_messages = list(branch.messages)
         if not branch_messages:
             return None
 
@@ -440,7 +508,8 @@ class LaneGRPOCollector:
                 "mid_cp_asst_step": group.mid_cp.asst_step,
                 "terminated_early": branch.terminated_early,
                 "raw_gt_score": branch.gt_score,
-                "raw_rubric_score": self._branch_overall_rubric_score(branch, group.judge_response),
+                "raw_siblings_score": self._branch_overall_rubric_score(branch, group.rubric_samples),
+                "raw_pc_score": self._branch_overall_rubric_score(branch, group.pc_rubric_samples),
                 "total_tokens": branch.total_tokens,
                 "parent_token_count": len(token_ids) - response_length,
                 "token_source": token_source,
@@ -469,7 +538,8 @@ class LaneGRPOCollector:
                 "mid_cp_asst_step": group.mid_cp.asst_step,
                 "terminated_early": False,
                 "raw_gt_score": 0.0,
-                "raw_rubric_score": None,
+                "raw_siblings_score": None,
+                "raw_pc_score": None,
                 "total_tokens": {"prompt": 0, "completion": 0},
                 "parent_token_count": 1,
                 "token_source": "dummy_empty_branch",
@@ -517,14 +587,19 @@ class LaneGRPOCollector:
             export_group = self.fork_group_to_export_group(instance_id=record.instance_id, group=group)
             if export_group is not None:
                 policy_groups.append(export_group)
+        rubric_groups = self._rubric_groups_for_record(record)
         return GRPOExportBundle(
             instance_id=record.instance_id,
             run_dir=record.run_dir,
             policy_groups=policy_groups,
-            rubric_groups=[],
+            rubric_groups=rubric_groups,
             metadata={
                 "config": record.config,
-                "policy_reward_alpha": self.policy_reward_alpha,
+                "policy_reward_weights": {
+                    "gt": self.policy_gt_weight,
+                    "siblings": self.policy_siblings_weight,
+                    "pc": self.policy_pc_weight,
+                },
                 "completed": record.completed,
                 "error": record.error,
                 "seconds": record.seconds,
@@ -533,6 +608,123 @@ class LaneGRPOCollector:
                 "scheme": "lane_v1",
             },
         )
+
+    def _rubric_groups_for_record(self, record: InstanceRecord) -> list[ExportGroup]:
+        groups: list[ExportGroup] = []
+        for group in record.groups:
+            groups.extend(
+                self._rubric_export_groups_for_scope(
+                    record=record,
+                    group=group,
+                    scope="siblings",
+                    samples=group.rubric_samples,
+                    update_messages=group.experience_bank_message,
+                )
+            )
+            groups.extend(
+                self._rubric_export_groups_for_scope(
+                    record=record,
+                    group=group,
+                    scope="pc",
+                    samples=group.pc_rubric_samples,
+                    update_messages=group.pc_experience_bank_message,
+                )
+            )
+        return groups
+
+    def _rubric_export_groups_for_scope(
+        self,
+        *,
+        record: InstanceRecord,
+        group: ForkGroup,
+        scope: str,
+        samples: list[dict[str, Any]],
+        update_messages: list[dict[str, Any]],
+    ) -> list[ExportGroup]:
+        turn_reward_alpha = 1.0 if scope == "siblings" else 0.0
+        export_groups: list[ExportGroup] = []
+        if samples:
+            retrieve_messages = next(
+                (sample["retrieve_messages"] for sample in samples if sample["retrieve_messages"]),
+                None,
+            )
+            if retrieve_messages:
+                group_id = f"rubric-{record.instance_id}-g{group.group_index:03d}-{scope}-retrieve"
+                reward = sum(float(sample["reward"]) for sample in samples) / len(samples)
+                export_groups.append(
+                    ExportGroup(
+                        group_id=group_id,
+                        samples=[
+                            ExportSample(
+                                sample_id=f"{scope}-retrieve-g{group.group_index:03d}",
+                                group_id=group_id,
+                                prompt=[self._export_message(retrieve_messages[0])],
+                                turns=[self._export_message(message) for message in retrieve_messages[1:]],
+                                reward=reward,
+                                metadata={
+                                    "instance_id": record.instance_id,
+                                    "scope": scope,
+                                    "stage": "retrieve",
+                                },
+                            )
+                        ],
+                    )
+                )
+            generation_group_id = f"rubric-{record.instance_id}-g{group.group_index:03d}-{scope}-generate"
+            generation_samples: list[ExportSample] = []
+            for sample in samples:
+                conversation = [self._export_message(message) for message in sample["messages"]]
+                if not conversation:
+                    continue
+                generation_samples.append(
+                    ExportSample(
+                        sample_id=f"{scope}-{sample['rubric_list_id']}",
+                        group_id=generation_group_id,
+                        prompt=conversation[:1],
+                        turns=conversation[1:],
+                        reward=float(sample["reward"]),
+                        metadata={
+                            "scope": scope,
+                            "stage": "generate",
+                            "instance_id": record.instance_id,
+                            "turn_rewards": _rubric_turn_rewards(
+                                payload=sample,
+                                conversation=conversation,
+                                alpha=turn_reward_alpha,
+                                gamma=1.0,
+                                theta=1.0,
+                            ),
+                        },
+                    )
+                )
+            if generation_samples:
+                export_groups.append(ExportGroup(group_id=generation_group_id, samples=generation_samples))
+
+        update_group_id = f"rubric-{record.instance_id}-g{group.group_index:03d}-{scope}-experience-update"
+        update_samples: list[ExportSample] = []
+        for index, item in enumerate(update_messages):
+            messages = item["messages"]
+            conversation = [self._export_message(message) for message in messages]
+            if not conversation:
+                continue
+            update_samples.append(
+                ExportSample(
+                    sample_id=f"{scope}-experience-update-g{group.group_index:03d}-{index:02d}",
+                    group_id=update_group_id,
+                    prompt=conversation[:1],
+                    turns=conversation[1:],
+                    reward=0.0,
+                    metadata={
+                        "scope": scope,
+                        "stage": "experience_update",
+                        "instance_id": record.instance_id,
+                        "deferred_reward_kind": f"{scope}_experience_update_batch_instance_group_average",
+                    },
+                )
+            )
+        if update_samples:
+            export_groups.append(ExportGroup(group_id=update_group_id, samples=update_samples))
+        return export_groups
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +759,8 @@ class TrajectorySearchParallelRunner:
         policy_base_url: str,
         rubric_base_url: str,
         api_key: str = "EMPTY",
+        score_banks: dict[str, ScoreRubricBank] | None = None,
+        experience_banks: dict[str, ExperienceRubricBank] | None = None,
     ) -> None:
         self.instance = copy.deepcopy(instance)
         self.backend = backend
@@ -583,7 +777,7 @@ class TrajectorySearchParallelRunner:
         self.task = instance["problem_statement"]
         self.task_id = instance["instance_id"]
         self.run_id = f"{self.task_id}-{time.strftime('%Y%m%d-%H%M%S')}"
-        self.base_image = str(self.backend.environment_config.get("image", ""))
+        self.base_image = str(self.backend.environment_config["image"])
         self.docker_executable = str(
             self.backend.environment_config.get("executable", "docker")
         )
@@ -594,6 +788,8 @@ class TrajectorySearchParallelRunner:
         (self.run_dir / "groups").mkdir(parents=True, exist_ok=True)
         self._created_image_tags: list[str] = []
         self._live_sessions: list[Any] = []
+        provided_score_banks = score_banks if score_banks is not None else {}
+        provided_experience_banks = experience_banks if experience_banks is not None else {}
         shared_extra_body = (
             {"chat_template_kwargs": {"enable_thinking": True}}
             if "qwen" in self.rubric_model_name.lower() or "qwen" in self.judge_model_name.lower()
@@ -610,9 +806,31 @@ class TrajectorySearchParallelRunner:
             **({"extra_body": shared_extra_body} if shared_extra_body else {}),
         }
         self.judge_model_kwargs: dict[str, Any] = copy.deepcopy(self.rubric_model_kwargs)
-        self.rubric_bank = ScoreRubricBank(max_active_rubrics=config.max_active_rubrics)
-        self.rubric_bank.initialize(self.task)
-        self.experience_bank = ExperienceRubricBank(write_artifacts=True)
+        self.rubric_scopes = ("siblings", "pc")
+        self.score_banks: dict[str, ScoreRubricBank] = {}
+        self.experience_banks: dict[str, ExperienceRubricBank] = {}
+        for scope in self.rubric_scopes:
+            score_bank = provided_score_banks.get(scope)
+            if score_bank is None:
+                score_bank = ScoreRubricBank(max_active_rubrics=config.max_active_rubrics, scope=scope)
+                score_bank.initialize(self.task)
+            self.score_banks[scope] = score_bank
+            experience_bank = provided_experience_banks.get(scope)
+            if experience_bank is None:
+                experience_kwargs: dict[str, Any] = {"scope": scope}
+                if scope == "pc":
+                    experience_kwargs.update(
+                        {
+                            "retrieval_prompt": PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
+                            "update_prompt": PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
+                        }
+                    )
+                experience_bank = ExperienceRubricBank(**experience_kwargs)
+            self.experience_banks[scope] = experience_bank
+        self.rubric_bank = self.score_banks["siblings"]
+        self.pc_rubric_bank = self.score_banks["pc"]
+        self.experience_bank = self.experience_banks["siblings"]
+        self.pc_experience_bank = self.experience_banks["pc"]
         self._summary_persistent_state = copy.deepcopy(EMPTY_PERSISTENT_STATE)
         self._summary_recent_segments: list[dict[str, Any]] = []
         self._summary_processed_segments = 0
@@ -642,31 +860,24 @@ class TrajectorySearchParallelRunner:
             ground_truth=self.instance.get("patch"),
             raw_user_query=self.task,
             limits={
-                "step_limit": (
-                    self.backend.agent_config.get("step_limit", 0)
-                    if hasattr(self.backend, "agent_config")
-                    else 0
-                )
+                "step_limit": self.backend.agent_config.get("step_limit", 0)
             },
             metadata={"template_vars": copy.deepcopy(self.instance)},
         )
         session = self.backend.create_session(spec)
         # Pin model calls to the policy URL with the Lane A sampling params.
-        try:
-            mk = session.agent.model.config.model_kwargs
-            mk["api_base"] = (
-                self.policy_base_url + "/v1"
-                if not self.policy_base_url.endswith("/v1")
-                else self.policy_base_url
-            )
-            mk.setdefault("api_key", self.api_key)
-            mk["temperature"] = float(self.config.policy_temperature)
-            mk["top_p"] = float(self.config.policy_top_p)
-            session.agent.model.config.model_name = _ensure_litellm_prefix(
-                session.agent.model.config.model_name
-            )
-        except Exception:
-            logger.warning("Could not pin api_base / model_name on Lane A session")
+        mk = session.agent.model.config.model_kwargs
+        mk["api_base"] = (
+            self.policy_base_url + "/v1"
+            if not self.policy_base_url.endswith("/v1")
+            else self.policy_base_url
+        )
+        mk["api_key"] = self.api_key
+        mk["temperature"] = float(self.config.policy_temperature)
+        mk["top_p"] = float(self.config.policy_top_p)
+        session.agent.model.config.model_name = _ensure_litellm_prefix(
+            session.agent.model.config.model_name
+        )
         self._live_sessions.append(session)
         return session
 
@@ -797,6 +1008,16 @@ class TrajectorySearchParallelRunner:
         except Exception:
             return "", True
 
+    @staticmethod
+    def _is_context_window_error(exc: Exception) -> bool:
+        message = str(exc)
+        return (
+            "ContextWindowExceeded" in message
+            or "maximum context length" in message
+            or "context length" in message
+            or "Requested token count exceeds" in message
+        )
+
     def _would_fork_overflow(self, session: Any) -> bool:
         """Predict whether a Lane B fork from current Lane A state would
         fail with sglang context-length 400 on its first /generate call.
@@ -868,8 +1089,8 @@ class TrajectorySearchParallelRunner:
         self._created_image_tags.append(tag)
         return tag
 
-    def _delete_image(self, image_tag: str | None) -> None:
-        if not image_tag or self.config.keep_images:
+    def _delete_image(self, image_tag: str) -> None:
+        if self.config.keep_images:
             return
         if image_tag == self.base_image:
             return
@@ -912,13 +1133,13 @@ class TrajectorySearchParallelRunner:
     ) -> None:
         """Pin a resumed snapshot's model calls to a specific sglang base_url
         and override sampling params (typically temp=1.0 for Lane B)."""
-        model_section = snapshot_dict.setdefault("model", {})
-        config_section = model_section.setdefault("config", {})
-        kwargs = config_section.setdefault("model_kwargs", {})
+        model_section = snapshot_dict["model"]
+        config_section = model_section["config"]
+        kwargs = config_section["model_kwargs"]
         kwargs["api_base"] = (
             base_url + "/v1" if not base_url.endswith("/v1") else base_url
         )
-        kwargs.setdefault("api_key", self.api_key)
+        kwargs["api_key"] = self.api_key
         kwargs["temperature"] = float(temperature)
         kwargs["top_p"] = float(top_p)
         if "model_name" in config_section:
@@ -926,7 +1147,15 @@ class TrajectorySearchParallelRunner:
                 config_section["model_name"]
             )
 
-    def _fork_lane_b(self, *, mid_cp: MidCp, branch_index: int, node_id: str | None = None) -> Any:
+    def _fork_lane_b(
+        self,
+        *,
+        mid_cp: MidCp,
+        branch_index: int,
+        node_id: str,
+        temperature: float,
+        top_p: float,
+    ) -> Any:
         """Fork a single Lane B branch from a MidCp. Returns the resumed
         session pinned to a fresh docker container (instantiated from
         mid_cp.image_tag) with Lane B sampling temperature.
@@ -937,9 +1166,6 @@ class TrajectorySearchParallelRunner:
         so each Lane B gets its own container. Without this, all siblings
         would share Lane A's container and the first cleanup()
         would kill the rest."""
-        node_id = node_id or (
-            f"lane-b-g{mid_cp.idx:03d}-b{branch_index:02d}-{uuid.uuid4().hex[:6]}"
-        )
         session_id = f"{node_id}-session"
         resumed = {
             "session_id": session_id,
@@ -958,12 +1184,12 @@ class TrajectorySearchParallelRunner:
         self._override_model_kwargs(
             resumed,
             self.policy_base_url,
-            temperature=self.config.lane_b_temperature,
-            top_p=self.config.lane_b_top_p,
+            temperature=temperature,
+            top_p=top_p,
         )
-        env_section = resumed.setdefault("environment", {})
-        env_config = env_section.setdefault("config", {})
-        env_state = env_section.setdefault("state", {})
+        env_section = resumed["environment"]
+        env_config = env_section["config"]
+        env_state = env_section["state"]
         env_config["image"] = mid_cp.image_tag
         env_config["reuse_container_id"] = None
         env_state["container_id"] = None
@@ -979,6 +1205,9 @@ class TrajectorySearchParallelRunner:
         branch_index: int,
         budget_steps: int,
         total_step_limit: int,
+        is_parent_baseline: bool,
+        initial_temperature: float,
+        initial_top_p: float,
     ) -> LaneBBranch:
         """Run a single Lane B branch end-to-end (blocking, called from
         the executor): fork, run the first budget with Lane B sampling,
@@ -988,9 +1217,8 @@ class TrajectorySearchParallelRunner:
 
         GT eval is dispatched separately by `_run_fork_group` so that the
         gt_pool can be shared across all groups."""
-        node_id = (
-            f"lane-b-g{mid_cp.idx:03d}-b{branch_index:02d}-{uuid.uuid4().hex[:6]}"
-        )
+        node_kind = "parent" if is_parent_baseline else f"b{branch_index:02d}"
+        node_id = f"lane-b-g{mid_cp.idx:03d}-{node_kind}-{uuid.uuid4().hex[:6]}"
         branch = LaneBBranch(
             group_index=mid_cp.idx,
             branch_index=branch_index,
@@ -999,15 +1227,21 @@ class TrajectorySearchParallelRunner:
             policy_model_name=self.policy_model_name,
             parent_asst_step=mid_cp.asst_step,
             started_at=time.perf_counter(),
+            is_parent_baseline=is_parent_baseline,
         )
         session = None
+        result: dict[str, Any] = {"status": "error", "exit_status": "not_started"}
+        workspace_meta = None
+        before_event_count = 0
+        before_message_count = 0
+        before_turn_count = 0
         try:
-            if budget_steps <= 0:
-                raise RuntimeError(
-                    f"no remaining branch budget at parent_asst_step={mid_cp.asst_step}"
-                )
             session = self._fork_lane_b(
-                mid_cp=mid_cp, branch_index=branch_index, node_id=node_id
+                mid_cp=mid_cp,
+                branch_index=branch_index,
+                node_id=node_id,
+                temperature=initial_temperature,
+                top_p=initial_top_p,
             )
             branch.session_id = session.spec.session_id
             session.agent.config.step_limit = int(total_step_limit)
@@ -1015,31 +1249,35 @@ class TrajectorySearchParallelRunner:
             before_message_count = mid_cp.parent_message_count
             before_turn_count = len(session.model_turns)
 
-            result = self._step_session(session, max_steps=budget_steps)
-            first_phase_steps = int(result.get("executed_steps", budget_steps) or 0)
-            logger.info(
-                "[%s] lane_b g=%d b=%d first_phase_done dt=%.1fs steps=%d status=%s submitted=%s",
-                self.task_id,
-                mid_cp.idx,
-                branch_index,
-                time.perf_counter() - branch.started_at,
-                first_phase_steps,
-                result.get("status", ""),
-                result.get("exit_status") == "Submitted",
-            )
+            if is_parent_baseline:
+                result = self._step_session(session, max_steps=self._branch_terminal_budget(mid_cp.asst_step))
+                workspace_meta = None
+            else:
+                result = self._step_session(session, max_steps=budget_steps)
+                workspace_meta = _collect_workspace_meta(session.agent.env)
+                first_phase_steps = int(result["executed_steps"])
+                logger.info(
+                    "[%s] lane_b g=%d b=%d first_phase_done dt=%.1fs steps=%d status=%s submitted=%s",
+                    self.task_id,
+                    mid_cp.idx,
+                    branch_index,
+                    time.perf_counter() - branch.started_at,
+                    first_phase_steps,
+                    result["status"],
+                    result["exit_status"] == "Submitted",
+                )
 
-            terminal_result = result
-            if result.get("status") != "finished":
-                branch_step_end = mid_cp.asst_step + first_phase_steps
-                remaining_steps = self._branch_terminal_budget(branch_step_end)
-                branch_model_kwargs = session.agent.model.config.model_kwargs
-                branch_model_kwargs["temperature"] = self.config.judge_temperature
-                branch_model_kwargs["top_p"] = self.config.judge_top_p
-                if remaining_steps > 0:
-                    terminal_result = self._step_session(session, max_steps=remaining_steps)
+                terminal_result = result
+                if result["status"] != "finished":
+                    branch_step_end = mid_cp.asst_step + first_phase_steps
+                    remaining_steps = self._branch_terminal_budget(branch_step_end)
+                    branch_model_kwargs = session.agent.model.config.model_kwargs
+                    branch_model_kwargs["temperature"] = self.config.judge_temperature
+                    branch_model_kwargs["top_p"] = self.config.judge_top_p
+                    if remaining_steps > 0:
+                        terminal_result = self._step_session(session, max_steps=remaining_steps)
+                result = terminal_result
 
-            result = terminal_result
-            workspace_meta = _collect_workspace_meta(session.agent.env)
             messages = copy.deepcopy(
                 session.agent.messages[before_message_count:]
             )
@@ -1054,8 +1292,8 @@ class TrajectorySearchParallelRunner:
                 "prompt": sum(t.prompt_tokens for t in branch.turns),
                 "completion": sum(t.completion_tokens for t in branch.turns),
             }
-            branch.status = result.get("status", "")
-            branch.terminated_early = result.get("exit_status") == "Submitted"
+            branch.status = result["status"]
+            branch.terminated_early = result["exit_status"] == "Submitted"
             branch.terminal_patch, branch.terminal_patch_from_fallback = (
                 self._extract_terminal_patch(result, session)
             )
@@ -1066,8 +1304,8 @@ class TrajectorySearchParallelRunner:
                 time.perf_counter() - branch.started_at,
                 len(branch.events), branch.terminated_early, branch.status,
                 len(branch.terminal_patch),
-                branch.total_tokens.get("prompt", 0),
-                branch.total_tokens.get("completion", 0),
+                branch.total_tokens["prompt"],
+                branch.total_tokens["completion"],
             )
         except Exception as exc:
             branch.error = f"{type(exc).__name__}: {exc}"
@@ -1077,6 +1315,33 @@ class TrajectorySearchParallelRunner:
                 self.task_id, mid_cp.idx, branch_index,
                 time.perf_counter() - branch.started_at, branch.error,
             )
+            if self._is_context_window_error(exc) and session is not None:
+                branch.error = None
+                branch.status = "context_overflow"
+                branch.terminated_early = False
+                branch.messages = copy.deepcopy(session.agent.messages[before_message_count:])
+                branch.events = _step_card_event_dicts(session.events[before_event_count:])
+                branch.workspace_meta = workspace_meta
+                branch.turns = self._extract_turn_token_info_from_turns(
+                    session.model_turns[before_turn_count:],
+                    starting_turn_index=before_turn_count,
+                )
+                branch.total_tokens = {
+                    "prompt": sum(t.prompt_tokens for t in branch.turns),
+                    "completion": sum(t.completion_tokens for t in branch.turns),
+                }
+                branch.terminal_patch, branch.terminal_patch_from_fallback = (
+                    self._extract_terminal_patch(result, session)
+                )
+                logger.warning(
+                    "[%s] lane_b g=%d b=%d stopped by context window dt=%.1fs "
+                    "patch_len=%d tokens_p=%d tokens_c=%d",
+                    self.task_id, mid_cp.idx, branch_index,
+                    time.perf_counter() - branch.started_at,
+                    len(branch.terminal_patch),
+                    branch.total_tokens["prompt"],
+                    branch.total_tokens["completion"],
+                )
         finally:
             branch.finished_at = time.perf_counter()
             if session is not None:
@@ -1178,6 +1443,203 @@ class TrajectorySearchParallelRunner:
             },
         }
 
+    async def _run_lane_c_scope(
+        self,
+        *,
+        group: ForkGroup,
+        scope: str,
+        question: dict[str, Any],
+        shared_context: dict[str, Any],
+        previous_state: dict[str, Any],
+        latest_shared_segment: dict[str, Any] | None,
+        continuations: list[dict[str, Any]],
+        score_bank: ScoreRubricBank,
+        experience_bank: ExperienceRubricBank,
+        generation_prompt: str,
+        rubric_list_prefix: str,
+        judge_prompt: str,
+        include_variance_reward: bool,
+    ) -> dict[str, Any]:
+        cfg = self.config
+        experience_context = await experience_bank.build_generation_context(
+            question=question,
+            previous_state=previous_state,
+            latest_shared_segment=latest_shared_segment,
+            continuations=continuations,
+            model_name=self.rubric_model_name,
+            temperature=cfg.rubric_temperature,
+            top_p=cfg.rubric_top_p,
+            max_tokens=cfg.rubric_max_tokens,
+            model_kwargs=self.rubric_model_kwargs,
+        )
+        score_context = score_bank.build_generation_context()
+        extra_prompt_sections = list(score_context.extra_prompt_sections)
+        extra_prompt_sections.extend(experience_context.extra_prompt_sections)
+        retrieved_experiences = copy.deepcopy(experience_context.retrieved)
+        retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
+
+        score_batch = await _generate_and_score_rubric_batch(
+            sample_count=cfg.n,
+            round_index=group.group_index + 1,
+            generation_kwargs={
+                "model_name": self.rubric_model_name,
+                "temperature": cfg.rubric_temperature,
+                "top_p": cfg.rubric_top_p,
+                "max_tokens": cfg.rubric_max_tokens,
+                "model_kwargs": self.rubric_model_kwargs,
+            },
+            generation_prompt=generation_prompt,
+            rubric_list_prefix=rubric_list_prefix,
+            question=question,
+            shared_context=shared_context,
+            continuations=continuations,
+            extra_prompt_sections=extra_prompt_sections,
+            judge_kwargs={
+                "model_name": self.judge_model_name,
+                "temperature": cfg.judge_temperature,
+                "top_p": cfg.judge_top_p,
+                "max_tokens": cfg.judge_max_tokens,
+                "model_kwargs": self.judge_model_kwargs,
+            },
+            judge_prompt=judge_prompt,
+        )
+        model_response = {
+            "scope": scope,
+            "num_samples": len(score_batch["generated_samples"]),
+            "generated_rubrics": [
+                asdict(rubric)
+                for sample in score_batch["generated_samples"]
+                for rubric in sample.generated
+            ],
+            "format_errors": [
+                error
+                for sample in score_batch["generated_samples"]
+                for error in (sample.format_errors or [])
+            ],
+            "terminal_errors": [
+                sample.terminal_error
+                for sample in score_batch["generated_samples"]
+                if sample.terminal_error
+            ],
+        }
+
+        group_generated_rubrics = [
+            rubric
+            for generated_rubrics in score_batch["sample_generated_rubrics"]
+            for rubric in generated_rubrics
+        ]
+
+        parent_gt = group.parent_branch.gt_score
+        gt_by_node = {branch.node_id: float(branch.gt_score or 0.0) for branch in group.branches}
+        pc_label_by_node = {
+            branch.node_id: _pc_progress_label(child_gt=branch.gt_score, parent_gt=parent_gt)
+            for branch in group.branches
+        }
+        aggregate_judge_response: dict[str, dict[str, Any]] = {}
+        group_reward_by_rubric: dict[str, float] = {}
+        rubric_samples: list[dict[str, Any]] = []
+        node_ids = [branch.node_id for branch in group.branches]
+        for sample_index, generated_sample in enumerate(score_batch["generated_samples"]):
+            generated_rubrics = score_batch["sample_generated_rubrics"][sample_index]
+            scoring_rubrics = generated_rubrics
+            evaluation = _rubric_sample_evaluation(
+                score_batch=score_batch,
+                sample_index=sample_index,
+                node_ids=node_ids,
+                scoring_rubrics=scoring_rubrics,
+                include_variance_reward=include_variance_reward,
+            )
+            metrics = evaluation["metrics"]
+            judge_response_for_sample: dict[str, dict[str, Any]] = {}
+            for branch, score_records in zip(group.branches, evaluation["scored_continuations"]):
+                for record in score_records:
+                    rubric_id = record["rubric_id"]
+                    entry = {
+                        "rubric_id": rubric_id,
+                        "branch_index": branch.branch_index,
+                        "node_id": branch.node_id,
+                        "score_raw": record.get("score_raw"),
+                        "score_normalized": record.get("score_normalized"),
+                        "weighted_score": record.get("weighted_score"),
+                        "judge_response": record.get("judge_response"),
+                        "judge_message": record.get("judge_message"),
+                    }
+                    judge_response_for_sample.setdefault(rubric_id, {})[branch.node_id] = entry
+                    aggregate_judge_response.setdefault(rubric_id, {})[branch.node_id] = entry
+            for error in evaluation["judge_errors"]:
+                rubric_id = error.get("rubric_id")
+                node_id = error.get("node_id")
+                if rubric_id and node_id:
+                    judge_response_for_sample.setdefault(rubric_id, {}).setdefault(node_id, {})["error"] = error.get("error")
+                    aggregate_judge_response.setdefault(rubric_id, {}).setdefault(node_id, {})["error"] = error.get("error")
+
+            group_reward_by_rubric.update(metrics["reward_by_rubric"])
+            avg_scores = _avg_scores_from_rubrics(
+                node_ids=node_ids,
+                score_lookup_by_node=evaluation["score_lookup_by_node"],
+                rubrics=scoring_rubrics,
+            )
+            ordered_node_ids = list(avg_scores)
+            ground_truth_by_node = (
+                copy.deepcopy(pc_label_by_node)
+                if scope == "pc"
+                else copy.deepcopy(gt_by_node)
+            )
+            reward = (
+                progress_reward(
+                    [ground_truth_by_node[node_id] for node_id in ordered_node_ids],
+                    [avg_scores[node_id] for node_id in ordered_node_ids],
+                )
+                if scope == "pc"
+                else gap_corr(
+                    [float(avg_scores[node_id]) for node_id in ordered_node_ids],
+                    [float(ground_truth_by_node[node_id]) for node_id in ordered_node_ids],
+                )
+            )
+            generated_ids = {rubric.rubric_id for rubric in generated_sample.generated}
+            sample_payload = {
+                "scope": scope,
+                "sample_index": generated_sample.sample_index,
+                "rubric_list_id": generated_sample.rubric_list_id,
+                "generated": [asdict(rubric) for rubric in generated_sample.generated],
+                "messages": copy.deepcopy(generated_sample.messages),
+                "format_errors": copy.deepcopy(generated_sample.format_errors or []),
+                "terminal_error": generated_sample.terminal_error,
+                "generated_titles": [rubric.title for rubric in generated_sample.generated],
+                "scoring_rubrics": [asdict(rubric) for rubric in scoring_rubrics],
+                **_rubric_metrics_payload(metrics, generated_ids),
+                "avg_scores": avg_scores,
+                "judge_errors": evaluation["judge_errors"],
+                "judge_response": judge_response_for_sample,
+                "gt_by_rubric": {
+                    rubric.rubric_id: {
+                        "child_scores": metrics["score_by_rubric"].get(rubric.rubric_id, {}),
+                        "ground_truth_by_node": copy.deepcopy(ground_truth_by_node),
+                    }
+                    for rubric in scoring_rubrics
+                },
+                "reward": float(reward),
+                "retrieved": [asdict(experience) for experience in retrieved_experiences],
+                "retrieve_messages": copy.deepcopy(retrieve_messages),
+                "selected": False,
+            }
+            rubric_samples.append(sample_payload)
+
+        bank_update = score_bank.update_after_round(
+            generated=group_generated_rubrics,
+            rewards=group_reward_by_rubric,
+        )
+        score_bank.set_state(
+            active_bank=copy.deepcopy(bank_update.active_after),
+            inactive_bank=copy.deepcopy(bank_update.inactive_after),
+        )
+        return {
+            "scope": scope,
+            "samples": rubric_samples,
+            "judge_response": aggregate_judge_response,
+            "model_response": model_response,
+        }
+
     async def _run_lane_c(
         self,
         *,
@@ -1189,7 +1651,7 @@ class TrajectorySearchParallelRunner:
         all_shared_step_cards = list(group.mid_cp.parent_step_cards)
 
         segments: list[dict[str, Any]] = []
-        spr = max(1, int(cfg.k))
+        spr = cfg.k
         for start in range(0, len(all_shared_step_cards), spr):
             end = min(start + spr, len(all_shared_step_cards))
             segments.append(
@@ -1210,7 +1672,7 @@ class TrajectorySearchParallelRunner:
                 system_prompt=self.system_prompt,
                 user_prompt=self.user_prompt,
                 previous_state=self._summary_persistent_state,
-                evicted_step_cards=evicted.get("step_cards", []),
+                evicted_step_cards=evicted["step_cards"],
                 workspace_meta=copy.deepcopy(EMPTY_WORKSPACE_META),
                 model_name=self.judge_model_name,
                 temperature=cfg.judge_temperature,
@@ -1249,321 +1711,113 @@ class TrajectorySearchParallelRunner:
             "previous_persistent_state": previous_state,
             "latest_agent_trajectory": latest_shared_segment,
         }
-        existing_rubrics = []
-        extra_prompt_sections: list[str] = []
-        score_context = self.rubric_bank.build_generation_context()
-        existing_rubrics = score_context.existing_rubrics
-        extra_prompt_sections.extend(score_context.extra_prompt_sections)
-        retrieved_experiences = []
-        retrieve_messages: list[dict[str, Any]] = []
-        if self.experience_bank.experiences:
-            experience_context = await self.experience_bank.build_generation_context(
-                question=question,
-                previous_state=previous_state,
-                latest_shared_segment=latest_shared_segment,
-                continuations=continuations,
-                model_name=self.rubric_model_name,
-                temperature=cfg.rubric_temperature,
-                top_p=cfg.rubric_top_p,
-                max_tokens=cfg.rubric_max_tokens,
-                model_kwargs=self.rubric_model_kwargs,
-            )
-            extra_prompt_sections.extend(experience_context.extra_prompt_sections)
-            retrieved_experiences = copy.deepcopy(experience_context.retrieved)
-            retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
-
-        group.rubric_prompt = _build_rubric_prompt(
-            system_prompt=self.system_prompt,
-            user_prompt=self.user_prompt,
-            previous_state=previous_state,
-            latest_shared_segment=latest_shared_segment,
-            continuations=continuations,
-        )
-        try:
-            generated_samples = await asyncio.gather(
-                *[
-                    _generate_round_rubrics(
-                        question=question,
-                        previous_state=previous_state,
-                        latest_shared_segment=latest_shared_segment,
-                        continuations=continuations,
-                        model_name=self.rubric_model_name,
-                        temperature=cfg.rubric_temperature,
-                        top_p=cfg.rubric_top_p,
-                        max_tokens=cfg.rubric_max_tokens,
-                        round_index=group.group_index + 1,
-                        sample_index=sample_index,
-                        model_kwargs=self.rubric_model_kwargs,
-                        extra_prompt_sections=extra_prompt_sections,
-                    )
-                    for sample_index in range(max(1, cfg.n))
-                ]
-            )
-            group.rubric_model_response = {
-                "num_samples": len(generated_samples),
-                "generated_rubrics": [
-                    asdict(rubric)
-                    for sample in generated_samples
-                    for rubric in sample.generated
-                ],
-                "format_errors": [
-                    error
-                    for sample in generated_samples
-                    for error in (sample.format_errors or [])
-                ],
-                "terminal_errors": [
-                    sample.terminal_error
-                    for sample in generated_samples
-                    if sample.terminal_error
-                ],
+        pc_parent_trajectory = self._build_continuation_view_lane_b(group.parent_branch)
+        pc_shared_context = {
+            "previous_persistent_state": previous_state,
+            "latest_agent_trajectory": pc_parent_trajectory,
+        }
+        scope_config = {
+            "siblings": {
+                "shared_context": shared_context,
+                "latest_shared_segment": latest_shared_segment,
+                "generation_prompt": SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
+                "rubric_list_prefix": "rubric",
+                "judge_prompt": SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+                "include_variance_reward": True,
+                "prompt_attr": "rubric_prompt",
+                "samples_attr": "rubric_samples",
+                "judge_attr": "judge_response",
+                "model_response_attr": "rubric_model_response",
+            },
+            "pc": {
+                "shared_context": pc_shared_context,
+                "latest_shared_segment": pc_parent_trajectory,
+                "generation_prompt": PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
+                "rubric_list_prefix": "pc-rubric",
+                "judge_prompt": PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+                "include_variance_reward": False,
+                "prompt_attr": "pc_rubric_prompt",
+                "samples_attr": "pc_rubric_samples",
+                "judge_attr": "pc_judge_response",
+                "model_response_attr": "pc_rubric_model_response",
+            },
+        }
+        scope_specs = [
+            {
+                "scope": scope,
+                "score_bank": self.score_banks[scope],
+                "experience_bank": self.experience_banks[scope],
+                **scope_config[scope],
             }
-            logger.info(
-                "[%s] lane_c g=%d rubric_done dt=%.1fs rubrics=%d term_err=%s",
-                self.task_id, group.group_index, time.perf_counter() - t_c,
-                len(group.rubric_model_response.get("generated_rubrics", [])),
-                group.rubric_model_response.get("terminal_errors"),
+            for scope in self.rubric_scopes
+        ]
+        for spec in scope_specs:
+            setattr(
+                group,
+                spec["prompt_attr"],
+                _build_rubric_prompt(
+                    system_prompt=self.system_prompt,
+                    user_prompt=self.user_prompt,
+                    previous_state=previous_state,
+                    latest_shared_segment=spec["latest_shared_segment"],
+                    continuations=continuations,
+                    generation_prompt=spec["generation_prompt"],
+                ),
+            )
+        try:
+            scope_results = await asyncio.gather(
+                *[
+                    self._run_lane_c_scope(
+                        group=group,
+                        scope=spec["scope"],
+                        question=question,
+                        shared_context=spec["shared_context"],
+                        previous_state=previous_state,
+                        latest_shared_segment=spec["latest_shared_segment"],
+                        continuations=continuations,
+                        score_bank=spec["score_bank"],
+                        experience_bank=spec["experience_bank"],
+                        generation_prompt=spec["generation_prompt"],
+                        rubric_list_prefix=spec["rubric_list_prefix"],
+                        judge_prompt=spec["judge_prompt"],
+                        include_variance_reward=spec["include_variance_reward"],
+                    )
+                    for spec in scope_specs
+                ]
             )
         except Exception as exc:
             group.rubric_model_response = {"error": f"{type(exc).__name__}: {exc}"}
-            logger.warning(
-                "[%s] lane_c g=%d rubric_FAILED %s",
-                self.task_id, group.group_index, exc,
-            )
+            group.pc_rubric_model_response = {"error": f"{type(exc).__name__}: {exc}"}
+            logger.warning("[%s] lane_c g=%d rubric_FAILED %s", self.task_id, group.group_index, exc)
             group.lane_c_done_at = time.perf_counter()
             return
 
-        t_judge = time.perf_counter()
-        aggregate_judge_response: dict[str, dict[str, Any]] = {}
-        active_ids = {rubric.rubric_id for rubric in existing_rubrics}
-        group_reward_by_rubric: dict[str, float] = {}
-        bank_active_before = copy.deepcopy(self.rubric_bank.active_bank)
-        bank_inactive_before = copy.deepcopy(self.rubric_bank.inactive_bank)
-        sample_generated_rubrics: list[list[Any]] = []
-        for generated_sample in generated_samples:
-            seen_rubric_ids: set[str] = set()
-            generated_rubrics = []
-            for rubric in generated_sample.generated:
-                if rubric.rubric_id in active_ids or rubric.rubric_id in seen_rubric_ids:
-                    continue
-                seen_rubric_ids.add(rubric.rubric_id)
-                generated_rubrics.append(rubric)
-            sample_generated_rubrics.append(generated_rubrics)
-        group_generated_rubrics = [
-            rubric
-            for generated_rubrics in sample_generated_rubrics
-            for rubric in generated_rubrics
-        ]
-        active_score_task = asyncio.create_task(
-            _score_round(
-                question=question,
-                shared_context=shared_context,
-                continuations=continuations,
-                rubrics=existing_rubrics,
-                model_name=self.judge_model_name,
-                temperature=cfg.judge_temperature,
-                top_p=cfg.judge_top_p,
-                max_tokens=cfg.judge_max_tokens,
-                model_kwargs=self.judge_model_kwargs,
-            )
-        )
-        generated_score_tasks: list[tuple[int, asyncio.Task]] = [
-            (
-                sample_index,
-                asyncio.create_task(
-                    _score_round(
-                        question=question,
-                        shared_context=shared_context,
-                        continuations=continuations,
-                        rubrics=generated_rubrics,
-                        model_name=self.judge_model_name,
-                        temperature=cfg.judge_temperature,
-                        top_p=cfg.judge_top_p,
-                        max_tokens=cfg.judge_max_tokens,
-                        model_kwargs=self.judge_model_kwargs,
-                    )
-                ),
-            )
-            for sample_index, generated_rubrics in enumerate(sample_generated_rubrics)
-            if generated_rubrics
-        ]
-        await asyncio.gather(
-            active_score_task,
-            *[task for _, task in generated_score_tasks],
-        )
-        active_scores, active_errors = active_score_task.result()
-        generated_score_results: dict[int, tuple[list[list[dict[str, Any]]], list[dict[str, Any]]]] = {
-            sample_index: ([[] for _ in continuations], [])
-            for sample_index in range(len(generated_samples))
-        }
-        for sample_index, task in generated_score_tasks:
-            generated_score_results[sample_index] = task.result()
-        group.rubric_samples = []
-        for sample_index, generated_sample in enumerate(generated_samples):
-            generated_rubrics = sample_generated_rubrics[sample_index]
-            generated_scores, generated_errors = generated_score_results[sample_index]
-            scored_continuations = [
-                copy.deepcopy(active_records) + generated_records
-                for active_records, generated_records in zip(active_scores, generated_scores)
-            ]
-            scoring_rubrics = existing_rubrics + generated_rubrics
-            judge_errors_payload = copy.deepcopy(active_errors + generated_errors)
-            child_score_lookup_by_node = {branch.node_id: {} for branch in group.branches}
-            judge_response_for_sample: dict[str, dict[str, Any]] = {}
-            for branch, score_records in zip(group.branches, scored_continuations):
-                for record in score_records:
-                    rubric_id = record["rubric_id"]
-                    child_score_lookup_by_node[branch.node_id][rubric_id] = float(record["score_normalized"])
-                    entry = {
-                        "rubric_id": rubric_id,
-                        "branch_index": branch.branch_index,
-                        "node_id": branch.node_id,
-                        "score_raw": record.get("score_raw"),
-                        "score_normalized": record.get("score_normalized"),
-                        "weighted_score": record.get("weighted_score"),
-                        "judge_response": record.get("judge_response"),
-                        "judge_message": record.get("judge_message"),
-                    }
-                    judge_response_for_sample.setdefault(rubric_id, {})[branch.node_id] = entry
-                    aggregate_judge_response.setdefault(rubric_id, {})[branch.node_id] = entry
-            for error in judge_errors_payload:
-                rubric_id = error.get("rubric_id")
-                node_id = error.get("node_id")
-                if rubric_id and node_id:
-                    judge_response_for_sample.setdefault(rubric_id, {}).setdefault(node_id, {})["error"] = error.get("error")
-                    aggregate_judge_response.setdefault(rubric_id, {}).setdefault(node_id, {})["error"] = error.get("error")
-
-            child_score_by_rubric: dict[str, dict[str, float]] = {}
-            variance_by_rubric: dict[str, float] = {}
-            redundency_by_rubric: dict[str, float] = {}
-            judge_error_by_rubric: dict[str, float] = {}
-            reward_by_rubric: dict[str, float] = {}
-            previous_score_vectors: list[list[float]] = []
-            for error in judge_errors_payload:
-                rubric_id = error.get("rubric_id")
-                if rubric_id:
-                    judge_error_by_rubric[rubric_id] = judge_error_by_rubric.get(rubric_id, 0.0) + JUDGE_ERROR_REWARD
-            for rubric in scoring_rubrics:
-                vector = [
-                    child_score_lookup_by_node[branch.node_id].get(rubric.rubric_id, 0.0)
-                    for branch in group.branches
-                ]
-                child_score_by_rubric[rubric.rubric_id] = {
-                    branch.node_id: child_score_lookup_by_node[branch.node_id].get(rubric.rubric_id, 0.0)
-                    for branch in group.branches
-                }
-                variance_by_rubric[rubric.rubric_id] = 0.0 if len(vector) <= 1 else float(pvariance(vector))
-                redundancy_reward = _redundancy_reward(vector, previous_score_vectors)
-                redundency_by_rubric[rubric.rubric_id] = redundancy_reward
-                reward_by_rubric[rubric.rubric_id] = (
-                    variance_by_rubric[rubric.rubric_id]
-                    + redundancy_reward
-                    + judge_error_by_rubric.get(rubric.rubric_id, 0.0)
-                )
-                group_reward_by_rubric[rubric.rubric_id] = reward_by_rubric[rubric.rubric_id]
-                previous_score_vectors.append(vector)
-
-            bank_scoring_rubrics = scoring_rubrics
-            child_rewards: dict[str, float] = {}
-            for branch in group.branches:
-                score_lookup = child_score_lookup_by_node[branch.node_id]
-                child_rewards[branch.node_id] = (
-                    sum(score_lookup.get(rubric.rubric_id, 0.0) * rubric.weight for rubric in bank_scoring_rubrics)
-                    / len(bank_scoring_rubrics)
-                    if bank_scoring_rubrics
-                    else 0.0
-                )
-            generated_ids = {rubric.rubric_id for rubric in generated_sample.generated}
-            sample_payload = {
-                "sample_index": generated_sample.sample_index,
-                "rubric_list_id": generated_sample.rubric_list_id,
-                "generated": [asdict(rubric) for rubric in generated_sample.generated],
-                "messages": copy.deepcopy(generated_sample.messages),
-                "format_errors": copy.deepcopy(generated_sample.format_errors or []),
-                "terminal_error": generated_sample.terminal_error,
-                "generated_titles": [rubric.title for rubric in generated_sample.generated],
-                "scoring_rubrics": [asdict(rubric) for rubric in scoring_rubrics],
-                "child_score_by_rubric": {
-                    rubric_id: scores
-                    for rubric_id, scores in child_score_by_rubric.items()
-                    if rubric_id in generated_ids or rubric_id in active_ids
-                },
-                "parent_score_by_rubric": {},
-                "child_rewards": child_rewards,
-                "parent_reward": None,
-                "variance_by_rubric": {
-                    rubric_id: value
-                    for rubric_id, value in variance_by_rubric.items()
-                    if rubric_id in generated_ids or rubric_id in active_ids
-                },
-                "redundency_by_rubric": {
-                    rubric_id: value
-                    for rubric_id, value in redundency_by_rubric.items()
-                    if rubric_id in generated_ids or rubric_id in active_ids
-                },
-                "judge_error_by_rubric": {
-                    rubric_id: judge_error_by_rubric.get(rubric_id, 0.0)
-                    for rubric_id in (generated_ids | active_ids)
-                },
-                "reward_by_rubric": {
-                    rubric_id: value
-                    for rubric_id, value in reward_by_rubric.items()
-                    if rubric_id in generated_ids or rubric_id in active_ids
-                },
-                "judge_errors": judge_errors_payload,
-                "judge_response": judge_response_for_sample,
-                "gt_by_rubric": {
-                    rubric.rubric_id: {
-                        "parent_score": None,
-                        "child_scores": child_score_by_rubric.get(rubric.rubric_id, {}),
-                        "ground_truth_by_node": {
-                            branch.node_id: float(branch.gt_score or 0.0)
-                            for branch in group.branches
-                        },
-                    }
-                    for rubric in scoring_rubrics
-                },
-                "retrieved": [asdict(experience) for experience in retrieved_experiences],
-                "retrieve_messages": copy.deepcopy(retrieve_messages),
-                "selected": False,
-            }
-            group.rubric_samples.append(sample_payload)
-        combined_bank_rewards = {
-            rubric.rubric_id: float(rubric.reward or 0.0)
-            for rubric in (bank_active_before + bank_inactive_before)
-        }
-        combined_bank_rewards.update(group_reward_by_rubric)
-        bank_update = self.rubric_bank.update_after_round(
-            generated=group_generated_rubrics,
-            rewards=combined_bank_rewards,
-        )
-        self.rubric_bank.set_state(
-            active_bank=copy.deepcopy(bank_update.active_after),
-            inactive_bank=copy.deepcopy(bank_update.inactive_after),
-        )
-        group.judge_response = aggregate_judge_response
+        results_by_scope = {result["scope"]: result for result in scope_results}
+        for spec in scope_specs:
+            result = results_by_scope[spec["scope"]]
+            setattr(group, spec["samples_attr"], result["samples"])
+            setattr(group, spec["judge_attr"], result["judge_response"])
+            setattr(group, spec["model_response_attr"], result["model_response"])
         group.lane_c_done_at = time.perf_counter()
         n_err = sum(
             1
-            for branch_map in aggregate_judge_response.values()
+            for response in (group.judge_response, group.pc_judge_response)
+            for branch_map in response.values()
             for record in branch_map.values()
             if isinstance(record, dict) and record.get("error")
         )
         logger.info(
-            "[%s] lane_c g=%d judge_done dt=%.1fs calls=%d err=%d (rubrics=%d branches=%d)",
-            self.task_id, group.group_index, time.perf_counter() - t_judge,
-            sum(len(branch_map) for branch_map in aggregate_judge_response.values()),
+            "[%s] lane_c g=%d judge_done dt=%.1fs err=%d siblings_rubrics=%d pc_rubrics=%d branches=%d",
+            self.task_id, group.group_index, time.perf_counter() - t_c,
             n_err,
-            len(aggregate_judge_response),
+            len(group.judge_response),
+            len(group.pc_judge_response),
             len(continuations),
         )
 
     async def _run_lane_c_in_order(self, group: ForkGroup) -> None:
         """Run Lane C as soon as this group is terminal, preserving rubric-bank order."""
         condition = self._lane_c_condition
-        if condition is None:
-            await self._run_lane_c(group=group)
-            return
-
         async with condition:
             await condition.wait_for(
                 lambda: self._next_lane_c_group_index == group.group_index
@@ -1601,16 +1855,31 @@ class TrajectorySearchParallelRunner:
             self.task_id, mid_cp.idx, cfg.m, mid_cp.image_tag, first_budget, total_budget,
         )
         branch_tasks: list[asyncio.Task] = []
-        for bi in range(cfg.m):
+        for bi in range(cfg.m + 1):
             ctx = contextvars.copy_context()
+            is_parent_baseline = bi == cfg.m
+            initial_temperature = (
+                cfg.judge_temperature if is_parent_baseline else cfg.lane_b_temperature
+            )
+            initial_top_p = cfg.judge_top_p if is_parent_baseline else cfg.lane_b_top_p
 
-            def _wrapped(mc=mid_cp, b=bi, c=ctx):
+            def _wrapped(
+                mc=mid_cp,
+                b=bi,
+                c=ctx,
+                parent=is_parent_baseline,
+                temperature=initial_temperature,
+                top_p=initial_top_p,
+            ):
                 return c.run(
                     self._run_lane_b_branch,
                     mid_cp=mc,
                     branch_index=b,
                     budget_steps=first_budget,
                     total_step_limit=cfg.step_limit,
+                    is_parent_baseline=parent,
+                    initial_temperature=temperature,
+                    initial_top_p=top_p,
                 )
 
             future = loop.run_in_executor(lane_b_pool, _wrapped)
@@ -1644,22 +1913,29 @@ class TrajectorySearchParallelRunner:
                 err_branch = LaneBBranch(
                     group_index=mid_cp.idx,
                     branch_index=bi,
-                    node_id=f"lane-b-g{mid_cp.idx:03d}-b{bi:02d}-err",
+                    node_id=(
+                        f"lane-b-g{mid_cp.idx:03d}-parent-err"
+                        if bi == cfg.m else f"lane-b-g{mid_cp.idx:03d}-b{bi:02d}-err"
+                    ),
                     parent_image_tag=mid_cp.image_tag,
                     policy_model_name=self.policy_model_name,
                     parent_asst_step=mid_cp.asst_step,
                     error=f"executor: {type(item).__name__}: {item}",
                     status="error",
+                    is_parent_baseline=bi == cfg.m,
                 )
                 err_branch.gt_score = 0.0
                 err_branch.gt_payload = {"reward": 0.0, "note": "branch_error"}
                 branch = err_branch
             else:
                 branch = item
-            branches_by_index[bi] = branch
-            group.branches = [
-                branches_by_index[index] for index in sorted(branches_by_index)
-            ]
+            if branch.is_parent_baseline:
+                group.parent_branch = branch
+            else:
+                branches_by_index[bi] = branch
+                group.branches = [
+                    branches_by_index[index] for index in sorted(branches_by_index)
+                ]
             self._dump_group_scaffold(group)
             self._dump_branch(group, branch)
             if branch.error is None:
@@ -1687,10 +1963,16 @@ class TrajectorySearchParallelRunner:
         logger.info(
             "[%s] fork_group g=%d done dt=%.1fs gt_scores=%s lane_c_dt=%.1fs",
             self.task_id, mid_cp.idx, time.perf_counter() - t_group,
-            [
-                round(b.gt_score, 3) if b.gt_score is not None else None
-                for b in branches
-            ],
+            {
+                "children": [
+                    round(b.gt_score, 3) if b.gt_score is not None else None
+                    for b in branches
+                ],
+                "parent": (
+                    round(group.parent_branch.gt_score, 3)
+                    if group.parent_branch.gt_score is not None else None
+                ),
+            },
             (group.lane_c_done_at - group.lane_c_started_at)
             if group.lane_c_started_at else 0.0,
         )
@@ -1704,9 +1986,8 @@ class TrajectorySearchParallelRunner:
         lane_a.started_at = time.perf_counter()
         session = self._make_initial_session()
         msgs = session.agent.messages
-        if msgs:
-            self.system_prompt = msgs[0].get("content", "") if len(msgs) >= 1 else ""
-            self.user_prompt = msgs[1].get("content", "") if len(msgs) >= 2 else ""
+        self.system_prompt = msgs[0]["content"]
+        self.user_prompt = msgs[1]["content"]
         return session
 
     def _run_lane_a_chunk(
@@ -1872,8 +2153,8 @@ class TrajectorySearchParallelRunner:
 
                 # Append to Lane A record.
                 lane_a.messages.extend(new_msgs)
-                tp = lane_a.total_tokens.get("prompt", 0)
-                tc = lane_a.total_tokens.get("completion", 0)
+                tp = lane_a.total_tokens["prompt"]
+                tc = lane_a.total_tokens["completion"]
                 lane_a.total_tokens = {
                     "prompt": tp + sum(t.prompt_tokens for t in new_turns),
                     "completion": tc + sum(t.completion_tokens for t in new_turns),
@@ -1884,8 +2165,8 @@ class TrajectorySearchParallelRunner:
                 all_turns_count = int(chunk["turn_count"])
                 all_events_count = int(chunk["event_count"])
                 cumulative_steps += len(new_step_cards)
-                lane_a.status = result.get("status", "")
-                terminated = result.get("exit_status") == "Submitted"
+                lane_a.status = result["status"]
+                terminated = result["exit_status"] == "Submitted"
                 logger.info(
                     "[%s] lane_a chunk=%d dt=%.1fs new_steps=%d cumulative=%d status=%s submitted=%s",
                     self.task_id,
@@ -2087,7 +2368,11 @@ class TrajectorySearchParallelRunner:
             thread_name_prefix=f"lane-a-{self.task_id[:12]}",
         )
         lane_b_pool = ThreadPoolExecutor(
-            max_workers=cfg.lane_b_pool_size or (cfg.m * cfg.max_rounds),
+            max_workers=(
+                cfg.lane_b_pool_size
+                if cfg.lane_b_pool_size is not None
+                else cfg.m * cfg.max_rounds
+            ),
             thread_name_prefix=f"lane-b-{self.task_id[:12]}",
         )
         gt_pool = ThreadPoolExecutor(
@@ -2110,11 +2395,10 @@ class TrajectorySearchParallelRunner:
             except Exception as exc:
                 logger.warning("[%s] fork-group raised: %s", self.task_id, exc)
                 condition = self._lane_c_condition
-                if condition is not None:
-                    async with condition:
-                        if self._next_lane_c_group_index == group_index:
-                            self._next_lane_c_group_index += 1
-                            condition.notify_all()
+                async with condition:
+                    if self._next_lane_c_group_index == group_index:
+                        self._next_lane_c_group_index += 1
+                        condition.notify_all()
                 return None
             self._dump_group(grp)
             await self._run_lane_c_in_order(grp)
@@ -2179,39 +2463,82 @@ class TrajectorySearchParallelRunner:
                     time.perf_counter() - t_drain,
                     len(instance_record.groups),
                 )
-            rubric_payloads = [
+            experience_update_attrs = {
+                "siblings": {
+                    "samples_attr": "rubric_samples",
+                    "update_attr": "experience_bank_update",
+                    "message_attr": "experience_bank_message",
+                },
+                "pc": {
+                    "samples_attr": "pc_rubric_samples",
+                    "update_attr": "pc_experience_bank_update",
+                    "message_attr": "pc_experience_bank_message",
+                },
+            }
+            experience_update_specs = [
                 {
-                    **copy.deepcopy(sample),
-                    "group_index": group.group_index,
-                    "messages": copy.deepcopy(sample.get("messages", [])),
+                    "scope": scope,
+                    "bank": self.experience_banks[scope],
+                    **experience_update_attrs[scope],
                 }
-                for group in instance_record.groups
-                for sample in group.rubric_samples
+                for scope in self.rubric_scopes
             ]
-            experience_update_payload = await self.experience_bank.update_after_instance(
-                run_dir=self.run_dir,
-                instance=self.instance,
-                rubric_payloads=rubric_payloads,
-                model_name=self.rubric_model_name,
-                temperature=cfg.rubric_temperature,
-                top_p=cfg.rubric_top_p,
-                max_tokens=cfg.rubric_max_tokens,
-                model_kwargs=self.rubric_model_kwargs,
+            experience_update_payloads = await asyncio.gather(
+                *[
+                    spec["bank"].update_after_instance(
+                        instance=self.instance,
+                        rubric_payloads=[
+                            {
+                                **copy.deepcopy(sample),
+                                "group_index": group.group_index,
+                                "messages": copy.deepcopy(sample["messages"]),
+                            }
+                            for group in instance_record.groups
+                            for sample in getattr(group, spec["samples_attr"])
+                        ],
+                        model_name=self.rubric_model_name,
+                        temperature=cfg.rubric_temperature,
+                        top_p=cfg.rubric_top_p,
+                        max_tokens=cfg.rubric_max_tokens,
+                        model_kwargs=self.rubric_model_kwargs,
+                    )
+                    for spec in experience_update_specs
+                ]
             )
+            experience_updates_by_scope = {
+                spec["scope"]: payload
+                for spec, payload in zip(experience_update_specs, experience_update_payloads)
+            }
+            for scope, payload in experience_updates_by_scope.items():
+                _atomic_write_json(
+                    self.run_dir / f"{scope}_rubric_bank.json",
+                    {
+                        "before": copy.deepcopy(payload["before"]),
+                        "after": copy.deepcopy(payload["after"]),
+                    },
+                )
             experience_updates_by_group = {
-                int(update["group_index"]): update
-                for update in experience_update_payload.get("groups", [])
+                scope: {
+                    int(update["group_index"]): update
+                    for update in payload["groups"]
+                }
+                for scope, payload in experience_updates_by_scope.items()
             }
             for group in instance_record.groups:
-                update = experience_updates_by_group.get(group.group_index)
-                if update is None:
-                    continue
-                group.experience_bank_update = {
-                    "before": copy.deepcopy(update["before"]),
-                    "actions": copy.deepcopy(update["actions"]),
-                    "after": copy.deepcopy(update["after"]),
-                }
-                group.experience_bank_message = copy.deepcopy(update["messages"])
+                for spec in experience_update_specs:
+                    update = experience_updates_by_group[spec["scope"]].get(group.group_index)
+                    if update is None:
+                        continue
+                    setattr(
+                        group,
+                        spec["update_attr"],
+                        {
+                            "before": copy.deepcopy(update["before"]),
+                            "actions": copy.deepcopy(update["actions"]),
+                            "after": copy.deepcopy(update["after"]),
+                        },
+                    )
+                    setattr(group, spec["message_attr"], copy.deepcopy(update["messages"]))
             instance_record.completed = (
                 instance_record.lane_a.error is None
                 and all(
@@ -2253,28 +2580,30 @@ class TrajectorySearchParallelRunner:
         gdir = self._group_dir(group)
         gdir.mkdir(parents=True, exist_ok=True)
         parent_payload = group.mid_cp.parent_messages_payload
-        if not parent_payload:
-            parent_messages = list(
-                (group.mid_cp.snapshot.get("agent", {}).get("state", {}) or {})
-                .get("messages", [])
-            )
-            parent_payload = _build_parent_messages_payload(
-                parent_messages,
-                model_name=self.policy_model_name,
-            )
         _atomic_write_json(
             gdir / "shared_parent_message.json",
             parent_payload,
         )
         _atomic_write_json(gdir / "summary.json", group.summary)
+        sibling_rubrics_dir = gdir / "sibling_rubrics"
+        pc_rubrics_dir = gdir / "pc_rubrics"
+        sibling_rubrics_dir.mkdir(parents=True, exist_ok=True)
+        pc_rubrics_dir.mkdir(parents=True, exist_ok=True)
         if group.experience_bank_update:
-            _atomic_write_json(gdir / "rubric_bank.json", group.experience_bank_update)
-            _atomic_write_json(gdir / "rubric_bank_message.json", group.experience_bank_message)
+            _atomic_write_json(sibling_rubrics_dir / "rubric_bank.json", group.experience_bank_update)
+            _atomic_write_json(sibling_rubrics_dir / "rubric_bank_message.json", group.experience_bank_message)
+        if group.pc_experience_bank_update:
+            _atomic_write_json(pc_rubrics_dir / "rubric_bank.json", group.pc_experience_bank_update)
+            _atomic_write_json(pc_rubrics_dir / "rubric_bank_message.json", group.pc_experience_bank_message)
         return gdir
 
     def _dump_branch(self, group: ForkGroup, branch: LaneBBranch) -> None:
         gdir = self._group_dir(group)
-        bdir = gdir / "branches" / f"branch_{branch.branch_index:02d}"
+        bdir = (
+            gdir / "parent_branch"
+            if branch.is_parent_baseline
+            else gdir / "branches" / f"branch_{branch.branch_index:02d}"
+        )
         bdir.mkdir(parents=True, exist_ok=True)
         branch_step_cards = _build_step_cards(branch.events, branch.parent_asst_step)
         stamped, _ = _stamp_steps(branch.messages, start_step=0)
@@ -2322,7 +2651,8 @@ class TrajectorySearchParallelRunner:
                     else ""
                 ),
                 "exit_status": "Submitted" if branch.terminated_early else "",
-                "policy_source": "student",
+                "policy_source": "parent_baseline" if branch.is_parent_baseline else "student",
+                "is_parent_baseline": branch.is_parent_baseline,
                 "policy_model_name": self.policy_model_name,
                 "branch_index": branch.branch_index,
                 "group_index": group.group_index,
@@ -2343,10 +2673,16 @@ class TrajectorySearchParallelRunner:
     def _dump_group(self, group: ForkGroup) -> None:
         """Persist one fork-group under run_dir/groups/group_NNN/."""
         gdir = self._dump_group_scaffold(group)
-        rubrics_dir = gdir / "rubrics"
+        self._dump_rubric_samples(gdir / "sibling_rubrics", group.rubric_samples)
+        self._dump_rubric_samples(gdir / "pc_rubrics", group.pc_rubric_samples)
+        self._dump_branch(group, group.parent_branch)
+        for branch in group.branches:
+            self._dump_branch(group, branch)
+
+    def _dump_rubric_samples(self, rubrics_dir: Path, samples: list[dict[str, Any]]) -> None:
         rubrics_dir.mkdir(parents=True, exist_ok=True)
-        for sample in group.rubric_samples:
-            rubric_dir = rubrics_dir / str(sample.get("rubric_list_id", f"sample-{sample.get('sample_index', 0):02d}"))
+        for sample in samples:
+            rubric_dir = rubrics_dir / str(sample["rubric_list_id"])
             rubric_dir.mkdir(parents=True, exist_ok=True)
             rubric_payload = {
                 k: copy.deepcopy(v)
@@ -2354,20 +2690,18 @@ class TrajectorySearchParallelRunner:
                 if k not in {"messages", "judge_response", "retrieve_messages"}
             }
             _atomic_write_json(rubric_dir / "rubric.json", rubric_payload)
-            _atomic_write_json(rubric_dir / "rubric_message.json", sample.get("messages", []))
-            _atomic_write_json(rubric_dir / "rubric_retrieve_message.json", sample.get("retrieve_messages", []))
+            _atomic_write_json(rubric_dir / "rubric_message.json", sample["messages"])
+            _atomic_write_json(rubric_dir / "rubric_retrieve_message.json", sample["retrieve_messages"])
             _atomic_write_json(
                 rubric_dir / "judge.json",
                 {
-                    "rubric_list_id": sample.get("rubric_list_id"),
-                    "judge_response": sample.get("judge_response", {}),
-                    "judge_errors": sample.get("judge_errors", []),
-                    "child_score_by_rubric": sample.get("child_score_by_rubric", {}),
-                    "judge_error_by_rubric": sample.get("judge_error_by_rubric", {}),
+                    "rubric_list_id": sample["rubric_list_id"],
+                    "judge_response": sample["judge_response"],
+                    "judge_errors": sample["judge_errors"],
+                    "score_by_rubric": sample["score_by_rubric"],
+                    "judge_error_by_rubric": sample["judge_error_by_rubric"],
                 },
             )
-        for branch in group.branches:
-            self._dump_branch(group, branch)
 
     def _dump_instance_record(self, instance_record: InstanceRecord) -> None:
         path = self.run_dir / "config.json"
@@ -2408,7 +2742,17 @@ class TrajectorySearchParallelRunner:
                             "emitted_at": g.mid_cp.emitted_at,
                         },
                         "num_branches": len(g.branches),
-                        "num_rubric_samples": len(g.rubric_samples),
+                        "num_sibling_rubric_samples": len(g.rubric_samples),
+                        "num_pc_rubric_samples": len(g.pc_rubric_samples),
+                        "parent_branch": {
+                            "branch_index": g.parent_branch.branch_index,
+                            "node_id": g.parent_branch.node_id,
+                            "status": g.parent_branch.status,
+                            "gt_score": g.parent_branch.gt_score,
+                            "n_step_cards": len(_build_step_cards(g.parent_branch.events, g.parent_branch.parent_asst_step)),
+                            "terminated_early": g.parent_branch.terminated_early,
+                            "error": g.parent_branch.error,
+                        },
                         "branches": [
                             {
                                 "branch_index": b.branch_index,

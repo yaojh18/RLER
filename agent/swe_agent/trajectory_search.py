@@ -386,23 +386,19 @@ async def _generate_round_rubrics(
     sample_index: int = 0,
     model_kwargs: dict[str, Any] | None = None,
     extra_prompt_sections: list[str] | None = None,
+    generation_prompt: str = SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
+    continue_prompt: str = RUBRIC_GENERATION_CONTINUE_PROMPT,
+    rubric_list_prefix: str = "rubric",
 ) -> RubricGenerationSample:
     latest_shared_segment_text = json.dumps(latest_shared_segment, indent=2, ensure_ascii=False) if latest_shared_segment else "None"
     prompt_parts = [
-        SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT.strip(),
-        "\n\n## Question:",
-        f"System Prompt:\n{question.get('system_prompt', '')}",
-        "",
-        f"User Prompt:\n{question.get('user_prompt', '')}",
-        "",
-        "## Previous Persistent State:",
-        json.dumps(previous_state, ensure_ascii=False, indent=2),
-        "",
-        "## Latest Agent Trajectory:",
-        latest_shared_segment_text,
-        "",
-        "## Agent Trajectory Continuations:"
+        generation_prompt.strip(),
+        f"\n\n## Question:\nSystem Prompt:\n{question.get('system_prompt', '')}",
+        f"\nUser Prompt:\n{question.get('user_prompt', '')}",
+        f"\n## Previous Persistent State:\n{json.dumps(previous_state, ensure_ascii=False, indent=2)}",
+        f"\n## Parent Trajectory:\n{latest_shared_segment_text}\n",
     ]
+    prompt_parts.append("## Agent Trajectory Continuations:")
     for index, continuation in enumerate(continuations, start=1):
         prompt_parts.extend(
             [
@@ -467,18 +463,18 @@ async def _generate_round_rubrics(
                 last_error = "Expected a rubric object with polarity, title, description, and a 1-5 scale."
         if parsed is None:
             format_errors.append({"turn_index": turn_index, "error": last_error})
-            conversation_messages.append({"role": "user", "content": last_error + f" {RUBRIC_GENERATION_CONTINUE_PROMPT}"})
+            conversation_messages.append({"role": "user", "content": last_error + f" {continue_prompt}"})
             turn_index += 1
             continue
         generated.append(parsed)
         if len(generated) >= MAX_RUBRICS:
             length_error = f"Reached max rubrics={MAX_RUBRICS}."
             break
-        conversation_messages.append({"role": "user", "content": RUBRIC_GENERATION_CONTINUE_PROMPT})
+        conversation_messages.append({"role": "user", "content": continue_prompt})
         turn_index += 1
     return RubricGenerationSample(
         sample_index=sample_index,
-        rubric_list_id=f"rubric-r{round_index:03d}-s{sample_index:02d}",
+        rubric_list_id=f"{rubric_list_prefix}-r{round_index:03d}-s{sample_index:02d}",
         generated=generated,
         messages=copy.deepcopy(conversation_messages),
         format_errors=format_errors,
@@ -497,6 +493,7 @@ async def _score_round(
     top_p: float,
     max_tokens: int,
     model_kwargs: dict[str, Any] | None = None,
+    judge_prompt: str = SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
 ) -> tuple[list[list[dict[str, Any]]], list[dict[str, str]]]:
     if not continuations or not rubrics:
         return [[] for _ in continuations], []
@@ -539,13 +536,15 @@ async def _score_round(
                     async_retry=True,
                 ):
                     with attempt:
-                        prompt = SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT.strip() + (
-                            f"\n\n## Question:\n{question_text}\n"
-                            f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
-                            f"## Previous Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
-                            f"## Continuation Trajectory:\n{response_text}\n"
-                            f"## Criterion:\n{criterion}"
-                        )
+                        prompt_parts = [
+                            judge_prompt.strip(),
+                            f"\n\n## Question:\n{question_text}\n",
+                            f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n",
+                            f"## Parent Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n",
+                            f"## Continuation Trajectory:\n{response_text}\n",
+                            f"## Criterion:\n{criterion}",
+                        ]
+                        prompt = "".join(prompt_parts)
                         assistant_message = await route_completion_message(
                             route_name="rubric_judge",
                             model_name=model_name,
@@ -598,103 +597,181 @@ async def _score_round(
     return per_view_scores, errors
 
 
-async def _score_parent_round(
+async def _generate_and_score_rubric_batch(
     *,
-    question: dict[str, str],
+    sample_count: int,
+    round_index: int,
+    generation_kwargs: dict[str, Any],
+    generation_prompt: str,
+    rubric_list_prefix: str,
+    question: dict[str, Any],
     shared_context: dict[str, Any],
-    rubrics: list[RubricRecord],
-    model_name: str,
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-    node_id: str,
-    model_kwargs: dict[str, Any] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    if not rubrics:
-        return [], []
-    calls = []
-    mapping: list[RubricRecord] = []
-    question_text = f"System Prompt:\n{question.get('system_prompt', '')}\n\nUser Prompt:\n{question.get('user_prompt', '')}"
-    for rubric in rubrics:
-        criterion = "\n".join(
-            [
-                f"Title: {rubric.title}",
-                f"Type: {rubric.direction}",
-                f"Description: {rubric.description}",
-                "Scale:",
-                *[f"{score}: {rubric.scale[str(score)]}" for score in range(1, 6)],
-                "Metadata:",
-                json.dumps(rubric.metadata, indent=2, ensure_ascii=False)
-            ]
-        )
-
-        async def _judge_single(
-            *,
-            criterion: str = criterion,
-        ) -> tuple[str, int, str | None, dict[str, Any]]:
-            async for attempt in retry(
-                logger=logger,
-                abort_exceptions=LitellmModel.abort_exceptions,
-                model_name=model_name,
-                async_retry=True,
-            ):
-                with attempt:
-                    prompt = SWE_TRAJECTORY_RUBRIC_JUDGE_PARENT_PROMPT.strip() + (
-                        f"\n\n## Question:\n{question_text}\n"
-                        f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n"
-                        f"## Agent Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n"
-                        f"## Criterion:\n{criterion}"
-                    )
-                    assistant_message = await route_completion_message(
-                        route_name="rubric_judge",
-                        model_name=model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                        response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
-                        model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
-                    )
-                    score_raw = _parse_judge_score(assistant_message.get("content_no_thinking"))
-                    if score_raw is None:
-                        return 1, "InvalidJudgeResponse", assistant_message
-                    return score_raw, None, assistant_message
-            raise RuntimeError("Parent judge retry loop exited without result")
-        calls.append(_judge_single())
-        mapping.append(rubric)
-    responses = await asyncio.gather(*calls)
-    score_records: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-    for rubric, response in zip(mapping, responses):
-        score_raw, error, judge_message = response
-        normalized = max(0.0, min(1.0, (score_raw - 1.0) / 4.0))
-        record = {
-            "rubric_id": rubric.rubric_id,
-            "rubric": {
-                "rubric_id": rubric.rubric_id,
-                "title": rubric.title,
-                "direction": rubric.direction,
-                "description": rubric.description,
-                "metadata": copy.deepcopy(rubric.metadata),
-                "scale": copy.deepcopy(rubric.scale),
-                "weight": rubric.weight,
-                "source_round": rubric.source_round,
-            },
-            "score_raw": score_raw,
-            "score_normalized": normalized,
-            "weighted_score": float(rubric.weight) * normalized,
-            "judge_message": judge_message,
-        }
-        score_records.append(record)
-        if error is not None:
-            errors.append(
-                {
-                    "node_id": node_id,
-                    "rubric_id": rubric.rubric_id,
-                    "error": error,
-                }
+    continuations: list[dict[str, Any]],
+    extra_prompt_sections: list[str],
+    judge_kwargs: dict[str, Any],
+    judge_prompt: str = SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+) -> dict[str, Any]:
+    generated_samples = await asyncio.gather(
+        *[
+            _generate_round_rubrics(
+                **generation_kwargs,
+                question=question,
+                previous_state=shared_context["previous_persistent_state"],
+                latest_shared_segment=shared_context["latest_agent_trajectory"],
+                continuations=continuations,
+                round_index=round_index,
+                extra_prompt_sections=extra_prompt_sections,
+                sample_index=sample_index,
+                generation_prompt=generation_prompt,
+                rubric_list_prefix=rubric_list_prefix,
             )
-    return score_records, errors
+            for sample_index in range(sample_count)
+        ],
+    )
+
+    sample_generated_rubrics: list[list[RubricRecord]] = []
+    for generated_sample in generated_samples:
+        seen_rubric_ids: set[str] = set()
+        generated_rubrics: list[RubricRecord] = []
+        for rubric in generated_sample.generated:
+            if rubric.rubric_id in seen_rubric_ids:
+                continue
+            seen_rubric_ids.add(rubric.rubric_id)
+            generated_rubrics.append(rubric)
+        sample_generated_rubrics.append(generated_rubrics)
+
+    generated_score_tasks: dict[int, asyncio.Task] = {
+        sample_index: asyncio.create_task(
+            _score_round(
+                question=question,
+                shared_context=shared_context,
+                continuations=continuations,
+                rubrics=generated_rubrics,
+                **judge_kwargs,
+                judge_prompt=judge_prompt,
+            )
+        )
+        for sample_index, generated_rubrics in enumerate(sample_generated_rubrics)
+        if generated_rubrics
+    }
+    await asyncio.gather(*generated_score_tasks.values())
+    generated_score_results = {
+        sample_index: ([[] for _ in continuations], [])
+        for sample_index in range(len(generated_samples))
+    }
+    for sample_index, task in generated_score_tasks.items():
+        generated_score_results[sample_index] = task.result()
+    return {
+        "generated_samples": list(generated_samples),
+        "sample_generated_rubrics": sample_generated_rubrics,
+        "generated_score_results": generated_score_results,
+    }
+
+
+def _rubric_sample_evaluation(
+    *,
+    score_batch: dict[str, Any],
+    sample_index: int,
+    node_ids: list[str],
+    scoring_rubrics: list[RubricRecord],
+    include_variance_reward: bool,
+) -> dict[str, Any]:
+    generated_scores, generated_errors = score_batch["generated_score_results"][sample_index]
+    scored_continuations = copy.deepcopy(generated_scores)
+    judge_errors = copy.deepcopy(generated_errors)
+    score_lookup_by_node = {node_id: {} for node_id in node_ids}
+    for node_id, score_records in zip(node_ids, scored_continuations):
+        for record in score_records:
+            score_lookup_by_node[node_id][record["rubric_id"]] = float(record["score_normalized"])
+    score_by_rubric: dict[str, dict[str, float]] = {}
+    variance_by_rubric: dict[str, float] = {}
+    redundency_by_rubric: dict[str, float] = {}
+    judge_error_by_rubric: dict[str, float] = {}
+    reward_by_rubric: dict[str, float] = {}
+    previous_score_vectors: list[list[float]] = []
+    for error in judge_errors:
+        rubric_id = error.get("rubric_id")
+        if rubric_id:
+            judge_error_by_rubric[rubric_id] = judge_error_by_rubric.get(rubric_id, 0.0) + JUDGE_ERROR_REWARD
+    for rubric in scoring_rubrics:
+        vector = [
+            score_lookup_by_node[node_id].get(rubric.rubric_id, 0.0)
+            for node_id in node_ids
+        ]
+        score_by_rubric[rubric.rubric_id] = {
+            node_id: score_lookup_by_node[node_id].get(rubric.rubric_id, 0.0)
+            for node_id in node_ids
+        }
+        variance_by_rubric[rubric.rubric_id] = 0.0 if len(vector) <= 1 else float(pvariance(vector))
+        redundancy_reward = _redundancy_reward(vector, previous_score_vectors)
+        redundency_by_rubric[rubric.rubric_id] = redundancy_reward
+        reward_by_rubric[rubric.rubric_id] = (
+            (variance_by_rubric[rubric.rubric_id] if include_variance_reward else 0.0)
+            + redundancy_reward
+            + judge_error_by_rubric.get(rubric.rubric_id, 0.0)
+        )
+        previous_score_vectors.append(vector)
+    metrics = {
+        "score_lookup_by_node": score_lookup_by_node,
+        "score_by_rubric": score_by_rubric,
+        "variance_by_rubric": variance_by_rubric,
+        "redundency_by_rubric": redundency_by_rubric,
+        "judge_error_by_rubric": judge_error_by_rubric,
+        "reward_by_rubric": reward_by_rubric,
+    }
+    return {
+        "scored_continuations": scored_continuations,
+        "judge_errors": judge_errors,
+        "score_lookup_by_node": score_lookup_by_node,
+        "metrics": metrics,
+    }
+
+
+def _rubric_metrics_payload(metrics: dict[str, Any], include_ids: set[str]) -> dict[str, Any]:
+    return {
+        "score_by_rubric": {
+            rubric_id: copy.deepcopy(scores)
+            for rubric_id, scores in metrics["score_by_rubric"].items()
+            if rubric_id in include_ids
+        },
+        "variance_by_rubric": {
+            rubric_id: value
+            for rubric_id, value in metrics["variance_by_rubric"].items()
+            if rubric_id in include_ids
+        },
+        "redundency_by_rubric": {
+            rubric_id: value
+            for rubric_id, value in metrics["redundency_by_rubric"].items()
+            if rubric_id in include_ids
+        },
+        "judge_error_by_rubric": {
+            rubric_id: metrics["judge_error_by_rubric"].get(rubric_id, 0.0)
+            for rubric_id in include_ids
+        },
+        "reward_by_rubric": {
+            rubric_id: value
+            for rubric_id, value in metrics["reward_by_rubric"].items()
+            if rubric_id in include_ids
+        },
+    }
+
+
+def _avg_scores_from_rubrics(
+    *,
+    node_ids: list[str],
+    score_lookup_by_node: dict[str, dict[str, float]],
+    rubrics: list[RubricRecord],
+) -> dict[str, float]:
+    if not rubrics:
+        return {node_id: 0.0 for node_id in node_ids}
+    rewards: dict[str, float] = {}
+    for node_id in node_ids:
+        score_lookup = score_lookup_by_node[node_id]
+        rewards[node_id] = (
+            sum(score_lookup.get(rubric.rubric_id, 0.0) * rubric.weight for rubric in rubrics)
+            / len(rubrics)
+        )
+    return rewards
 
 
 # NOTE: the correlation score will be unstable when there are very few data points
@@ -808,7 +885,7 @@ class TrajectorySearchRunner:
         rubric_model_kwargs: dict[str, Any] | None = None,
         judge_model_kwargs: dict[str, Any] | None = None,
         harness_namespace: str | None = None,
-        rubric_bank: ExperienceRubricBank | None = None,
+        experience_banks: dict[str, ExperienceRubricBank] | None = None,
         resume: bool = False,
     ) -> None:
         self.instance = copy.deepcopy(instance)
@@ -843,18 +920,42 @@ class TrajectorySearchRunner:
         self.frontier_ids: list[str] = []
         uses_experience_bank = self.search_config.rubric_bank_strategy in {"experience", "both"}
         uses_score_bank = self.search_config.rubric_bank_strategy in {"score", "both"}
+        self.rubric_scopes = ("siblings", "pc")
         if uses_score_bank:
-            self.rubric_bank = ScoreRubricBank(max_active_rubrics=self.search_config.max_active_rubrics)
+            self.rubric_bank = ScoreRubricBank(max_active_rubrics=self.search_config.max_active_rubrics, scope="siblings")
+            self.pc_rubric_bank = ScoreRubricBank(max_active_rubrics=self.search_config.max_active_rubrics, scope="pc")
         else:
             self.rubric_bank = None
+            self.pc_rubric_bank = None
+        provided_experience_banks = experience_banks if experience_banks is not None else {}
         if uses_experience_bank:
-            self.experience_bank = (
-                rubric_bank
-                if isinstance(rubric_bank, ExperienceRubricBank)
-                else ExperienceRubricBank(write_artifacts=self.search_config.write_artifacts)
+            siblings_experience_bank = provided_experience_banks.get("siblings")
+            self.experience_bank = (siblings_experience_bank if isinstance(siblings_experience_bank, ExperienceRubricBank)
+                else ExperienceRubricBank(
+                    retrieval_prompt=RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
+                    update_prompt=RUBRIC_EXPERIENCE_UPDATE_PROMPT,
+                    scope="siblings",
+                )
+            )
+            pc_experience_bank = provided_experience_banks.get("pc")
+            self.pc_experience_bank = (pc_experience_bank if isinstance(pc_experience_bank, ExperienceRubricBank)
+                else ExperienceRubricBank(
+                    retrieval_prompt=PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
+                    update_prompt=PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
+                    scope="pc",
+                )
             )
         else:
             self.experience_bank = None
+            self.pc_experience_bank = None
+        self.score_banks = {
+            "siblings": self.rubric_bank,
+            "pc": self.pc_rubric_bank,
+        }
+        self.experience_banks = {
+            "siblings": self.experience_bank,
+            "pc": self.pc_experience_bank,
+        }
         self.current_round = 0
         self.system_prompt = ""
         self.user_prompt = ""
@@ -904,33 +1005,13 @@ class TrajectorySearchRunner:
                     break
                 self.current_round += 1
                 round_rubric_records = self._run_round(self.frontier_ids[0], self.current_round)
-                if self.experience_bank is not None:
+                if any(bank is not None for bank in self.experience_banks.values()):
                     rubric_update_records.extend(round_rubric_records)
                 self._save_manifest()
             self.artifact_writer.wait()
             if self.patch_eval_manager is not None:
                 self.patch_eval_manager.wait()
-            if self.experience_bank is not None:
-                rubric_payloads = [
-                    {
-                        **record["rubric_payload"],
-                        "messages": copy.deepcopy(record.get("messages", [])),
-                    }
-                    for record in rubric_update_records
-                    if isinstance(record.get("rubric_payload"), dict)
-                ]
-                asyncio.run(
-                    self.experience_bank.update_after_instance(
-                        run_dir=self.run_dir,
-                        instance=self.instance,
-                        rubric_payloads=rubric_payloads,
-                        model_name=self.rubric_model_name,
-                        temperature=self.search_config.rubric_temperature,
-                        top_p=self.search_config.rubric_top_p,
-                        max_tokens=self.search_config.rubric_max_tokens,
-                        model_kwargs=self.rubric_model_kwargs,
-                    )
-                )
+            self._update_experience_banks(rubric_update_records)
             self._finalize_outputs()
         finally:
             if self.patch_eval_manager is not None:
@@ -942,6 +1023,73 @@ class TrajectorySearchRunner:
             while self._manifest_futures:
                 self._manifest_futures.pop(0).result()
             self._manifest_executor.shutdown(wait=True, cancel_futures=False)
+
+
+    def _update_experience_banks(self, rubric_update_records: list[dict[str, Any]]) -> None:
+        experience_update_specs = [
+            {"scope": scope, "bank": self.experience_banks[scope]}
+            for scope in self.rubric_scopes
+        ]
+        experience_update_jobs = []
+        for spec in experience_update_specs:
+            if spec["bank"] is None:
+                continue
+            rubric_payloads = [
+                {
+                    **copy.deepcopy(record["rubric_payload"]),
+                    "round_index": int(record["round_index"]),
+                    "messages": copy.deepcopy(record["messages"]),
+                }
+                for record in rubric_update_records
+                if record.get("scope") == spec["scope"] and isinstance(record.get("rubric_payload"), dict)
+            ]
+            experience_update_jobs.append(
+                (
+                    spec["scope"],
+                    spec["bank"].update_after_instance(
+                        instance=self.instance,
+                        rubric_payloads=rubric_payloads,
+                        model_name=self.rubric_model_name,
+                        temperature=self.search_config.rubric_temperature,
+                        top_p=self.search_config.rubric_top_p,
+                        max_tokens=self.search_config.rubric_max_tokens,
+                        model_kwargs=self.rubric_model_kwargs,
+                    ),
+                )
+            )
+        if experience_update_jobs:
+            async def _run_experience_updates() -> list[dict[str, Any]]:
+                return list(await asyncio.gather(*(job for _, job in experience_update_jobs)))
+            update_payloads = asyncio.run(_run_experience_updates())
+            if self.search_config.write_artifacts:
+                scoped_updates = {
+                    scope: payload
+                    for (scope, _), payload in zip(experience_update_jobs, update_payloads)
+                }
+                for scope, payload in scoped_updates.items():
+                    _atomic_write_json(
+                        self.run_dir / f"{scope}_rubric_bank.json",
+                        {
+                            "before": copy.deepcopy(payload.get("before", [])),
+                            "after": copy.deepcopy(payload.get("after", [])),
+                        },
+                    )
+                    for update in payload.get("groups", []):
+                        round_index = int(update["round_index"])
+                        update_dir = self.rubrics_dir / scope / f"round_{round_index:03d}"
+                        _atomic_write_json(
+                            update_dir / "rubric_bank.json",
+                            {
+                                "before": copy.deepcopy(update.get("before", [])),
+                                "actions": copy.deepcopy(update.get("actions", [])),
+                                "after": copy.deepcopy(update.get("after", [])),
+                            },
+                        )
+                        _atomic_write_json(
+                            update_dir / "rubric_bank_message.json",
+                            copy.deepcopy(update.get("messages", [])),
+                        )
+
 
     def _save_manifest(self) -> None:
         if not self.search_config.write_artifacts:
@@ -967,9 +1115,14 @@ class TrajectorySearchRunner:
         }
         if self.experience_bank is not None:
             manifest_payload["rubric_bank"] = self.experience_bank.to_list()
+        if self.pc_experience_bank is not None:
+            manifest_payload["pc_rubric_bank"] = self.pc_experience_bank.to_list()
         if self.rubric_bank is not None:
             manifest_payload["active_bank"] = [asdict(rubric) for rubric in self.rubric_bank.active_bank]
             manifest_payload["inactive_bank"] = [asdict(rubric) for rubric in self.rubric_bank.inactive_bank]
+        if self.pc_rubric_bank is not None:
+            manifest_payload["pc_active_bank"] = [asdict(rubric) for rubric in self.pc_rubric_bank.active_bank]
+            manifest_payload["pc_inactive_bank"] = [asdict(rubric) for rubric in self.pc_rubric_bank.inactive_bank]
         node_index_text = "\n".join(
             json.dumps(asdict(self.nodes[node_id]), ensure_ascii=False, default=str) for node_id in sorted(self.nodes)
         )
@@ -1001,6 +1154,10 @@ class TrajectorySearchRunner:
             active_bank = [RubricRecord(**rubric) for rubric in manifest.get("active_bank", [])]
             inactive_bank = [RubricRecord(**rubric) for rubric in manifest.get("inactive_bank", [])]
             self.rubric_bank.set_state(active_bank=active_bank, inactive_bank=inactive_bank)
+        if self.pc_rubric_bank is not None:
+            pc_active_bank = [RubricRecord(**rubric) for rubric in manifest.get("pc_active_bank", [])]
+            pc_inactive_bank = [RubricRecord(**rubric) for rubric in manifest.get("pc_inactive_bank", [])]
+            self.pc_rubric_bank.set_state(active_bank=pc_active_bank, inactive_bank=pc_inactive_bank)
         self.nodes = {}
         for node_id in manifest.get("node_ids", []):
             node_path = self.nodes_dir / node_id / "node.json"
@@ -1057,7 +1214,7 @@ class TrajectorySearchRunner:
             ]
             for future in futures:
                 future.result()
-    
+
     def _initialize_root(self) -> None:
         spec = RolloutSessionSpec(
             session_id=f"root-{uuid.uuid4().hex}",
@@ -1091,6 +1248,15 @@ class TrajectorySearchRunner:
                     "inactive_bank_after": [],
                 }
             )
+        if self.pc_rubric_bank is not None:
+            self.pc_rubric_bank.initialize(initial_task_text or self.task)
+            root_rubric_round.update(
+                {
+                    "pc_active_bank_before": [],
+                    "pc_active_bank_after": [asdict(rubric) for rubric in self.pc_rubric_bank.active_bank],
+                    "pc_inactive_bank_after": [],
+                }
+            )
         root_node = SearchNode(
             node_id="root",
             parent_id=None,
@@ -1108,10 +1274,8 @@ class TrajectorySearchRunner:
             "recent_segments": [],
             "workspace_meta": workspace_meta,
             "rubric_round": root_rubric_round,
-            "overall_reward": 0.0,
+            "overall_score": 0.0,
             "ground_truth_reward": 0.0,
-            "baseline_parent_reward": None,
-            "regressed_vs_parent": False,
         }
         root_snapshot = _resume_snapshot_payload(
             snapshot,
@@ -1136,6 +1300,150 @@ class TrajectorySearchRunner:
         self.finished_node_ids = []
         self._save_manifest()
         self._dispose_session(session)
+
+    def _rubric_scope_specs(self, *, compare_parent: bool) -> list[dict[str, Any]]:
+        specs = [
+            {
+                "scope": "siblings",
+                "score_bank": self.score_banks["siblings"],
+                "experience_bank": self.experience_banks["siblings"],
+                "generation_prompt": SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
+                "judge_prompt": SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+                "rubric_list_prefix": "rubric",
+                "include_variance_reward": True,
+            }
+        ]
+        if compare_parent:
+            specs.append(
+                {
+                    "scope": "pc",
+                    "score_bank": self.score_banks["pc"],
+                    "experience_bank": self.experience_banks["pc"],
+                    "generation_prompt": PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
+                    "judge_prompt": PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+                    "rubric_list_prefix": "pc-rubric",
+                    "include_variance_reward": False,
+                }
+            )
+        return specs
+
+    async def _run_rubric_scope_judging(
+        self,
+        *,
+        scope_spec: dict[str, Any],
+        question: dict[str, Any],
+        shared_context: dict[str, Any],
+        previous_state: dict[str, Any],
+        latest_shared_segment: dict[str, Any] | None,
+        continuations: list[dict[str, Any]],
+        node_ids: list[str],
+        round_index: int,
+        generation_kwargs: dict[str, Any],
+        judge_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        score_bank = scope_spec["score_bank"]
+        experience_bank = scope_spec["experience_bank"]
+        extra_prompt_sections: list[str] = []
+        retrieved_experiences = []
+        retrieve_messages: list[dict[str, Any]] = []
+        if score_bank is not None:
+            score_context = score_bank.build_generation_context()
+            extra_prompt_sections.extend(score_context.extra_prompt_sections)
+        if experience_bank is not None:
+            experience_context = await experience_bank.build_generation_context(
+                question=question,
+                previous_state=previous_state,
+                latest_shared_segment=latest_shared_segment,
+                continuations=continuations,
+                model_name=self.rubric_model_name,
+                temperature=self.search_config.rubric_temperature,
+                top_p=self.search_config.rubric_top_p,
+                max_tokens=self.search_config.rubric_max_tokens,
+                model_kwargs=self.rubric_model_kwargs,
+            )
+            extra_prompt_sections.extend(experience_context.extra_prompt_sections)
+            retrieved_experiences = copy.deepcopy(experience_context.retrieved)
+            retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
+
+        score_batch = await _generate_and_score_rubric_batch(
+            sample_count=self.search_config.n,
+            round_index=round_index,
+            generation_kwargs=generation_kwargs,
+            generation_prompt=scope_spec["generation_prompt"],
+            rubric_list_prefix=scope_spec["rubric_list_prefix"],
+            question=question,
+            shared_context=shared_context,
+            continuations=continuations,
+            extra_prompt_sections=extra_prompt_sections,
+            judge_kwargs=judge_kwargs,
+            judge_prompt=scope_spec["judge_prompt"],
+        )
+
+        rubric_samples: list[dict[str, Any]] = []
+        valid_rubric_samples: list[dict[str, Any]] = []
+        for sample_index, generated_sample in enumerate(score_batch["generated_samples"]):
+            generated_rubrics = score_batch["sample_generated_rubrics"][sample_index]
+            evaluation = _rubric_sample_evaluation(
+                score_batch=score_batch,
+                sample_index=sample_index,
+                node_ids=node_ids,
+                scoring_rubrics=generated_rubrics,
+                include_variance_reward=bool(scope_spec["include_variance_reward"]),
+            )
+            metrics = evaluation["metrics"]
+            bank_update = (
+                score_bank.update_after_round(
+                    generated=generated_rubrics,
+                    rewards=metrics["reward_by_rubric"],
+                )
+                if score_bank is not None
+                else None
+            )
+            avg_scores = _avg_scores_from_rubrics(
+                node_ids=node_ids,
+                score_lookup_by_node=evaluation["score_lookup_by_node"],
+                rubrics=generated_rubrics,
+            )
+            generated_ids = {rubric.rubric_id for rubric in generated_sample.generated}
+            sample_payload = {
+                "scope": scope_spec["scope"],
+                "sample_index": generated_sample.sample_index,
+                "round_index": round_index,
+                "rubric_list_id": generated_sample.rubric_list_id,
+                "has_scoring_rubrics": bool(generated_rubrics),
+                "generated": generated_sample.generated,
+                "messages": generated_sample.messages,
+                "format_errors": copy.deepcopy(generated_sample.format_errors or []),
+                "terminal_error": generated_sample.terminal_error,
+                "generated_titles": [rubric.title for rubric in generated_sample.generated],
+                **_rubric_metrics_payload(metrics, generated_ids),
+                "avg_scores": avg_scores,
+                "judge_errors": evaluation["judge_errors"],
+                "selected": False,
+            }
+            if experience_bank is not None:
+                sample_payload.update(
+                    {
+                        "retrieved": [asdict(experience) for experience in retrieved_experiences],
+                        "retrieve_messages": copy.deepcopy(retrieve_messages),
+                    }
+                )
+            if bank_update is not None:
+                sample_payload.update(
+                    {
+                        "active_before": bank_update.active_before,
+                        "active_after": bank_update.active_after,
+                        "inactive_after": bank_update.inactive_after,
+                    }
+                )
+            rubric_samples.append(sample_payload)
+            if generated_rubrics:
+                valid_rubric_samples.append(sample_payload)
+        return {
+            "scope": scope_spec["scope"],
+            "samples": rubric_samples,
+            "valid_samples": valid_rubric_samples,
+        }
 
     async def _prepare_round_judging(
         self,
@@ -1197,279 +1505,100 @@ class TrajectorySearchRunner:
                 "trajectory_continuation": copy.deepcopy(branch["recent_segments"][-1]) if branch["recent_segments"] else None,
             }
             continuations.append(branch["continuation_view"])
-        existing_rubrics: list[RubricRecord] = []
-        extra_prompt_sections: list[str] = []
-        retrieved_experiences = []
-        retrieve_messages: list[dict[str, Any]] = []
-        if self.rubric_bank is not None and self.rubric_bank.active_bank:
-            score_context = self.rubric_bank.build_generation_context()
-            existing_rubrics = score_context.existing_rubrics
-            extra_prompt_sections.extend(score_context.extra_prompt_sections)
-        if self.experience_bank is not None and self.experience_bank.experiences:
-            experience_context = await self.experience_bank.build_generation_context(
-                question={**question, "instance_id": self.task_id},
-                previous_state=updated_parent_state,
-                latest_shared_segment=latest_shared_segment,
-                continuations=continuations,
-                model_name=self.rubric_model_name,
-                temperature=self.search_config.rubric_temperature,
-                top_p=self.search_config.rubric_top_p,
-                max_tokens=self.search_config.rubric_max_tokens,
-                model_kwargs=self.rubric_model_kwargs,
-            )
-            extra_prompt_sections.extend(experience_context.extra_prompt_sections)
-            retrieved_experiences = copy.deepcopy(experience_context.retrieved)
-            retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
         rubric_generation_kwargs = {
-            "question": {**question, "instance_id": self.task_id},
-            "previous_state": updated_parent_state,
-            "latest_shared_segment": latest_shared_segment,
-            "continuations": continuations,
             "model_name": self.rubric_model_name,
             "temperature": self.search_config.rubric_temperature,
             "top_p": self.search_config.rubric_top_p,
             "max_tokens": self.search_config.rubric_max_tokens,
-            "round_index": round_index,
             "model_kwargs": self.rubric_model_kwargs,
-            "extra_prompt_sections": extra_prompt_sections,
         }
-        generated_samples = await asyncio.gather(
+        rubric_judge_kwargs = {
+            "model_name": self.judge_model_name,
+            "temperature": self.search_config.judge_temperature,
+            "top_p": self.search_config.judge_top_p,
+            "max_tokens": self.search_config.judge_max_tokens,
+            "model_kwargs": self.judge_model_kwargs,
+        }
+        node_ids = [branch["node_id"] for branch in branch_records]
+        scope_results = await asyncio.gather(
             *[
-                _generate_round_rubrics(
-                    **rubric_generation_kwargs,
-                    sample_index=sample_index,
-                )
-                for sample_index in range(self.search_config.n)
-            ],
-        )
-        rubric_samples: list[dict[str, Any]] = []
-        valid_rubric_samples: list[dict[str, Any]] = []
-        active_continuation_scores, active_continuation_errors = await _score_round(
-            question=question,
-            shared_context=shared_context,
-            continuations=continuations,
-            rubrics=existing_rubrics,
-            model_name=self.judge_model_name,
-            temperature=self.search_config.judge_temperature,
-            top_p=self.search_config.judge_top_p,
-            max_tokens=self.search_config.judge_max_tokens,
-            model_kwargs=self.judge_model_kwargs,
-        )
-        active_parent_scores: list[dict[str, Any]] = []
-        active_parent_errors: list[dict[str, str]] = []
-        if compare_parent:
-            active_parent_scores, active_parent_errors = await _score_parent_round(
-                question=question,
-                shared_context=shared_context,
-                rubrics=existing_rubrics,
-                model_name=self.judge_model_name,
-                temperature=self.search_config.judge_temperature,
-                top_p=self.search_config.judge_top_p,
-                max_tokens=self.search_config.judge_max_tokens,
-                node_id=parent_node.node_id,
-                model_kwargs=self.judge_model_kwargs,
-            )
-        active_ids = {rubric.rubric_id for rubric in existing_rubrics}
-        for generated_sample in generated_samples:
-            generated_rubrics: list[RubricRecord] = []
-            seen_rubric_ids: set[str] = set()
-            for rubric in generated_sample.generated:
-                if rubric.rubric_id in active_ids or rubric.rubric_id in seen_rubric_ids:
-                    continue
-                seen_rubric_ids.add(rubric.rubric_id)
-                generated_rubrics.append(rubric)
-            scoring_rubrics = existing_rubrics + generated_rubrics
-            if generated_rubrics:
-                generated_continuation_scores, continuation_errors = await _score_round(
+                self._run_rubric_scope_judging(
+                    scope_spec=scope_spec,
                     question=question,
                     shared_context=shared_context,
+                    previous_state=updated_parent_state,
+                    latest_shared_segment=latest_shared_segment,
                     continuations=continuations,
-                    rubrics=generated_rubrics,
-                    model_name=self.judge_model_name,
-                    temperature=self.search_config.judge_temperature,
-                    top_p=self.search_config.judge_top_p,
-                    max_tokens=self.search_config.judge_max_tokens,
-                    model_kwargs=self.judge_model_kwargs,
+                    node_ids=node_ids,
+                    round_index=round_index,
+                    generation_kwargs=rubric_generation_kwargs,
+                    judge_kwargs=rubric_judge_kwargs,
                 )
-            else:
-                generated_continuation_scores = [[] for _ in continuations]
-                continuation_errors = []
-            scored_continuations = [
-                copy.deepcopy(active_records) + generated_records
-                for active_records, generated_records in zip(active_continuation_scores, generated_continuation_scores)
+                for scope_spec in self._rubric_scope_specs(compare_parent=compare_parent)
             ]
-            parent_scores = copy.deepcopy(active_parent_scores)
-            judge_errors_payload = copy.deepcopy(active_continuation_errors + active_parent_errors + continuation_errors)
-            if compare_parent and generated_rubrics:
-                parent_scores, parent_errors = await _score_parent_round(
-                    question=question,
-                    shared_context=shared_context,
-                    rubrics=generated_rubrics,
-                    model_name=self.judge_model_name,
-                    temperature=self.search_config.judge_temperature,
-                    top_p=self.search_config.judge_top_p,
-                    max_tokens=self.search_config.judge_max_tokens,
-                    node_id=parent_node.node_id,
-                    model_kwargs=self.judge_model_kwargs,
-                )
-                parent_scores = copy.deepcopy(active_parent_scores) + parent_scores
-                judge_errors_payload.extend(parent_errors)
+        )
+        results_by_scope = {result["scope"]: result for result in scope_results}
+        rubric_samples = results_by_scope["siblings"]["samples"]
+        valid_rubric_samples = results_by_scope["siblings"]["valid_samples"]
+        if compare_parent:
+            pc_rubric_samples = results_by_scope["pc"]["samples"]
+            valid_pc_rubric_samples = results_by_scope["pc"]["valid_samples"]
+        else:
+            pc_rubric_samples = None
+            valid_pc_rubric_samples = None
 
-            child_score_lookup_by_node = {branch["node_id"]: {} for branch in branch_records}
-            for branch, score_records in zip(branch_records, scored_continuations):
-                for record in score_records:
-                    child_score_lookup_by_node[branch["node_id"]][record["rubric_id"]] = float(record["score_normalized"])
-            parent_score_lookup = {record["rubric_id"]: float(record["score_normalized"]) for record in parent_scores}
-
-            parent_score_by_rubric: dict[str, float] = {}
-            child_score_by_rubric: dict[str, dict[str, float]] = {}
-            variance_by_rubric: dict[str, float] = {}
-            redundency_by_rubric: dict[str, float] = {}
-            judge_error_by_rubric: dict[str, float] = {}
-            reward_by_rubric: dict[str, float] = {}
-            previous_score_vectors: list[list[float]] = []
-            for error in judge_errors_payload:
-                rubric_id = error.get("rubric_id")
-                if rubric_id:
-                    judge_error_by_rubric[rubric_id] = judge_error_by_rubric.get(rubric_id, 0.0) + JUDGE_ERROR_REWARD
-            for rubric in scoring_rubrics:
-                vector: list[float] = []
-                parent_score = parent_score_lookup.get(rubric.rubric_id, 0.0)
-                parent_score_by_rubric[rubric.rubric_id] = parent_score
-                if compare_parent:
-                    vector.append(parent_score)
-                child_scores_for_rubric: dict[str, float] = {}
-                for branch in branch_records:
-                    score = child_score_lookup_by_node[branch["node_id"]].get(rubric.rubric_id, 0.0)
-                    child_scores_for_rubric[branch["node_id"]] = score
-                    vector.append(score)
-                child_score_by_rubric[rubric.rubric_id] = child_scores_for_rubric
-                variance_by_rubric[rubric.rubric_id] = 0.0 if len(vector) <= 1 else float(pvariance(vector))
-                redundancy_reward = _redundancy_reward(vector, previous_score_vectors)
-                redundency_by_rubric[rubric.rubric_id] = redundancy_reward
-                # NOTE: when computing the rubric bank, we use equal weight
-                reward_by_rubric[rubric.rubric_id] = (
-                    variance_by_rubric[rubric.rubric_id]
-                    + redundancy_reward
-                    + judge_error_by_rubric.get(rubric.rubric_id, 0.0)
-                )
-                previous_score_vectors.append(vector)
-            if self.rubric_bank is not None:
-                bank_update = self.rubric_bank.update_after_round(
-                    generated=generated_sample.generated,
-                    rewards=reward_by_rubric,
-                )
-            else:
-                bank_update = generated_sample.generated
-            bank_scoring_rubrics = bank_update.rubrics
-            parent_reward = 0.0
-            if compare_parent and bank_scoring_rubrics:
-                parent_reward = sum(parent_score_lookup.get(rubric.rubric_id, 0.0) for rubric in bank_scoring_rubrics) / len(bank_scoring_rubrics)
-            child_rewards: dict[str, float] = {}
-            for branch in branch_records:
-                score_lookup = child_score_lookup_by_node[branch["node_id"]]
-                child_rewards[branch["node_id"]] = (
-                    sum(score_lookup.get(rubric.rubric_id, 0.0) * rubric.weight for rubric in bank_scoring_rubrics) / len(bank_scoring_rubrics)
-                    if bank_scoring_rubrics
-                    else 0.0
-                )
-
-            generated_ids = {rubric.rubric_id for rubric in generated_sample.generated}
-            sample_payload = {
-                "sample_index": generated_sample.sample_index,
-                "rubric_list_id": generated_sample.rubric_list_id,
-                "generated": generated_sample.generated,
-                "messages": generated_sample.messages,
-                "format_errors": copy.deepcopy(generated_sample.format_errors or []),
-                "terminal_error": generated_sample.terminal_error,
-                "generated_titles": [rubric.title for rubric in generated_sample.generated],
-                "child_score_by_rubric": {
-                    rubric_id: {
-                        node_id: score
-                        for node_id, score in node_scores.items()
-                    }
-                    for rubric_id, node_scores in child_score_by_rubric.items()
-                    if rubric_id in generated_ids
-                },
-                "parent_score_by_rubric": {
-                    rubric_id: score
-                    for rubric_id, score in parent_score_by_rubric.items()
-                    if rubric_id in generated_ids
-                },
-                "child_rewards": child_rewards,
-                "parent_reward": parent_reward,
-                "variance_by_rubric": {
-                    rubric_id: variance
-                    for rubric_id, variance in variance_by_rubric.items()
-                    if rubric_id in generated_ids
-                },
-                "redundency_by_rubric": {
-                    rubric_id: reward
-                    for rubric_id, reward in redundency_by_rubric.items()
-                    if rubric_id in generated_ids
-                },
-                "judge_error_by_rubric": {
-                    rubric_id: judge_error_by_rubric.get(rubric_id, 0.0)
-                    for rubric_id in generated_ids
-                },
-                "reward_by_rubric": {
-                    rubric_id: reward
-                    for rubric_id, reward in reward_by_rubric.items()
-                    if rubric_id in generated_ids
-                },
-                "judge_errors": judge_errors_payload,
-                "selected": False,
-            }
-            if self.experience_bank is not None:
-                sample_payload.update(
-                    {
-                        "retrieved": [asdict(experience) for experience in retrieved_experiences],
-                        "retrieve_messages": copy.deepcopy(retrieve_messages),
-                    }
-                )
-            if self.rubric_bank is not None:
-                sample_payload.update(
-                    {
-                        "active_before": copy.deepcopy(existing_rubrics),
-                        "active_after": bank_update.active_after,
-                        "inactive_after": bank_update.inactive_after,
-                    }
-                )
-            rubric_samples.append(sample_payload)
-            valid_rubric_samples.append(sample_payload)
-
-        if len(valid_rubric_samples) < min(2, self.search_config.n):
+        if len(valid_rubric_samples) < min(2, self.search_config.n) or compare_parent and len(valid_pc_rubric_samples) < min(2, self.search_config.n):
             return {
                 "rubric_samples": rubric_samples,
+                "pc_rubric_samples": pc_rubric_samples,
                 "stop_search": True,
             }
 
         selected_sample = random.choice(valid_rubric_samples)
         selected_sample["selected"] = True
-        averaged_child_rewards = [
-            sum(sample["child_rewards"][branch["node_id"]] for sample in valid_rubric_samples) / len(valid_rubric_samples)
+        selected_pc_sample = None
+        if compare_parent:
+            selected_pc_sample = random.choice(valid_pc_rubric_samples)
+            selected_pc_sample["selected"] = True
+
+        sibling_scores = [
+            sum(sample["avg_scores"][branch["node_id"]] for sample in valid_rubric_samples) / len(valid_rubric_samples)
             for branch in branch_records
         ]
-        parent_reward = sum(sample["parent_reward"] for sample in valid_rubric_samples) / len(valid_rubric_samples)
+        if compare_parent:
+            pc_scores = [
+                sum(sample["avg_scores"][branch["node_id"]] for sample in valid_pc_rubric_samples) / len(valid_pc_rubric_samples)
+                for branch in branch_records
+            ]
+            combined_scores = [
+                (sibling_reward + pc_reward) / 2.0
+                for sibling_reward, pc_reward in zip(sibling_scores, pc_scores)
+            ]
+        else:
+            pc_scores = None
+            combined_scores = sibling_scores
         return {
             "rubric_samples": rubric_samples,
-            "child_rewards": averaged_child_rewards,
-            "parent_reward": parent_reward,
+            "pc_rubric_samples": pc_rubric_samples,
+            "combined_scores": combined_scores,
+            "siblings_scores": sibling_scores,
+            "pc_scores": pc_scores,
             "selected_sample_index": selected_sample["sample_index"],
             "selected_sample": selected_sample,
+            "selected_pc_sample": selected_pc_sample,
             "stop_search": False,
         }
 
     def _rubric_bank_payload_fields(self, sample: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = {}
-        if self.experience_bank is not None:
+        if "retrieved" in sample or "retrieve_messages" in sample:
             payload.update(
                 {
                     "retrieved": copy.deepcopy(sample.get("retrieved", [])),
                     "retrieve_messages": copy.deepcopy(sample.get("retrieve_messages")),
                 }
             )
-        if self.rubric_bank is not None:
+        if "active_before" in sample and "active_after" in sample and "inactive_after" in sample:
             payload.update(
                 {
                     "active_bank_before": [asdict(rubric) for rubric in sample["active_before"]],
@@ -1482,6 +1611,7 @@ class TrajectorySearchRunner:
     def _rubric_round_payload(self, sample: dict[str, Any]) -> dict[str, Any]:
         payload = {
             "rubric_list_id": sample["rubric_list_id"],
+            "round_index": sample["round_index"],
             "generated": [asdict(rubric) for rubric in sample["generated"]],
             "format_errors": copy.deepcopy(sample.get("format_errors", [])),
             "terminal_error": sample.get("terminal_error"),
@@ -1498,15 +1628,12 @@ class TrajectorySearchRunner:
         payload = {
             **self._rubric_round_payload(sample),
             "parent_node_id": parent_id,
-            "child_score_by_rubric": copy.deepcopy(sample["child_score_by_rubric"]),
-            "parent_score_by_rubric": copy.deepcopy(sample["parent_score_by_rubric"]),
-            "child_rewards": copy.deepcopy(sample["child_rewards"]),
-            "parent_reward": sample["parent_reward"],
+            "score_by_rubric": copy.deepcopy(sample["score_by_rubric"]),
+            "avg_scores": copy.deepcopy(sample["avg_scores"]),
             "generated_titles": list(sample["generated_titles"]),
             "selected": bool(sample["selected"]),
             "gt_by_rubric": {},
-            "gt_reward_siblings": 0.0,
-            "gt_reward_parent": 0.0,
+            "reward": 0.0,
         }
         return payload
 
@@ -1521,10 +1648,12 @@ class TrajectorySearchRunner:
         parent_rubric_round = parent_judge.get("rubric_round", {})
         if self.rubric_bank is not None:
             active_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("active_bank_after", [])]
-            if parent_id == "root" and not active_bank:
-                raise RuntimeError("Root rubric bank was not initialized in _initialize_root")
             inactive_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("inactive_bank_after", [])]
             self.rubric_bank.set_state(active_bank=active_bank, inactive_bank=inactive_bank)
+        if self.pc_rubric_bank is not None:
+            pc_active_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("pc_active_bank_after", [])]
+            pc_inactive_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("pc_inactive_bank_after", [])]
+            self.pc_rubric_bank.set_state(active_bank=pc_active_bank, inactive_bank=pc_inactive_bank)
         previous_frontier = list(self.frontier_ids)
         branch_records: list[dict[str, Any]] = []
         valid_branch_records: list[dict[str, Any]] = []
@@ -1656,37 +1785,40 @@ class TrajectorySearchRunner:
         if bool(judged.get("stop_search")):
             self.peaceful_exit(branch_records, parent_id)
             return []
-        selected_sample = judged["selected_sample"]
-        parent_baseline_reward = float(judged["parent_reward"])
         node_round_records = []
         valid_branches: list[dict[str, Any]] = []
-        for index, (branch, averaged_reward) in enumerate(zip(valid_branch_records, judged["child_rewards"])):
-            branch["reward"] = float(averaged_reward)
+        pc_scores = judged.get("pc_scores")
+        pc_regression_threshold = 0.5 + self.search_config.regression_margin
+        for index, (branch, avg_score) in enumerate(zip(valid_branch_records, judged["combined_scores"])):
+            branch["score"] = float(avg_score)
+            pc_score = float(pc_scores[index]) if pc_scores is not None else None
+            branch["regressed_vs_parent"] = parent_id != "root" and pc_score is not None and pc_score < pc_regression_threshold
             valid_branches.append(branch)
             node_round_records.append({
                 "node_id": branch["node_id"],
-                "score": branch["reward"],
+                "score": branch["score"],
+                "regressed_vs_parent": branch["regressed_vs_parent"],
             })
-        valid_branches.sort(key=lambda branch: (branch["reward"], branch["result"]["status"] == "finished"), reverse=True)
+        valid_branches.sort(key=lambda branch: (branch["score"], branch["result"]["status"] == "finished"), reverse=True)
         frontier_branches = (
             valid_branches
-            if parent_id == "root"
-            else [branch for branch in valid_branches if branch["reward"] >= parent_baseline_reward + self.search_config.regression_margin]
+            if parent_id == "root" or pc_scores is None
+            else [branch for branch in valid_branches if not branch["regressed_vs_parent"]]
         )
         chosen_branches = _sample_by_strategy(
             frontier_branches,
-            [branch["reward"] for branch in frontier_branches],
+            [branch["score"] for branch in frontier_branches],
             count=self.search_config.p,
             strategy=self.search_config.strategy,
         )
         top_child_ids = [branch["node_id"] for branch in chosen_branches]
-        regressed = parent_id != "root" and not top_child_ids
+        regressed = parent_id != "root" and pc_scores is not None and not top_child_ids
         candidate_frontier_ids = list(top_child_ids)
         candidate_frontier_ids.extend(
             node_id for node_id in previous_frontier if node_id != parent_id and node_id not in candidate_frontier_ids
         )
         kept_child_ids = set(top_child_ids)
-        if regressed and parent_id != "root":
+        if regressed:
             self.best_node_id = parent_id
 
         round_rubric_path = self.rubrics_dir / f"round_{round_index:03d}.json"
@@ -1694,11 +1826,13 @@ class TrajectorySearchRunner:
         rubric_update_records = []
         rubric_artifact_bundles: list[RubricArtifactBundle] = []
         for sample in judged["rubric_samples"]:
-            rubric_dir = self.rubrics_dir / sample["rubric_list_id"]
+            rubric_dir = self.rubrics_dir / "siblings" / sample["rubric_list_id"]
             rubric_payload = self._rubric_artifact_payload(sample, parent_id)
             rubric_sample_payloads.append(rubric_payload)
             rubric_update_records.append(
                 {
+                    "scope": "siblings",
+                    "round_index": round_index,
                     "rubric_payload": rubric_payload,
                     "messages": sample["messages"],
                 }
@@ -1713,6 +1847,30 @@ class TrajectorySearchRunner:
                     selected_for_round_summary=bool(sample["selected"]),
                 )
             )
+        pc_rubric_sample_payloads = []
+        for sample in judged.get("pc_rubric_samples") or []:
+            rubric_dir = self.rubrics_dir / "pc" / sample["rubric_list_id"]
+            rubric_payload = self._rubric_artifact_payload(sample, parent_id)
+            pc_rubric_sample_payloads.append(rubric_payload)
+            rubric_update_records.append(
+                {
+                    "scope": "pc",
+                    "round_index": round_index,
+                    "rubric_payload": rubric_payload,
+                    "messages": sample["messages"],
+                }
+            )
+            rubric_artifact_bundles.append(
+                RubricArtifactBundle(
+                    rubric_dir=rubric_dir,
+                    rubric_payload=rubric_payload,
+                    messages_payload=sample["messages"],
+                    retrieve_messages_payload=rubric_payload.get("retrieve_messages"),
+                    scope="pc",
+                )
+            )
+
+        selected_sample = judged["selected_sample"]
         round_payload = {
             **self._rubric_artifact_payload(selected_sample, parent_id),
             "round_index": round_index,
@@ -1720,7 +1878,6 @@ class TrajectorySearchRunner:
             "selected_sample_index": judged["selected_sample_index"],
             "selected_rubric_list_id": selected_sample["rubric_list_id"],
             "regressed": regressed,
-            "baseline_parent_reward": parent_baseline_reward,
             "node_scores": node_round_records,
             "policy_generation_errors": policy_generation_errors,
             "rubric_samples": rubric_sample_payloads,
@@ -1729,6 +1886,19 @@ class TrajectorySearchRunner:
             self.rubric_bank.set_state(
                 active_bank=copy.deepcopy(selected_sample["active_after"]),
                 inactive_bank=copy.deepcopy(selected_sample["inactive_after"]),
+            )
+        selected_pc_sample = judged.get("selected_pc_sample", None)
+        if selected_pc_sample is not None:
+            self.pc_rubric_bank.set_state(
+                active_bank=copy.deepcopy(selected_pc_sample["active_after"]),
+                inactive_bank=copy.deepcopy(selected_pc_sample["inactive_after"]),
+            )
+            round_payload.update(
+                {
+                    "pc_rubric_samples": pc_rubric_sample_payloads,
+                    "pc_active_bank_after": [asdict(rubric) for rubric in self.pc_rubric_bank.active_bank],
+                    "pc_inactive_bank_after": [asdict(rubric) for rubric in self.pc_rubric_bank.inactive_bank],
+                }
             )
 
         for branch in valid_branch_records:
@@ -1787,13 +1957,8 @@ class TrajectorySearchRunner:
                 "persistent_state": branch.get("persistent_state", copy.deepcopy(parent_judge.get("persistent_state", EMPTY_PERSISTENT_STATE))),
                 "recent_segments": branch["recent_segments"],
                 "workspace_meta": branch["workspace_meta"],
-                "rubric_round": {
-                    **self._rubric_round_payload(selected_sample),
-                    "selected_sample_index": judged["selected_sample_index"],
-                },
-                "overall_reward": branch["reward"],
-                "baseline_parent_reward": parent_baseline_reward if parent_id != "root" else None,
-                "regressed_vs_parent": regressed,
+                "overall_score": branch["score"],
+                "regressed_vs_parent": branch["regressed_vs_parent"],
             }
 
             terminal_messages = None
@@ -1916,19 +2081,19 @@ class TrajectorySearchRunner:
         return rubric_update_records
 
     def _finalize_outputs(self) -> None:
-        def _cached_overall_reward(node_id: str) -> float:
-            reward = (self._node_judge_cache.get(node_id) or {}).get("overall_reward")
+        def _cached_overall_score(node_id: str) -> float:
+            reward = (self._node_judge_cache.get(node_id) or {}).get("overall_score")
             return float(reward) if reward is not None else float("-inf")
 
         if self.finished_node_ids:
             final_node_id = max(
                 (node_id for node_id in self.finished_node_ids if node_id in self.nodes),
-                key=_cached_overall_reward,
+                key=_cached_overall_score,
             )
         elif self.frontier_ids:
             final_node_id = max(
                 (node_id for node_id in self.frontier_ids if node_id in self.nodes),
-                key=_cached_overall_reward,
+                key=_cached_overall_score,
             )
         elif self.best_node_id is not None:
             final_node_id = self.best_node_id

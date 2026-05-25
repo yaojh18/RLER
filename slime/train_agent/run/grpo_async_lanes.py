@@ -42,7 +42,11 @@ def _parse_lanes_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--lanes-completion-max-tokens", type=int, default=4096)
     p.add_argument("--lanes-gt-eval-workers", type=int, default=8)
     p.add_argument("--lanes-lane-b-pool-size", type=int, default=0)
-    p.add_argument("--lanes-policy-alpha", type=float, default=1.0)
+    p.add_argument("--lanes-policy-alpha", type=float, default=0.0,
+                   help="Legacy alias for --lanes-policy-gt-weight.")
+    p.add_argument("--lanes-policy-gt-weight", type=float, default=None)
+    p.add_argument("--lanes-policy-siblings-weight", type=float, default=0.5)
+    p.add_argument("--lanes-policy-pc-weight", type=float, default=0.5)
     p.add_argument("--lanes-policy-temperature", type=float, default=1.0,
                    help="Lane A sampling temperature (the linear spine).")
     p.add_argument("--lanes-policy-top-p", type=float, default=0.95)
@@ -84,7 +88,12 @@ def _export_lanes_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_LANES_GT_EVAL_WORKERS"] = str(ns.lanes_gt_eval_workers)
     if ns.lanes_lane_b_pool_size:
         os.environ["SWE_AGENT_LANES_LANE_B_POOL_SIZE"] = str(ns.lanes_lane_b_pool_size)
-    os.environ["SWE_AGENT_LANES_POLICY_ALPHA"] = str(ns.lanes_policy_alpha)
+    policy_gt_weight = ns.lanes_policy_gt_weight
+    if policy_gt_weight is None:
+        policy_gt_weight = ns.lanes_policy_alpha
+    os.environ["SWE_AGENT_LANES_POLICY_GT_WEIGHT"] = str(policy_gt_weight)
+    os.environ["SWE_AGENT_LANES_POLICY_SIBLINGS_WEIGHT"] = str(ns.lanes_policy_siblings_weight)
+    os.environ["SWE_AGENT_LANES_POLICY_PC_WEIGHT"] = str(ns.lanes_policy_pc_weight)
     os.environ["SWE_AGENT_LANES_POLICY_TEMPERATURE"] = str(ns.lanes_policy_temperature)
     os.environ["SWE_AGENT_LANES_POLICY_TOP_P"] = str(ns.lanes_policy_top_p)
     os.environ["SWE_AGENT_LANES_LANE_B_TEMPERATURE"] = str(ns.lanes_lane_b_temperature)

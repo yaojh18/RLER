@@ -18,7 +18,9 @@ the SLURM script's tunables):
   SWE_AGENT_LANES_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
   SWE_AGENT_LANES_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
   SWE_AGENT_LANES_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 4096)
-  SWE_AGENT_LANES_POLICY_ALPHA       float  GT vs rubric weight (default 1.0)
+  SWE_AGENT_LANES_POLICY_GT_WEIGHT   float  policy GT reward weight (default 0.0)
+  SWE_AGENT_LANES_POLICY_SIBLINGS_WEIGHT float sibling rubric reward weight (default 0.5)
+  SWE_AGENT_LANES_POLICY_PC_WEIGHT   float  parent-child rubric reward weight (default 0.5)
   SWE_AGENT_LANES_POLICY_TEMPERATURE float  Lane A sampling temp (default 1.0)
   SWE_AGENT_LANES_POLICY_TOP_P       float  default 0.95
   SWE_AGENT_LANES_LANE_B_TEMPERATURE float  Lane B sampling temp (default 1.0)
@@ -181,7 +183,9 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         )
         record = asyncio.run(runner.run())
         bundle = LaneGRPOCollector(
-            policy_reward_alpha=task.get("policy_reward_alpha", 1.0),
+            policy_gt_weight=task.get("policy_gt_weight", 0.0),
+            policy_siblings_weight=task.get("policy_siblings_weight", 0.5),
+            policy_pc_weight=task.get("policy_pc_weight", 0.5),
         ).instance_record_to_bundle(record)
         result = {
             "index": task["index"],
@@ -385,7 +389,12 @@ def _lanes_values_from_env() -> dict[str, Any]:
         "gt_eval_workers": _int("SWE_AGENT_LANES_GT_EVAL_WORKERS", 8),
         "lane_b_pool_size": _int("SWE_AGENT_LANES_LANE_B_POOL_SIZE"),
         "completion_max_tokens": _int("SWE_AGENT_LANES_COMPLETION_MAX_TOKENS", 4096),
-        "policy_reward_alpha": _float("SWE_AGENT_LANES_POLICY_ALPHA", 1.0),
+        "policy_gt_weight": _float(
+            "SWE_AGENT_LANES_POLICY_GT_WEIGHT",
+            _float("SWE_AGENT_LANES_POLICY_ALPHA", 0.0),
+        ),
+        "policy_siblings_weight": _float("SWE_AGENT_LANES_POLICY_SIBLINGS_WEIGHT", 0.5),
+        "policy_pc_weight": _float("SWE_AGENT_LANES_POLICY_PC_WEIGHT", 0.5),
         "policy_temperature": _float("SWE_AGENT_LANES_POLICY_TEMPERATURE", 1.0),
         "policy_top_p": _float("SWE_AGENT_LANES_POLICY_TOP_P", 0.95),
         "lane_b_temperature": _float("SWE_AGENT_LANES_LANE_B_TEMPERATURE", 1.0),
