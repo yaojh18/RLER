@@ -1131,6 +1131,30 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     # Expose per-model router info for custom rollout functions.
     args.sglang_model_routers = {name: (srv.router_ip, srv.router_port) for name, srv in servers.items()}
 
+    # Expose per-engine endpoints so collectors can dispatch directly per
+    # trial (bypassing the router's cache-aware policy that pins all trials
+    # of an instance to the same engine). Each entry is the list of
+    # (host, port) pairs for node-rank-0 engines in the server's groups.
+    # get_url returns None for non-rank-0 engines, which we filter out.
+    model_engines: dict[str, list[tuple[str, int]]] = {}
+    for name, srv in servers.items():
+        urls = ray.get([eng.get_url.remote() for eng in srv.engines if eng is not None])
+        endpoints: list[tuple[str, int]] = []
+        for u in urls:
+            if not u:
+                continue
+            parsed = u.replace("http://", "").replace("https://", "")
+            if ":" not in parsed:
+                continue
+            host, port_s = parsed.rsplit(":", 1)
+            try:
+                endpoints.append((host, int(port_s)))
+            except ValueError:
+                continue
+        model_engines[name] = endpoints
+        logger.info(f"[server={name}] per-engine endpoints ({len(endpoints)}): {endpoints}")
+    args.sglang_model_engines = model_engines
+
     return servers
 
 

@@ -81,6 +81,13 @@ class NaiveSearchConfig:
     # fallback penalty above.
     no_action_patch_penalty: float = 0.0
 
+    # Reward formula. 'soft' = raw passed_set / (passed ∪ failed) on the
+    # patched repo (always >= 0). 'delta' = max(0, raw - baseline), where
+    # baseline is the soft score of an empty patch (only p2p_total contributes
+    # to passed). 'delta' floors at 0 so a rollout that merely preserves
+    # baseline pass-rate earns no credit; only NEW pass-rate gets signal.
+    reward_kind: str = "delta"
+
 
 @dataclass
 class NaiveRollout:
@@ -152,6 +159,9 @@ class NaiveSearchRunner:
         harness_namespace: str | None,
         policy_base_url: str,
         api_key: str = "EMPTY",
+        # Per-trial URL list; trial ri uses policy_base_urls[ri % len(...)].
+        # Falls back to policy_base_url for all trials if not provided.
+        policy_base_urls: list[str] | None = None,
         # Accepted for call-site parity with the lanes runner; unused here.
         rubric_model_name: str | None = None,
         judge_model_name: str | None = None,
@@ -164,6 +174,10 @@ class NaiveSearchRunner:
         self.config = config
         self.harness_namespace = harness_namespace
         self.policy_base_url = policy_base_url.rstrip("/")
+        if policy_base_urls:
+            self.policy_base_urls = [u.rstrip("/") for u in policy_base_urls]
+        else:
+            self.policy_base_urls = [self.policy_base_url]
         self.api_key = api_key
 
         self.task = instance["problem_statement"]
@@ -208,10 +222,11 @@ class NaiveSearchRunner:
         session = self.backend.create_session(spec)
         try:
             mk = session.agent.model.config.model_kwargs
+            trial_url = self.policy_base_urls[
+                rollout_index % len(self.policy_base_urls)
+            ]
             mk["api_base"] = (
-                self.policy_base_url + "/v1"
-                if not self.policy_base_url.endswith("/v1")
-                else self.policy_base_url
+                trial_url + "/v1" if not trial_url.endswith("/v1") else trial_url
             )
             mk.setdefault("api_key", self.api_key)
             mk["temperature"] = float(self.config.policy_temperature)
@@ -423,9 +438,22 @@ class NaiveSearchRunner:
                 payload.get(rollout.node_id, {}) if isinstance(payload, dict) else {}
             )
             raw_reward = float(rollout_payload.get("reward", 0.0))
+            # base_score = soft score on the unmodified repo: all p2p pass,
+            # all f2p fail -> p2p_total / (p2p_total + f2p_total). Subtracting
+            # it floors at 0, so a rollout that merely preserves baseline
+            # earns no reward; only NEW pass rate gets signal.
+            f2p_total = int(rollout_payload.get("f2p_total") or 0)
+            p2p_total = int(rollout_payload.get("p2p_total") or 0)
+            denom = f2p_total + p2p_total
+            base_score = (p2p_total / denom) if denom > 0 else 0.0
+            delta_reward = max(0.0, raw_reward - base_score)
             penalty = float(self.config.fallback_patch_penalty)
             no_action_penalty = float(self.config.no_action_patch_penalty)
-            scored_reward = raw_reward
+            reward_kind = (self.config.reward_kind or "delta").lower()
+            if reward_kind == "soft":
+                scored_reward = raw_reward
+            else:
+                scored_reward = delta_reward
             notes: list[str] = []
             multipliers: dict[str, float] = {}
             if rollout.terminal_patch_from_fallback and penalty != 1.0:
@@ -437,15 +465,15 @@ class NaiveSearchRunner:
                 multipliers["no_action_penalty"] = no_action_penalty
                 notes.append("no_action_emitted")
             rollout.gt_score = scored_reward
-            if notes:
-                rollout.gt_payload = {
-                    **rollout_payload,
-                    "raw_reward": raw_reward,
-                    **multipliers,
-                    "note": "+".join(notes),
-                }
-            else:
-                rollout.gt_payload = rollout_payload
+            rollout.gt_payload = {
+                **rollout_payload,
+                "raw_reward": raw_reward,
+                "base_score": base_score,
+                "delta_reward": delta_reward,
+                "reward_kind": reward_kind,
+                **multipliers,
+                **({"note": "+".join(notes)} if notes else {}),
+            }
             logger.info(
                 "[%s] gt_done node=%s dt=%.1fs reward=%.3f",
                 self.task_id, rollout.node_id, time.perf_counter() - t_gt,
@@ -473,9 +501,11 @@ class NaiveSearchRunner:
         )
         started = time.perf_counter()
         cfg = self.config
+        # Show distinct URLs in use (deduped) so per-trial routing is visible.
+        distinct_urls = sorted(set(self.policy_base_urls))
         logger.info(
-            "[%s] naive.run.start m=%d step_limit=%d policy_url=%s",
-            self.task_id, cfg.m, cfg.step_limit, self.policy_base_url,
+            "[%s] naive.run.start m=%d step_limit=%d policy_urls=%s",
+            self.task_id, cfg.m, cfg.step_limit, distinct_urls,
         )
 
         loop = asyncio.get_running_loop()

@@ -18,10 +18,13 @@ SLURM script's tunables):
   SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY float default 0.5
   SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY float default 0.0  (hard zero by default)
   SWE_AGENT_NAIVE_OUTPUT_ROOT        str    where to write per-instance run dirs
-  SWE_AGENT_NAIVE_API_HOST           str    sglang policy host (default http://127.0.0.1)
-  SWE_AGENT_NAIVE_POLICY_PORTS       str    csv of ports (one per sglang engine)
   SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE  int    per-instance ThreadPoolExecutor cap (default = M)
   SWE_AGENT_NAIVE_SEED               int    seed for sampling (optional)
+  SWE_AGENT_NAIVE_REWARD_KIND        str    'soft' (raw_reward) or 'delta'
+                                            (max(0, raw - baseline)); default 'delta'
+Per-engine endpoints come from args.sglang_model_engines (populated at engine
+init in slime/ray/rollout.py). The legacy SWE_AGENT_NAIVE_POLICY_PORTS env
+var is no longer consulted.
 """
 
 from __future__ import annotations
@@ -82,6 +85,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         split = task["split"]
         model_name = task["model_name"]
         policy_base_url = task["policy_base_url"]
+        policy_base_urls = task.get("policy_base_urls") or [policy_base_url]
         api_key = task["api_key"]
         output_root = Path(task["output_root"])
         output_root.mkdir(parents=True, exist_ok=True)
@@ -139,6 +143,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             policy_top_p=task.get("policy_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
             no_action_patch_penalty=task.get("no_action_patch_penalty", 0.0),
+            reward_kind=task.get("reward_kind", "delta"),
         )
         run_dir = (
             output_root / instance_id
@@ -155,6 +160,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             config=cfg,
             harness_namespace=get_swebench_harness_namespace(instance),
             policy_base_url=policy_base_url,
+            policy_base_urls=policy_base_urls,
             api_key=api_key,
         )
         record = asyncio.run(runner.run())
@@ -224,6 +230,20 @@ _FAILED_INSTANCES = 0
 _DROPPED_OVERSIZED = 0
 _FILTER_DROPPED_GROUPS = 0
 _FILTER_DROP_REASONS: dict[str, int] = {}
+# Cumulative totals at the close of the previous perf log line. Subtract from
+# current totals to expose per-step deltas in wandb alongside the cumulative
+# counters (no manual diff() needed in the dashboard).
+_PREV_STALE_DROPPED_GROUPS = 0
+_PREV_FILTER_DROPPED_GROUPS = 0
+# Per-endpoint in-flight trial count, used by _pick_least_loaded_endpoints
+# to route each new instance's M trials across the engines that are currently
+# least loaded. Bumped when an instance is dispatched, decremented when its
+# bundle returns (success, error, or stale-dropped). Key is (host, port) so
+# we route across multiple physical nodes, not just multiple ports on one
+# host. With the default sglang_router cache_aware policy this is the only
+# way to get per-trial fanout: trials hitting the router collapse onto one
+# engine because their starting prompts share a long prefix.
+_ENDPOINT_INFLIGHT: dict[tuple[str, int], int] = {}
 
 _NODE_WORKERS: list[Any] = []
 _NODE_WORKER_IPS: list[str] = []
@@ -235,33 +255,56 @@ _DISPATCH_COUNTER = 0
 class _NaiveNodeWorker:
     """Per-physical-node executor for naive bundle tasks. Same pattern
     as lanes _LanesNodeWorker — atomic ProcessPoolExecutor with
-    max_tasks_per_child=5 to bound cross-task RAM leaks."""
+    max_tasks_per_child=100 to bound cross-task RAM leaks while keeping
+    subprocess recycle rare enough to avoid the SemLock spawn race
+    (cpython #84559: a recycled child unpickling SemLock can race the
+    dying parent's resource_tracker unlink → FileNotFoundError →
+    BrokenProcessPool that never self-heals). submit_task wraps
+    BrokenProcessPool with a rebuild-and-retry-once safety net."""
 
-    def __init__(self, name: str = "", max_workers: int = 8, max_tasks_per_child: int = 5):
+    def __init__(self, name: str = "", max_workers: int = 8, max_tasks_per_child: int = 100):
         self.name = name
         self.max_workers = max_workers
         self.max_tasks_per_child = max_tasks_per_child
-        from concurrent.futures import ProcessPoolExecutor
-        try:
-            self._executor = ProcessPoolExecutor(
-                max_workers=max_workers,
-                max_tasks_per_child=max_tasks_per_child,
-            )
-        except TypeError:
-            self._executor = ProcessPoolExecutor(max_workers=max_workers)
+        self._build_executor()
         import socket
         self.ip = socket.gethostbyname(socket.gethostname())
         logger.info(
             f"[NaiveNodeWorker {self.name}] up on ip={self.ip} "
-            f"max_workers={max_workers}"
+            f"max_workers={max_workers} max_tasks_per_child={max_tasks_per_child}"
         )
+
+    def _build_executor(self) -> None:
+        from concurrent.futures import ProcessPoolExecutor
+        try:
+            self._executor = ProcessPoolExecutor(
+                max_workers=self.max_workers,
+                max_tasks_per_child=self.max_tasks_per_child,
+            )
+        except TypeError:
+            self._executor = ProcessPoolExecutor(max_workers=self.max_workers)
 
     def get_ip(self) -> str:
         return self.ip
 
     def submit_task(self, task: dict[str, Any]) -> dict[str, Any]:
-        future = self._executor.submit(_naive_bundle_task, task)
-        return future.result()
+        from concurrent.futures.process import BrokenProcessPool
+        try:
+            future = self._executor.submit(_naive_bundle_task, task)
+            return future.result()
+        except BrokenProcessPool:
+            logger.warning(
+                "[NaiveNodeWorker %s] BrokenProcessPool — rebuilding "
+                "executor and retrying instance=%s",
+                self.name, task.get("instance_id", "?"),
+            )
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self._build_executor()
+            future = self._executor.submit(_naive_bundle_task, task)
+            return future.result()
 
     def memory_usage(self) -> dict:
         try:
@@ -380,6 +423,7 @@ def _naive_values_from_env() -> dict[str, Any]:
         "policy_top_p": _float("SWE_AGENT_NAIVE_POLICY_TOP_P", 0.95),
         "fallback_patch_penalty": _float("SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY", 0.5),
         "no_action_patch_penalty": _float("SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY", 0.0),
+        "reward_kind": (os.environ.get("SWE_AGENT_NAIVE_REWARD_KIND") or "delta").lower(),
     }
 
 
@@ -389,9 +433,37 @@ def _hash_to_index(s: str, n: int) -> int:
     return int(h, 16) % n
 
 
-def _route_for_instance(instance_id: str, ports: list[int], host: str) -> str:
-    p = ports[_hash_to_index(instance_id, len(ports))]
-    return f"{host.rstrip('/')}:{p}"
+def _pick_least_loaded_endpoints(
+    m: int, endpoints: list[tuple[str, int]]
+) -> tuple[list[str], list[tuple[str, int]]]:
+    """Pick M URLs (with repetition if m > len(endpoints)) by current in-flight
+    load: each call selects the (host,port) with the smallest
+    _ENDPOINT_INFLIGHT count, pre-incrementing that count so the next pick
+    within the same call sees the updated load. Returns (urls, endpoints_picked)
+    so the caller can later decrement the same endpoints when the bundle
+    returns.
+
+    Ties are broken by ascending (host, port), giving deterministic spread
+    when all engines start empty: the first M instances dispatched will
+    spread across the first M engines, second batch across next M, etc.
+    Each trial keeps its endpoint for the full multi-turn rollout so the
+    engine's prefix cache stays warm — exactly the per-trial sticky pattern
+    sglang_router's cache_aware policy can't deliver because it sees all
+    trials of an instance as cache-identical at trial-start.
+    """
+    picks: list[tuple[str, int]] = []
+    for _ in range(m):
+        ep = min(endpoints, key=lambda hp: (_ENDPOINT_INFLIGHT.get(hp, 0), hp[0], hp[1]))
+        _ENDPOINT_INFLIGHT[ep] = _ENDPOINT_INFLIGHT.get(ep, 0) + 1
+        picks.append(ep)
+    urls = [f"http://{h}:{p}" for (h, p) in picks]
+    return urls, picks
+
+
+def _release_endpoints(endpoints_picked: list[tuple[str, int]]) -> None:
+    for ep in endpoints_picked:
+        cur = _ENDPOINT_INFLIGHT.get(ep, 0)
+        _ENDPOINT_INFLIGHT[ep] = max(0, cur - 1)
 
 
 def _submit_until_full(
@@ -407,17 +479,27 @@ def _submit_until_full(
     submitted = 0
     naive_values = _naive_values_from_env()
 
-    policy_ports = [
-        int(p) for p in os.environ.get("SWE_AGENT_NAIVE_POLICY_PORTS", "").split(",") if p
-    ]
-    if not policy_ports:
+    # Per-engine endpoints discovered at engine init in slime/ray/rollout.py.
+    # Each entry is (host, port) for one sglang engine; the policy dispatcher
+    # picks the least-loaded one per trial, then pins all turns of that trial
+    # to the chosen endpoint (sticky per trial -> KV cache reuse within the
+    # trial, spread across trials of an instance).
+    endpoints: list[tuple[str, int]] = list(
+        (getattr(args, "sglang_model_engines", None) or {}).get(model_name, [])
+    )
+    if not endpoints:
+        # Fallback: route everything through the single router. Loses
+        # per-trial spread but keeps the collector functional even if the
+        # ray.get_url discovery failed for this server.
         router_ip, router_port = (getattr(args, "sglang_model_routers", None) or {}).get(
             model_name, (args.sglang_router_ip, args.sglang_router_port),
         )
-        policy_ports = [router_port]
-        api_host = f"http://{router_ip}"
-    else:
-        api_host = os.environ.get("SWE_AGENT_NAIVE_API_HOST", "http://127.0.0.1")
+        endpoints = [(router_ip, router_port)]
+        logger.warning(
+            "[naive-async] no per-engine endpoints for model=%s — "
+            "falling back to single router %s:%s (per-trial routing dormant)",
+            model_name, router_ip, router_port,
+        )
 
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
 
@@ -431,7 +513,14 @@ def _submit_until_full(
         # the first duplicate. n_samples_per_prompt MUST equal SWE_AGENT_NAIVE_M.
         metadata = prompt_group[0].metadata
         instance_id = metadata["instance_id"]
-        policy_base_url = _route_for_instance(instance_id, policy_ports, api_host)
+        # Per-trial routing: pick M URLs by current per-engine load. The M
+        # trials of this instance get spread across distinct engines (cycling
+        # back to least-loaded if M > num_engines), so all engines stay busy
+        # even when max_pending < num_engines.
+        m_trials = int(naive_values.get("m", 8))
+        policy_base_urls, endpoints_picked = _pick_least_loaded_endpoints(
+            m_trials, endpoints,
+        )
 
         task = {
             "index": _TASK_INDEX,
@@ -441,7 +530,11 @@ def _submit_until_full(
             "split": metadata["split"],
             "output_root": str(output_root / f"rollout_{rollout_id:04d}"),
             "model_name": model_name,
-            "policy_base_url": policy_base_url,
+            # Legacy single-URL key (kept for any consumer that hasn't been
+            # updated yet; worker prefers policy_base_urls when present).
+            "policy_base_url": policy_base_urls[0],
+            "policy_base_urls": policy_base_urls,
+            "_endpoints_picked": endpoints_picked,
             "api_key": api_key,
             **naive_values,
         }
@@ -489,6 +582,12 @@ def _harvest_ready(
         ready, _ = ray.wait(pending_refs, num_returns=len(pending_refs), timeout=0)
     for ref in ready:
         task = _PENDING.pop(ref)
+        # The bundle is no longer in-flight on any engine — release the
+        # M endpoint slots we reserved at dispatch, regardless of outcome.
+        # Tuples come back from Ray as lists; coerce to tuple for dict key.
+        _release_endpoints([
+            tuple(ep) for ep in task.get("_endpoints_picked", [])
+        ])
         try:
             result = ray.get(ref)
         except Exception as exc:
@@ -831,6 +930,17 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         if p2p_total > 0:
             p2p_pass_rates.append(p2p_passed / p2p_total)
 
+    global _PREV_STALE_DROPPED_GROUPS, _PREV_FILTER_DROPPED_GROUPS
+    stale_dropped_step = _STALE_DROPPED_GROUPS - _PREV_STALE_DROPPED_GROUPS
+    filter_dropped_step = _FILTER_DROPPED_GROUPS - _PREV_FILTER_DROPPED_GROUPS
+    _PREV_STALE_DROPPED_GROUPS = _STALE_DROPPED_GROUPS
+    _PREV_FILTER_DROPPED_GROUPS = _FILTER_DROPPED_GROUPS
+    n_groups_kept = len(selected_groups)
+    filter_drop_rate_step = (
+        filter_dropped_step / (filter_dropped_step + n_groups_kept)
+        if (filter_dropped_step + n_groups_kept) > 0 else 0.0
+    )
+
     return RolloutFnTrainOutput(
         samples=samples,
         metrics={
@@ -844,6 +954,10 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/stale_dropped_groups_total": _STALE_DROPPED_GROUPS,
             "swe_agent/dropped_oversized_samples_total": _DROPPED_OVERSIZED,
             "swe_agent/filter_dropped_groups_total": _FILTER_DROPPED_GROUPS,
+            # --- per-step drop deltas (easier to chart than diff of totals) ---
+            "swe_agent/stale_dropped_groups": stale_dropped_step,
+            "swe_agent/dynamic_filter_dropped_groups": filter_dropped_step,
+            "swe_agent/dynamic_filter_drop_rate": filter_drop_rate_step,
             "swe_agent/wait_seconds": time.perf_counter() - wait_started,
             "swe_agent/seconds": time.perf_counter() - started,
             "swe_agent/source": "naive",
