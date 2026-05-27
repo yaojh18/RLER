@@ -26,7 +26,11 @@ for path in (REPO_ROOT / "agent", REPO_ROOT / "slime"):
 from swe_agent.run.benchmarks.swebench import load_swebench_instances
 from swe_agent.run.benchmarks.swebench import get_swebench_docker_image_name
 from swe_agent.run.run_swe_agent import infer_litellm_api_env
-from train_agent.collect_sft_rollout import DEFAULT_TEACHER_MODEL, collect_teacher_student_export
+from train_agent.collect_sft_rollout import (
+    DEFAULT_TEACHER_MODEL,
+    collect_teacher_student_export,
+    collect_teacher_student_export_parallel,
+)
 from train_agent.contracts import ExportSample
 from train_agent.data_export import _RunArtifacts
 from train_agent.serving.sglang_chat_service import (
@@ -459,6 +463,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--search-k", type=int, default=20)
     parser.add_argument("--search-max-rounds", type=int, default=5)
     parser.add_argument("--search-step-limit", type=int, default=100)
+    # Parallel (v1-lanes) search path — skips the slime server lifecycle
+    # and talks directly to the teacher sglang endpoint via the parallel
+    # trajectory_search runner with full-parity rubric machinery.
+    parser.add_argument(
+        "--use-parallel-search",
+        action="store_true",
+        help="Use trajectory_search_parallel + ParallelSFTDataExporter instead "
+             "of the sequential search + SFTDataExporter pipeline. "
+             "Skips slime-server lifecycle (assumes --teacher-base-url is up).",
+    )
+    parser.add_argument(
+        "--teacher-base-url",
+        default=os.environ.get("DSV4_BASE_URL", ""),
+        help="sglang base URL for the teacher (used by --use-parallel-search). "
+             "Falls back to $DSV4_BASE_URL env var. For multi-server "
+             "scale-out, launch K collector processes (1 per endpoint) — see "
+             "launch_sft_parallel_sharded.sh.",
+    )
+    parser.add_argument(
+        "--rubric-base-url",
+        default=None,
+        help="If set, route rubric+judge calls to a separate sglang URL. "
+             "Defaults to --teacher-base-url.",
+    )
+    parser.add_argument(
+        "--rubric-bank-strategy",
+        choices=["score", "experience", "both"],
+        default="score",
+    )
+    parser.add_argument(
+        "--lanes-max-mid-cps",
+        type=int,
+        default=6,
+        help="Cap on Lane A mid_cp emissions per instance (parallel path).",
+    )
+    parser.add_argument(
+        "--lanes-steps-per-round",
+        type=int,
+        default=20,
+        help="Asst turns between Lane A mid_cps (parallel path). Also used as "
+             "trainable-token cap in the policy bundle (task 3).",
+    )
+    parser.add_argument(
+        "--lanes-gt-eval-workers",
+        type=int,
+        default=8,
+        help="Per-instance GT eval worker count (parallel path).",
+    )
     parser.add_argument(
         "--search-output-root",
         "--output-root",
@@ -794,6 +846,113 @@ def run_concurrent_instances(
     return successful_instances
 
 
+def run_parallel_instances(
+    *,
+    args: argparse.Namespace,
+    logs_dir: Path,
+    instance_ids: list[str],
+    summary: dict[str, Any],
+    started: float,
+) -> int:
+    """Parallel-search SFT collection: runs `--instance-workers` instances
+    concurrently in this process (each instance internally fans out Lane B
+    branches + GT eval + Lane C rubric).
+
+    Single endpoint per collector process. For multi-server scale-out,
+    launch K collector processes (1 per endpoint) — see
+    launch_sft_parallel_sharded.sh.
+    """
+    if not args.teacher_base_url:
+        raise RuntimeError(
+            "--use-parallel-search requires --teacher-base-url (or $DSV4_BASE_URL)"
+        )
+    successful_instances = 0
+    workers = max(1, args.instance_workers)
+
+    def _one(idx: int, instance_id: str) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        try:
+            sft_bundle = collect_teacher_student_export_parallel(
+                instance_id=instance_id,
+                output_root=args.search_output_root,
+                teacher_model_name=args.teacher_model,
+                teacher_base_url=args.teacher_base_url,
+                teacher_api_key=args.teacher_api_key or "EMPTY",
+                rubric_base_url=args.rubric_base_url,
+                rubric_bank_strategy=args.rubric_bank_strategy,
+                subset=args.subset,
+                split=args.split,
+                m=args.search_m,
+                n=args.search_n,
+                max_mid_cps=args.lanes_max_mid_cps,
+                steps_per_round=args.lanes_steps_per_round,
+                step_limit=args.search_step_limit,
+                gt_eval_workers=args.lanes_gt_eval_workers,
+            )
+            accepted = [
+                *(sample_length_record("policy", s, sft_bundle.instance_id) for s in sft_bundle.policy_samples),
+                *(sample_length_record("rubric", s, sft_bundle.instance_id) for s in sft_bundle.rubric_samples),
+            ]
+            md = dict(sft_bundle.metadata)
+            # After the policy/rubric decoupling, `accepted_group_ids` means
+            # "groups that contributed AT LEAST ONE sample (policy OR
+            # rubric)" — i.e. NOT fully dropped. The strict-coupled
+            # interpretation (both policy AND rubric) is gone. Surface the
+            # decoupled counts so consumers can pick.
+            return {
+                "status": "ok",
+                "instance_id": instance_id,
+                "index": idx,
+                "total": len(instance_ids),
+                "run_dir": sft_bundle.run_dir,
+                "accepted_group_ids": list(sft_bundle.accepted_group_ids),
+                # Headline sample counts (decoupled):
+                "policy_samples": len(sft_bundle.policy_samples),
+                "rubric_samples": len(sft_bundle.rubric_samples),
+                # Group-level breakdown (decoupled — these may differ from
+                # len(accepted_group_ids) which is the OR-union):
+                "groups_with_policy": int(md.get("num_groups_with_policy", 0)),
+                "groups_with_rubric": int(md.get("num_groups_with_rubric", 0)),
+                "groups_with_any": len(sft_bundle.accepted_group_ids),
+                "num_groups": int(md.get("num_groups", 0)),
+                "seconds": time.perf_counter() - t0,
+                "metadata": md,
+                "_accepted_length_records": accepted,
+            }
+        except Exception as exc:
+            import traceback
+            return {
+                "status": "error",
+                "instance_id": instance_id,
+                "index": idx,
+                "total": len(instance_ids),
+                "seconds": time.perf_counter() - t0,
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+                "_accepted_length_records": [],
+            }
+
+    # Bound concurrency with a ThreadPoolExecutor. Each instance's parallel
+    # runner uses asyncio internally; running multiple via threads gives
+    # us cross-instance concurrency without subprocess overhead.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(_one, idx, instance_id): instance_id
+            for idx, instance_id in enumerate(instance_ids, start=1)
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
+            summary["accepted_sft_length_records"].extend(
+                res.pop("_accepted_length_records", []) or []
+            )
+            summary["results"].append(res)
+            if res.get("status") == "ok":
+                successful_instances += 1
+            update_summary_progress(summary, started=started, successful_instances=successful_instances)
+            write_summary(args.summary_path, summary)
+    return successful_instances
+
+
 def run_serial_instances(
     *,
     args: argparse.Namespace,
@@ -949,7 +1108,15 @@ def main(argv: list[str] | None = None) -> int:
         write_summary(args.summary_path, summary)
 
     started = time.perf_counter()
-    if args.instance_workers > 1 and len(instance_ids) > 1:
+    if args.use_parallel_search:
+        successful_instances = run_parallel_instances(
+            args=args,
+            logs_dir=logs_dir,
+            instance_ids=instance_ids,
+            summary=summary,
+            started=started,
+        )
+    elif args.instance_workers > 1 and len(instance_ids) > 1:
         successful_instances = run_concurrent_instances(
             args=args,
             logs_dir=logs_dir,
