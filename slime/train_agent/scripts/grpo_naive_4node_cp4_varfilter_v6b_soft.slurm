@@ -65,7 +65,7 @@ ACTOR_NUM_GPUS=8
 ROLLOUT_NUM_GPUS=24
 GRPO_TARGET=policy
 GRPO_MODEL_NAME="Qwen/Qwen3.5-9B"
-PROMPT_BUDGET=1316
+PROMPT_BUDGET=1150          # v2 dataset: 1316 - 166 (registry-deleted images)
 CONTEXT_PARALLEL_SIZE=4
 # ====================================================================
 
@@ -77,7 +77,7 @@ RAY_PORT=6379
 
 RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench
-SUBSET=$BASE/datasets/v2_python_train_plus_sweep_middle
+SUBSET=$BASE/datasets/v2_python_train_plus_sweep_middle_v2
 RUN_DIR=/home/sihanzeng_meta_com/rler_runs/${SLURM_JOB_ID}-grpo-naive-cp4-v6b
 SLURM_LOGS=/home/sihanzeng_meta_com/rler_runs/_slurm-logs
 mkdir -p $RUN_DIR $SLURM_LOGS $RUN_DIR/_logs
