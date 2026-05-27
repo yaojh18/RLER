@@ -484,9 +484,13 @@ def _submit_until_full(
     # picks the least-loaded one per trial, then pins all turns of that trial
     # to the chosen endpoint (sticky per trial -> KV cache reuse within the
     # trial, spread across trials of an instance).
-    endpoints: list[tuple[str, int]] = list(
-        (getattr(args, "sglang_model_engines", None) or {}).get(model_name, [])
-    )
+    engines_map = getattr(args, "sglang_model_engines", None) or {}
+    endpoints: list[tuple[str, int]] = list(engines_map.get(model_name, []))
+    if not endpoints and len(engines_map) == 1:
+        # Upstream slime keys this dict by server name ("default"), not by
+        # served model name. When there is exactly one server we can use
+        # its endpoints unambiguously regardless of the key.
+        endpoints = list(next(iter(engines_map.values())))
     if not endpoints:
         # Fallback: route everything through the single router. Loses
         # per-trial spread but keeps the collector functional even if the
