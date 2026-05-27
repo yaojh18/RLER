@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent_rl import (
     ModelTurn,
@@ -213,6 +213,83 @@ class SWEAgentSession:
         self.last_step_index = step_index
         self.status = "finished" if self.is_finished() else "running"
 
+    def step_with_pre_action_hook(
+        self,
+        pre_action_hook: Optional[
+            Callable[["SWEAgentSession", int, dict[str, Any], list[dict[str, Any]]], None]
+        ] = None,
+    ) -> None:
+        if self.is_finished():
+            self.status = "finished"
+            return
+
+        step_index = self.last_step_index + 1
+        query_messages = copy.deepcopy(self.agent.messages)
+        self._record_event(
+            step_index=step_index,
+            kind="model_request",
+            payload={"messages": query_messages},
+            provenance={
+                "policy_ref": self.spec.policy_ref,
+                "policy_version": self.spec.policy_version,
+                "model_name": getattr(getattr(self.agent.model, "config", None), "model_name", None),
+            },
+        )
+
+        try:
+            model_message = self.agent.query()
+            self._record_event(
+                step_index=step_index,
+                kind="model_response",
+                payload={"message": copy.deepcopy(model_message)},
+            )
+            self.model_turns.append(
+                ModelTurn(
+                    session_id=self.spec.session_id,
+                    step_index=step_index,
+                    query_messages=_messages_to_protocol(query_messages, source="conversation", trainable=False),
+                    response_message=_message_to_protocol(model_message, source="model", trainable=True),
+                    metadata={
+                        "policy_ref": self.spec.policy_ref,
+                        "policy_version": self.spec.policy_version,
+                        "dataset_name": self.spec.dataset_name,
+                        "ground_truth": self.spec.ground_truth,
+                    },
+                )
+            )
+            actions = copy.deepcopy(model_message.get("extra", {}).get("actions") or [])
+            if actions:
+                self._record_event(
+                    step_index=step_index,
+                    kind="environment_action",
+                    payload={"actions": actions},
+                )
+            if pre_action_hook is not None:
+                pre_action_hook(self, step_index, copy.deepcopy(model_message), copy.deepcopy(actions))
+            observation_messages = self.agent.execute_actions(model_message)
+        except InterruptAgentFlow as exc:
+            interrupt_messages = []
+            assistant_message = getattr(exc, "assistant_message", None)
+            if assistant_message:
+                interrupt_messages.append(assistant_message)
+            interrupt_messages.extend(exc.messages)
+            self._record_interrupt(step_index=step_index, messages=self.agent.add_messages(*interrupt_messages))
+            self.status = "finished" if self.is_finished() else "running"
+            return
+        except Exception as exc:
+            self._record_uncaught_exception(step_index=step_index, error=exc)
+            raise
+
+        if observation_messages:
+            self._record_event(
+                step_index=step_index,
+                kind="environment_result",
+                payload={"messages": copy.deepcopy(observation_messages)},
+            )
+
+        self.last_step_index = step_index
+        self.status = "finished" if self.is_finished() else "running"
+
     def run_until_pause(self, max_steps: Optional[int] = None) -> RolloutResult:
         executed_steps = 0
         while True:
@@ -220,6 +297,43 @@ class SWEAgentSession:
                 break
             self.step()
             executed_steps += 1
+        return self.export_result()
+
+    def run_until_pause_or_trigger(
+        self,
+        max_steps: Optional[int] = None,
+        trigger: Optional[Callable[["SWEAgentSession", int], bool]] = None,
+    ) -> RolloutResult:
+        executed_steps = 0
+        while True:
+            if self._mark_paused_if_needed(max_steps=max_steps, executed_steps=executed_steps):
+                break
+            self.step()
+            executed_steps += 1
+            if trigger is not None and trigger(self, executed_steps):
+                if not self.is_finished():
+                    self.status = "paused"
+                break
+        return self.export_result()
+
+    def run_until_pause_or_pre_action_trigger(
+        self,
+        max_steps: Optional[int] = None,
+        pre_action_hook: Optional[
+            Callable[["SWEAgentSession", int, dict[str, Any], list[dict[str, Any]]], None]
+        ] = None,
+        trigger: Optional[Callable[["SWEAgentSession", int], bool]] = None,
+    ) -> RolloutResult:
+        executed_steps = 0
+        while True:
+            if self._mark_paused_if_needed(max_steps=max_steps, executed_steps=executed_steps):
+                break
+            self.step_with_pre_action_hook(pre_action_hook=pre_action_hook)
+            executed_steps += 1
+            if trigger is not None and trigger(self, executed_steps):
+                if not self.is_finished():
+                    self.status = "paused"
+                break
         return self.export_result()
 
     def _component_state(self, component: Any, *, key: str) -> SessionComponentState:

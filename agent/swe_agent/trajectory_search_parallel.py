@@ -73,7 +73,7 @@ from swe_agent.prompt import (
     SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
 )
 from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches
-from swe_agent.rubric_bank import ExperienceRubricBank, ScoreRubricBank
+from swe_agent.rubric_bank import ExperienceRubricBank, ScoreRubricBank, build_terminal_update_evidence
 from swe_agent.trajectory_search import (
     _avg_scores_from_rubrics,
     _generate_and_score_rubric_batch,
@@ -2490,6 +2490,21 @@ class TrajectorySearchParallelRunner:
                         rubric_payloads=[
                             {
                                 **copy.deepcopy(sample),
+                                **build_terminal_update_evidence(
+                                    parent_patch=group.parent_branch.terminal_patch if group.parent_branch else "",
+                                    parent_evaluation=(
+                                        group.parent_branch.gt_payload
+                                        if group.parent_branch and group.parent_branch.gt_payload
+                                        else None
+                                    ),
+                                    continuations=[
+                                        {
+                                            "patch": branch.terminal_patch,
+                                            "evaluation": branch.gt_payload,
+                                        }
+                                        for branch in group.branches
+                                    ],
+                                ),
                                 "group_index": group.group_index,
                                 "messages": copy.deepcopy(sample["messages"]),
                             }

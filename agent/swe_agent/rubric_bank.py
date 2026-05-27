@@ -24,6 +24,7 @@ from swe_agent.prompt import (
 
 
 logger = logging.getLogger(__name__)
+MAX_TERMINAL_PATCH_SECTION_CHARS = 4096
 
 
 @dataclass
@@ -192,6 +193,61 @@ def gold_patch_skeleton(gold_patch: str, max_chars: int = 4096) -> str:
     return text[:half].rstrip() + "\n...[truncated]...\n" + text[-half:].lstrip()
 
 
+def build_terminal_update_evidence(
+    *,
+    parent_patch: str = "",
+    parent_evaluation: dict[str, Any] | None = None,
+    continuations: list[dict[str, Any]],
+) -> dict[str, str]:
+    participants = [
+        {
+            "title": "Parent",
+            "patch": parent_patch or "",
+            "passed_tests": (
+                {str(test) for test in parent_evaluation.get("passed_tests", []) if str(test)}
+                if isinstance(parent_evaluation, dict)
+                else set()
+            ),
+            "has_evaluation": parent_evaluation is not None,
+        }
+    ]
+    for index, continuation in enumerate(continuations, start=1):
+        evaluation = continuation.get("evaluation")
+        participants.append(
+            {
+                "title": f"Continuation {index}",
+                "patch": str(continuation.get("patch") or ""),
+                "passed_tests": (
+                    {str(test) for test in evaluation.get("passed_tests", []) if str(test)}
+                    if isinstance(evaluation, dict)
+                    else set()
+                ),
+                "has_evaluation": evaluation is not None,
+            }
+        )
+    test_participants = [item for item in participants if item["has_evaluation"]]
+    common_passed = set.intersection(*(item["passed_tests"] for item in test_participants)) if test_participants else set()
+    terminal_patch_rows: list[str] = []
+    passed_test_rows: list[str] = []
+    for item in participants:
+        patch = str(item["patch"] or "")
+        if len(patch) > MAX_TERMINAL_PATCH_SECTION_CHARS:
+            half = MAX_TERMINAL_PATCH_SECTION_CHARS // 2
+            patch = patch[:half].rstrip() + "\n...[truncated]...\n" + patch[-half:].lstrip()
+        diff_tests = set(item["passed_tests"]) - common_passed
+        terminal_patch_rows.extend([f"## {item['title']}:", patch.strip() if patch.strip() else "<empty>"])
+        passed_test_rows.extend(
+            [
+                f"## {item['title']}:",
+                "\n".join(sorted(diff_tests)) if diff_tests else "<none>",
+            ]
+        )
+    return {
+        "terminal_patch": "\n\n".join(terminal_patch_rows),
+        "passed_tests": "\n\n".join(passed_test_rows),
+    }
+
+
 def _convert_experience(payload: dict[str, Any], experience_id: str | None = None) -> RubricExperience | None:
     required_keys = {"title", "description", "metadata", "context", "experience"}
     if required_keys - set(payload):
@@ -352,6 +408,7 @@ def _rubric_accuracy_payload(
     score_by_rubric: dict[str, dict[str, float]],
     gt_scores: dict[str, float],
     ordered_node_ids: list[str],
+    scope: str = "siblings",
 ) -> dict[str, dict[str, Any]]:
     accuracy: dict[str, dict[str, Any]] = {}
     for rubric in generated:
@@ -362,7 +419,11 @@ def _rubric_accuracy_payload(
             continue
         direction = rubric.get("direction")
         aligned_scores = {
-            node_id: (1.0 - float(raw_scores.get(node_id)) if direction == "negative" else float(raw_scores.get(node_id)))
+            node_id: (
+                0.5 * (1.0 - float(raw_scores.get(node_id)))
+                if scope == "pc" and direction == "negative"
+                else (1.0 - float(raw_scores.get(node_id)) if direction == "negative" else float(raw_scores.get(node_id)))
+            )
             for node_id in ordered_node_ids
             if node_id in raw_scores
         }
@@ -845,6 +906,7 @@ class ExperienceRubricBank:
                 },
                 gt_scores=ground_truth_by_node,
                 ordered_node_ids=ordered_node_ids,
+                scope=self.scope,
             )
             attempts.append(
                 {
@@ -852,6 +914,8 @@ class ExperienceRubricBank:
                     "retrieved_experience": [_public_experience(item) for item in payload.get("retrieved", [])],
                     "generated_rubrics": generated_rubrics,
                     "gt_skeleton": gt_skeleton,
+                    "terminal_patch": str(payload.get("terminal_patch") or ""),
+                    "passed_tests": str(payload.get("passed_tests") or ""),
                     "gt_scores": _rounded_score_list(ground_truth_by_node, ordered_node_ids),
                     "average_rubric_judged_scores": _rounded_score_list(avg_scores, ordered_node_ids),
                     "generated_rubric_accuracy": generated_rubric_accuracy,

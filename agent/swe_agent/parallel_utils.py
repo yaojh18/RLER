@@ -12,6 +12,7 @@ from typing import Any, Callable
 import numpy as np
 from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
 from swe_agent.prompt import SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT
+from swe_agent.rubric_bank import build_terminal_update_evidence
 
 INVALID_SAMPLE_REWARD = -1.0
 RUBRIC_FORMAT_ERROR_REWARD = -1.0
@@ -442,10 +443,9 @@ class PatchEvalManager:
         bundles: list[NodeArtifactBundle],
         rubric_bundles: list[RubricArtifactBundle] | None,
         extra_json_writes: list[tuple[Path, Any]] | None,
-        previous_future: Future | None,
-    ) -> dict[str, dict[str, Any]]:
-        if previous_future is not None:
-            previous_future.result()
+    ) -> dict[str, Any]:
+        terminal_patch_by_node_id: dict[str, str] = {}
+        terminal_evaluation_by_node_id: dict[str, dict[str, Any]] = {}
 
         patches_by_node_id: dict[str, str] = {}
         empty_node_ids: list[str] = []
@@ -481,6 +481,15 @@ class PatchEvalManager:
             for bundle in bundles
             if bundle.node_id in evaluations
         ]
+        for bundle in bundles:
+            node_id = bundle.node_id
+            terminal_patch_payload = bundle.terminal_patch_payload or {}
+            task_payload = terminal_patch_payload.get(self.task_id, {}) if isinstance(terminal_patch_payload, dict) else {}
+            if isinstance(task_payload, dict):
+                terminal_patch_by_node_id[node_id] = str(task_payload.get("model_patch") or "")
+            if node_id in evaluations:
+                terminal_evaluation_by_node_id[node_id] = evaluations[node_id]
+        rubric_update_payloads: list[dict[str, Any]] = []
         gt_by_node_id = {node_id: float(payload.get("reward", 0.0)) for node_id, payload in evaluations.items()}
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
@@ -488,6 +497,18 @@ class PatchEvalManager:
             score_by_rubric = payload["score_by_rubric"]
             ordered_node_ids = sorted(node_id for node_id in avg_scores if node_id in gt_by_node_id)
             gt_by_ordered_node_id = {node_id: gt_by_node_id[node_id] for node_id in ordered_node_ids}
+            parent_node_id = str(payload.get("parent_node_id") or "root")
+            terminal_update_evidence = build_terminal_update_evidence(
+                parent_patch=terminal_patch_by_node_id.get(parent_node_id, ""),
+                parent_evaluation=terminal_evaluation_by_node_id.get(parent_node_id),
+                continuations=[
+                    {
+                        "patch": terminal_patch_by_node_id.get(node_id, ""),
+                        "evaluation": terminal_evaluation_by_node_id.get(node_id),
+                    }
+                    for node_id in ordered_node_ids
+                ],
+            )
             if bundle.scope == "siblings":
                 ground_truth_by_node = gt_by_ordered_node_id
             elif bundle.scope == "pc":
@@ -521,6 +542,13 @@ class PatchEvalManager:
                 payload["reward"] = gap_corr(predicted_scores, gt_scores)
             else:
                 payload["reward"] = progress_reward(gt_scores, predicted_scores)
+            rubric_update_payloads.append(
+                {
+                    "scope": bundle.scope,
+                    "rubric_list_id": payload.get("rubric_list_id") or payload.get("sample_id") or bundle.rubric_dir.name,
+                    **terminal_update_evidence,
+                }
+            )
 
 
         if self.collector is not None:
@@ -528,7 +556,10 @@ class PatchEvalManager:
             self.collector.collect(bundles, rubric_bundles or [], parent_id)
         if self.write_artifacts:
             _write_gt_artifacts(bundles, rubric_bundles, (extra_json_writes or []) + eval_extra_writes)
-        return evaluations
+        return {
+            "evaluations": evaluations,
+            "rubric_update_payloads": rubric_update_payloads,
+        }
 
     def submit_round(
         self,
@@ -536,18 +567,15 @@ class PatchEvalManager:
         rubric_bundles: list[RubricArtifactBundle] | Future | None = None,
         extra_json_writes: list[tuple[Path, Any]] | None = None,
     ) -> Future:
-        if isinstance(rubric_bundles, Future):
-            previous_future = rubric_bundles
-            rubric_bundles = None
-        else:
-            previous_future = self._futures[-1] if self._futures else None
-        future = self._executor.submit(self._evaluate_round, bundles, rubric_bundles, extra_json_writes, previous_future)
+        future = self._executor.submit(self._evaluate_round, bundles, rubric_bundles, extra_json_writes)
         self._futures.append(future)
         return future
 
-    def wait(self) -> None:
+    def wait(self) -> list[dict[str, Any]]:
+        results = []
         while self._futures:
-            self._futures.pop(0).result()
+            results.append(self._futures.pop(0).result())
+        return results
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=False)

@@ -774,6 +774,28 @@ def _avg_scores_from_rubrics(
     return rewards
 
 
+def _pc_avg_scores_from_rubrics(
+    *,
+    node_ids: list[str],
+    score_lookup_by_node: dict[str, dict[str, float]],
+    rubrics: list[RubricRecord],
+) -> dict[str, float]:
+    if not rubrics:
+        return {node_id: 0.5 for node_id in node_ids}
+    rewards: dict[str, float] = {}
+    for node_id in node_ids:
+        total = 0.0
+        score_lookup = score_lookup_by_node[node_id]
+        for rubric in rubrics:
+            raw = score_lookup.get(rubric.rubric_id, 0.0)
+            if rubric.direction == "negative":
+                total += 0.5 * (1.0 - raw)
+            else:
+                total += raw
+        rewards[node_id] = total / len(rubrics)
+    return rewards
+
+
 # NOTE: the correlation score will be unstable when there are very few data points
 def _redundancy_reward(
     candidate_scores: list[float],
@@ -1009,9 +1031,10 @@ class TrajectorySearchRunner:
                     rubric_update_records.extend(round_rubric_records)
                 self._save_manifest()
             self.artifact_writer.wait()
+            patch_eval_payloads = []
             if self.patch_eval_manager is not None:
-                self.patch_eval_manager.wait()
-            self._update_experience_banks(rubric_update_records)
+                patch_eval_payloads = self.patch_eval_manager.wait()
+            self._update_experience_banks(rubric_update_records, patch_eval_payloads)
             self._finalize_outputs()
         finally:
             if self.patch_eval_manager is not None:
@@ -1025,7 +1048,19 @@ class TrajectorySearchRunner:
             self._manifest_executor.shutdown(wait=True, cancel_futures=False)
 
 
-    def _update_experience_banks(self, rubric_update_records: list[dict[str, Any]]) -> None:
+    def _update_experience_banks(
+        self,
+        rubric_update_records: list[dict[str, Any]],
+        patch_eval_payloads: list[dict[str, Any]] | None = None,
+    ) -> None:
+        terminal_evidence_by_rubric = {}
+        for payload in patch_eval_payloads or []:
+            for item in payload.get("rubric_update_payloads") or []:
+                key = (item.get("scope"), item.get("rubric_list_id"))
+                terminal_evidence_by_rubric[key] = {
+                    "terminal_patch": str(item.get("terminal_patch") or ""),
+                    "passed_tests": str(item.get("passed_tests") or ""),
+                }
         experience_update_specs = [
             {"scope": scope, "bank": self.experience_banks[scope]}
             for scope in self.rubric_scopes
@@ -1037,6 +1072,13 @@ class TrajectorySearchRunner:
             rubric_payloads = [
                 {
                     **copy.deepcopy(record["rubric_payload"]),
+                    **terminal_evidence_by_rubric.get(
+                        (
+                            spec["scope"],
+                            record["rubric_payload"].get("rubric_list_id"),
+                        ),
+                        {},
+                    ),
                     "round_index": int(record["round_index"]),
                     "messages": copy.deepcopy(record["messages"]),
                 }
@@ -1399,11 +1441,18 @@ class TrajectorySearchRunner:
                 if score_bank is not None
                 else None
             )
-            avg_scores = _avg_scores_from_rubrics(
-                node_ids=node_ids,
-                score_lookup_by_node=evaluation["score_lookup_by_node"],
-                rubrics=generated_rubrics,
-            )
+            if scope_spec["scope"] == "pc":
+                avg_scores = _pc_avg_scores_from_rubrics(
+                    node_ids=node_ids,
+                    score_lookup_by_node=evaluation["score_lookup_by_node"],
+                    rubrics=generated_rubrics,
+                )
+            else:
+                avg_scores = _avg_scores_from_rubrics(
+                    node_ids=node_ids,
+                    score_lookup_by_node=evaluation["score_lookup_by_node"],
+                    rubrics=generated_rubrics,
+                )
             generated_ids = {rubric.rubric_id for rubric in generated_sample.generated}
             sample_payload = {
                 "scope": scope_spec["scope"],
