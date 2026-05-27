@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
-"""Async rollout function backed by TrajectorySearchParallelRunner (v1).
+"""Async rollout function backed by NaiveSearchRunner (naive baseline).
 
-Drop-in for collect_grpo_rollout_async.generate_rollout — same signature,
-same return type. Uses the v1 lane-based search to produce per-instance
-GRPOExportBundle.policy_groups (one ExportGroup per fork-group = per
-mid_cp). Atomic mode only — no streaming queue.
+Drop-in for collect_lanes_rollout_async.generate_rollout — same signature,
+same return type. Each instance produces ONE ExportGroup of M=8 samples,
+one per independent linear rollout. No Lane A spine, no Lane B forks from
+intermediate states, no Lane C rubric/judge. GT reward only.
 
-Selects target='policy' (rubric_groups not generated in v1 first pass).
-
-ENV CONTRACT (set by slime/train_agent/run/grpo_async_lanes.py to match
-the SLURM script's tunables):
-  SWE_AGENT_LANES_M                  int    forks per mid_cp (default 8)
-  SWE_AGENT_LANES_MAX_MID_CPS        int    mid_cps cap per instance (default 6)
-  SWE_AGENT_LANES_STEPS_PER_ROUND    int    asst turns between mid_cps (default 20)
-  SWE_AGENT_LANES_STEP_LIMIT         int    hard cap per Lane B branch (default 120)
-  SWE_AGENT_LANES_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
-  SWE_AGENT_LANES_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
-  SWE_AGENT_LANES_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 4096)
-  SWE_AGENT_LANES_POLICY_TEMPERATURE float  Lane A sampling temp (default 1.0)
-  SWE_AGENT_LANES_POLICY_TOP_P       float  default 0.95
-  SWE_AGENT_LANES_LANE_B_TEMPERATURE float  Lane B sampling temp (default 1.0)
-  SWE_AGENT_LANES_LANE_B_TOP_P       float  default 0.95
-  SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY float default 0.5
-  SWE_AGENT_LANES_OUTPUT_ROOT        str    where to write per-instance run dirs
-  SWE_AGENT_LANES_API_HOST           str    sglang policy host (default http://127.0.0.1)
-  SWE_AGENT_LANES_POLICY_PORTS       str    csv of ports (one per sglang engine)
+ENV CONTRACT (set by slime/train_agent/run/grpo_async_naive.py from the
+SLURM script's tunables):
+  SWE_AGENT_NAIVE_M                  int    rollouts per instance (default 8)
+  SWE_AGENT_NAIVE_STEP_LIMIT         int    hard cap per rollout (default 120)
+  SWE_AGENT_NAIVE_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
+  SWE_AGENT_NAIVE_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
+  SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 4096)
+  SWE_AGENT_NAIVE_POLICY_TEMPERATURE float  sampling temp (default 1.0)
+  SWE_AGENT_NAIVE_POLICY_TOP_P       float  default 0.95
+  SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY float default 0.5
+  SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY float default 0.0  (hard zero by default)
+  SWE_AGENT_NAIVE_OUTPUT_ROOT        str    where to write per-instance run dirs
+  SWE_AGENT_NAIVE_API_HOST           str    sglang policy host (default http://127.0.0.1)
+  SWE_AGENT_NAIVE_POLICY_PORTS       str    csv of ports (one per sglang engine)
+  SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE  int    per-instance ThreadPoolExecutor cap (default = M)
+  SWE_AGENT_NAIVE_SEED               int    seed for sampling (optional)
 """
 
 from __future__ import annotations
@@ -34,7 +31,6 @@ import atexit
 import logging
 import os
 import random
-import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -49,13 +45,11 @@ from slime.rollout.filter_hub.base_types import call_dynamic_filter
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
-# Reuse v0's tokenizer cache + rollout-sample assembler — they're independent
-# of the search topology. build_rollout_samples consumes ExportGroup -> Sample.
 from train_agent.collect_grpo_rollout import _rollout_tokenizer, build_rollout_samples
 from train_agent.serving.sglang_chat_service import start_slime_policy_route_warmup
 
 
-logger = logging.getLogger("train_agent.collect_lanes_rollout_async")
+logger = logging.getLogger("train_agent.collect_naive_rollout_async")
 
 
 # ---------------------------------------------------------------------------
@@ -63,20 +57,17 @@ logger = logging.getLogger("train_agent.collect_lanes_rollout_async")
 # ---------------------------------------------------------------------------
 
 
-def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
-    """Worker-process entry. Builds backend + runner for one instance,
-    runs the v1 lane search, returns the GRPOExportBundle.
-
-    Atomic-only: no per-group streaming queue. The whole bundle is built
-    after runner.run() returns; harvest reads it from the Ray Future.
+def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Worker-process entry. Builds backend + naive runner for one instance,
+    runs M independent linear rollouts, GT-scores each, returns the
+    GRPOExportBundle (one ExportGroup of M samples).
     """
     try:
         os.environ["SEARCH_SWE_SLIME_API_BASE"] = task["policy_base_url"]
         os.environ["SEARCH_SWE_SLIME_API_KEY"] = task["api_key"]
-        # Imports inside the subprocess so env-var-dependent module init runs
-        # AFTER we've set the slime API base.
         from swe_agent.backend import SWEAgentRolloutBackend
-        from swe_agent.lane_to_grpo_bundle import instance_record_to_bundle
+        from swe_agent.naive_search import NaiveSearchConfig, NaiveSearchRunner
+        from swe_agent.naive_to_grpo_bundle import naive_record_to_bundle
         from swe_agent.run.benchmarks.swebench import (
             build_swebench_config,
             get_swebench_docker_image_name,
@@ -84,10 +75,6 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             load_swebench_instances_by_id,
         )
         from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
-        from swe_agent.trajectory_search_parallel import (
-            ParallelSearchConfig,
-            TrajectorySearchParallelRunner,
-        )
         from swe_agent.utils.serialize import recursive_merge
 
         instance_id = task["instance_id"]
@@ -95,7 +82,6 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         split = task["split"]
         model_name = task["model_name"]
         policy_base_url = task["policy_base_url"]
-        rubric_base_url = task["rubric_base_url"]
         api_key = task["api_key"]
         output_root = Path(task["output_root"])
         output_root.mkdir(parents=True, exist_ok=True)
@@ -143,21 +129,16 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                                           .get("environment_class", "docker"),
         )
 
-        cfg = ParallelSearchConfig(
+        cfg = NaiveSearchConfig(
             m=task["m"],
-            max_mid_cps=task["max_mid_cps"],
-            steps_per_round=task["steps_per_round"],
             step_limit=task["step_limit"],
             seed=task.get("seed"),
             gt_eval_workers=task.get("gt_eval_workers", 8),
-            lane_b_pool_size=task.get("lane_b_pool_size") or (task["m"] * task["max_mid_cps"]),
-            keep_images=False,
+            rollout_pool_size=task.get("rollout_pool_size") or task["m"],
             policy_temperature=task.get("policy_temperature", 1.0),
             policy_top_p=task.get("policy_top_p", 0.95),
-            lane_b_temperature=task.get("lane_b_temperature", 1.0),
-            lane_b_top_p=task.get("lane_b_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
-            disable_rubric=task.get("disable_rubric", False),
+            no_action_patch_penalty=task.get("no_action_patch_penalty", 0.0),
         )
         run_dir = (
             output_root / instance_id
@@ -166,26 +147,18 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         )
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        runner = TrajectorySearchParallelRunner(
+        runner = NaiveSearchRunner(
             instance=instance,
             backend=backend,
             run_dir=run_dir,
             policy_model_name=model_name,
-            rubric_model_name=task.get("rubric_model_name") or model_name,
-            judge_model_name=task.get("judge_model_name") or model_name,
             config=cfg,
             harness_namespace=get_swebench_harness_namespace(instance),
             policy_base_url=policy_base_url,
-            rubric_base_url=rubric_base_url,
             api_key=api_key,
         )
         record = asyncio.run(runner.run())
-        # steps_per_round is read from record.config inside the converter;
-        # task["steps_per_round"] is honored as an explicit override.
-        bundle = instance_record_to_bundle(
-            record, steps_per_round=task.get("steps_per_round"),
-            gt_only_reward=task.get("disable_rubric", False),
-        )
+        bundle = naive_record_to_bundle(record)
         result = {
             "index": task["index"],
             "instance_id": instance_id,
@@ -200,10 +173,10 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             "error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
         }
     finally:
-        # Per-task subprocess cleanup to bound RAM growth in a persistent
-        # ProcessPoolExecutor worker (52084 leaked ~25 GB/task → OOM at step 42).
-        # Drop refs to the heaviest per-task locals BEFORE returning so the
-        # subprocess can release pages back to the OS via malloc_trim.
+        # Per-task subprocess cleanup. Same OOM mitigation as the lanes
+        # collector: ProcessPoolExecutor(max_tasks_per_child=5) recycles
+        # the worker, but we still drop the heaviest locals + malloc_trim
+        # to bound RAM growth between tasks within a worker's lifetime.
         try: del record
         except UnboundLocalError: pass
         try: del runner
@@ -233,7 +206,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Module-level rollout state (mirrors v0's pattern)
+# Module-level rollout state (mirrors lanes pattern)
 # ---------------------------------------------------------------------------
 
 
@@ -252,38 +225,34 @@ _DROPPED_OVERSIZED = 0
 _FILTER_DROPPED_GROUPS = 0
 _FILTER_DROP_REASONS: dict[str, int] = {}
 
-_NODE_WORKERS: list[Any] = []          # list[ray.actor.ActorHandle]
+_NODE_WORKERS: list[Any] = []
 _NODE_WORKER_IPS: list[str] = []
-_PENDING: dict[Any, dict[str, Any]] = {}   # ObjectRef -> task dict
+_PENDING: dict[Any, dict[str, Any]] = {}
 _DISPATCH_COUNTER = 0
 
 
 @ray.remote(num_cpus=2)
-class _LanesNodeWorker:
-    """Per-physical-node executor for v1 lane bundle tasks.
-
-    Identical pattern to v0's _PDSNodeWorker but atomic-only (no streaming
-    queue → no multiprocessing.Manager involved → no initializer needed)."""
+class _NaiveNodeWorker:
+    """Per-physical-node executor for naive bundle tasks. Same pattern
+    as lanes _LanesNodeWorker — atomic ProcessPoolExecutor with
+    max_tasks_per_child=5 to bound cross-task RAM leaks."""
 
     def __init__(self, name: str = "", max_workers: int = 8, max_tasks_per_child: int = 5):
         self.name = name
         self.max_workers = max_workers
         self.max_tasks_per_child = max_tasks_per_child
         from concurrent.futures import ProcessPoolExecutor
-        # max_tasks_per_child recycles each subprocess after N tasks. Bounds
-        # any cross-task RAM leak (52084 grew ~25 GB/task → OOM at step 42).
         try:
             self._executor = ProcessPoolExecutor(
                 max_workers=max_workers,
                 max_tasks_per_child=max_tasks_per_child,
             )
         except TypeError:
-            # Python < 3.11 fallback
             self._executor = ProcessPoolExecutor(max_workers=max_workers)
         import socket
         self.ip = socket.gethostbyname(socket.gethostname())
         logger.info(
-            f"[LanesNodeWorker {self.name}] up on ip={self.ip} "
+            f"[NaiveNodeWorker {self.name}] up on ip={self.ip} "
             f"max_workers={max_workers}"
         )
 
@@ -291,7 +260,7 @@ class _LanesNodeWorker:
         return self.ip
 
     def submit_task(self, task: dict[str, Any]) -> dict[str, Any]:
-        future = self._executor.submit(_lanes_bundle_task, task)
+        future = self._executor.submit(_naive_bundle_task, task)
         return future.result()
 
     def memory_usage(self) -> dict:
@@ -326,33 +295,54 @@ def _spawn_node_workers(per_node_concurrency: int) -> None:
     global _NODE_WORKERS, _NODE_WORKER_IPS
     if _NODE_WORKERS:
         return
-    nodes = [
-        n for n in ray.nodes()
-        if n.get("Alive") and float(n.get("Resources", {}).get("GPU", 0)) > 0
-    ]
+    # SWE_AGENT_NAIVE_SKIP_NODE_IPS: csv of IPs/hostnames to exclude from
+    # the NodeWorker pool. Used when the actor lives on a dedicated node
+    # and we don't want rollout subprocess pressure on it (round-1 OOM at
+    # step 23 was on the actor node co-hosting 6 instance workers).
+    skip = {
+        s.strip()
+        for s in os.environ.get("SWE_AGENT_NAIVE_SKIP_NODE_IPS", "").split(",")
+        if s.strip()
+    }
+    nodes = []
+    for n in ray.nodes():
+        if not n.get("Alive"):
+            continue
+        if float(n.get("Resources", {}).get("GPU", 0)) <= 0:
+            continue
+        node_ip = n.get("NodeManagerAddress") or ""
+        node_name = n.get("NodeName") or ""
+        if node_ip in skip or node_name in skip:
+            logger.info(
+                f"[naive-async] SKIP node {node_name or node_ip} "
+                f"(matched SWE_AGENT_NAIVE_SKIP_NODE_IPS)"
+            )
+            continue
+        nodes.append(n)
     if not nodes:
-        raise RuntimeError("No GPU-bearing Ray nodes found for Lanes worker spawn")
+        raise RuntimeError("No GPU-bearing Ray nodes found for Naive worker spawn")
     actor_concurrency = per_node_concurrency + 4
     logger.info(
-        f"[lanes-async] spawning {len(nodes)} node workers, "
+        f"[naive-async] spawning {len(nodes)} node workers "
+        f"(skipped={len(skip)}), "
         f"per-node concurrency={per_node_concurrency} "
         f"actor_concurrency={actor_concurrency}"
     )
     for n in nodes:
         node_id = n["NodeID"]
         node_name = n.get("NodeName") or n.get("NodeManagerAddress") or node_id[:8]
-        worker = _LanesNodeWorker.options(
+        worker = _NaiveNodeWorker.options(
             num_cpus=2,
             max_concurrency=actor_concurrency,
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=node_id, soft=False,
             ),
-            name=f"lanes-node-worker-{node_name}",
+            name=f"naive-node-worker-{node_name}",
         ).remote(name=node_name, max_workers=per_node_concurrency)
         ip = ray.get(worker.get_ip.remote())
         _NODE_WORKERS.append(worker)
         _NODE_WORKER_IPS.append(ip)
-        logger.info(f"[lanes-async]   spawned worker on node={node_name} ip={ip}")
+        logger.info(f"[naive-async]   spawned worker on node={node_name} ip={ip}")
 
 
 def _shutdown_node_workers() -> None:
@@ -369,8 +359,8 @@ def _shutdown_node_workers() -> None:
 atexit.register(_shutdown_node_workers)
 
 
-def _lanes_values_from_env() -> dict[str, Any]:
-    """Read v1 lane-specific knobs from env."""
+def _naive_values_from_env() -> dict[str, Any]:
+    """Read naive-specific knobs from env."""
     def _int(name, default=None):
         v = os.environ.get(name, "")
         return int(v) if v else default
@@ -379,29 +369,17 @@ def _lanes_values_from_env() -> dict[str, Any]:
         v = os.environ.get(name, "")
         return float(v) if v else default
 
-    def _bool(name, default):
-        v = os.environ.get(name, "")
-        if not v:
-            return default
-        return v.strip().lower() in ("1", "true", "yes", "on")
-
     return {
-        "m": _int("SWE_AGENT_LANES_M", 8),
-        "max_mid_cps": _int("SWE_AGENT_LANES_MAX_MID_CPS", 6),
-        "steps_per_round": _int("SWE_AGENT_LANES_STEPS_PER_ROUND", 20),
-        "step_limit": _int("SWE_AGENT_LANES_STEP_LIMIT", 120),
-        "seed": _int("SWE_AGENT_LANES_SEED"),
-        "gt_eval_workers": _int("SWE_AGENT_LANES_GT_EVAL_WORKERS", 8),
-        "lane_b_pool_size": _int("SWE_AGENT_LANES_LANE_B_POOL_SIZE"),
-        "completion_max_tokens": _int("SWE_AGENT_LANES_COMPLETION_MAX_TOKENS", 4096),
-        "policy_temperature": _float("SWE_AGENT_LANES_POLICY_TEMPERATURE", 1.0),
-        "policy_top_p": _float("SWE_AGENT_LANES_POLICY_TOP_P", 0.95),
-        "lane_b_temperature": _float("SWE_AGENT_LANES_LANE_B_TEMPERATURE", 1.0),
-        "lane_b_top_p": _float("SWE_AGENT_LANES_LANE_B_TOP_P", 0.95),
-        "fallback_patch_penalty": _float("SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY", 0.5),
-        # GT-only training: skip rubric/judge in trajectory_search_parallel
-        # and use branch.gt_score as the reward in the bundler.
-        "disable_rubric": _bool("SWE_AGENT_LANES_DISABLE_RUBRIC", False),
+        "m": _int("SWE_AGENT_NAIVE_M", 8),
+        "step_limit": _int("SWE_AGENT_NAIVE_STEP_LIMIT", 120),
+        "seed": _int("SWE_AGENT_NAIVE_SEED"),
+        "gt_eval_workers": _int("SWE_AGENT_NAIVE_GT_EVAL_WORKERS", 8),
+        "rollout_pool_size": _int("SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE"),
+        "completion_max_tokens": _int("SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS", 4096),
+        "policy_temperature": _float("SWE_AGENT_NAIVE_POLICY_TEMPERATURE", 1.0),
+        "policy_top_p": _float("SWE_AGENT_NAIVE_POLICY_TOP_P", 0.95),
+        "fallback_patch_penalty": _float("SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY", 0.5),
+        "no_action_patch_penalty": _float("SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY", 0.0),
     }
 
 
@@ -412,39 +390,8 @@ def _hash_to_index(s: str, n: int) -> int:
 
 
 def _route_for_instance(instance_id: str, ports: list[int], host: str) -> str:
-    """LEGACY hash-based routing. Kept for back-compat but superseded
-    by _route_least_loaded — hash is uneven on small N (e.g. 4 servers,
-    30 instances → can dump 12/6/6/6 or worse).
-    """
     p = ports[_hash_to_index(instance_id, len(ports))]
     return f"{host.rstrip('/')}:{p}"
-
-
-# Per-port in-flight counters for least-loaded routing. Lock-protected
-# because _submit_until_full runs on the rollout coordinator thread but
-# completion (which releases the counter) happens in _harvest_ready —
-# they may interleave with future async tweaks.
-_ENDPOINT_LOAD: dict[str, int] = {}
-_ENDPOINT_LOAD_LOCK = threading.Lock()
-
-
-def _route_least_loaded(ports: list[int], host: str) -> str:
-    """Pick the endpoint with fewest in-flight instances. Increments the
-    counter — caller MUST call _release_endpoint() when the instance
-    completes (success OR failure)."""
-    candidates = [f"{host.rstrip('/')}:{p}" for p in ports]
-    with _ENDPOINT_LOAD_LOCK:
-        for c in candidates:
-            _ENDPOINT_LOAD.setdefault(c, 0)
-        url = min(candidates, key=lambda c: _ENDPOINT_LOAD[c])
-        _ENDPOINT_LOAD[url] += 1
-        return url
-
-
-def _release_endpoint(url: str) -> None:
-    with _ENDPOINT_LOAD_LOCK:
-        if url in _ENDPOINT_LOAD:
-            _ENDPOINT_LOAD[url] = max(0, _ENDPOINT_LOAD[url] - 1)
 
 
 def _submit_until_full(
@@ -458,13 +405,10 @@ def _submit_until_full(
 ) -> int:
     global _TASK_INDEX, _DISPATCH_COUNTER
     submitted = 0
-    lanes_values = _lanes_values_from_env()
+    naive_values = _naive_values_from_env()
 
     policy_ports = [
-        int(p) for p in os.environ.get("SWE_AGENT_LANES_POLICY_PORTS", "").split(",") if p
-    ]
-    rubric_ports = [
-        int(p) for p in os.environ.get("SWE_AGENT_LANES_RUBRIC_PORTS", "").split(",") if p
+        int(p) for p in os.environ.get("SWE_AGENT_NAIVE_POLICY_PORTS", "").split(",") if p
     ]
     if not policy_ports:
         router_ip, router_port = (getattr(args, "sglang_model_routers", None) or {}).get(
@@ -473,9 +417,7 @@ def _submit_until_full(
         policy_ports = [router_port]
         api_host = f"http://{router_ip}"
     else:
-        api_host = os.environ.get("SWE_AGENT_LANES_API_HOST", "http://127.0.0.1")
-    if not rubric_ports:
-        rubric_ports = list(policy_ports)
+        api_host = os.environ.get("SWE_AGENT_NAIVE_API_HOST", "http://127.0.0.1")
 
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
 
@@ -485,20 +427,11 @@ def _submit_until_full(
             break
         (prompt_group,) = prompt_groups
         # slime expands n_samples_per_prompt by duplicating the prompt; the
-        # runner itself creates the M=8 sibling group, so we just take the
-        # first duplicate. n_samples_per_prompt MUST equal SWE_AGENT_LANES_M.
+        # naive runner itself creates the M=8 sibling group, so we just take
+        # the first duplicate. n_samples_per_prompt MUST equal SWE_AGENT_NAIVE_M.
         metadata = prompt_group[0].metadata
         instance_id = metadata["instance_id"]
-        # LEAST-LOADED routing — pin THIS instance's policy AND rubric
-        # to the same lightest-loaded endpoint. Policy and rubric pin
-        # together so radix prefix cache stays warm within the instance.
-        # _release_endpoint is called when the task's bundle is reaped
-        # in _harvest_ready below.
-        policy_base_url = _route_least_loaded(policy_ports, api_host)
-        if rubric_ports == policy_ports:
-            rubric_base_url = policy_base_url
-        else:
-            rubric_base_url = _route_least_loaded(rubric_ports, api_host)
+        policy_base_url = _route_for_instance(instance_id, policy_ports, api_host)
 
         task = {
             "index": _TASK_INDEX,
@@ -508,19 +441,10 @@ def _submit_until_full(
             "split": metadata["split"],
             "output_root": str(output_root / f"rollout_{rollout_id:04d}"),
             "model_name": model_name,
-            "rubric_model_name": os.environ.get("SWE_AGENT_LANES_RUBRIC_MODEL") or model_name,
-            "judge_model_name": os.environ.get("SWE_AGENT_LANES_JUDGE_MODEL") or model_name,
             "policy_base_url": policy_base_url,
-            "rubric_base_url": rubric_base_url,
             "api_key": api_key,
-            **lanes_values,
+            **naive_values,
         }
-        # Stash for release on completion.
-        task["_pinned_endpoints"] = (
-            [policy_base_url]
-            if rubric_base_url == policy_base_url
-            else [policy_base_url, rubric_base_url]
-        )
         _TASK_INDEX += 1
         worker = _NODE_WORKERS[_DISPATCH_COUNTER % len(_NODE_WORKERS)]
         _DISPATCH_COUNTER += 1
@@ -565,17 +489,12 @@ def _harvest_ready(
         ready, _ = ray.wait(pending_refs, num_returns=len(pending_refs), timeout=0)
     for ref in ready:
         task = _PENDING.pop(ref)
-        # Release this task's pinned endpoint(s) from the least-loaded
-        # counter — must happen regardless of success/error so the
-        # counter stays correct.
-        for ep in task.get("_pinned_endpoints", []):
-            _release_endpoint(ep)
         try:
             result = ray.get(ref)
         except Exception as exc:
             _FAILED_INSTANCES += 1
             logger.warning(
-                "[lanes-async] instance %s failed: %s",
+                "[naive-async] instance %s failed: %s",
                 task.get("instance_id"), str(exc)[:200],
             )
             del ref
@@ -583,7 +502,7 @@ def _harvest_ready(
         if result.get("error"):
             _FAILED_INSTANCES += 1
             logger.warning(
-                "[lanes-async] instance %s failed: %s",
+                "[naive-async] instance %s failed: %s",
                 result.get("instance_id"), result["error"][:200],
             )
             del result, ref
@@ -592,7 +511,7 @@ def _harvest_ready(
         if bundle is None:
             del result, ref
             continue
-        # Target selection: v1 first pass only generates policy_groups.
+        # Naive baseline is policy-only. target=rubric is invalid here.
         groups = (
             bundle.policy_groups if target == "policy" else bundle.rubric_groups
         )
@@ -641,14 +560,9 @@ def _drop_stale_buffer(current_rollout_id: int) -> None:
 
 
 def _pop_groups(min_groups: int) -> list[_BufferedGroup]:
-    # Shuffle the buffer before slicing to break completion-order bias.
-    # Without this, easy instances (which finish fast → land in buffer first)
-    # dominate the early training steps, and reward statistics drift down
-    # as harder instances trickle in. Stale-drop ensures the buffer only
-    # holds rollout_id in {current-1, current}, so shuffling across that
-    # boundary is harmless. Reproducibility is not needed at this layer.
-    # Set SWE_AGENT_LANES_NO_SHUFFLE=1 to disable (for A/B against v0 order).
-    if os.environ.get("SWE_AGENT_LANES_NO_SHUFFLE", "0") != "1":
+    # Shuffle for the same reason as the lanes collector: easy instances
+    # finish first and would dominate early batches otherwise.
+    if os.environ.get("SWE_AGENT_NAIVE_NO_SHUFFLE", "0") != "1":
         random.shuffle(_BUFFER)
     groups = _BUFFER[:min_groups]
     del _BUFFER[:min_groups]
@@ -670,8 +584,8 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     target = os.environ.get("SWE_AGENT_GRPO_TARGET", "policy")
     output_root = Path(
         os.environ.get(
-            "SWE_AGENT_LANES_OUTPUT_ROOT",
-            "/workspace/rler/agent/outputs/lane_outputs/train_async_lanes",
+            "SWE_AGENT_NAIVE_OUTPUT_ROOT",
+            "/workspace/rler/agent/outputs/naive_outputs/train_async_naive",
         )
     )
     model_name = os.environ.get("SWE_AGENT_GRPO_MODEL_NAME") or "Qwen/Qwen3.5-9B"
@@ -692,29 +606,37 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 ),
             )
         except Exception as exc:
-            logger.warning("[lanes-async] warmup failed (continuing): %s", exc)
+            logger.warning("[naive-async] warmup failed (continuing): %s", exc)
         _WARMUP_DONE = True
 
     tokenizer = _rollout_tokenizer(args)
-    instance_workers = max(1, int(os.environ.get("SWE_AGENT_LANES_INSTANCE_WORKERS", "8")))
+    instance_workers = max(1, int(os.environ.get("SWE_AGENT_NAIVE_INSTANCE_WORKERS", "8")))
     max_pending = max(1, int(
-        os.environ.get("SWE_AGENT_LANES_MAX_PENDING", str(instance_workers))
+        os.environ.get("SWE_AGENT_NAIVE_MAX_PENDING", str(instance_workers))
     ))
     min_ready_groups = max(1, int(
-        os.environ.get("SWE_AGENT_LANES_MIN_READY_GROUPS", str(args.rollout_batch_size))
+        os.environ.get("SWE_AGENT_NAIVE_MIN_READY_GROUPS", str(args.rollout_batch_size))
     ))
-    timeout = float(os.environ.get("SWE_AGENT_LANES_WAIT_TIMEOUT", "10800"))
+    timeout = float(os.environ.get("SWE_AGENT_NAIVE_WAIT_TIMEOUT", "10800"))
 
     if not _NODE_WORKERS:
+        skip = {
+            s.strip()
+            for s in os.environ.get("SWE_AGENT_NAIVE_SKIP_NODE_IPS", "").split(",")
+            if s.strip()
+        }
         n_nodes = max(1, len([
             n for n in ray.nodes()
-            if n.get("Alive") and float(n.get("Resources", {}).get("GPU", 0)) > 0
+            if n.get("Alive")
+            and float(n.get("Resources", {}).get("GPU", 0)) > 0
+            and (n.get("NodeManagerAddress") or "") not in skip
+            and (n.get("NodeName") or "") not in skip
         ]))
         per_node = max(1, (instance_workers + n_nodes - 1) // n_nodes)
         _spawn_node_workers(per_node_concurrency=per_node)
 
     logger.info(
-        "[lanes-async] generate_rollout START rollout_id=%d target=%s "
+        "[naive-async] generate_rollout START rollout_id=%d target=%s "
         "min_ready_groups=%d max_pending=%d buffer_at_entry=%d pending_at_entry=%d",
         rollout_id, target, min_ready_groups, max_pending,
         len(_BUFFER), len(_PENDING),
@@ -730,7 +652,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         output_root=output_root, model_name=model_name, max_pending=max_pending,
     )
     logger.info(
-        "[lanes-async] post-init submitted=%d buffer=%d pending=%d",
+        "[naive-async] post-init submitted=%d buffer=%d pending=%d",
         submitted, len(_BUFFER), len(_PENDING),
     )
 
@@ -739,7 +661,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     while len(_BUFFER) < min_ready_groups:
         if time.perf_counter() - wait_started > timeout:
             raise RuntimeError(
-                f"Lanes async timed out waiting for samples: "
+                f"Naive async timed out waiting for samples: "
                 f"buffer={len(_BUFFER)} pending={len(_PENDING)}"
             )
         _harvest_ready(
@@ -766,15 +688,15 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 except Exception as exc:
                     mems.append(f"err={type(exc).__name__}")
             logger.info(
-                "[lanes-async] WAITING rollout_id=%d elapsed=%.0fs "
+                "[naive-async] WAITING rollout_id=%d elapsed=%.0fs "
                 "buffer=%d/%d pending=%d submitted_total=%d",
                 rollout_id, time.perf_counter() - wait_started,
                 len(_BUFFER), min_ready_groups, len(_PENDING), submitted,
             )
-            logger.info("[lanes-mem] %s", " | ".join(mems))
+            logger.info("[naive-mem] %s", " | ".join(mems))
         if not _PENDING and len(_BUFFER) < min_ready_groups:
             raise RuntimeError(
-                f"Lanes async produced no {target} samples and has no pending instance."
+                f"Naive async produced no {target} samples and has no pending instance."
             )
 
     selected_groups = _pop_groups(min_ready_groups)
@@ -790,9 +712,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         sample.index = index
 
     # --- per-batch metrics aggregated from sample.metadata + sample fields ---
-    # Stashed by lane_to_grpo_bundle._build_branch_sample:
-    #   n_continuation_steps, n_parent_steps, n_full_trace_steps,
-    #   raw_gt_score, terminated_early, instance_id, is_dummy
     def _safe_mean(xs: list[float]) -> float:
         return float(sum(xs) / len(xs)) if xs else 0.0
     cont_steps = [
@@ -803,12 +722,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         int(s.metadata.get("n_full_trace_steps", 0) or 0)
         for s in samples if s.metadata
     ]
-    parent_steps = [
-        int(s.metadata.get("n_parent_steps", 0) or 0)
-        for s in samples if s.metadata
-    ]
-    # Exclude dummy samples (loss_mask all-zero placeholders for empty branches)
-    # from reward/pass stats — they're not real model outputs.
     real_samples = [s for s in samples if not (s.metadata and s.metadata.get("is_dummy"))]
     n_dummy = len(samples) - len(real_samples)
     gts = [
@@ -821,7 +734,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         1 for s in real_samples
         if s.metadata and s.metadata.get("terminated_early")
     )
-    # Per-instance pass: instance succeeds if ANY of its branches pass.
+    # Per-instance pass: instance succeeds if ANY of its rollouts pass.
     by_inst_max: dict[str, float] = {}
     for s in real_samples:
         if not s.metadata:
@@ -836,19 +749,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         sum(1 for v in by_inst_max.values() if v >= 0.5) / distinct_instances
         if distinct_instances else 0.0
     )
-    # Groups-per-instance = how many mid_cps per instance landed in this batch.
-    from collections import Counter
-    inst_group_count = Counter(
-        s.metadata.get("instance_id") or "" for s in samples if s.metadata
-    )
-    m = max(1, int(os.environ.get("SWE_AGENT_LANES_M", "8")))
-    groups_per_inst = (
-        _safe_mean([c // m for c in inst_group_count.values()])
-        if inst_group_count else 0.0
-    )
-    # Truncation rate: fraction of samples whose status reached the per-branch
-    # step_limit without submitting (slime sets Sample.Status.TRUNCATED in that
-    # case; we approximate from .status if available).
     try:
         from slime.utils.types import Sample as _SlimeSample
         trunc_count = sum(
@@ -857,9 +757,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         )
     except Exception:
         trunc_count = 0
-    # Raw entropy proxy: mean of rollout-time per-token logprobs. More
-    # negative = more entropy. Drift toward zero across rollouts signals
-    # the policy is getting more confident (potential mode collapse).
+    # Raw entropy proxy from rollout-time logprobs.
     rollout_lps: list[float] = []
     for s in samples:
         lps = getattr(s, "rollout_log_probs", None)
@@ -868,7 +766,12 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 if isinstance(x, (int, float)):
                     rollout_lps.append(float(x))
 
-    # --- patch + eval ratios over post-filter batch (parity with naive) -----
+    # --- Patch + eval-based ratios over the post-filter training batch ---
+    # Denominators:
+    #   * patch/submit ratios use all real_samples
+    #   * f2p/p2p-based ratios use only `eval_samples` (real samples whose
+    #     eval payload carries f2p/p2p counts — excludes empty patches and
+    #     harness errors), per user spec "Exclude no-eval samples entirely".
     n_real = len(real_samples)
     formal_submit = sum(
         1 for s in real_samples
@@ -908,16 +811,21 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         f2p_total = int(md.get("f2p_total") or 0)
         p2p_passed = int(md.get("p2p_passed_count") or 0)
         p2p_total = int(md.get("p2p_total") or 0)
+        # full_pass: all F2P + all P2P pass (and there was something to test)
         if (f2p_total + p2p_total) > 0 \
                 and f2p_passed == f2p_total \
                 and p2p_passed == p2p_total:
             full_pass += 1
+        # zero_new_pass: f2p_passed==0, no P2P regression
         if f2p_total > 0 and f2p_passed == 0 and p2p_passed == p2p_total:
             zero_new_pass += 1
+        # zero_pass: strict — both passed counts are 0
         if f2p_passed == 0 and p2p_passed == 0:
             zero_pass += 1
+        # regression: any P2P now fails (p2f > 0)
         if p2p_total > 0 and p2p_passed < p2p_total:
             regression += 1
+        # some_pass: partial F2P progress
         if f2p_total > 0 and 0 < f2p_passed < f2p_total:
             some_pass += 1
         if p2p_total > 0:
@@ -938,18 +846,16 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/filter_dropped_groups_total": _FILTER_DROPPED_GROUPS,
             "swe_agent/wait_seconds": time.perf_counter() - wait_started,
             "swe_agent/seconds": time.perf_counter() - started,
-            "swe_agent/source": "lanes",
-            # --- per-batch rollout shape (requested) ---
+            "swe_agent/source": "naive",
+            # --- per-batch rollout shape ---
             "swe_agent/sample_cont_steps_mean": _safe_mean(cont_steps),
             "swe_agent/sample_full_steps_mean": _safe_mean(full_steps),
-            "swe_agent/sample_parent_steps_mean": _safe_mean(parent_steps),
             "swe_agent/sample_gt_mean": _safe_mean(gts),
             "swe_agent/sample_pass_at_0.5": (n_passed / len(gts)) if gts else 0.0,
             "swe_agent/submit_rate": (submit_count / len(real_samples)) if real_samples else 0.0,
             "swe_agent/truncation_rate": (trunc_count / len(samples)) if samples else 0.0,
             "swe_agent/distinct_instances_in_batch": distinct_instances,
             "swe_agent/instance_pass_at_0.5": instance_pass,
-            "swe_agent/avg_groups_per_instance_in_batch": groups_per_inst,
             "swe_agent/dummy_sample_count": n_dummy,
             "swe_agent/dummy_sample_rate": (n_dummy / len(samples)) if samples else 0.0,
             "swe_agent/rollout_logprob_mean": _safe_mean(rollout_lps),

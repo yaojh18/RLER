@@ -950,8 +950,25 @@ def policy_loss_function(
         entropy = log_probs_and_entropy["entropy"]
         entropy = torch.cat(entropy, dim=0)
         entropy_loss = sum_of_sample_mean(entropy)
+        raw_entropy = entropy_loss
     else:
         entropy_loss = logits.new_zeros(())
+        # Always log raw entropy for diagnostic visibility (mode collapse,
+        # exploration health) regardless of entropy_coef. Recompute under
+        # no_grad on detached logits so the backward graph stays free of
+        # vocab-sized entropy tensors — same cost as the original
+        # with_entropy path, but with no autograd footprint.
+        with torch.no_grad():
+            _, _ent_only = get_log_probs_and_entropy(
+                logits.detach(),
+                args=args,
+                unconcat_tokens=batch["unconcat_tokens"],
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+                with_entropy=True,
+                max_seq_lens=max_seq_lens,
+            )
+            raw_entropy = sum_of_sample_mean(torch.cat(_ent_only["entropy"], dim=0))
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
@@ -984,6 +1001,7 @@ def policy_loss_function(
         "loss": loss.clone().detach(),
         "pg_loss": pg_loss.clone().detach(),
         "entropy_loss": entropy_loss.clone().detach(),
+        "raw_entropy": raw_entropy.clone().detach(),
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }

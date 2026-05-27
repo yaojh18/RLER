@@ -152,11 +152,22 @@ def build_rollout_samples(
             # Propagate ExportSample.metadata onto Sample.metadata so
             # downstream metric aggregation in the rollout-fn metrics dict
             # (e.g. swe_agent/sample_cont_steps_mean) can read per-sample
-            # fields that the SWE search exporter stashes
+            # fields that lane_to_grpo_bundle._build_branch_sample stashes
             # there: n_continuation_steps, n_parent_steps, n_full_trace_steps,
             # raw_gt_score, raw_rubric_score, terminated_early, is_dummy, etc.
             if export_sample.metadata:
                 sample.metadata = dict(export_sample.metadata)
+            # Propagate sglang-stored rollout-time logprobs onto the
+            # slime Sample so TIS (off-policy IS correction) can compute
+            # exp(actor_logprob - rollout_logprob). naive bundle emits a
+            # dense per-response-token vector of length response_length,
+            # aligned with loss_mask[-response_length:]. Lane bundle
+            # still emits a sparse (asst-only) vector — wire TIS for
+            # lanes when that's updated.
+            if export_sample.rollout_logprobs is not None:
+                lp = list(export_sample.rollout_logprobs)
+                if len(lp) == response_length:
+                    sample.rollout_log_probs = lp
             if include_turn_rewards:
                 sample.train_metadata = _build_turn_metadata(
                     full_loss_mask=full_loss_mask,

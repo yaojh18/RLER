@@ -261,6 +261,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wandb-project", default="swe-agent-grpo")
     parser.add_argument("--wandb-group")
     parser.add_argument(
+        "--use-tis",
+        action="store_true",
+        default=False,
+        help=(
+            "Forwarded to slime train_async.py. Enable Truncated Importance "
+            "Sampling for off-policy correction "
+            "(https://fengyao.notion.site/off-policy-rl)."
+        ),
+    )
+    parser.add_argument(
+        "--tis-clip",
+        type=float,
+        default=None,
+        help="Forwarded to slime train_async.py. TIS upper clip C (default 2.0 inside slime).",
+    )
+    parser.add_argument(
+        "--dynamic-sampling-filter-path",
+        type=str,
+        default=None,
+        help=(
+            "Forwarded to slime train_async.py. Import path to a function that "
+            "decides per-group whether to keep or drop the M siblings (e.g. "
+            "slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
+            "drops groups whose rewards have zero std → zero gradient)."
+        ),
+    )
+    parser.add_argument(
         "--save-debug-train-data",
         type=str,
         default=None,
@@ -300,6 +327,16 @@ def main(argv: list[str] | None = None) -> int:
         shlex.join(["--over-sampling-batch-size", str(args.over_sampling_batch_size)])
         if args.over_sampling_batch_size is not None else ""
     )
+    dynamic_filter_arg = (
+        shlex.join(["--dynamic-sampling-filter-path", args.dynamic_sampling_filter_path])
+        if args.dynamic_sampling_filter_path else ""
+    )
+    tis_arg_parts: list[str] = []
+    if args.use_tis:
+        tis_arg_parts.append("--use-tis")
+    if args.tis_clip is not None:
+        tis_arg_parts.extend(["--tis-clip", str(args.tis_clip)])
+    tis_arg = shlex.join(tis_arg_parts) if tis_arg_parts else ""
     save_debug_arg = (
         shlex.join(["--save-debug-train-data", args.save_debug_train_data])
         if args.save_debug_train_data else ""
@@ -322,11 +359,25 @@ def main(argv: list[str] | None = None) -> int:
     config_overrides = "\n".join(override_lines)
     wandb_args = ""
     if args.wandb_mode != "disabled":
+        # Default the wandb group/run-name to the SLURM job name when running
+        # under SLURM (so each launched job shows up in WandB as its job name
+        # like "grpo-naive-cp4vftis-56612" rather than every run colliding on
+        # "policy-grpo"). Falls back to <target>-grpo for non-SLURM launches.
+        slurm_job_name = os.environ.get("SLURM_JOB_NAME") or ""
+        slurm_job_id = os.environ.get("SLURM_JOB_ID") or ""
+        if args.wandb_group:
+            wandb_group = args.wandb_group
+        elif slurm_job_name:
+            wandb_group = (
+                f"{slurm_job_name}-{slurm_job_id}" if slurm_job_id else slurm_job_name
+            )
+        else:
+            wandb_group = f"{args.target}-grpo"
         pieces = [
             "--use-wandb",
             "--wandb-mode", args.wandb_mode,
             "--wandb-project", args.wandb_project,
-            "--wandb-group", args.wandb_group or f"{args.target}-grpo",
+            "--wandb-group", wandb_group,
             "--wandb-dir", str(wandb_dir),
             "--disable-wandb-random-suffix",
         ]
@@ -420,6 +471,8 @@ python3 train_async.py \\
   "${{GRPO_ROLLOUT_ARGS[@]}}" \\
   "${{GRPO_SGLANG_ARGS[@]}}" \\
   "${{GRPO_MISC_ARGS[@]}}" \\
+  {dynamic_filter_arg} \\
+  {tis_arg} \\
   {save_debug_arg} \\
   {save_debug_rollout_arg} \\
   {wandb_args}
