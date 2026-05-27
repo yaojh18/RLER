@@ -10,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.utils.mask_utils import MultiTurnLossMaskGenerator
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
@@ -74,16 +74,72 @@ def build_rollout_samples(
     loss_mask_type: str,
     include_turn_rewards: bool,
     group_index_offset: int = 0,
-) -> list[Sample]:
+    max_sample_tokens: int | None = None,
+) -> tuple[list[Sample], int]:
+    """Materialize Sample objects from PDS / search-output ExportGroups.
+
+    Two paths:
+      A. Precomputed (PDS): export_sample.token_ids + .loss_mask +
+         .response_length are populated by _build_policy_samples_for_round.
+         We use them directly — they encode the correct loss_mask (parent's
+         shared prefix masked OUT, only THIS branch's new assistant tokens
+         trainable). This fixes the bug where the legacy path applied loss
+         to parent's shared trace x M=8 siblings per round.
+      B. Re-tokenization fallback: text-only export_sample. Build messages,
+         tokenize via slime's MultiTurnLossMaskGenerator. OK for non-PDS
+         single-trajectory rollouts.
+
+    Safety net: when max_sample_tokens is given, any sample with
+    len(token_ids) > max_sample_tokens is dropped (logged + counted).
+    slime's _get_capped_partitions asserts when a single sample exceeds the
+    partition budget — dropping here keeps that from killing the whole
+    training step. Returns (samples, dropped_count).
+    """
     samples: list[Sample] = []
+    dropped = 0
     mask_generator = MultiTurnLossMaskGenerator(tokenizer, tokenizer_type=loss_mask_type)
     for group_index, group in enumerate(groups):
         for export_sample in group.samples:
-            messages = build_training_messages(export_sample.prompt, export_sample.turns)
-            token_ids, full_loss_mask = mask_generator.get_loss_mask(messages)
-            response_length = mask_generator.get_response_lengths([full_loss_mask])[0]
-            if response_length <= 0:
-                raise ValueError(f"Sample {export_sample.sample_id} does not contain trainable assistant tokens.")
+            has_precomputed = (
+                export_sample.token_ids is not None
+                and export_sample.loss_mask is not None
+                and export_sample.response_length is not None
+            )
+            if has_precomputed:
+                # Path A: use PDS-side precomputed token_ids + loss_mask.
+                token_ids = list(export_sample.token_ids)
+                full_loss_mask = list(export_sample.loss_mask)
+                response_length = int(export_sample.response_length)
+                if len(token_ids) != len(full_loss_mask):
+                    raise ValueError(
+                        f"Sample {export_sample.sample_id}: token_ids len "
+                        f"({len(token_ids)}) != loss_mask len ({len(full_loss_mask)})"
+                    )
+                if response_length <= 0:
+                    continue
+                # Reconstruct text messages so Sample.prompt stays populated
+                # for any downstream code that inspects it (logging/dump).
+                messages = build_training_messages(export_sample.prompt, export_sample.turns)
+            else:
+                # Path B: text-only fallback.
+                messages = build_training_messages(export_sample.prompt, export_sample.turns)
+                token_ids, full_loss_mask = mask_generator.get_loss_mask(messages)
+                response_length = mask_generator.get_response_lengths([full_loss_mask])[0]
+                if response_length <= 0:
+                    raise ValueError(f"Sample {export_sample.sample_id} does not contain trainable assistant tokens.")
+            if max_sample_tokens is not None and len(token_ids) > max_sample_tokens:
+                # sglang's context_length cap (80960 by default) bounds the
+                # token-in/token-out path's full sequence; samples beyond
+                # that would have come from a different / older code path
+                # or some edge case. Drop them rather than asserting in
+                # slime's _get_capped_partitions.
+                print(
+                    f"[build_rollout_samples] DROP sample {export_sample.sample_id}: "
+                    f"len(token_ids)={len(token_ids)} > max_sample_tokens={max_sample_tokens}",
+                    flush=True,
+                )
+                dropped += 1
+                continue
             sample = Sample(
                 group_index=group_index_offset + group_index,
                 prompt=messages,
@@ -93,6 +149,25 @@ def build_rollout_samples(
                 loss_mask=full_loss_mask[-response_length:],
                 status=Sample.Status.COMPLETED,
             )
+            # Propagate ExportSample.metadata onto Sample.metadata so
+            # downstream metric aggregation in the rollout-fn metrics dict
+            # (e.g. swe_agent/sample_cont_steps_mean) can read per-sample
+            # fields that lane_to_grpo_bundle._build_branch_sample stashes
+            # there: n_continuation_steps, n_parent_steps, n_full_trace_steps,
+            # raw_gt_score, raw_rubric_score, terminated_early, is_dummy, etc.
+            if export_sample.metadata:
+                sample.metadata = dict(export_sample.metadata)
+            # Propagate sglang-stored rollout-time logprobs onto the
+            # slime Sample so TIS (off-policy IS correction) can compute
+            # exp(actor_logprob - rollout_logprob). naive bundle emits a
+            # dense per-response-token vector of length response_length,
+            # aligned with loss_mask[-response_length:]. Lane bundle
+            # still emits a sparse (asst-only) vector — wire TIS for
+            # lanes when that's updated.
+            if export_sample.rollout_logprobs is not None:
+                lp = list(export_sample.rollout_logprobs)
+                if len(lp) == response_length:
+                    sample.rollout_log_probs = lp
             if include_turn_rewards:
                 sample.train_metadata = _build_turn_metadata(
                     full_loss_mask=full_loss_mask,
@@ -100,7 +175,7 @@ def build_rollout_samples(
                     export_sample=export_sample,
                 )
             samples.append(sample)
-    return samples
+    return samples, dropped
 
 
 def _build_turn_metadata(
@@ -228,6 +303,18 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     group_index_offset = 0
     collected_instances: list[str] = []
     failed_instances: list[str] = []
+    total_dropped_oversized = 0
+    # Drop samples whose total token length exceeds slime's per-sample budget
+    # (= max_tokens_per_gpu * cp_size). Without this, one oversized sample
+    # trips slime's _get_capped_partitions assertion and kills training.
+    max_sample_tokens: int | None = None
+    try:
+        mt = int(getattr(args, "max_tokens_per_gpu", 0) or 0)
+        cp = int(getattr(args, "context_parallel_size", 1) or 1)
+        if mt > 0:
+            max_sample_tokens = mt * cp
+    except Exception:
+        max_sample_tokens = None
     search_values: dict[str, int | None] = {}
     for env_name, arg_name in (
         ("SWE_AGENT_GRPO_M", "m"),
@@ -280,13 +367,15 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             continue
         bundle = result["bundle"]
         groups = bundle.policy_groups if target == "policy" else bundle.rubric_groups
-        samples = build_rollout_samples(
+        samples, dropped_here = build_rollout_samples(
             groups=groups,
             tokenizer=tokenizer,
             loss_mask_type=getattr(args, "loss_mask_type", "qwen3_5"),
             include_turn_rewards=target == "rubric",
             group_index_offset=group_index_offset,
+            max_sample_tokens=max_sample_tokens,
         )
+        total_dropped_oversized += dropped_here
         group_index_offset += len(groups)
         collected_instances.append(instance_id)
         all_samples.extend(samples)
@@ -303,6 +392,8 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/samples": len(all_samples),
             "swe_agent/groups": group_index_offset,
             "swe_agent/failed_instances": len(failed_instances),
+            "swe_agent/dropped_oversized_samples": total_dropped_oversized,
+            "swe_agent/max_sample_tokens": max_sample_tokens or 0,
             "swe_agent/seconds": time.perf_counter() - started,
         },
     )

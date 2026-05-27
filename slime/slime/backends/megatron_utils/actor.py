@@ -476,6 +476,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_data,
             )
 
+            # Save the rollout_data dump BEFORE train() runs, so a NaN-crashing
+            # backward pass doesn't lose its input data. Upstream slime saves
+            # this after train() succeeds — useful for postmortem of a clean
+            # step but blind to the data that triggered a crash. Our v1 lanes
+            # work hit NaN in step 1 with the post-save ordering and we had
+            # no dump for the failing step.
+            train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -490,8 +498,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
 
             self.prof.step(rollout_id=rollout_id)
-
-        train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()

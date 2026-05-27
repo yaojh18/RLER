@@ -22,16 +22,41 @@ def convert_samples_to_train_data(args, samples):
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     rewards = list(raw_rewards)
+    # Track samples in degenerate groups (singleton or all-same reward).
+    # These carry no GRPO signal and would produce NaN in whitening:
+    #   * n=1: PyTorch unbiased std of a single element is NaN
+    #          → 0 / (NaN + 1e-6) = NaN, poisons training (51963 step 0)
+    #   * std=0 (all-same): 0 / (0 + 1e-6) = 0, no NaN but zero signal
+    # In both cases we zero the loss_mask so the sample contributes nothing
+    # to the policy update. Caused by oversized-drop reducing a group's
+    # surviving sample count below 2.
+    samples_to_drop: set[int] = set()
     if (
         args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
     ):
         for indices in grouped_indices.values():
-            group_rewards = torch.tensor([raw_rewards[index] for index in indices], dtype=torch.float).view(1, -1)
-            group_rewards = group_rewards - group_rewards.mean(dim=-1, keepdim=True)
+            group_raw = [raw_rewards[index] for index in indices]
+            n = len(group_raw)
+            if n < 2:
+                # Singleton group → no GRPO comparison. Zero advantage + drop.
+                for idx in indices:
+                    rewards[idx] = 0.0
+                    samples_to_drop.add(idx)
+                continue
+            group_rewards = torch.tensor(group_raw, dtype=torch.float).view(1, -1)
+            # unbiased=False is the population std — finite even for tiny groups.
+            std = group_rewards.std(dim=-1, keepdim=True, unbiased=False)
+            if torch.isnan(std).any() or (std <= 1e-9).all():
+                # all-same reward → no signal, drop
+                for idx in indices:
+                    rewards[idx] = 0.0
+                    samples_to_drop.add(idx)
+                continue
+            centered = group_rewards - group_rewards.mean(dim=-1, keepdim=True)
             if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
-                group_rewards = group_rewards / (group_rewards.std(dim=-1, keepdim=True) + 1e-6)
-            for sample_index, reward in zip(indices, group_rewards.flatten().tolist(), strict=False):
+                centered = centered / (std + 1e-6)
+            for sample_index, reward in zip(indices, centered.flatten().tolist(), strict=False):
                 rewards[sample_index] = reward
 
     train_data = {
@@ -43,13 +68,13 @@ def convert_samples_to_train_data(args, samples):
         "sample_indices": [sample.index for sample in samples],
         "loss_masks": [],
     }
-    for sample in samples:
+    for idx, sample in enumerate(samples):
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
         assert (
             len(sample.loss_mask) == sample.response_length
         ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
-        if sample.remove_sample:
+        if sample.remove_sample or idx in samples_to_drop:
             sample.loss_mask = [0] * sample.response_length
         train_data["loss_masks"].append(sample.loss_mask)
 
@@ -153,15 +178,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save-dir", type=Path, required=True)
     parser.add_argument("--ref-load-dir", type=Path)
     parser.add_argument("--config-path", type=Path, default=Path("/workspace/rler/slime/train_agent/configs/grpo.sh"))
+    parser.add_argument("--rler-root", type=Path, default=Path("/workspace/rler"),
+                        help="Root dir of the RLER repo as seen by the runtime (used to build PYTHONPATH and cd into slime). "
+                             "Override when not running in the original docker layout (e.g. inside pyxis with --container-mounts to a Lustre path).")
     parser.add_argument("--rollout-function-path", default="train_agent.collect_grpo_rollout.generate_rollout")
     parser.add_argument("--num-rollout", type=int)
     parser.add_argument("--rollout-batch-size", type=int, default=2)
+    parser.add_argument("--over-sampling-batch-size", type=int,
+                        help="If set, slime pulls this many prompts per rollout cycle "
+                             "(must be >= --rollout-batch-size). Long-tail buffer.")
     parser.add_argument("--global-batch-size", type=int)
-    parser.add_argument("--actor-num-gpus", type=int, default=2)
-    parser.add_argument("--rollout-num-gpus", type=int, default=2)
+    parser.add_argument("--actor-num-gpus", type=int, default=2,
+                        help="Total actor GPUs across all nodes")
+    parser.add_argument("--rollout-num-gpus", type=int, default=2,
+                        help="Total rollout (sglang) GPUs across all nodes")
+    parser.add_argument("--num-nodes", type=int, default=1,
+                        help="Total number of physical nodes (>=1). For >1, "
+                        "an external Ray cluster must already be running on "
+                        "this machine — set --ray-external.")
+    parser.add_argument("--num-gpus-per-node", type=int, default=8,
+                        help="GPUs per physical node.")
+    parser.add_argument("--actor-num-nodes", type=int,
+                        help="Number of nodes for actor (defaults to "
+                        "--num-nodes when actor uses every node).")
+    parser.add_argument("--ray-external", action="store_true",
+                        help="Skip the inline 'ray start --head' (cluster is "
+                        "brought up externally, e.g. by SLURM srun).")
     parser.add_argument("--context-parallel-size", type=int)
+    parser.add_argument("--tensor-model-parallel-size", type=int)
     parser.add_argument("--max-tokens-per-gpu", type=int)
     parser.add_argument("--log-probs-chunk-size", type=int)
+    parser.add_argument("--sglang-context-length", type=int)
     parser.add_argument("--rollout-instance-workers", type=int, default=2)
     parser.add_argument("--ray-num-cpus", type=int, default=32)
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
@@ -179,28 +226,124 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wandb-team", default=os.environ.get("WANDB_ENTITY"))
     parser.add_argument("--wandb-project", default="swe-agent-grpo")
     parser.add_argument("--wandb-group")
+    parser.add_argument(
+        "--use-tis",
+        action="store_true",
+        default=False,
+        help=(
+            "Forwarded to slime train_async.py. Enable Truncated Importance "
+            "Sampling for off-policy correction "
+            "(https://fengyao.notion.site/off-policy-rl)."
+        ),
+    )
+    parser.add_argument(
+        "--tis-clip",
+        type=float,
+        default=None,
+        help="Forwarded to slime train_async.py. TIS upper clip C (default 2.0 inside slime).",
+    )
+    parser.add_argument(
+        "--dynamic-sampling-filter-path",
+        type=str,
+        default=None,
+        help=(
+            "Forwarded to slime train_async.py. Import path to a function that "
+            "decides per-group whether to keep or drop the M siblings (e.g. "
+            "slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
+            "drops groups whose rewards have zero std → zero gradient)."
+        ),
+    )
+    parser.add_argument(
+        "--save-debug-train-data",
+        type=str,
+        default=None,
+        help=(
+            "Forwarded to slime train_async.py. Path template (e.g. "
+            "'/path/{rollout_id}_{rank}.pt') for per-rollout per-rank "
+            "rollout_data torch.save dumps — used for NaN post-mortem."
+        ),
+    )
+    parser.add_argument(
+        "--save-debug-rollout-data",
+        type=str,
+        default=None,
+        help=(
+            "Forwarded to slime train_async.py. Path template (e.g. "
+            "'/path/{rollout_id}.pt') for per-rollout sample dumps captured "
+            "at the rollout manager (one file per rollout, all samples). "
+            "Complements --save-debug-train-data which dumps the per-rank "
+            "training data after group-by-prompt + advantage compute."
+        ),
+    )
     args = parser.parse_args(argv)
 
     total_gpus = args.actor_num_gpus + args.rollout_num_gpus
+    actor_num_nodes = args.actor_num_nodes or args.num_nodes
+    if args.actor_num_gpus % actor_num_nodes != 0:
+        raise SystemExit(
+            f"--actor-num-gpus ({args.actor_num_gpus}) must be divisible "
+            f"by --actor-num-nodes ({actor_num_nodes})"
+        )
+    actor_gpus_per_node = args.actor_num_gpus // actor_num_nodes
     ref_load_dir = args.ref_load_dir or args.load_dir
     wandb_dir = args.wandb_dir or (args.save_dir / "wandb")
     global_batch_size = shlex.quote(str(args.global_batch_size or args.rollout_batch_size))
     num_rollout_args = shlex.join(["--num-rollout", str(args.num_rollout)]) if args.num_rollout is not None else ""
+    oversample_arg = (
+        shlex.join(["--over-sampling-batch-size", str(args.over_sampling_batch_size)])
+        if args.over_sampling_batch_size is not None else ""
+    )
+    dynamic_filter_arg = (
+        shlex.join(["--dynamic-sampling-filter-path", args.dynamic_sampling_filter_path])
+        if args.dynamic_sampling_filter_path else ""
+    )
+    tis_arg_parts: list[str] = []
+    if args.use_tis:
+        tis_arg_parts.append("--use-tis")
+    if args.tis_clip is not None:
+        tis_arg_parts.extend(["--tis-clip", str(args.tis_clip)])
+    tis_arg = shlex.join(tis_arg_parts) if tis_arg_parts else ""
+    save_debug_arg = (
+        shlex.join(["--save-debug-train-data", args.save_debug_train_data])
+        if args.save_debug_train_data else ""
+    )
+    save_debug_rollout_arg = (
+        shlex.join(["--save-debug-rollout-data", args.save_debug_rollout_data])
+        if args.save_debug_rollout_data else ""
+    )
     override_lines = []
     if args.context_parallel_size is not None:
         override_lines.append(f"GRPO_PARALLEL_ARGS+=(--context-parallel-size {args.context_parallel_size})")
+    if args.tensor_model_parallel_size is not None:
+        override_lines.append(f"GRPO_PARALLEL_ARGS+=(--tensor-model-parallel-size {args.tensor_model_parallel_size})")
     if args.max_tokens_per_gpu is not None:
         override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
     if args.log_probs_chunk_size is not None:
         override_lines.append(f"GRPO_COMMON_ARGS+=(--log-probs-chunk-size {args.log_probs_chunk_size})")
+    if args.sglang_context_length is not None:
+        override_lines.append(f"GRPO_SGLANG_ARGS+=(--sglang-context-length {args.sglang_context_length})")
     config_overrides = "\n".join(override_lines)
     wandb_args = ""
     if args.wandb_mode != "disabled":
+        # Default the wandb group/run-name to the SLURM job name when running
+        # under SLURM (so each launched job shows up in WandB as its job name
+        # like "grpo-naive-cp4vftis-56612" rather than every run colliding on
+        # "policy-grpo"). Falls back to <target>-grpo for non-SLURM launches.
+        slurm_job_name = os.environ.get("SLURM_JOB_NAME") or ""
+        slurm_job_id = os.environ.get("SLURM_JOB_ID") or ""
+        if args.wandb_group:
+            wandb_group = args.wandb_group
+        elif slurm_job_name:
+            wandb_group = (
+                f"{slurm_job_name}-{slurm_job_id}" if slurm_job_id else slurm_job_name
+            )
+        else:
+            wandb_group = f"{args.target}-grpo"
         pieces = [
             "--use-wandb",
             "--wandb-mode", args.wandb_mode,
             "--wandb-project", args.wandb_project,
-            "--wandb-group", args.wandb_group or f"{args.target}-grpo",
+            "--wandb-group", wandb_group,
             "--wandb-dir", str(wandb_dir),
             "--disable-wandb-random-suffix",
         ]
@@ -208,10 +351,30 @@ def main(argv: list[str] | None = None) -> int:
             pieces.extend(["--wandb-team", args.wandb_team])
         wandb_args = shlex.join(pieces)
 
+    if args.ray_external:
+        ray_start_line = "# external ray cluster expected (--ray-external)"
+        ray_stop_line = "# skipping ray stop / pkill — external cluster owned by launcher"
+        ray_trap_line = "# skipping EXIT trap — external cluster owned by launcher"
+    else:
+        ray_start_line = (
+            f"ray start --head --node-ip-address 127.0.0.1 "
+            f"--num-gpus {total_gpus} --num-cpus {args.ray_num_cpus} "
+            f"--temp-dir \"${{RAY_TMPDIR}}\" --disable-usage-stats >/dev/null"
+        )
+        ray_stop_line = "pkill -9 sglang >/dev/null 2>&1 || true\nray stop --force >/dev/null 2>&1 || true"
+        ray_trap_line = "trap 'ray stop --force >/dev/null 2>&1 || true' EXIT"
+
+    rler_root = str(args.rler_root)
+    # Preserve any PYTHONPATH set by the launcher (e.g. for jsonlines / docker
+    # / other agent runtime deps installed into a Lustre-side site dir).
+    extra_pp = os.environ.get("EXTRA_PYTHONPATH", "")
+    pythonpath = f"{rler_root}/slime:{rler_root}:{rler_root}/agent:/root/Megatron-LM"
+    if extra_pp:
+        pythonpath = f"{extra_pp}:{pythonpath}"
     command = f"""
 set -euo pipefail
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="/workspace/rler/slime:/workspace/rler:/workspace/rler/agent:/root/Megatron-LM"
+export PYTHONPATH="{pythonpath}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export SWE_AGENT_GRPO_TARGET={shlex.quote(args.target)}
 export SWE_AGENT_GRPO_OUTPUT_ROOT={shlex.quote(str(args.search_output_root))}
@@ -224,12 +387,11 @@ export SWE_AGENT_GRPO_P={"" if args.search_p is None else args.search_p}
 export SWE_AGENT_GRPO_MAX_ROUNDS={"" if args.search_max_rounds is None else args.search_max_rounds}
 export SWE_AGENT_GRPO_STEP_LIMIT={"" if args.search_step_limit is None else args.search_step_limit}
 export SWE_AGENT_GRPO_INSTANCE_WORKERS={args.rollout_instance_workers}
-export SWE_AGENT_PYTHON="/workspace/rler/agent/.venv/bin/python"
-trap 'ray stop --force >/dev/null 2>&1 || true' EXIT
-pkill -9 sglang >/dev/null 2>&1 || true
-ray stop --force >/dev/null 2>&1 || true
-cd /workspace/rler/slime
-source /workspace/rler/slime/train_agent/configs/qwen3.5-9B.sh
+export SWE_AGENT_PYTHON="{rler_root}/agent/.venv/bin/python"
+{ray_trap_line}
+{ray_stop_line}
+cd {rler_root}/slime
+source {rler_root}/slime/train_agent/configs/qwen3.5-9B.sh
 source {shlex.quote(str(args.config_path))}
 {config_overrides}
 if [ {shlex.quote(args.target)} = "rubric" ]; then
@@ -249,12 +411,12 @@ for CHECKPOINT_DIR in {shlex.quote(str(args.load_dir))} {shlex.quote(str(ref_loa
 done
 RAY_TMPDIR="/tmp/ray-swe-{args.target}-grpo-$$"
 mkdir -p "${{RAY_TMPDIR}}"
-ray start --head --node-ip-address 127.0.0.1 --num-gpus {total_gpus} --num-cpus {args.ray_num_cpus} --temp-dir "${{RAY_TMPDIR}}" --disable-usage-stats >/dev/null
+{ray_start_line}
 python3 train_async.py \\
-  --actor-num-nodes 1 \\
-  --actor-num-gpus-per-node {args.actor_num_gpus} \\
+  --actor-num-nodes {actor_num_nodes} \\
+  --actor-num-gpus-per-node {actor_gpus_per_node} \\
   --rollout-num-gpus {args.rollout_num_gpus} \\
-  --num-gpus-per-node {total_gpus} \\
+  --num-gpus-per-node {args.num_gpus_per_node} \\
   "${{MODEL_ARGS[@]}}" \\
   --hf-checkpoint {shlex.quote(str(args.hf_checkpoint))} \\
   --load {shlex.quote(str(args.load_dir))} \\
@@ -263,6 +425,7 @@ python3 train_async.py \\
   --prompt-data {shlex.quote(str(args.prompt_data))} \\
   --rollout-batch-size {args.rollout_batch_size} \\
   --global-batch-size "${{GLOBAL_BATCH_SIZE}}" \\
+  {oversample_arg} \\
   --sglang-served-model-name {shlex.quote(args.student_model)} \\
   "${{GRPO_COMMON_ARGS[@]}}" \\
   --rollout-function-path {shlex.quote(args.rollout_function_path)} \\
@@ -274,6 +437,10 @@ python3 train_async.py \\
   "${{GRPO_ROLLOUT_ARGS[@]}}" \\
   "${{GRPO_SGLANG_ARGS[@]}}" \\
   "${{GRPO_MISC_ARGS[@]}}" \\
+  {dynamic_filter_arg} \\
+  {tis_arg} \\
+  {save_debug_arg} \\
+  {save_debug_rollout_arg} \\
   {wandb_args}
 """
     subprocess.run(["bash", "-lc", command], check=True)

@@ -837,75 +837,82 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     # 3. dist_init_addr port
     # 4. other ports for dp_attention, which is of size 4 + dp_size
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
 
-    # Track per-node port cursors so that different server groups (called
-    # sequentially) never race for the same ports on a given node.
-    node_port_cursor: dict[int, int] = {}
-
-    visited_nodes = set()
+    # Group engines by their ACTUAL physical node IP (queried from Ray) rather
+    # than by slime's old `local_rank // num_engines_per_node` heuristic. The
+    # old heuristic assumes Ray packs `num_gpus_per_node // gpus_per_engine`
+    # engines onto each physical node, but that breaks when actor co-locates
+    # with rollout asymmetrically (e.g. 4 actor + 4 rollout on node 0 + 8
+    # rollout on node 1: slime would group engines 0-7 as one logical node and
+    # give them all engine 0's IP, but engines 4-7 are physically on node 1
+    # and time out trying to dist-init at node 0's IP).
+    #
+    # By querying each engine's IP directly we tolerate any placement.
+    engine_ips: dict[int, str] = {}
     for rank, engine in rollout_engines:
-        local_rank = rank - rank_offset
-        node_index = local_rank // num_engines_per_node
-        if node_index in visited_nodes:
-            continue
-        visited_nodes.add(node_index)
-        # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
+        ip, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
+        engine_ips[rank] = ip
 
-        def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
+    from collections import defaultdict
+    engines_by_ip: dict[str, list[tuple[int, object]]] = defaultdict(list)
+    for rank, engine in rollout_engines:
+        engines_by_ip[engine_ips[rank]].append((rank, engine))
 
+    # Per-physical-node port cursor (keyed by IP, not by slime's logical node
+    # index). Different server groups (called sequentially) won't race for
+    # ports on a given physical node.
+    node_port_cursor: dict[str, int] = {}
+
+    for ip, group in engines_by_ip.items():
+        # All engines in this group are on the same physical node, so they
+        # share an IP and a port cursor. Pick any one as the port-allocation
+        # handle (Ray queries free ports against this engine's process).
+        handle = group[0][1]
+        # Closure over (handle, ip) — the default-arg trick avoids late-binding
+        # issues from the surrounding for-loop.
+        def make_port_fn(handle=handle, ip=ip):
             def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
+                start = node_port_cursor.get(ip, base_port)
+                _, p = ray.get(
+                    handle._get_current_node_ip_and_free_port.remote(
+                        start_port=start,
                         consecutive=consecutive,
                     )
                 )
-                start_port = port + consecutive
-                node_port_cursor[node_idx] = start_port
-                return port
+                node_port_cursor[ip] = p + consecutive
+                return p
+            return port
+        get_port = make_port_fn()
 
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
-
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine, node_index)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
+        # Per-engine: server port + nccl port (+ optional disagg bootstrap).
+        for rank, _engine in group:
+            addr_and_ports.setdefault(rank, {})
+            addr_and_ports[rank]["host"] = ip
+            addr_and_ports[rank]["port"] = get_port()
+            addr_and_ports[rank]["nccl_port"] = get_port()
             if worker_type == "prefill":
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
+                addr_and_ports[rank]["disaggregation_bootstrap_port"] = get_port()
 
+        # dist_init_addr — same port on this physical node's IP for the whole
+        # multi-node engine when an engine spans nodes (TP > num_gpus_per_node);
+        # otherwise one per single-node engine.
         if _gpus_per_engine > args.num_gpus_per_node:
             num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
-            if local_rank % num_node_per_engine == 0:
-                # this is the first node in the engine, we need to allocate the dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
+            for i, (rank, _e) in enumerate(group):
+                if i % num_node_per_engine == 0:
+                    dist_init_addr = f"{ip}:{get_port(30 + args.sglang_dp_size)}"
+                    for j in range(num_node_per_engine):
+                        if i + j < len(group):
+                            addr_and_ports[group[i + j][0]]["dist_init_addr"] = dist_init_addr
         else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
+            for rank, _engine in group:
+                addr_and_ports[rank]["dist_init_addr"] = f"{ip}:{get_port(30 + args.sglang_dp_size)}"
 
-    for i, _ in rollout_engines:
+    for rank, _ in rollout_engines:
         for key in ["port", "nccl_port", "dist_init_addr"]:
-            assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
-        logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")
+            assert key in addr_and_ports[rank], f"Engine {rank} {key} is not set."
+        logger.info(f"Ports for engine {rank}: {addr_and_ports[rank]}")
 
     return addr_and_ports, node_port_cursor
 
