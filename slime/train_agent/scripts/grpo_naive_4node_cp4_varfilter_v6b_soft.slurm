@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=grpo-naive-cp4varf-v6a
+#SBATCH --job-name=grpo-naive-cp4varf-v6b
 #SBATCH --account=ads_cpt
 #SBATCH --qos=ads_cpt
 #SBATCH --partition=a4
