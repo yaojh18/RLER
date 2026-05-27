@@ -994,14 +994,10 @@ class TrajectorySearchParallelRunner:
         if patch:
             return patch, False
         try:
+            # Don't hardcode /testbed — ReBench docker images don't mount the
+            # repo there. Run from the agent's current working directory.
             diff = session.agent.env.execute(
-                {
-                    "command": (
-                        'repo=$(git -C /testbed rev-parse --show-toplevel 2>/dev/null '
-                        '|| git rev-parse --show-toplevel 2>/dev/null || pwd); '
-                        'cd "$repo" && git add -N . >/dev/null 2>&1; git diff'
-                    )
-                },
+                {"command": "git add -N . >/dev/null 2>&1; git diff"},
                 timeout=30,
             )
             return _normalize(diff.get("output") or ""), True

@@ -27,6 +27,7 @@ from agent_rl.run_utils import (
 )
 
 from swe_agent.backend import SWEAgentRolloutBackend
+from swe_agent.run.benchmarks.rebench_eval import is_rebench_instance, rebench_workdir
 from swe_agent.run.benchmarks.swebench import (
     DATASET_MAPPING,
     build_swebench_config,
@@ -874,6 +875,8 @@ def run_aggregate(
                     environment_config = instance_config.setdefault("environment", {})
                     if environment_config.get("environment_class", "docker") == "docker":
                         environment_config["image"] = get_swebench_docker_image_name(instance)
+                    if is_rebench_instance(instance):
+                        environment_config["cwd"] = rebench_workdir(instance)
                     try:
                         runner = AggregateTrajectoryRunner(
                             instance=instance,
