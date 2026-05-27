@@ -230,11 +230,21 @@ _FAILED_INSTANCES = 0
 _DROPPED_OVERSIZED = 0
 _FILTER_DROPPED_GROUPS = 0
 _FILTER_DROP_REASONS: dict[str, int] = {}
+# L3 circuit-breaker counters: count *attempted* on-policy bundles and how
+# many of them were dropped by naive_to_grpo_bundle for infra reasons
+# (too_many_dummies / insufficient_real_samples / no_rollouts). Stale-drops
+# and dynamic-filter-drops are deliberately excluded — those are normal
+# off-policy / model-based filtering, not infra failures.
+_INFRA_DROPPED_GROUPS = 0
+_INFRA_DROP_REASONS: dict[str, int] = {}
+_TOTAL_GROUPS_ATTEMPTED = 0
 # Cumulative totals at the close of the previous perf log line. Subtract from
 # current totals to expose per-step deltas in wandb alongside the cumulative
 # counters (no manual diff() needed in the dashboard).
 _PREV_STALE_DROPPED_GROUPS = 0
 _PREV_FILTER_DROPPED_GROUPS = 0
+_PREV_INFRA_DROPPED_GROUPS = 0
+_PREV_TOTAL_GROUPS_ATTEMPTED = 0
 # Per-endpoint in-flight trial count, used by _pick_least_loaded_endpoints
 # to route each new instance's M trials across the engines that are currently
 # least loaded. Bumped when an instance is dispatched, decremented when its
@@ -563,6 +573,7 @@ def _harvest_ready(
     bundle, expand its policy_groups into Samples and append to _BUFFER."""
     global _FAILED_INSTANCES, _STALE_DROPPED_GROUPS, _DROPPED_OVERSIZED
     global _FILTER_DROPPED_GROUPS, _FILTER_DROP_REASONS
+    global _INFRA_DROPPED_GROUPS, _INFRA_DROP_REASONS, _TOTAL_GROUPS_ATTEMPTED
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path)
         if getattr(args, "dynamic_sampling_filter_path", None) else None
@@ -619,9 +630,24 @@ def _harvest_ready(
             bundle.policy_groups if target == "policy" else bundle.rubric_groups
         )
         if task["rollout_id"] < current_rollout_id - 1:
+            # Stale-drops are NOT counted as attempted — they're off-policy
+            # noise from a previous rollout_id, not a fresh on-policy attempt.
             _STALE_DROPPED_GROUPS += len(groups)
             del result, bundle, groups, ref
             continue
+        # L3 attempted-group bookkeeping. Naive scheme produces exactly one
+        # ExportGroup per instance (see naive_to_grpo_bundle); when that
+        # group is dropped for infra reasons (too_many_dummies / etc.) the
+        # bundle still arrives but with empty policy_groups. Count BOTH
+        # cases as one attempted group so the drop rate is well-defined.
+        if target == "policy":
+            _TOTAL_GROUPS_ATTEMPTED += 1
+            drop_reason = (bundle.metadata or {}).get("group_dropped_reason")
+            if drop_reason:
+                _INFRA_DROPPED_GROUPS += 1
+                # Normalize "too_many_dummies (n_dummy=3 >= 2)" -> "too_many_dummies"
+                key = str(drop_reason).split(" ", 1)[0]
+                _INFRA_DROP_REASONS[key] = _INFRA_DROP_REASONS.get(key, 0) + 1
         for group in groups:
             samples, dropped_here = build_rollout_samples(
                 groups=[group],
@@ -935,15 +961,53 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             p2p_pass_rates.append(p2p_passed / p2p_total)
 
     global _PREV_STALE_DROPPED_GROUPS, _PREV_FILTER_DROPPED_GROUPS
+    global _PREV_INFRA_DROPPED_GROUPS, _PREV_TOTAL_GROUPS_ATTEMPTED
     stale_dropped_step = _STALE_DROPPED_GROUPS - _PREV_STALE_DROPPED_GROUPS
     filter_dropped_step = _FILTER_DROPPED_GROUPS - _PREV_FILTER_DROPPED_GROUPS
+    infra_dropped_step = _INFRA_DROPPED_GROUPS - _PREV_INFRA_DROPPED_GROUPS
+    attempted_step = _TOTAL_GROUPS_ATTEMPTED - _PREV_TOTAL_GROUPS_ATTEMPTED
     _PREV_STALE_DROPPED_GROUPS = _STALE_DROPPED_GROUPS
     _PREV_FILTER_DROPPED_GROUPS = _FILTER_DROPPED_GROUPS
+    _PREV_INFRA_DROPPED_GROUPS = _INFRA_DROPPED_GROUPS
+    _PREV_TOTAL_GROUPS_ATTEMPTED = _TOTAL_GROUPS_ATTEMPTED
     n_groups_kept = len(selected_groups)
     filter_drop_rate_step = (
         filter_dropped_step / (filter_dropped_step + n_groups_kept)
         if (filter_dropped_step + n_groups_kept) > 0 else 0.0
     )
+    infra_drop_rate_step = (
+        infra_dropped_step / attempted_step if attempted_step > 0 else 0.0
+    )
+    # L3 circuit-breaker. Raise if too many groups were dropped for infra
+    # reasons (docker pull misses, cache failures, etc.). Default 50% with
+    # a minimum of 8 attempted groups in the step, both overridable via env
+    # so we can tune without redeploying. Setting limit >= 1.0 disables.
+    try:
+        _infra_limit = float(os.getenv("NAIVE_INFRA_DROP_RATE_LIMIT", "0.5"))
+    except ValueError:
+        _infra_limit = 0.5
+    try:
+        _infra_min = int(os.getenv("NAIVE_INFRA_DROP_MIN_ATTEMPTED", "8"))
+    except ValueError:
+        _infra_min = 8
+    if (
+        _infra_limit < 1.0
+        and attempted_step >= _infra_min
+        and infra_drop_rate_step > _infra_limit
+    ):
+        top_reasons = sorted(
+            _INFRA_DROP_REASONS.items(), key=lambda kv: -kv[1]
+        )[:3]
+        raise RuntimeError(
+            f"[naive-async] L3 circuit-breaker tripped: infra_drop_rate="
+            f"{infra_drop_rate_step:.1%} ({infra_dropped_step}/{attempted_step}) "
+            f"> limit={_infra_limit:.1%} (min_attempted={_infra_min}). "
+            f"Top reasons (cumulative): {top_reasons}. "
+            f"Likely a docker-cache miss / registry rate-limit storm — "
+            f"check the missing-image list and the docker_lustre_wrapper logs "
+            f"before resubmitting. Set NAIVE_INFRA_DROP_RATE_LIMIT=1.0 to "
+            f"disable (NOT recommended)."
+        )
 
     return RolloutFnTrainOutput(
         samples=samples,
@@ -958,10 +1022,15 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/stale_dropped_groups_total": _STALE_DROPPED_GROUPS,
             "swe_agent/dropped_oversized_samples_total": _DROPPED_OVERSIZED,
             "swe_agent/filter_dropped_groups_total": _FILTER_DROPPED_GROUPS,
+            "swe_agent/infra_dropped_groups_total": _INFRA_DROPPED_GROUPS,
+            "swe_agent/total_groups_attempted_total": _TOTAL_GROUPS_ATTEMPTED,
             # --- per-step drop deltas (easier to chart than diff of totals) ---
             "swe_agent/stale_dropped_groups": stale_dropped_step,
             "swe_agent/dynamic_filter_dropped_groups": filter_dropped_step,
             "swe_agent/dynamic_filter_drop_rate": filter_drop_rate_step,
+            "swe_agent/infra_dropped_groups": infra_dropped_step,
+            "swe_agent/groups_attempted": attempted_step,
+            "swe_agent/infra_drop_rate": infra_drop_rate_step,
             "swe_agent/wait_seconds": time.perf_counter() - wait_started,
             "swe_agent/seconds": time.perf_counter() - started,
             "swe_agent/source": "naive",
