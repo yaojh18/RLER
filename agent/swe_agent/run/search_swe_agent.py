@@ -12,6 +12,7 @@ from typing import Any, Sequence
 from agent_rl import clear_model_services, register_model_service
 from agent_rl.run_utils import ModelRouteConfig, clear_model_routes, configure_model_route
 from swe_agent.backend import SWEAgentRolloutBackend
+from swe_agent.run.benchmarks.rebench_eval import is_rebench_instance, rebench_workdir
 from swe_agent.run.benchmarks.swebench import (
     build_swebench_config,
     get_swebench_docker_image_name,
@@ -69,6 +70,8 @@ def _run_single_instance(
     environment_config = instance_config.setdefault("environment", {})
     if environment_config.get("environment_class", "docker") == "docker":
         environment_config["image"] = get_swebench_docker_image_name(instance)
+    if is_rebench_instance(instance):
+        environment_config["cwd"] = rebench_workdir(instance)
     runner = TrajectorySearchRunner(
         instance=instance,
         backend=SWEAgentRolloutBackend(
@@ -164,6 +167,17 @@ def run_search(
         required_env = infer_litellm_api_env(args.openai_model)
         if required_env and not os.getenv(required_env):
             raise RuntimeError(f"{required_env} is not set for model {args.openai_model}")
+        # RouteTextbasedModel takes the token-in/token-out path against sglang
+        # /generate; it requires api_base in model_kwargs. When the openai
+        # backend points at a local OpenAI-compatible sglang server (e.g. a
+        # DSv4 teacher hosted on a GCP node), pick up the same endpoint
+        # litellm uses (OPENAI_API_BASE) so RouteTextbasedModel can post to
+        # /generate on it. Fallback env SEARCH_SWE_OPENAI_API_BASE lets the
+        # caller override without disturbing litellm's own routing.
+        openai_api_base = os.environ.get("SEARCH_SWE_OPENAI_API_BASE") or os.environ.get("OPENAI_API_BASE")
+        if openai_api_base:
+            shared_model_kwargs["api_base"] = openai_api_base
+            shared_model_kwargs.setdefault("api_key", os.environ.get("OPENAI_API_KEY", "EMPTY"))
     else:
         service_name = SLIME_SERVICE_NAME
         register_model_service(
@@ -201,12 +215,55 @@ def run_search(
         configure_model_route("policy", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
         configure_model_route("rubric_generation", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
         configure_model_route("rubric_judge", ModelRouteConfig(backend="service", service_name=service_name, model_name=args.slime_model))
+
+    # Optional: route the judge to a separate sglang server (e.g. DeepSeek-V4-Pro on a different node).
+    # Probes the endpoint at startup so we fail loudly if the Qwen node can't reach the judge node.
+    if args.judge_base_url:
+        import urllib.request, urllib.error, json as _json
+        judge_service_name = "judge_remote"
+        judge_model = args.judge_model or args.judge_served_model
+        if judge_model is None:
+            raise RuntimeError("--judge-base-url requires --judge-model (or --judge-served-model) to be set")
+        try:
+            with urllib.request.urlopen(args.judge_base_url.rstrip("/").rsplit("/v1", 1)[0] + "/health", timeout=10) as resp:
+                _ = resp.read(64)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+            raise RuntimeError(
+                f"Cannot reach judge endpoint at {args.judge_base_url} from this node "
+                f"(host={os.uname().nodename}). Verify the judge sglang server is up, the port is open, "
+                f"and intra-cluster networking allows it. Underlying error: {type(exc).__name__}: {exc}"
+            )
+        register_model_service(
+            judge_service_name,
+            SGLangChatService(
+                base_url=args.judge_base_url,
+                api_key=args.judge_api_key,
+                default_model_name=judge_model,
+            ),
+        )
+        configure_model_route(
+            "rubric_judge",
+            ModelRouteConfig(backend="service", service_name=judge_service_name, model_name=judge_model),
+        )
     errors: list[str] = []
     try:
+        # RouteTextbasedModel (DEFAULT_MODEL_CLASS) hits sglang /generate with
+        # raw input_ids tokenized by the *local* Qwen3.5-9B tokenizer (the
+        # tokenization.py default). That's safe when teacher==student (both
+        # Qwen-family), but for the openai backend the teacher endpoint may
+        # be a totally different model (e.g. DSv4-Pro on a separate sglang),
+        # whose vocab disagrees with Qwen's. Sending Qwen token IDs to a
+        # DSv4 /generate produces out-of-distribution embeddings and crashes
+        # the mHC kernel (CUDA_ERROR_ASSERT, see project_dsv4_blackwell_image_buggy).
+        # Switch to litellm_textbased for openai backend: it posts messages
+        # to /v1/chat/completions and lets the server tokenize correctly.
+        effective_model_class = (
+            "litellm_textbased" if args.backend == "openai" else DEFAULT_MODEL_CLASS
+        )
         config = build_swebench_config(
             config_spec=[str(SWE_AGENT_TEXTBASED_CONFIG)],
             model=model_name,
-            model_class=DEFAULT_MODEL_CLASS,
+            model_class=effective_model_class,
             extra_overrides={
                 "agent": {
                     "step_limit": args.step_limit,
@@ -346,6 +403,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evaluate-final-patch", action="store_true", default=True)
     parser.add_argument("--export-grpo-bundles", action="store_true", default=True)
     parser.add_argument("--write-artifacts", action="store_true", default=True)
+    parser.add_argument(
+        "--judge-base-url",
+        default=None,
+        help="If set, route rubric_judge calls to a separate sglang server at this OpenAI-compatible base URL "
+             "(e.g. http://metavmds1-a4-91:8888/v1). Use to put a stronger judge on a separate node.",
+    )
+    parser.add_argument(
+        "--judge-api-key",
+        default="EMPTY",
+        help="API key for --judge-base-url. Default 'EMPTY' works for an unauthenticated sglang server.",
+    )
+    parser.add_argument(
+        "--judge-served-model",
+        default=None,
+        help="If --judge-model is unset but --judge-base-url is set, use this as the served-model name on the judge endpoint.",
+    )
     return parser
 
 

@@ -181,6 +181,26 @@ async def run_litellm_completion_async(
                 raw_response={"validation_error": str(exc)},
                 metadata={"timestamp": time.time(), "content_no_thinking": raw_content},
             )
+        # ContextWindow / token-count overflow must NOT be silently swallowed: doing so
+        # causes the agent loop to inject a format_error template and retry with a
+        # still-longer prompt, growing the conversation past the cap (we observed
+        # 250k -> 263k+ via +152-tok-per-iter loops).
+        # sglang/litellm reports overflow under TWO exception classes depending on
+        # version/path:
+        #   1) litellm.ContextWindowExceededError
+        #   2) litellm.BadRequestError with message "Requested token count exceeds ..."
+        #      or "longer than the model's context length"
+        # Re-raise both so the calling rollout terminates this branch cleanly.
+        _exc_msg = str(exc)
+        _is_overflow = (
+            isinstance(exc, getattr(litellm, "ContextWindowExceededError", ()))
+            or "ContextWindowExceededError" in type(exc).__name__
+            or "Requested token count exceeds" in _exc_msg
+            or "longer than the model's context length" in _exc_msg
+        )
+        if _is_overflow:
+            print(f"Error in run_litellm_completion_async (FATAL, raising): {exc}")
+            raise
         print(f"Error in run_litellm_completion_async: {exc}")
         return ChatCompletion(content="", model_name=model_name, metadata={"timestamp": time.time()})
     choice = response.choices[0]
@@ -211,6 +231,135 @@ async def run_litellm_completion_async(
         usage=usage,
         raw_response=response.model_dump() if hasattr(response, "model_dump") else {},
         metadata={"timestamp": time.time(), "content_no_thinking": content_no_thinking},
+    )
+
+
+async def run_generate_with_route_async(
+    *,
+    route_name: str,
+    input_ids: List[int],
+    api_base: str,
+    api_key: str = "EMPTY",
+    sampling_params: Optional[Dict[str, Any]] = None,
+    return_logprobs: bool = True,
+    request_timeout: float = 600.0,
+) -> ChatCompletion:
+    """Token-in / token-out call against sglang's `/generate` endpoint.
+
+    Pre-conditions:
+      - `input_ids` has been chat-template-encoded by the caller using the
+        same tokenizer sglang loaded (see swe_agent.tokenization).
+      - `api_base` ends in `/v1` (chat-completions endpoint convention) or
+        is the bare hostname; this function strips `/v1` and posts to
+        `{base}/generate`.
+
+    Returns ChatCompletion with:
+      - content              = decoded text of generated tokens
+      - output_token_ids     = sglang's exact output_ids
+      - output_logprobs      = per-token chosen logprobs in token order
+      - input_token_ids      = echo of the input_ids we sent
+      - usage                = {prompt_tokens, completion_tokens}
+      - finish_reason        = inferred from sglang meta_info
+      - raw_response         = the full sglang JSON for debugging
+    """
+    import aiohttp  # local import — only token-IO path needs aiohttp
+    if sampling_params is None:
+        sampling_params = {}
+    base = api_base.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = f"{base}/generate"
+    payload = {
+        "input_ids": list(input_ids),
+        "sampling_params": sampling_params,
+        "return_logprob": bool(return_logprobs),
+        # -1 = output tokens only. 0 would request logprobs over the FULL
+        # prompt too, which forces sglang to allocate a (prompt_len, vocab)
+        # buffer per request. With long chat-template prompts (16k+ tokens)
+        # this triggered GPU OOM in the scheduler.
+        "logprob_start_len": -1,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+    timeout = aiohttp.ClientTimeout(total=request_timeout)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(
+                        f"sglang /generate {resp.status}: {body[:500]}"
+                    )
+                data = await resp.json()
+    except Exception as exc:
+        # Mirror the litellm path: swallow non-fatal errors so the agent
+        # retry loop in models/utils/retry.py can re-attempt. ContextWindow
+        # / overflow errors are NOT swallowed (sglang returns 4xx and we
+        # raise above).
+        msg = str(exc)
+        if "longer than" in msg or "context length" in msg or "Requested token count exceeds" in msg:
+            raise
+        print(f"Error in run_generate_with_route_async: {exc}")
+        return ChatCompletion(content="", model_name=route_name, metadata={"timestamp": time.time(), "error": msg})
+
+    # sglang /generate response shape:
+    #   {
+    #     "text": "<decoded text>",
+    #     "output_ids": [int, ...],
+    #     "meta_info": {
+    #         "prompt_tokens": N,
+    #         "completion_tokens": M,
+    #         "finish_reason": {"type": "stop"|"length"|...},
+    #         "output_token_logprobs": [(logprob, token_id, decoded), ...],  # if return_logprob
+    #         "input_token_logprobs": [...],                                  # if requested
+    #     }
+    #   }
+    text = data.get("text", "") or ""
+    output_ids = list(data.get("output_ids") or [])
+    meta = data.get("meta_info") or {}
+    finish_info = meta.get("finish_reason") or {}
+    if isinstance(finish_info, dict):
+        finish_reason = finish_info.get("type", "stop") or "stop"
+    else:
+        finish_reason = str(finish_info) or "stop"
+    usage = {
+        "prompt_tokens": int(meta.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(meta.get("completion_tokens", 0) or 0),
+    }
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    output_logprobs: List[float] = []
+    raw_lp = meta.get("output_token_logprobs") or []
+    for entry in raw_lp:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
+            try:
+                output_logprobs.append(float(entry[0]))
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(entry, dict) and "logprob" in entry:
+            try:
+                output_logprobs.append(float(entry["logprob"]))
+            except (TypeError, ValueError):
+                pass
+    return ChatCompletion(
+        content=text,
+        finish_reason=finish_reason,
+        model_name=route_name,
+        cost=0.0,
+        usage=usage,
+        raw_response=data,
+        metadata={
+            "timestamp": time.time(),
+            # No <think>/</think> stripping here — sglang already returns the
+            # decoded text including thinking content; downstream agents do
+            # their own parsing on `content`.
+            "content_no_thinking": text,
+            "endpoint": "generate",
+        },
+        output_token_ids=output_ids,
+        output_logprobs=output_logprobs,
+        input_token_ids=list(input_ids),
     )
 
 

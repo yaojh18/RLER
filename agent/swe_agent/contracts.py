@@ -12,6 +12,30 @@ class ExportSample:
     turns: list[dict[str, Any]]
     reward: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # ---- precomputed token-level fields (preferred for training) ----
+    # If set, slime's build_rollout_samples uses these directly and SKIPS
+    # text re-tokenization. They are the source of truth for PDS samples.
+    #   token_ids       = full sequence (parent's shared prefix + this branch's
+    #                     new messages, encoded with the same chat template
+    #                     used by sglang)
+    #   loss_mask       = same length as token_ids; 1 for tokens that should
+    #                     contribute to the policy gradient, 0 otherwise.
+    #                     Crucially this is 0 over the parent's shared prefix
+    #                     so M=8 siblings don't repeatedly train on the same
+    #                     parent tokens, AND 0 over this branch's user/tool
+    #                     tokens (only assistant generations are trainable).
+    #   response_length = number of branch's NEW tokens (= len(token_ids) -
+    #                     len(parent_prefix)). slime takes
+    #                     loss_mask[-response_length:] as the per-token
+    #                     advantage mask.
+    #   rollout_logprobs= per-assistant-token logprobs from sglang during
+    #                     rollout (concatenated over the branch's new
+    #                     portion). Reserved for future TIS / off-policy
+    #                     correction; None when not available.
+    token_ids: list[int] | None = None
+    loss_mask: list[int] | None = None
+    response_length: int | None = None
+    rollout_logprobs: list[float] | None = None
 
 
 @dataclass

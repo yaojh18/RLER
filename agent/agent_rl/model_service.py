@@ -24,6 +24,13 @@ class ChatCompletion:
     usage: Dict[str, Any] = field(default_factory=dict)
     raw_response: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Token-level fields populated by sglang /generate path. When set,
+    # downstream consumers (PDS, training-side sample builder) prefer
+    # output_token_ids over re-tokenizing `content`. logprobs are only
+    # the chosen tokens' logprobs, in token order.
+    output_token_ids: List[int] = field(default_factory=list)
+    output_logprobs: List[float] = field(default_factory=list)
+    input_token_ids: List[int] = field(default_factory=list)
 
 
 @runtime_checkable

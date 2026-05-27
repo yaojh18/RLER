@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import random
 import re
 import subprocess
@@ -750,7 +751,14 @@ def _sample_by_strategy(
 
 
 def _docker_commit(executable: str, container_id: str, image_tag: str) -> tuple[str, str]:
-    subprocess.run([executable, "commit", container_id, image_tag], check=True, capture_output=True, text=True)
+    # --pause=false: containers can leak in 'paused' state under high commit
+    # load. Safe here because we only commit after run_until_pause() returns,
+    # i.e. when the agent step has finished and no in-container command is in
+    # progress.
+    subprocess.run(
+        [executable, "commit", "--pause=false", container_id, image_tag],
+        check=True, capture_output=True, text=True,
+    )
     image_id = subprocess.run(
         [executable, "image", "inspect", image_tag, "--format", "{{.Id}}"],
         check=True,
@@ -1213,6 +1221,14 @@ class TrajectorySearchRunner:
             "model_kwargs": self.rubric_model_kwargs,
             "extra_prompt_sections": extra_prompt_sections,
         }
+        _t_rub_start = time.perf_counter()
+        try:
+            logging.getLogger("swe_agent.trajectory_search").info(
+                "[TIMING] rubric_gen.start round=%d n_samples=%d active=%d"
+                % (round_index, self.search_config.n, len(self.active_bank))
+            )
+        except Exception:
+            pass
         generated_samples = await asyncio.gather(
             *[
                 _generate_round_rubrics(
@@ -1222,8 +1238,23 @@ class TrajectorySearchRunner:
                 for sample_index in range(self.search_config.n)
             ],
         )
+        try:
+            logging.getLogger("swe_agent.trajectory_search").info(
+                "[TIMING] rubric_gen.end   round=%d took=%.1fs samples=%d"
+                % (round_index, time.perf_counter()-_t_rub_start, len(generated_samples))
+            )
+        except Exception:
+            pass
         rubric_samples: list[dict[str, Any]] = []
         valid_rubric_samples: list[dict[str, Any]] = []
+        _t_jud_start = time.perf_counter()
+        try:
+            logging.getLogger("swe_agent.trajectory_search").info(
+                "[TIMING] judge_active.start round=%d branches=%d rubrics=%d"
+                % (round_index, len(continuations), len(self.active_bank))
+            )
+        except Exception:
+            pass
         active_continuation_scores, active_continuation_errors = await _score_round(
             question=question,
             shared_context=shared_context,
@@ -1235,6 +1266,13 @@ class TrajectorySearchRunner:
             max_tokens=self.search_config.judge_max_tokens,
             model_kwargs=self.judge_model_kwargs,
         )
+        try:
+            logging.getLogger("swe_agent.trajectory_search").info(
+                "[TIMING] judge_active.end   round=%d took=%.1fs scores=%d errs=%d"
+                % (round_index, time.perf_counter()-_t_jud_start, len(active_continuation_scores), len(active_continuation_errors))
+            )
+        except Exception:
+            pass
         active_parent_scores: list[dict[str, Any]] = []
         active_parent_errors: list[dict[str, str]] = []
         if compare_parent:
@@ -1518,16 +1556,60 @@ class TrajectorySearchRunner:
         else:
             sample_plan = [("teacher", self.policy_model_name)] * sample_count
 
-        for sample_index, (policy_source, policy_model_name) in enumerate(sample_plan):
+        # Run the m sibling branches in parallel using a thread pool.
+        # Each thread owns its own docker session; the underlying sglang server
+        # batches their token generations naturally for higher GPU utilization.
+        def _run_one_branch(sample_index_and_plan):
+            sample_index, (policy_source, policy_model_name) = sample_index_and_plan
             node_id = f"node-r{round_index:03d}-s{sample_index:02d}-{uuid.uuid4().hex[:6]}"
+            _t_br_start = time.perf_counter()
+            try:
+                logging.getLogger("swe_agent.trajectory_search").info(
+                    "[TIMING] branch.start round=%d sample=%d node=%s k=%d"
+                    % (round_index, sample_index, node_id, self.search_config.k)
+                )
+            except Exception:
+                pass
             resumed_snapshot = copy.deepcopy(parent_snapshot)
             resumed_snapshot["session_id"] = f"{node_id}-session"
             resumed_snapshot["spec"]["session_id"] = resumed_snapshot["session_id"]
-            resumed_snapshot["spec"]["policy_ref"] = policy_model_name
-            
-            resumed_snapshot["spec"]["policy_version"] = policy_model_name
-            resumed_snapshot["model"]["config"]["model_name"] = policy_model_name
+            # When the model class is litellm_textbased (openai backend in
+            # search_swe_agent.py), litellm.completion() needs a provider
+            # prefix on the model name: bare "Qwen/Qwen3.5-9B" raises
+            # BadRequestError ("LLM Provider NOT provided"). For local
+            # OpenAI-compatible sglang servers (which is what we're hitting
+            # via the api_base in model_kwargs), "openai/<name>" is the
+            # right prefix and is a no-op when already present.
+            _eff_model_name = policy_model_name
+            for _prefix in ("openai/", "azure/", "anthropic/", "huggingface/", "hosted_vllm/"):
+                if _eff_model_name.startswith(_prefix):
+                    break
+            else:
+                _eff_model_name = "openai/" + _eff_model_name
+            resumed_snapshot["spec"]["policy_ref"] = _eff_model_name
+            resumed_snapshot["spec"]["policy_version"] = _eff_model_name
+            resumed_snapshot["model"]["config"]["model_name"] = _eff_model_name
             resumed_snapshot["model"]["config"]["route_name"] = "policy_student" if policy_source == "student" else "policy"
+            # Per-branch api_base swap: RouteTextbasedModel.query (token-in/
+            # token-out path against sglang /generate) reads api_base from
+            # model_kwargs, NOT from the route config. If teacher and student
+            # are on different sglang servers (e.g. DSv4 vs Qwen3.5-9B on
+            # separate GCP nodes), each branch must point at the right one.
+            # Env vars set by the orchestrator:
+            #   SEARCH_SWE_TEACHER_API_BASE/_API_KEY   (teacher endpoint)
+            #   SEARCH_SWE_STUDENT_API_BASE/_API_KEY   (student endpoint)
+            # If unset, leaves the inherited model_kwargs alone (current
+            # behavior).
+            _mk = resumed_snapshot["model"]["config"].setdefault("model_kwargs", {})
+            if policy_source == "student":
+                _ab = os.environ.get("SEARCH_SWE_STUDENT_API_BASE")
+                _ak = os.environ.get("SEARCH_SWE_STUDENT_API_KEY", "EMPTY")
+            else:
+                _ab = os.environ.get("SEARCH_SWE_TEACHER_API_BASE")
+                _ak = os.environ.get("SEARCH_SWE_TEACHER_API_KEY", "EMPTY")
+            if _ab:
+                _mk["api_base"] = _ab if _ab.endswith("/v1") else _ab.rstrip("/") + "/v1"
+                _mk["api_key"] = _ak
             for index, event in enumerate(resumed_snapshot.get("metadata", {}).get("events", [])):
                 event["session_id"] = resumed_snapshot["session_id"]
                 event["event_id"] = f"{resumed_snapshot['session_id']}:{index}"
@@ -1538,12 +1620,6 @@ class TrajectorySearchRunner:
                 result = session.run_until_pause(max_steps=self.search_config.k).model_dump(mode="json")
             except Exception as exc:
                 error_text = f"{type(exc).__name__}: {exc}"
-                policy_generation_errors.append(
-                    {
-                        "node_id": node_id,
-                        "error": error_text,
-                    }
-                )
                 snapshot_after = session.snapshot().model_dump(mode="json")
                 before_message_count = len(parent_snapshot.get("agent", {}).get("state", {}).get("messages", []))
                 message_payload = copy.deepcopy(
@@ -1555,7 +1631,7 @@ class TrajectorySearchRunner:
                     "submission": "",
                     "metadata": {},
                 }
-                branch_records.append({
+                rec = {
                     "node_id": node_id,
                     "result": result,
                     "policy_source": policy_source,
@@ -1564,9 +1640,17 @@ class TrajectorySearchRunner:
                     "prompt_payload": {"messages": copy.deepcopy(resumed_snapshot.get("agent").get("state").get("messages"))},
                     "message_payload": build_messages(message_payload, model_name=policy_model_name),
                     "is_valid": False,
-                })
+                }
                 self._dispose_session(session)
-                continue
+                try:
+                    _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
+                    logging.getLogger("swe_agent.trajectory_search").info(
+                        "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d (ERR)"
+                        % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
+                    )
+                except Exception:
+                    pass
+                return rec, error_text
             snapshot_after = session.snapshot().model_dump(mode="json")
             workspace_meta = _collect_workspace_meta(session.agent.env)
             before_event_count = len(parent_snapshot.get("metadata", {}).get("events", []))
@@ -1582,7 +1666,7 @@ class TrajectorySearchRunner:
             recent_segments.append({"step_cards": copy.deepcopy(step_cards), "segment_step_range": [step_start, step_end]})
             if len(recent_segments) > 2:
                 recent_segments = recent_segments[-2:]
-            branch_record = {
+            rec = {
                 "node_id": node_id,
                 "session": session,
                 "result": result,
@@ -1597,8 +1681,24 @@ class TrajectorySearchRunner:
                 "recent_segments": recent_segments,
                 "is_valid": True,
             }
-            branch_records.append(branch_record)
-            valid_branch_records.append(branch_record)
+            try:
+                _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
+                logging.getLogger("swe_agent.trajectory_search").info(
+                    "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d"
+                    % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
+                )
+            except Exception:
+                pass
+            return rec, None
+
+        with ThreadPoolExecutor(max_workers=max(1, len(sample_plan)), thread_name_prefix="search-branch") as _branch_pool:
+            ordered_results = list(_branch_pool.map(_run_one_branch, enumerate(sample_plan)))
+        for rec, err_text in ordered_results:
+            branch_records.append(rec)
+            if err_text is not None:
+                policy_generation_errors.append({"node_id": rec["node_id"], "error": err_text})
+            elif rec["is_valid"]:
+                valid_branch_records.append(rec)
 
         if len(valid_branch_records) < 2:
             self.peaceful_exit(branch_records, parent_id)
@@ -1782,11 +1882,34 @@ class TrajectorySearchRunner:
                     terminal_snapshot["agent"]["state"].get("messages", []),
                     model_name=branch["policy_model_name"],
                 )
+                # git apply / patch require the diff to END WITH '\n' — strip()
+                # ate the trailing newline which produced "corrupt patch at line N"
+                # errors during PatchEvalManager scoring (every patch failed → all
+                # ground_truth_reward=0.0 even when patches were textually correct).
+                # Re-append a single '\n' after stripping so we both preserve the
+                # historic stripping intent (kill trailing blank lines / spaces)
+                # and produce a well-formed patch.
+                def _ensure_patch_newline(s: str) -> str:
+                    s = (s or "").strip()
+                    return s + "\n" if s else s
+                _patch = _ensure_patch_newline(terminal_result.get("submission", ""))
+                if not _patch:
+                    # Agent didn't explicitly submit (ran out of step budget mid-edit).
+                    # Fall back to the actual git diff inside the docker container so we
+                    # don't lose real intermediate work.
+                    try:
+                        _diff = branch["session"].agent.env.execute(
+                            {"command": "git add -N . >/dev/null 2>&1; git diff"},
+                            timeout=30,
+                        )
+                        _patch = _ensure_patch_newline(_diff.get("output") or "")
+                    except Exception:
+                        _patch = ""
                 terminal_patch = {
                     self.task_id: {
                         "model_name_or_path": branch["policy_model_name"],
                         "instance_id": self.task_id,
-                        "model_patch": terminal_result.get("submission", "") or "",
+                        "model_patch": _patch,
                         "terminal_error": terminal_error,
                     }
                 }
@@ -1864,6 +1987,14 @@ class TrajectorySearchRunner:
             )
         self._sweep_checkpoint_images()
         return rubric_update_records
+
+        try:
+            logging.getLogger("swe_agent.trajectory_search").info(
+                "[TIMING] run_round.end   round=%d took=%.1fs frontier=%d best=%s"
+                % (round_index, time.perf_counter()-_t_round_start, len(self.frontier_ids), str(self.best_node_id))
+            )
+        except Exception:
+            pass
 
     def _finalize_outputs(self) -> None:
         def _cached_overall_reward(node_id: str) -> float:
