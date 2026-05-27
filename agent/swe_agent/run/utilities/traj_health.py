@@ -15,6 +15,13 @@ record so the loop/empty-bash/docker-death signals can be checked mid-training.
   * empty-bash-output turn count (heredoc-only turns yielding no feedback)
   * docker container death ("No such container" surfaced through bash)
   * litellm timeout occurrences (inside the trajectory user observations)
+  * dummy-rollout rate + reason histogram (no messages / no asst turns /
+    summary.error / unreadable JSON — matches the conditions that
+    naive_to_grpo_bundle._build_rollout_sample uses to fall back to
+    _dummy_sample_for_rollout)
+  * L2a group-drop projection: per (instance group of M siblings), how
+    many would be dropped by naive_to_grpo_bundle when n_dummy crosses
+    NAIVE_MAX_DUMMY_PER_GROUP (default 2) or n_real < 2
   * exit_status histogram
 
 Usage:
@@ -46,6 +53,9 @@ LOOP_MIN_LEN = 1500         # ignore short assistant turns when scanning for loo
 EMPTY_OUTPUT_MARKERS = ("<output>\n</output>", "<output></output>")
 DOCKER_DEATH_MARKER = "No such container"
 LITELLM_TIMEOUT_MARKER = "litellm.Timeout"
+# Mirror naive_to_grpo_bundle._max_dummy_per_group default. Override at scan
+# time with NAIVE_MAX_DUMMY_PER_GROUP to match a particular run's setting.
+DEFAULT_MAX_DUMMY_PER_GROUP = max(1, int(os.environ.get("NAIVE_MAX_DUMMY_PER_GROUP", "2") or "2"))
 
 
 def pct(xs: list[float], q: float) -> float:
@@ -85,25 +95,38 @@ def find_grpo_rollouts(run_dir: Path) -> list[tuple[str, Path]]:
 
 
 def analyse_grpo_rollout(kind: str, path: Path) -> dict[str, Any]:
-    """Analyse a single GRPO training rollout (naive rollout or lane branch)."""
+    """Analyse a single GRPO training rollout (naive rollout or lane branch).
+
+    Always returns a record (never bare-errors out) so the dummy-counting
+    aggregation can see every attempted rollout. Unreadable / missing
+    messages.json is itself a dummy signal — that's exactly what
+    naive_to_grpo_bundle._build_rollout_sample treats as a dummy (no
+    asst_with_tokens -> None -> _dummy_sample_for_rollout placeholder).
+    """
     summary: dict[str, Any] = {}
+    summary_err: str | None = None
     try:
         summary = json.loads((path / "summary.json").read_text(encoding="utf-8", errors="replace"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        summary_err = f"{type(exc).__name__}: {str(exc)[:80]}"
 
+    msgs: list[Any] = []
+    load_err: str | None = None
     if kind == "naive":
         try:
             msgs = json.loads((path / "messages.json").read_text(encoding="utf-8", errors="replace"))
         except (FileNotFoundError, json.JSONDecodeError) as exc:
-            return {"path": str(path), "error": f"messages.json: {exc}"}
-        instance_short = path.parents[2].name
-        rollout_step = path.parents[4].name
-        rollout_idx = path.name
+            load_err = f"messages.json: {type(exc).__name__}"
+        # naive layout: naive_out/rollout_NNNN/<inst>/<ts>/task-NNNNNN/rollouts/rollout_MM
+        instance_short = path.parents[3].name        # <inst>
+        rollout_step = path.parents[4].name          # rollout_NNNN
+        rollout_idx = path.name                      # rollout_MM
+        # M=8 siblings live under one `rollouts/` dir — group them by that
+        # parent so we can count per-group dummies the same way L2a does.
+        group_key = str(path.parents[0])
     else:  # lane branch
         # full conversation = shared_parent.json + continuation.json
         group_dir = path.parent.parent  # branches/.. -> group_XXX
-        msgs: list[Any] = []
         try:
             parent = json.loads((group_dir / "shared_parent.json").read_text(encoding="utf-8", errors="replace"))
             if isinstance(parent, list):
@@ -115,10 +138,11 @@ def analyse_grpo_rollout(kind: str, path: Path) -> dict[str, Any]:
             if isinstance(cont, list):
                 msgs.extend(cont)
         except (FileNotFoundError, json.JSONDecodeError) as exc:
-            return {"path": str(path), "error": f"continuation.json: {exc}"}
-        instance_short = path.parents[4].name
-        rollout_step = path.parents[6].name
+            load_err = f"continuation.json: {type(exc).__name__}"
+        instance_short = path.parents[5].name        # <inst>
+        rollout_step = path.parents[6].name          # rollout_NNNN
         rollout_idx = f"{path.parents[1].name}/{path.name}"  # group_XXX/branch_NN
+        group_key = str(group_dir)                   # one group_XXX = one GRPO group
 
     patch_chars = 0
     try:
@@ -127,8 +151,9 @@ def analyse_grpo_rollout(kind: str, path: Path) -> dict[str, Any]:
         pass
 
     status = summary.get("status") or "unknown"
-    if summary.get("error"):
-        exit_status = f"error:{str(summary['error'])[:24]}"
+    summary_error = summary.get("error")
+    if summary_error:
+        exit_status = f"error:{str(summary_error)[:24]}"
     elif summary.get("terminated_early"):
         exit_status = "terminated_early"
     else:
@@ -138,12 +163,37 @@ def analyse_grpo_rollout(kind: str, path: Path) -> dict[str, Any]:
     traj = {"messages": msgs, "info": info,
             "instance_id": f"{instance_short}/{rollout_idx}"}
     rec = _analyse_messages(traj, path / "messages.json")
+
+    # Dummy detection — matches naive_to_grpo_bundle._build_rollout_sample.
+    # A rollout becomes a dummy placeholder iff it has no usable assistant
+    # token data. We can't see token_ids from disk, but n_assistant_turns==0
+    # (no asst message at all) is a strict subset and the dominant case in
+    # practice — docker-start failures kill the subprocess before any LLM
+    # call, leaving messages.json empty or absent.
+    dummy_reason: str | None = None
+    if load_err is not None:
+        dummy_reason = load_err
+    elif rec["n_assistant_turns"] == 0:
+        if summary_error:
+            dummy_reason = f"summary_error:{str(summary_error)[:40]}"
+        elif summary_err is not None:
+            dummy_reason = "no_summary_or_messages"
+        else:
+            dummy_reason = "no_assistant_turns"
+    elif rec["asst_chars_total"] == 0:
+        # Pathological: assistant turns exist but emit zero content. Token
+        # path will likely return None too. Count as dummy.
+        dummy_reason = "asst_chars_zero"
+
     rec["rollout_step"] = rollout_step
     rec["instance_short"] = instance_short
     rec["rollout_idx"] = rollout_idx
     rec["terminated_early"] = bool(summary.get("terminated_early"))
     rec["patch_chars"] = patch_chars
     rec["kind"] = kind
+    rec["group_key"] = group_key
+    rec["is_dummy"] = dummy_reason is not None
+    rec["dummy_reason"] = dummy_reason
     return rec
 
 
@@ -220,18 +270,23 @@ def analyse_trajectory(path: Path) -> dict[str, Any]:
     return _analyse_messages(traj, path)
 
 
-def aggregate_run(run_dir: Path, grpo: bool = False) -> dict[str, Any]:
+def aggregate_run(run_dir: Path, grpo: bool = False,
+                  max_dummy_per_group: int = DEFAULT_MAX_DUMMY_PER_GROUP) -> dict[str, Any]:
     if grpo:
         rollout_dirs = find_grpo_rollouts(run_dir)
         if not rollout_dirs:
             return {"run_dir": str(run_dir), "n_trajectories": 0}
         per = [analyse_grpo_rollout(k, p) for k, p in rollout_dirs]
+        # In GRPO mode we keep "error" records because they ARE the dummies
+        # we want to count. analyse_grpo_rollout no longer bails out — it
+        # returns a fully-populated record with is_dummy=True instead.
     else:
         traj_paths = find_trajectories(run_dir)
         if not traj_paths:
             return {"run_dir": str(run_dir), "n_trajectories": 0}
         per = [analyse_trajectory(p) for p in traj_paths]
-    per = [r for r in per if "error" not in r]
+        # Legacy single_run trajectories: error records can't be analysed.
+        per = [r for r in per if "error" not in r]
     n = len(per)
     turns = [r["n_msgs"] for r in per]
     tokens = [r["asst_tokens_est"] for r in per]
@@ -243,9 +298,39 @@ def aggregate_run(run_dir: Path, grpo: bool = False) -> dict[str, Any]:
     timeout_rate = sum(1 for r in per if r["litellm_timeout_msgs"] > 0) / n
     submitted_rate = sum(1 for r in per if r["submission_present"]) / n
 
+    # Dummy / L2a group-drop aggregation. GRPO only — legacy single_run
+    # records have no group structure and never carry is_dummy.
+    dummy_count = sum(1 for r in per if r.get("is_dummy"))
+    dummy_rate = dummy_count / n
+    dummy_reason_hist: Counter[str] = Counter(
+        (r.get("dummy_reason") or "").split(":", 1)[0]
+        for r in per if r.get("is_dummy")
+    )
+    # Group rollouts the same way L2a does: M siblings under one group_key.
+    by_group: dict[str, list[dict[str, Any]]] = {}
+    for r in per:
+        gk = r.get("group_key")
+        if gk:
+            by_group.setdefault(gk, []).append(r)
+    n_groups = len(by_group)
+    groups_dropped = 0
+    group_size_hist: Counter[int] = Counter()
+    if by_group:
+        for siblings in by_group.values():
+            n_dummy = sum(1 for s in siblings if s.get("is_dummy"))
+            n_real = len(siblings) - n_dummy
+            group_size_hist[len(siblings)] += 1
+            # Match naive_to_grpo_bundle.naive_record_to_bundle exactly:
+            # drop when there are fewer than 2 real rollouts OR the dummy
+            # count crosses the threshold.
+            if n_real < 2 or n_dummy >= max_dummy_per_group:
+                groups_dropped += 1
+    group_drop_rate = (groups_dropped / n_groups) if n_groups else 0.0
+
     return {
         "run_dir": str(run_dir),
         "n_trajectories": n,
+        "n_groups": n_groups,
         "turns_p50": int(pct(list(map(float, turns)), 0.5)),
         "turns_p90": int(pct(list(map(float, turns)), 0.9)),
         "turns_p99": int(pct(list(map(float, turns)), 0.99)),
@@ -259,6 +344,13 @@ def aggregate_run(run_dir: Path, grpo: bool = False) -> dict[str, Any]:
         "empty_heavy_rate": round(empty_heavy_rate, 3),
         "litellm_timeout_rate": round(timeout_rate, 3),
         "submitted_rate": round(submitted_rate, 3),
+        "dummy_count": dummy_count,
+        "dummy_rate": round(dummy_rate, 3),
+        "dummy_reasons": dict(dummy_reason_hist.most_common()),
+        "groups_dropped": groups_dropped,
+        "group_drop_rate": round(group_drop_rate, 3),
+        "group_size_hist": dict(group_size_hist),
+        "max_dummy_per_group": max_dummy_per_group,
         "exit_status_hist": dict(exit_hist.most_common()),
         "_per_trajectory": per,
     }
@@ -278,6 +370,17 @@ def print_run(agg: dict[str, Any], top: int) -> None:
     print(f"  empty_heavy_rate     {agg['empty_heavy_rate']:.1%}   (>=3 empty bash outputs)")
     print(f"  litellm_timeout_rate {agg['litellm_timeout_rate']:.1%}")
     print(f"  submitted_rate       {agg['submitted_rate']:.1%}")
+    if agg.get("n_groups", 0) > 0:
+        print(
+            f"  dummy_rate           {agg['dummy_rate']:.1%}  "
+            f"({agg['dummy_count']}/{agg['n_trajectories']} rollouts) "
+            f"reasons={dict(list(agg['dummy_reasons'].items())[:4])}"
+        )
+        print(
+            f"  group_drop_rate      {agg['group_drop_rate']:.1%}  "
+            f"({agg['groups_dropped']}/{agg['n_groups']} groups would be dropped "
+            f"@ max_dummy_per_group={agg['max_dummy_per_group']})"
+        )
     print(f"  exit_status:         {dict(list(agg['exit_status_hist'].items())[:6])}")
     if top > 0:
         print(f"  top-{top} longest trajectories:")
@@ -302,6 +405,8 @@ COMPARE_COLS = [
     ("empty%", "empty_heavy_rate", "{:>6.1%}"),
     ("timeout%", "litellm_timeout_rate", "{:>7.1%}"),
     ("submit%", "submitted_rate", "{:>7.1%}"),
+    ("dummy%", "dummy_rate", "{:>7.1%}"),
+    ("grp_drop%", "group_drop_rate", "{:>9.1%}"),
 ]
 
 
@@ -339,13 +444,19 @@ def main() -> int:
     ap.add_argument("--label", default="", help="comma-separated labels for compare mode")
     ap.add_argument("--grpo", action="store_true",
                     help="walk live GRPO rollout layout instead of single_run/*.traj.json")
+    ap.add_argument("--max-dummy-per-group", type=int, default=DEFAULT_MAX_DUMMY_PER_GROUP,
+                    help=(
+                        "Group is considered dropped when it has >= this many dummy rollouts; "
+                        "matches NAIVE_MAX_DUMMY_PER_GROUP in naive_to_grpo_bundle (default 2)."
+                    ))
     args = ap.parse_args()
 
     dirs = expand_run_dirs(args.run_dirs)
     if not dirs:
         print("no matching run dirs", file=sys.stderr)
         return 2
-    aggs = [aggregate_run(d, grpo=args.grpo) for d in dirs]
+    aggs = [aggregate_run(d, grpo=args.grpo,
+                          max_dummy_per_group=args.max_dummy_per_group) for d in dirs]
 
     if args.json:
         out = [{k: v for k, v in a.items() if k != "_per_trajectory"} for a in aggs]
