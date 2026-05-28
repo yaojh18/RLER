@@ -28,7 +28,7 @@ class DockerEnvironmentConfig(BaseModel):
     """Timeout for executing commands in the container."""
     executable: str = os.getenv("MSWEA_DOCKER_EXECUTABLE", "docker")
     """Path to the docker/container executable."""
-    run_args: list[str] = ["--rm"]
+    run_args: list[str] = ["--rm", "--memory=256g", "--memory-swap=256g"]
     """Additional arguments to pass to the docker/container executable.
     Default is ["--rm"], which removes the container after it exits.
     """
