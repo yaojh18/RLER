@@ -144,6 +144,10 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
             no_action_patch_penalty=task.get("no_action_patch_penalty", 0.0),
             reward_kind=task.get("reward_kind", "delta"),
+            format_error_per_step_penalty=task.get(
+                "format_error_per_step_penalty", 0.0
+            ),
+            format_ok_gate_threshold=task.get("format_ok_gate_threshold", 0.0),
         )
         run_dir = (
             output_root / instance_id
@@ -434,6 +438,12 @@ def _naive_values_from_env() -> dict[str, Any]:
         "fallback_patch_penalty": _float("SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY", 0.5),
         "no_action_patch_penalty": _float("SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY", 0.0),
         "reward_kind": (os.environ.get("SWE_AGENT_NAIVE_REWARD_KIND") or "delta").lower(),
+        "format_error_per_step_penalty": _float(
+            "SWE_AGENT_NAIVE_FORMAT_ERROR_PER_STEP_PENALTY", 0.0
+        ),
+        "format_ok_gate_threshold": _float(
+            "SWE_AGENT_NAIVE_FORMAT_OK_GATE_THRESHOLD", 0.0
+        ),
     }
 
 
@@ -931,9 +941,21 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     some_pass = 0
     p2p_pass_rates: list[float] = []
     turns_for_avg: list[int] = []
+    fe_rates: list[float] = []
+    fe_counts: list[int] = []
+    n_fe_gated = 0
     for s in real_samples:
         if s.metadata and s.metadata.get("n_full_trace_steps") is not None:
             turns_for_avg.append(int(s.metadata.get("n_full_trace_steps") or 0))
+        if s.metadata and s.metadata.get("n_assistant_turns") is not None:
+            rate = float(s.metadata.get("format_error_rate") or 0.0)
+            count = int(s.metadata.get("n_format_errors") or 0)
+            fe_rates.append(rate)
+            fe_counts.append(count)
+            # A trajectory is "gated" if more than half its asst turns were
+            # format errors — same signal the runtime gate uses (default 0.5).
+            if rate > 0.5:
+                n_fe_gated += 1
     for s in eval_samples:
         md = s.metadata
         f2p_passed = int(md.get("f2p_passed_count") or 0)
@@ -1059,5 +1081,13 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/ratio_some_pass": (some_pass / n_eval) if n_eval else 0.0,
             "swe_agent/avg_turns": _safe_mean([float(x) for x in turns_for_avg]),
             "swe_agent/avg_existing_utest_pass_rate": _safe_mean(p2p_pass_rates),
+            # --- format-error health (job 58062 mode-collapse signal) ---
+            "swe_agent/format_error_rate_mean": _safe_mean(fe_rates),
+            "swe_agent/format_error_count_mean": _safe_mean(
+                [float(x) for x in fe_counts]
+            ),
+            "swe_agent/ratio_fe_gated_trajectories": (
+                (n_fe_gated / n_real) if n_real else 0.0
+            ),
         },
     )

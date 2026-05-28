@@ -88,6 +88,25 @@ class NaiveSearchConfig:
     # baseline pass-rate earns no credit; only NEW pass-rate gets signal.
     reward_kind: str = "delta"
 
+    # ---- Format-error penalties (job 58062 mode-collapse fix) -------------
+    # 58062 (v6b soft) collapsed: most rollouts emitted ```bash fences
+    # instead of ```mswea_bash_command, so every assistant turn raised
+    # FormatError ("Expected exactly 1 action, found 0") and the model
+    # reinforced the broken pattern. Two compounding fixes below — both
+    # default to OFF so existing runs are unaffected.
+    #
+    # Fix 1: linear per-turn decay. Reward *= max(0, 1 - n_fe * k). At
+    # k=0.02 a rollout with 50 format-error turns has reward zeroed; with
+    # 10 format-error turns it loses 20%. Mild push away from spamming
+    # malformed turns without nuking single-mistake rollouts.
+    format_error_per_step_penalty: float = 0.0
+    # Fix 2: hard gate. If format-error / total-asst-turn rate exceeds
+    # this threshold, reward is forced to 0 regardless of patch outcome.
+    # Catches the pathological case (e.g. 109/120 = 91% in 58062) where
+    # even an accidentally-correct fallback patch would otherwise leak
+    # positive reward through to the policy. 0.0 = disabled.
+    format_ok_gate_threshold: float = 0.0
+
 
 @dataclass
 class NaiveRollout:
@@ -113,6 +132,8 @@ class NaiveRollout:
     terminal_patch_from_fallback: bool = False
     n_action_steps: int = 0  # count of step_cards with at least one command
     terminal_no_action_emitted: bool = False  # True iff zero env actions across rollout
+    n_assistant_turns: int = 0  # total assistant turns in this rollout (denominator for FE rate)
+    n_format_errors: int = 0  # assistant turns flagged with extra.format_error = True
     error: str | None = None
     gt_score: float | None = None
     gt_payload: dict[str, Any] | None = None
@@ -374,6 +395,20 @@ class NaiveSearchRunner:
                 1 for c in rollout.step_cards if c.get("commands")
             )
             rollout.terminal_no_action_emitted = (rollout.n_action_steps == 0)
+            # Format-error count is read off the live snapshot's assistant
+            # messages — route_textbased_model.py stamps extra.format_error
+            # on the assistant message before re-raising the FormatError.
+            # These extras are preserved on rollout.messages here (the
+            # stripping in _dump_record happens later, on the messages.json
+            # copy only — messages_raw.json keeps them).
+            rollout.n_assistant_turns = sum(
+                1 for m in rollout.messages if m.get("role") == "assistant"
+            )
+            rollout.n_format_errors = sum(
+                1 for m in rollout.messages
+                if m.get("role") == "assistant"
+                and bool((m.get("extra") or {}).get("format_error"))
+            )
             rollout.workspace_meta = workspace_meta
             rollout.turns = self._extract_turn_token_info(snapshot_after, base_turn_count)
             rollout.total_tokens = {
@@ -464,6 +499,25 @@ class NaiveSearchRunner:
                 scored_reward = scored_reward * no_action_penalty
                 multipliers["no_action_penalty"] = no_action_penalty
                 notes.append("no_action_emitted")
+            # Fix 1: linear per-turn format-error penalty. Multiplicative,
+            # capped at 0 so we never flip sign. Default k=0 → no-op.
+            fe_k = float(self.config.format_error_per_step_penalty)
+            fe_count = int(rollout.n_format_errors)
+            if fe_k > 0.0 and fe_count > 0:
+                fe_multiplier = max(0.0, 1.0 - fe_count * fe_k)
+                scored_reward = scored_reward * fe_multiplier
+                multipliers["format_error_penalty"] = fe_multiplier
+                notes.append(f"format_errors={fe_count}")
+            # Fix 2: hard gate. If format-error rate over assistant turns
+            # exceeds the threshold, zero reward outright. Catches the
+            # 58062 pathology where the model emits ~90% malformed turns.
+            fe_gate = float(self.config.format_ok_gate_threshold)
+            n_asst = int(rollout.n_assistant_turns)
+            fe_rate = (fe_count / n_asst) if n_asst > 0 else 0.0
+            if fe_gate > 0.0 and fe_rate > fe_gate:
+                scored_reward = 0.0
+                multipliers["format_ok_gate"] = 0.0
+                notes.append(f"format_ok_gate_tripped:rate={fe_rate:.2f}>{fe_gate:.2f}")
             rollout.gt_score = scored_reward
             rollout.gt_payload = {
                 **rollout_payload,
@@ -471,6 +525,9 @@ class NaiveSearchRunner:
                 "base_score": base_score,
                 "delta_reward": delta_reward,
                 "reward_kind": reward_kind,
+                "n_format_errors": fe_count,
+                "n_assistant_turns": n_asst,
+                "format_error_rate": fe_rate,
                 **multipliers,
                 **({"note": "+".join(notes)} if notes else {}),
             }
@@ -608,6 +665,8 @@ class NaiveSearchRunner:
                         "terminal_patch_from_fallback": r.terminal_patch_from_fallback,
                         "terminal_no_action_emitted": r.terminal_no_action_emitted,
                         "n_action_steps": r.n_action_steps,
+                        "n_assistant_turns": r.n_assistant_turns,
+                        "n_format_errors": r.n_format_errors,
                         "terminal_patch_chars": len(r.terminal_patch or ""),
                         "error": r.error,
                         "n_messages": len(r.messages),

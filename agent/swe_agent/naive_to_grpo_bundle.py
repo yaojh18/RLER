@@ -206,6 +206,12 @@ def _build_rollout_sample(
             "terminal_patch_from_fallback": bool(rollout.terminal_patch_from_fallback),
             "terminal_no_action_emitted": bool(rollout.terminal_no_action_emitted),
             "n_action_steps": int(rollout.n_action_steps),
+            "n_assistant_turns": int(rollout.n_assistant_turns),
+            "n_format_errors": int(rollout.n_format_errors),
+            "format_error_rate": (
+                (rollout.n_format_errors / rollout.n_assistant_turns)
+                if rollout.n_assistant_turns > 0 else 0.0
+            ),
             "eval_status": gt_payload.get("status"),
             "eval_note": gt_payload.get("note"),
             "f2p_passed_count": gt_payload.get("f2p_passed_count"),
@@ -253,6 +259,9 @@ def _dummy_sample_for_rollout(
             "terminal_patch_from_fallback": False,
             "terminal_no_action_emitted": True,
             "n_action_steps": 0,
+            "n_assistant_turns": 0,
+            "n_format_errors": 0,
+            "format_error_rate": 0.0,
             "eval_status": None,
             "eval_note": None,
             "f2p_passed_count": None,

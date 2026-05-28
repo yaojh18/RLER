@@ -44,6 +44,14 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--naive-no-action-patch-penalty", type=float, default=0.0,
                    help="Multiplier applied when rollout emitted zero env actions. "
                         "0.0 = hard zero reward (default), 1.0 = no penalty.")
+    p.add_argument("--naive-format-error-per-step-penalty", type=float, default=0.0,
+                   help="Linear per-turn format-error reward decay coefficient k. "
+                        "Reward *= max(0, 1 - n_format_errors * k). 0.0 = disabled "
+                        "(default). k=0.02 zeros reward at 50 format-error turns.")
+    p.add_argument("--naive-format-ok-gate-threshold", type=float, default=0.0,
+                   help="Hard gate: zero reward when format-error-rate over assistant "
+                        "turns exceeds this threshold. 0.0 = disabled (default). "
+                        "0.5 = kill reward on any trajectory >50%% malformed turns.")
     return p.parse_known_args(argv)
 
 
@@ -74,6 +82,12 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_NAIVE_POLICY_TOP_P"] = str(ns.naive_policy_top_p)
     os.environ["SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY"] = str(ns.naive_fallback_patch_penalty)
     os.environ["SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY"] = str(ns.naive_no_action_patch_penalty)
+    os.environ["SWE_AGENT_NAIVE_FORMAT_ERROR_PER_STEP_PENALTY"] = str(
+        ns.naive_format_error_per_step_penalty
+    )
+    os.environ["SWE_AGENT_NAIVE_FORMAT_OK_GATE_THRESHOLD"] = str(
+        ns.naive_format_ok_gate_threshold
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
