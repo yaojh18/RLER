@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=grpo-naive-cp4varf-v7b
+#SBATCH --job-name=grpo-naive-soft-fmtfix
 #SBATCH --account=ads_cpt
 #SBATCH --qos=ads_cpt
 #SBATCH --partition=a4
@@ -10,7 +10,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --time=24:00:00
-#SBATCH --output=/home/sihanzeng_meta_com/rler_runs/_slurm-logs/grpo-naive-cp4-v7b-%j.log
+#SBATCH --output=/home/sihanzeng_meta_com/rler_runs/_slurm-logs/grpo-naive-soft-fmtfix-%j.log
 
 # 4-node GRPO async NAIVE — V7b (soft + format-error penalties).
 # Same as V6b except: format-error per-step penalty (k=0.02) AND format-ok
@@ -79,13 +79,13 @@ RAY_PORT=6379
 RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench
 SUBSET=$BASE/datasets/v2_python_train_plus_sweep_middle_v2
-RUN_DIR=/home/sihanzeng_meta_com/rler_runs/${SLURM_JOB_ID}-grpo-naive-cp4-v7b
+RUN_DIR=/home/sihanzeng_meta_com/rler_runs/${SLURM_JOB_ID}-grpo-naive-soft-fmtfix
 SLURM_LOGS=/home/sihanzeng_meta_com/rler_runs/_slurm-logs
 mkdir -p $RUN_DIR $SLURM_LOGS $RUN_DIR/_logs
 
 HF_CHECKPOINT=/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-9B
 LOAD_DIR=/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/slime_qwen35/ckpt/Qwen3.5-9B_torch_dist_latest
-SAVE_DIR=/mnt/localssd/rler-runs/${SLURM_JOB_ID}-grpo-naive-cp4-v7b/policy_ckpt
+SAVE_DIR=/mnt/localssd/rler-runs/${SLURM_JOB_ID}-grpo-naive-soft-fmtfix/policy_ckpt
 PROMPT_DATA=$RUN_DIR/grpo_prompts.jsonl
 
 echo "[$(date)] jobid=$SLURM_JOB_ID nodes=$SLURM_JOB_NUM_NODES head=$HEAD_NODE head_ip=$HEAD_IP"
