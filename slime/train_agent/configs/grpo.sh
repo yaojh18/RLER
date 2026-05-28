@@ -14,7 +14,10 @@ GRPO_COMMON_ARGS=(
   --loss-mask-type qwen3_5
   --advantage-estimator grpo
   --eps-clip 0.2
-  --entropy-coef 0.0
+  --entropy-coef 0.001
+  --use-kl-loss
+  --kl-loss-coef 0.01
+  --kl-loss-type k1
   --calculate-per-token-loss
   --log-probs-chunk-size 256
   --use-dynamic-global-batch-size

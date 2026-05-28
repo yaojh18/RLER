@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import random
 import re
 import subprocess
@@ -1674,17 +1675,53 @@ class TrajectorySearchRunner:
             sample_index, (policy_source, policy_model_name) = sample_index_and_plan
             node_id = f"node-r{round_index:03d}-s{sample_index:02d}-{uuid.uuid4().hex[:6]}"
             _t_br_start = time.perf_counter()
-            logger.info(
-                "[TIMING] branch.start round=%d sample=%d node=%s k=%d"
-                % (round_index, sample_index, node_id, self.search_config.k)
-            )
+            try:
+                logging.getLogger("swe_agent.trajectory_search").info(
+                    "[TIMING] branch.start round=%d sample=%d node=%s k=%d"
+                    % (round_index, sample_index, node_id, self.search_config.k)
+                )
+            except Exception:
+                pass
             resumed_snapshot = copy.deepcopy(parent_snapshot)
             resumed_snapshot["session_id"] = f"{node_id}-session"
             resumed_snapshot["spec"]["session_id"] = resumed_snapshot["session_id"]
-            resumed_snapshot["spec"]["policy_ref"] = policy_model_name
-            resumed_snapshot["spec"]["policy_version"] = policy_model_name
-            resumed_snapshot["model"]["config"]["model_name"] = policy_model_name
+            # When the model class is litellm_textbased (openai backend in
+            # search_swe_agent.py), litellm.completion() needs a provider
+            # prefix on the model name: bare "Qwen/Qwen3.5-9B" raises
+            # BadRequestError ("LLM Provider NOT provided"). For local
+            # OpenAI-compatible sglang servers (which is what we're hitting
+            # via the api_base in model_kwargs), "openai/<name>" is the
+            # right prefix and is a no-op when already present.
+            _eff_model_name = policy_model_name
+            for _prefix in ("openai/", "azure/", "anthropic/", "huggingface/", "hosted_vllm/"):
+                if _eff_model_name.startswith(_prefix):
+                    break
+            else:
+                _eff_model_name = "openai/" + _eff_model_name
+            resumed_snapshot["spec"]["policy_ref"] = _eff_model_name
+            resumed_snapshot["spec"]["policy_version"] = _eff_model_name
+            resumed_snapshot["model"]["config"]["model_name"] = _eff_model_name
             resumed_snapshot["model"]["config"]["route_name"] = "policy_student" if policy_source == "student" else "policy"
+            # Per-branch api_base swap: RouteTextbasedModel.query (token-in/
+            # token-out path against sglang /generate) reads api_base from
+            # model_kwargs, NOT from the route config. If teacher and student
+            # are on different sglang servers (e.g. DSv4 vs Qwen3.5-9B on
+            # separate GCP nodes), each branch must point at the right one.
+            # Env vars set by the orchestrator:
+            #   SEARCH_SWE_TEACHER_API_BASE/_API_KEY   (teacher endpoint)
+            #   SEARCH_SWE_STUDENT_API_BASE/_API_KEY   (student endpoint)
+            # If unset, leaves the inherited model_kwargs alone (current
+            # behavior).
+            _mk = resumed_snapshot["model"]["config"].setdefault("model_kwargs", {})
+            if policy_source == "student":
+                _ab = os.environ.get("SEARCH_SWE_STUDENT_API_BASE")
+                _ak = os.environ.get("SEARCH_SWE_STUDENT_API_KEY", "EMPTY")
+            else:
+                _ab = os.environ.get("SEARCH_SWE_TEACHER_API_BASE")
+                _ak = os.environ.get("SEARCH_SWE_TEACHER_API_KEY", "EMPTY")
+            if _ab:
+                _mk["api_base"] = _ab if _ab.endswith("/v1") else _ab.rstrip("/") + "/v1"
+                _mk["api_key"] = _ak
             for index, event in enumerate(resumed_snapshot.get("metadata", {}).get("events", [])):
                 event["session_id"] = resumed_snapshot["session_id"]
                 event["event_id"] = f"{resumed_snapshot['session_id']}:{index}"
@@ -1717,11 +1754,14 @@ class TrajectorySearchRunner:
                     "is_valid": False,
                 }
                 self._dispose_session(session)
-                _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
-                logger.info(
-                    "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d (ERR)"
-                    % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
-                )
+                try:
+                    _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
+                    logging.getLogger("swe_agent.trajectory_search").info(
+                        "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d (ERR)"
+                        % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
+                    )
+                except Exception:
+                    pass
                 return rec, error_text
             snapshot_after = session.snapshot().model_dump(mode="json")
             workspace_meta = _collect_workspace_meta(session.agent.env)
@@ -1753,11 +1793,14 @@ class TrajectorySearchRunner:
                 "recent_segments": recent_segments,
                 "is_valid": True,
             }
-            _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
-            logger.info(
-                "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d"
-                % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
-            )
+            try:
+                _step_n = (rec.get("step_end", 0) or 0) - (rec.get("step_start", 0) or 0)
+                logging.getLogger("swe_agent.trajectory_search").info(
+                    "[TIMING] branch.end   round=%d sample=%d node=%s took=%.1fs steps=%d"
+                    % (round_index, sample_index, node_id, time.perf_counter()-_t_br_start, _step_n)
+                )
+            except Exception:
+                pass
             return rec, None
 
         with ThreadPoolExecutor(max_workers=max(1, len(sample_plan)), thread_name_prefix="search-branch") as _branch_pool:
@@ -1988,24 +2031,29 @@ class TrajectorySearchRunner:
                     model_name=branch["policy_model_name"],
                     preserve_token_fields=True,
                 )
-                _patch = (terminal_result.get("submission", "") or "").strip()
+                # git apply / patch require the diff to END WITH '\n' — strip()
+                # ate the trailing newline which produced "corrupt patch at line N"
+                # errors during PatchEvalManager scoring (every patch failed → all
+                # ground_truth_reward=0.0 even when patches were textually correct).
+                # Re-append a single '\n' after stripping so we both preserve the
+                # historic stripping intent (kill trailing blank lines / spaces)
+                # and produce a well-formed patch.
+                def _ensure_patch_newline(s: str) -> str:
+                    s = (s or "").strip()
+                    return s + "\n" if s else s
+                _patch = _ensure_patch_newline(terminal_result.get("submission", ""))
                 if not _patch:
                     # Agent didn't explicitly submit (ran out of step budget mid-edit).
                     # Fall back to the actual git diff inside the docker container so we
-                    # don't lose real intermediate work. Some ReBench images do not mount
-                    # the repository at /testbed, so discover the git root when needed.
+                    # don't lose real intermediate work. Run from the agent's current
+                    # working directory rather than hardcoding /testbed — ReBench docker
+                    # images don't mount the repo at /testbed.
                     try:
                         _diff = branch["session"].agent.env.execute(
-                            {
-                                "command": (
-                                    'repo=$(git -C /testbed rev-parse --show-toplevel 2>/dev/null '
-                                    '|| git rev-parse --show-toplevel 2>/dev/null || pwd); '
-                                    'cd "$repo" && git add -N . >/dev/null 2>&1; git diff'
-                                )
-                            },
+                            {"command": "git add -N . >/dev/null 2>&1; git diff"},
                             timeout=30,
                         )
-                        _patch = (_diff.get("output") or "").strip()
+                        _patch = _ensure_patch_newline(_diff.get("output") or "")
                     except Exception:
                         _patch = ""
                 terminal_patch = {
@@ -2079,6 +2127,14 @@ class TrajectorySearchRunner:
             )
         self._sweep_checkpoint_images()
         return rubric_update_records
+
+        try:
+            logging.getLogger("swe_agent.trajectory_search").info(
+                "[TIMING] run_round.end   round=%d took=%.1fs frontier=%d best=%s"
+                % (round_index, time.perf_counter()-_t_round_start, len(self.frontier_ids), str(self.best_node_id))
+            )
+        except Exception:
+            pass
 
     def _finalize_outputs(self) -> None:
         def _cached_overall_score(node_id: str) -> float:

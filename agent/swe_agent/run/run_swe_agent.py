@@ -62,6 +62,13 @@ DEFAULT_STEP_LIMIT = 160
 DEFAULT_COMPLETION_MAX_TOKENS = 4096
 EMPTY_REWARD = 0.0
 ERROR_REWARD = 0.0
+# RLER_REWARD_SCHEME selects the GT reward formula used by make_evaluation_payload.
+#   "soft"     (default, legacy): len(passed) / len(passed ∪ failed_in_view) over all visible tests.
+#                                 No-op on 9 P2P + 1 F2P scores 0.9 — high baseline.
+#   "joint":    frac_F2P_passed × frac_P2P_passed. Lazy no-op = 0; perfect fix = 1.
+#               Penalises P2P regressions multiplicatively. Requires per-instance F2P/P2P sets.
+#   "f2p_only": len(passed_F2P) / len(F2P). Ignores P2P regressions; pure bug-fix progress.
+SUPPORTED_REWARD_SCHEMES = {"soft", "joint", "f2p_only"}
 DEFAULT_VLLM_PORT = 30000
 DEFAULT_ENV_TIMEOUT = 300
 DEFAULT_PULL_TIMEOUT = 600
@@ -445,6 +452,8 @@ def make_evaluation_payload(
     failed_tests: Sequence[str] | None = None,
     output: str = "",
     error: Exception | str | None = None,
+    pass_to_pass_expected: Sequence[str] | None = None,
+    fail_to_pass_expected: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     if status not in {"resolved", "unresolved", "empty", "error"}:
         raise ValueError(f"Unknown evaluation status: {status}")
@@ -459,19 +468,38 @@ def make_evaluation_payload(
         )
         output = "\n".join(part for part in [output, error_output] if part)
 
+    scheme = os.environ.get("RLER_REWARD_SCHEME", "soft").strip().lower() or "soft"
+    if scheme not in SUPPORTED_REWARD_SCHEMES:
+        raise ValueError(f"Unsupported RLER_REWARD_SCHEME={scheme!r}; choose from {sorted(SUPPORTED_REWARD_SCHEMES)}")
+
+    passed_set = set(passed)
+    f2p = {str(t) for t in (fail_to_pass_expected or []) if str(t)}
+    p2p = {str(t) for t in (pass_to_pass_expected or []) if str(t)}
+
     if status == "empty":
         reward = EMPTY_REWARD
     elif status == "error":
         reward = ERROR_REWARD
+    elif scheme == "soft":
+        total = len(passed_set | set(failed))
+        reward = len(passed_set) / total if total else (1.0 if status == "resolved" else 0.0)
     else:
-        total = len(set(passed) | set(failed))
-        reward = len(set(passed)) / total if total else (1.0 if status == "resolved" else 0.0)
+        f2p_frac = len(passed_set & f2p) / len(f2p) if f2p else 1.0
+        p2p_frac = len(passed_set & p2p) / len(p2p) if p2p else 1.0
+        if scheme == "joint":
+            reward = f2p_frac * p2p_frac
+        else:  # f2p_only
+            reward = f2p_frac
 
     return {
         "status": status,
         "passed_tests": passed,
         "failed_tests": failed,
         "reward": float(reward),
+        "f2p_passed_count": len(passed_set & f2p),
+        "f2p_total": len(f2p),
+        "p2p_passed_count": len(passed_set & p2p),
+        "p2p_total": len(p2p),
         "metainfo": {"output": str(output)} if output else {},
     }
 
@@ -576,10 +604,19 @@ def _rebench_result_payload(result: dict[str, Any]) -> dict[str, Any]:
         passed_tests=passed_tests,
         failed_tests=failed_tests,
         output=result.get("evaluation_output") or "",
+        pass_to_pass_expected=result.get("pass_to_pass_expected", []),
+        fail_to_pass_expected=result.get("fail_to_pass_expected", []),
     )
 
 
-def _swebench_report_payload(report: dict[str, Any], instance_id: str, output: str = "") -> dict[str, Any]:
+def _swebench_report_payload(
+    report: dict[str, Any],
+    instance_id: str,
+    output: str = "",
+    *,
+    fail_to_pass_expected: Sequence[str] | None = None,
+    pass_to_pass_expected: Sequence[str] | None = None,
+) -> dict[str, Any]:
     instance_report = report.get(instance_id, {}) if isinstance(report, dict) else {}
     tests_status = instance_report.get("tests_status", {}) if isinstance(instance_report, dict) else {}
     passed: list[str] = []
@@ -595,6 +632,8 @@ def _swebench_report_payload(report: dict[str, Any], instance_id: str, output: s
         passed_tests=passed,
         failed_tests=failed,
         output=output,
+        fail_to_pass_expected=fail_to_pass_expected,
+        pass_to_pass_expected=pass_to_pass_expected,
     )
 
 
@@ -686,7 +725,13 @@ def evaluate_swebench_instance_patches(
                 if report_path.exists():
                     try:
                         report = json.loads(report_path.read_text())
-                        payload = _swebench_report_payload(report, test_spec.instance_id, output)
+                        payload = _swebench_report_payload(
+                            report,
+                            test_spec.instance_id,
+                            output,
+                            fail_to_pass_expected=instance.get("FAIL_TO_PASS", []) or [],
+                            pass_to_pass_expected=instance.get("PASS_TO_PASS", []) or [],
+                        )
                     except (json.JSONDecodeError, KeyError, TypeError) as exc:
                         payload = make_evaluation_payload("error", output=output, error=exc)
                 else:
@@ -956,6 +1001,7 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
                 "agent": {
                     "step_limit": args.step_limit,
                     "cost_limit": 0,
+                    "wall_clock_limit_seconds": args.wall_clock_limit_seconds,
                 },
                 "environment": {
                     "timeout": 120,
@@ -1012,6 +1058,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--step-limit", type=int, default=DEFAULT_STEP_LIMIT)
+    parser.add_argument(
+        "--wall-clock-limit-seconds",
+        type=int,
+        default=6900,
+        help="Hard wall-clock cap on each agent trajectory. Default 6900 (= 1h55m) "
+        "sits below mini-swe-agent's hardcoded `sleep 2h` container fuse so the "
+        "agent exits cleanly with LimitsExceeded before the container dies and "
+        "pollutes the trace with 'No such container' errors. Set 0 to disable.",
+    )
     parser.add_argument("--gpu-id", default="auto:2")
     parser.add_argument("--vllm-port", type=int, default=8011)
     parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN)

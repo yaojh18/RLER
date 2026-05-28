@@ -31,6 +31,20 @@ def is_rebench_instance(instance: dict[str, Any]) -> bool:
     return bool(instance.get("image_name")) and isinstance(instance.get("install_config"), dict)
 
 
+def rebench_workdir(instance: dict[str, Any]) -> str:
+    """In-container working directory for a SWE-rebench instance.
+
+    Rebench images put the repo at `/{repo_name}` (no /testbed). Both the
+    docker `-w` flag and the agent's prompt rely on this so the rollout
+    actually lands inside the repo and the fallback git-diff captures the
+    right tree.
+    """
+    repo = instance.get("repo") or ""
+    if "/" not in repo:
+        raise ValueError(f"rebench instance missing repo: {instance.get('instance_id')}")
+    return f"/{repo.split('/', 1)[1]}"
+
+
 def _normalize_test_name(name: str) -> str:
     for pattern in _TIMING_NORMALIZE_RES:
         name = pattern.sub("", name)
@@ -72,7 +86,7 @@ def evaluate_rebench_instance(
         raise ValueError(f"Unknown log parser: {parser_name}")
 
     resolved_work_dir = work_dir.resolve()
-    workdir = f"/{repo.split('/')[1]}"
+    workdir = rebench_workdir(instance)
     test_patch = instance.get("test_patch", "")
     if not test_patch:
         raise ValueError(f"Task {instance_id} missing test_patch.")
@@ -127,9 +141,9 @@ def evaluate_rebench_instance(
     parsed = {_normalize_test_name(name): status for name, status in parsed.items()}
     passed = sorted(name for name, status in parsed.items() if status == "PASSED")
     failed = sorted(name for name, status in parsed.items() if status == "FAILED")
-    expected_passed = sorted(
-        _normalize_test_name(name) for name in (instance.get("PASS_TO_PASS", []) + instance.get("FAIL_TO_PASS", []))
-    )
+    pass_to_pass = sorted({_normalize_test_name(name) for name in instance.get("PASS_TO_PASS", [])})
+    fail_to_pass = sorted({_normalize_test_name(name) for name in instance.get("FAIL_TO_PASS", [])})
+    expected_passed = sorted(set(pass_to_pass) | set(fail_to_pass))
     return {
         "instance_id": instance_id,
         "resolved": passed == expected_passed,
@@ -137,6 +151,8 @@ def evaluate_rebench_instance(
         "passed_actual": passed,
         "failed_actual": failed,
         "passed_expected": expected_passed,
+        "pass_to_pass_expected": pass_to_pass,
+        "fail_to_pass_expected": fail_to_pass,
         "evaluation_output": output,
     }
 

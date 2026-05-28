@@ -4,6 +4,7 @@ or https://minimal-agent.com for a tutorial on the basic building principles.
 
 import json
 import logging
+import time
 import traceback
 from pathlib import Path
 
@@ -26,6 +27,11 @@ class AgentConfig(BaseModel):
     """Maximum number of steps the agent can take."""
     cost_limit: float = 3.0
     """Stop agent after exceeding (!) this cost."""
+    wall_clock_limit_seconds: int = 0
+    """Stop agent after this many seconds of wall-clock time in run(). 0 disables.
+    Set this slightly below the docker container_timeout (mini-swe-agent hardcodes
+    2h via `sleep 2h`) so the agent exits cleanly before the container dies and
+    pollutes the trajectory with "No such container" errors."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
 
@@ -41,6 +47,7 @@ class DefaultAgent:
         self.logger = logging.getLogger("agent")
         self.cost = 0.0
         self.n_calls = 0
+        self.start_time = time.monotonic()
 
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
@@ -78,6 +85,7 @@ class DefaultAgent:
         """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
+        self.start_time = time.monotonic()
         self.add_messages(
             self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
             self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
@@ -105,7 +113,12 @@ class DefaultAgent:
 
     def query(self) -> dict:
         """Query the model and return model messages. Override to add hooks."""
-        if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
+        wall_elapsed = time.monotonic() - self.start_time
+        if (
+            (0 < self.config.step_limit <= self.n_calls)
+            or (0 < self.config.cost_limit <= self.cost)
+            or (0 < self.config.wall_clock_limit_seconds <= wall_elapsed)
+        ):
             raise LimitsExceeded(
                 {
                     "role": "exit",

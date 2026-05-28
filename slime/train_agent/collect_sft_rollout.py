@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 from swe_agent.run.search_swe_agent import build_arg_parser, run_search
 
 from .contracts import SFTExportBundle
-from .data_export import SFTDataExporter
+from .data_export import ParallelSFTDataExporter, SFTDataExporter
 
 
 DEFAULT_TEACHER_MODEL = "gemini/gemini-3.1-pro-preview"
@@ -119,6 +121,169 @@ def collect_teacher_student_export(
             "teacher_model_name": teacher_model_name,
         }
     )
+    return bundle
+
+
+def collect_teacher_student_export_parallel(
+    *,
+    instance_id: str,
+    output_root: Path,
+    teacher_model_name: str,
+    teacher_base_url: str,
+    teacher_api_key: str = "EMPTY",
+    rubric_base_url: str | None = None,
+    rubric_api_key: str | None = None,
+    judge_base_url: str | None = None,
+    judge_api_key: str | None = None,
+    student_model_name: str | None = None,
+    subset: str = "rebench_v2",
+    split: str = "train",
+    m: int = 8,
+    n: int = 1,
+    max_mid_cps: int = 6,
+    steps_per_round: int = 20,
+    step_limit: int = 120,
+    rubric_temperature: float = 1.0,
+    rubric_top_p: float = 0.95,
+    rubric_max_tokens: int = 4096,
+    judge_temperature: float = 0.1,
+    judge_top_p: float = 0.95,
+    judge_max_tokens: int = 1024,
+    rubric_bank_strategy: str = "score",
+    max_active_rubrics: int = 6,
+    gt_eval_workers: int = 8,
+) -> SFTExportBundle:
+    """Drive the v1-lanes parallel search runner against a single instance
+    and export an SFT bundle from its on-disk artifacts.
+
+    teacher_base_url: sglang URL of the policy server (Lane A + Lane B).
+    rubric_base_url: defaults to teacher_base_url; can point at a separate
+                     judge-quality model.
+
+    The parallel runner produces:
+      * Lane A spine + m Lane B forks per MidCp (parallel)
+      * Full-parity rubric machinery per fork-group (task 2 — rubric_bank
+        carry-forward, N-sample fan-out, two-phase scoring, PSU)
+      * Per-group rubric_samples.json with the same payload shape as the
+        sequential runner
+
+    ParallelSFTDataExporter applies the same accept-filter as the sequential
+    exporter: gt_reward >= 1.0 on at least one branch in the group AND
+    gap_corr(rubric_judge_scores, gt_scores) > 0.8 across the group's
+    branches. Groups failing either are dropped.
+    """
+    # Lazy imports keep this module light when the parallel path isn't used.
+    from swe_agent.backend import SWEAgentRolloutBackend
+    from swe_agent.run.benchmarks.swebench import (
+        build_swebench_config,
+        get_swebench_docker_image_name,
+        get_swebench_harness_namespace,
+        load_swebench_instances,
+    )
+    from swe_agent.run.run_swe_agent import (
+        DEFAULT_COMPLETION_MAX_TOKENS,
+        DEFAULT_ENV_TIMEOUT,
+        DEFAULT_PULL_TIMEOUT,
+        SWE_AGENT_TEXTBASED_CONFIG,
+    )
+    from swe_agent.trajectory_search_parallel import (
+        ParallelSearchConfig,
+        TrajectorySearchParallelRunner,
+    )
+
+    instances = load_swebench_instances(subset, split)
+    matching = [inst for inst in instances if str(inst["instance_id"]) == instance_id]
+    if not matching:
+        raise RuntimeError(f"instance not found in {subset}/{split}: {instance_id}")
+    instance = matching[0]
+
+    run_dir = output_root / "teacher_student_parallel" / f"{instance_id}-{time.strftime('%Y%m%d-%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build a backend pointing at the teacher endpoint via litellm_textbased
+    # (matches search_swe_agent.py's openai backend path so token-vocab
+    # mismatch is avoided when teacher is DSv4 and tokenizer is local Qwen).
+    image_name = get_swebench_docker_image_name(instance)
+    api_base = (
+        teacher_base_url if teacher_base_url.endswith("/v1")
+        else teacher_base_url.rstrip("/") + "/v1"
+    )
+    config = build_swebench_config(
+        config_spec=[str(SWE_AGENT_TEXTBASED_CONFIG)],
+        model=teacher_model_name,
+        model_class="litellm_textbased",
+        extra_overrides={
+            "agent": {"step_limit": step_limit, "cost_limit": 0},
+            "environment": {
+                "image": image_name,
+                "cwd": "",
+                "timeout": DEFAULT_ENV_TIMEOUT,
+                "pull_timeout": DEFAULT_PULL_TIMEOUT,
+                "executable": os.environ.get("MSWEA_DOCKER_EXECUTABLE", "docker"),
+            },
+            "model": {
+                "model_kwargs": {
+                    "api_base": api_base,
+                    "api_key": teacher_api_key,
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "max_tokens": DEFAULT_COMPLETION_MAX_TOKENS,
+                },
+                "cost_tracking": "ignore_errors",
+            },
+        },
+    )
+    backend = SWEAgentRolloutBackend(
+        model=config.get("model", {}),
+        environment=config.get("environment", {}),
+        agent=config.get("agent", {}),
+        default_agent_type="default",
+        default_environment_type=config.get("environment", {}).get("environment_class", "docker"),
+    )
+
+    pcfg = ParallelSearchConfig(
+        m=m,
+        max_mid_cps=max_mid_cps,
+        steps_per_round=steps_per_round,
+        step_limit=step_limit,
+        rubric_temperature=rubric_temperature,
+        rubric_top_p=rubric_top_p,
+        rubric_max_tokens=rubric_max_tokens,
+        judge_temperature=judge_temperature,
+        judge_top_p=judge_top_p,
+        judge_max_tokens=judge_max_tokens,
+        n=n,
+        max_active_rubrics=max_active_rubrics,
+        rubric_bank_strategy=rubric_bank_strategy,
+        gt_eval_workers=gt_eval_workers,
+        keep_images=False,
+        return_logprobs=False,  # SFT export doesn't need rollout logprobs
+    )
+
+    runner = TrajectorySearchParallelRunner(
+        instance=instance,
+        backend=backend,
+        run_dir=run_dir,
+        policy_model_name=teacher_model_name,
+        rubric_model_name=teacher_model_name,
+        judge_model_name=teacher_model_name,
+        config=pcfg,
+        harness_namespace=get_swebench_harness_namespace(instance),
+        policy_base_url=teacher_base_url,
+        rubric_base_url=rubric_base_url or teacher_base_url,
+        api_key=teacher_api_key,
+    )
+    asyncio.run(runner.run())
+    bundle = ParallelSFTDataExporter(run_dir=run_dir).export_bundle()
+    bundle.metadata.update({
+        "teacher_model_name": teacher_model_name,
+        "teacher_base_url": teacher_base_url,
+        "rubric_bank_strategy": rubric_bank_strategy,
+        "n": n,
+        "m": m,
+        "max_mid_cps": max_mid_cps,
+        "steps_per_round": steps_per_round,
+    })
     return bundle
 
 
