@@ -264,7 +264,8 @@ DONE_FLAG=$RUN_DIR/_logs/driver_done.flag
 if [ "$NODE" = "$HEAD_NODE" ]; then
     echo "[node=$NODE] role=HEAD: starting ray head"
     ray start --head --node-ip-address=$MY_IP --num-gpus=8 --num-cpus=128 \
-        --port=$RAY_PORT --disable-usage-stats 2>&1 | sed 's/^/[ray-head] /'
+        --port=$RAY_PORT --object-store-memory=200000000000 \
+        --disable-usage-stats 2>&1 | sed 's/^/[ray-head] /'
     for i in $(seq 1 60); do
         n=$(ray status 2>/dev/null | grep -E '^ *[0-9]+ node_' | wc -l)
         echo "[node=$NODE] ray sees $n nodes (waiting for $NUM_NODES)"
@@ -328,7 +329,8 @@ else
         sleep 2
     done
     ray start --address=$HEAD_IP:$RAY_PORT --node-ip-address=$MY_IP \
-        --num-gpus=8 --num-cpus=128 --disable-usage-stats
+        --num-gpus=8 --num-cpus=128 --object-store-memory=200000000000 \
+        --disable-usage-stats
     echo "[node=$NODE] joined ray cluster, waiting for driver done flag"
     while [ ! -f "$DONE_FLAG" ]; do
         sleep 10
