@@ -267,12 +267,28 @@ def _dummy_sample_for_rollout(
     )
 
 
+import os as _os
+
+
+def _max_dummy_per_group() -> int:
+    """Read NAIVE_MAX_DUMMY_PER_GROUP at call time (test/config friendly)."""
+    try:
+        return max(1, int(_os.getenv("NAIVE_MAX_DUMMY_PER_GROUP", "2")))
+    except ValueError:
+        return 2
+
+
 def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
     """Convert one NaiveRecord into a GRPOExportBundle.
 
     policy_groups: a single ExportGroup with M ExportSamples (one per
     naive rollout). Empty/errored rollouts get a dummy 0-reward
-    placeholder; if EVERY rollout is empty, the whole group is dropped.
+    placeholder. The group is dropped when n_dummy >= NAIVE_MAX_DUMMY_PER_GROUP
+    (default 2) — too many dummies signal an infra issue (cache miss,
+    docker daemon, etc.) and the group's baseline cannot be trusted.
+    A single transient dummy is tolerated; downstream advantage
+    normalization (slime/train_agent/run/grpo.py) excludes is_dummy
+    samples from the group mean/std so the baseline stays clean.
 
     rubric_groups: always empty (naive baseline has no rubric/judge).
     """
@@ -286,8 +302,19 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
             n_real += 1
         samples.append(s)
 
+    n_dummy = len(samples) - n_real
+    max_dummy = _max_dummy_per_group()
+    group_dropped_reason: str | None = None
+    if not samples:
+        group_dropped_reason = "no_rollouts"
+    elif n_real < 2:
+        # GRPO needs >=2 real samples for any group baseline.
+        group_dropped_reason = f"insufficient_real_samples (n_real={n_real})"
+    elif n_dummy >= max_dummy:
+        group_dropped_reason = f"too_many_dummies (n_dummy={n_dummy} >= {max_dummy})"
+
     policy_groups: list[ExportGroup] = []
-    if n_real > 0 and samples:
+    if group_dropped_reason is None:
         policy_groups.append(
             ExportGroup(
                 group_id=samples[0].group_id,
@@ -296,7 +323,7 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
                     "group_index": 0,
                     "n_rollouts": len(record.rollouts),
                     "n_real": n_real,
-                    "n_dummy": len(samples) - n_real,
+                    "n_dummy": n_dummy,
                 },
             )
         )
@@ -313,5 +340,8 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
             "seconds": record.seconds,
             "num_rollouts": len(record.rollouts),
             "scheme": "naive_v1",
+            "n_real": n_real,
+            "n_dummy": n_dummy,
+            "group_dropped_reason": group_dropped_reason,
         },
     )
