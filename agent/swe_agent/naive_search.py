@@ -107,6 +107,20 @@ class NaiveSearchConfig:
     # positive reward through to the policy. 0.0 = disabled.
     format_ok_gate_threshold: float = 0.0
 
+    # ---- Format-error circuit breaker ------------------------------------
+    # When > 0, the runner steps the agent in chunks of `threshold` turns
+    # and, after each chunk, walks the assistant messages in reverse to
+    # count trailing turns flagged with extra.format_error. If the trailing
+    # count reaches the threshold, the rollout is aborted (loop exits;
+    # session.close() handles docker teardown). The killed rollout flows
+    # through the normal reward path — its high format_error_rate trips
+    # the existing format_ok_gate / per-step penalty, so reward is zeroed
+    # without any is_dummy routing. 0 (default) disables and preserves the
+    # original single-call agent loop. Designed to catch format-error
+    # storms (e.g. stfc-psyclone-2953: 120 turns × 100% format errors)
+    # without paying per-turn HTTP-poll overhead.
+    format_error_consecutive_kill: int = 0
+
 
 
 @dataclass
@@ -135,6 +149,10 @@ class NaiveRollout:
     terminal_no_action_emitted: bool = False  # True iff zero env actions across rollout
     n_assistant_turns: int = 0  # total assistant turns in this rollout (denominator for FE rate)
     n_format_errors: int = 0  # assistant turns flagged with extra.format_error = True
+    # True iff format-error circuit breaker aborted the loop. The rollout
+    # is not dummified — it flows to reward as usual, and its 100% trailing
+    # format-error rate trips the existing format_ok_gate / penalty path.
+    format_error_killed: bool = False
     error: str | None = None
     gt_score: float | None = None
     gt_payload: dict[str, Any] | None = None
@@ -267,6 +285,77 @@ class NaiveSearchRunner:
     def _step_session(self, session: Any, max_steps: int) -> dict[str, Any]:
         return session.run_until_pause(max_steps=max_steps).model_dump(mode="json")
 
+    def _count_trailing_format_errors(self, session: Any) -> int:
+        """Walk the live session's assistant messages in reverse and count
+        how many *consecutive* trailing assistant turns are flagged with
+        extra.format_error=True. Non-assistant messages (tool / user) are
+        skipped (don't break the streak); the first non-error assistant
+        turn ends the count. Returns 0 if no assistant turns observed.
+
+        Tolerant of dict / pydantic message shapes to match
+        _peek_latest_assistant_weight_version's defensive style."""
+        try:
+            state = getattr(getattr(session, "agent", None), "state", None)
+            msgs = getattr(state, "messages", None) if state is not None else None
+            if not msgs:
+                return 0
+            n = 0
+            for m in reversed(msgs):
+                role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+                if role != "assistant":
+                    continue
+                if isinstance(m, dict):
+                    extra = m.get("extra") or {}
+                    flagged = bool(extra.get("format_error")) if isinstance(extra, dict) else False
+                else:
+                    extra = getattr(m, "extra", None) or {}
+                    if isinstance(extra, dict):
+                        flagged = bool(extra.get("format_error"))
+                    else:
+                        flagged = bool(getattr(extra, "format_error", False))
+                if flagged:
+                    n += 1
+                else:
+                    break
+            return n
+        except Exception:
+            return 0
+
+    def _step_session_with_format_check(
+        self, session: Any, rollout: "NaiveRollout", threshold: int
+    ) -> dict[str, Any]:
+        """Run the agent loop in `threshold`-turn chunks. After each chunk,
+        bail out if the trailing N=threshold assistant turns are all
+        format-error flagged. Worst-case detection latency is (2*threshold-1)
+        turns past the first error of a contiguous run (when the run
+        straddles a chunk boundary).
+
+        Returns the same dict shape as `_step_session` — the most recent
+        run_until_pause result, or a copy with exit_status stamped to
+        "format_error_storm" when the breaker fires."""
+        chunk = max(1, threshold)
+        remaining = int(self.config.step_limit)
+        result: dict[str, Any] = {}
+        while remaining > 0:
+            take = min(chunk, remaining)
+            result = self._step_session(session, max_steps=take)
+            remaining -= take
+            # Agent reached a terminal state (Submitted / errored). Pass through.
+            if result.get("exit_status"):
+                return result
+            n_trailing = self._count_trailing_format_errors(session)
+            if n_trailing >= threshold:
+                rollout.format_error_killed = True
+                result = dict(result)
+                result["exit_status"] = "format_error_storm"
+                logger.info(
+                    "[%s] naive r=%d format_error_storm killed "
+                    "(trailing_fe=%d >= threshold=%d)",
+                    self.task_id, rollout.rollout_index, n_trailing, threshold,
+                )
+                return result
+        return result
+
     def _extract_turn_token_info(
         self, snapshot_dict: dict[str, Any], starting_turn_index: int
     ) -> list[TurnTokenInfo]:
@@ -377,7 +466,13 @@ class NaiveSearchRunner:
                 base_turn_count = 0
                 base_event_count = 0
 
-            result = self._step_session(session, max_steps=self.config.step_limit)
+            fe_kill_threshold = int(self.config.format_error_consecutive_kill)
+            if fe_kill_threshold > 0:
+                result = self._step_session_with_format_check(
+                    session, rollout, fe_kill_threshold,
+                )
+            else:
+                result = self._step_session(session, max_steps=self.config.step_limit)
             snapshot_after = session.snapshot().model_dump(mode="json")
             workspace_meta = _collect_workspace_meta(session.agent.env)
             # The training sample wants the FULL chat (sys+user+all asst+tool)

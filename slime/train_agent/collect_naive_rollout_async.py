@@ -148,6 +148,9 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                 "format_error_per_step_penalty", 0.0
             ),
             format_ok_gate_threshold=task.get("format_ok_gate_threshold", 0.0),
+            format_error_consecutive_kill=task.get(
+                "format_error_consecutive_kill", 0
+            ),
         )
         run_dir = (
             output_root / instance_id
@@ -443,6 +446,9 @@ def _naive_values_from_env() -> dict[str, Any]:
         ),
         "format_ok_gate_threshold": _float(
             "SWE_AGENT_NAIVE_FORMAT_OK_GATE_THRESHOLD", 0.0
+        ),
+        "format_error_consecutive_kill": _int(
+            "SWE_AGENT_NAIVE_FORMAT_ERROR_CONSECUTIVE_KILL", 0
         ),
     }
 
@@ -1017,6 +1023,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     fe_rates: list[float] = []
     fe_counts: list[int] = []
     n_fe_gated = 0
+    n_fe_killed = 0
     for s in real_samples:
         if s.metadata and s.metadata.get("n_full_trace_steps") is not None:
             turns_for_avg.append(int(s.metadata.get("n_full_trace_steps") or 0))
@@ -1029,6 +1036,8 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             # format errors — same signal the runtime gate uses (default 0.5).
             if rate > 0.5:
                 n_fe_gated += 1
+        if s.metadata and s.metadata.get("format_error_killed"):
+            n_fe_killed += 1
     for s in eval_samples:
         md = s.metadata
         f2p_passed = int(md.get("f2p_passed_count") or 0)
@@ -1161,6 +1170,12 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             ),
             "swe_agent/ratio_fe_gated_trajectories": (
                 (n_fe_gated / n_real) if n_real else 0.0
+            ),
+            # Format-error circuit breaker fired on this rollout — runner
+            # aborted after N consecutive trailing format errors.
+            "swe_agent/n_format_error_killed": n_fe_killed,
+            "swe_agent/ratio_format_error_killed": (
+                (n_fe_killed / n_real) if n_real else 0.0
             ),
             # --- policy-drift age (current actor wv - first turn wv) ---
             # avg/min/max_eldest_weight_lag are now (current_actor_wv - first_turn_wv)

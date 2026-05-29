@@ -52,6 +52,15 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
                    help="Hard gate: zero reward when format-error-rate over assistant "
                         "turns exceeds this threshold. 0.0 = disabled (default). "
                         "0.5 = kill reward on any trajectory >50%% malformed turns.")
+    p.add_argument("--naive-format-error-consecutive-kill", type=int, default=0,
+                   help="Format-error circuit breaker. When the trailing N "
+                        "assistant turns are ALL flagged extra.format_error, "
+                        "abort the rollout. Runner steps in N-turn chunks and "
+                        "checks trailing format errors after each chunk; killed "
+                        "rollout flows through normal reward path (its 100%% "
+                        "trailing fmt-error rate trips format_ok_gate / per-step "
+                        "penalty). 0 = disabled (default). 5 = aggressive early "
+                        "abort of fmt-storm trajectories (e.g. psyclone-2953).")
     return p.parse_known_args(argv)
 
 
@@ -87,6 +96,9 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     )
     os.environ["SWE_AGENT_NAIVE_FORMAT_OK_GATE_THRESHOLD"] = str(
         ns.naive_format_ok_gate_threshold
+    )
+    os.environ["SWE_AGENT_NAIVE_FORMAT_ERROR_CONSECUTIVE_KILL"] = str(
+        ns.naive_format_error_consecutive_kill
     )
 
 

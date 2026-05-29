@@ -232,6 +232,7 @@ def _build_rollout_sample(
                 (rollout.n_format_errors / rollout.n_assistant_turns)
                 if rollout.n_assistant_turns > 0 else 0.0
             ),
+            "format_error_killed": bool(rollout.format_error_killed),
             "eval_status": gt_payload.get("status"),
             "eval_note": gt_payload.get("note"),
             "f2p_passed_count": gt_payload.get("f2p_passed_count"),
@@ -282,6 +283,7 @@ def _dummy_sample_for_rollout(
             "n_assistant_turns": 0,
             "n_format_errors": 0,
             "format_error_rate": 0.0,
+            "format_error_killed": bool(getattr(rollout, "format_error_killed", False)),
             "eval_status": None,
             "eval_note": None,
             "f2p_passed_count": None,
