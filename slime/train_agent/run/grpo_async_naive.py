@@ -52,6 +52,14 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
                    help="Hard gate: zero reward when format-error-rate over assistant "
                         "turns exceeds this threshold. 0.0 = disabled (default). "
                         "0.5 = kill reward on any trajectory >50%% malformed turns.")
+    p.add_argument("--naive-kill-stale-docker-threshold", type=int, default=0,
+                   help="Stale-docker kill threshold. When a running rollout's "
+                        "intra-trajectory weight-version spread "
+                        "(latest_turn_wv - eldest_observed_wv) exceeds this value, "
+                        "the docker env is aborted and the rollout is routed to a "
+                        "dummy sample (excluded from baseline + zero loss_mask). "
+                        "0 = disabled (default), preserves the original single-call "
+                        "agent loop.")
     return p.parse_known_args(argv)
 
 
@@ -87,6 +95,9 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     )
     os.environ["SWE_AGENT_NAIVE_FORMAT_OK_GATE_THRESHOLD"] = str(
         ns.naive_format_ok_gate_threshold
+    )
+    os.environ["SWE_AGENT_NAIVE_KILL_STALE_DOCKER_THRESHOLD"] = str(
+        ns.naive_kill_stale_docker_threshold
     )
 
 
