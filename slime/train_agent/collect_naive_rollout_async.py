@@ -916,21 +916,53 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 if isinstance(x, (int, float)):
                     rollout_lps.append(float(x))
 
-    # Per-trajectory eldest weight-version lag (= rollout_id - min(turn_wv)).
-    # Captures within-trajectory staleness: a trajectory that ran for ~25 min
-    # may have its FIRST turn served by SGLang weights N versions older than
-    # the current actor. Sample.metadata['turn_weight_versions'] is populated
-    # by naive_to_grpo_bundle from per-turn extra.weight_version that
-    # route_textbased_model.py stashes on each /generate response.
+    # Per-trajectory weight-version staleness, measured as
+    # (current actor wv at consumption) - (wv stamped on first assistant turn).
+    # The current actor wv is the TRUE source of truth: query SGLang's
+    # /get_weight_version (the same endpoint trainer hits via
+    # /update_weight_version after each broadcast) so the metric here matches
+    # what the in-flight kill watchdog sees.
+    #
+    # We can't use `rollout_id - min(turn_wv)` because rollout_id is the
+    # consumer's call counter (off-by-one from actor wv at startup, and may
+    # diverge under async pacing), and within-trajectory min vs first-turn
+    # are equivalent unless turns span weight broadcasts.
+    current_actor_wv: int | None = None
+    try:
+        router_ip, router_port = (getattr(args, "sglang_model_routers", None) or {}).get(
+            model_name, (args.sglang_router_ip, args.sglang_router_port),
+        )
+        import requests as _rq
+        _r = _rq.get(
+            f"http://{router_ip}:{router_port}/get_weight_version", timeout=10
+        )
+        _r.raise_for_status()
+        current_actor_wv = int(_r.json().get("weight_version"))
+    except Exception as _exc:
+        logger.warning(
+            "[naive-async] could not fetch current_actor_wv from sglang: %s", _exc,
+        )
+
+    first_turn_wvs: list[int] = []
     eldest_lags: list[int] = []
+    intra_traj_spreads: list[int] = []
     for s in samples:
         if not s.metadata:
             continue
         wvs = s.metadata.get("turn_weight_versions") or []
         if not wvs:
             continue
-        eldest = min(int(v) for v in wvs)
-        eldest_lags.append(rollout_id - eldest)
+        try:
+            int_wvs = [int(v) for v in wvs]
+        except (TypeError, ValueError):
+            continue
+        if not int_wvs:
+            continue
+        first_wv = int_wvs[0]
+        first_turn_wvs.append(first_wv)
+        intra_traj_spreads.append(int_wvs[-1] - first_wv)
+        if current_actor_wv is not None:
+            eldest_lags.append(current_actor_wv - first_wv)
     if eldest_lags:
         avg_eldest_weight_lag = sum(eldest_lags) / len(eldest_lags)
         min_eldest_weight_lag = min(eldest_lags)
@@ -941,6 +973,12 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         min_eldest_weight_lag = 0
         max_eldest_weight_lag = 0
         eldest_lag_coverage = 0.0
+    if intra_traj_spreads:
+        avg_intra_traj_spread = sum(intra_traj_spreads) / len(intra_traj_spreads)
+        max_intra_traj_spread = max(intra_traj_spreads)
+    else:
+        avg_intra_traj_spread = 0.0
+        max_intra_traj_spread = 0
 
     # --- Patch + eval-based ratios over the post-filter training batch ---
     # Denominators:
@@ -1143,11 +1181,24 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/ratio_fe_gated_trajectories": (
                 (n_fe_gated / n_real) if n_real else 0.0
             ),
-            # --- intra-trajectory staleness (rollout_id - eldest turn wv) ---
+            # --- policy-drift age (current actor wv - first turn wv) ---
+            # avg/min/max_eldest_weight_lag are now (current_actor_wv - first_turn_wv)
+            # for each trajectory in the consumed batch. current_actor_wv is
+            # polled from sglang's /get_weight_version at the start of the
+            # post-batch metrics block; this is the same source the kill
+            # watchdog uses for in-flight aborts (see naive_search.py:_step_
+            # session_with_stale_check). intra_traj_spread is the within-
+            # trajectory delta (= last_turn_wv - first_turn_wv) — this is
+            # what the OLD wandb metric and OLD killer were measuring.
+            "swe_agent/current_actor_wv": (
+                int(current_actor_wv) if current_actor_wv is not None else -1
+            ),
             "swe_agent/avg_eldest_weight_lag": avg_eldest_weight_lag,
             "swe_agent/min_eldest_weight_lag": min_eldest_weight_lag,
             "swe_agent/max_eldest_weight_lag": max_eldest_weight_lag,
             "swe_agent/eldest_lag_coverage": eldest_lag_coverage,
+            "swe_agent/avg_intra_traj_spread": avg_intra_traj_spread,
+            "swe_agent/max_intra_traj_spread": max_intra_traj_spread,
             # --- stale-docker kill watchdog ---
             "swe_agent/n_killed_stale_docker": n_killed_stale,
             "swe_agent/ratio_killed_stale_docker": (

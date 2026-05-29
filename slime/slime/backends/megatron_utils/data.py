@@ -293,6 +293,14 @@ def _get_capped_partitions(seqlen_list: Sequence[int], num_partitions: int, max_
     Uses the same first-fit algorithm as ``get_minimum_num_micro_batch_size``
     so that when ``num_partitions >= get_minimum_num_micro_batch_size(...)``,
     every partition is guaranteed to stay within *max_tokens*.
+
+    Megatron + CP/DP require every micro-batch to be non-empty across all
+    ranks (the per-rank token-list goes through ``torch.cat`` in
+    ``slice_with_cp``). After first-fit packing we may have empty partitions
+    when DP all-reduced ``num_microbatches`` to a value larger than this
+    rank's locally-needed count; redistribute one item from the heaviest
+    multi-item partition into each empty partition so every micro-batch has
+    at least one sample.
     """
     partitions: list[list[int]] = [[] for _ in range(num_partitions)]
     sums = [0] * num_partitions
@@ -305,6 +313,27 @@ def _get_capped_partitions(seqlen_list: Sequence[int], num_partitions: int, max_
                 break
         else:
             raise AssertionError("This should never happen.")
+
+    while True:
+        empty_idxs = [i for i in range(num_partitions) if not partitions[i]]
+        if not empty_idxs:
+            break
+        donor_candidates = [i for i in range(num_partitions) if len(partitions[i]) >= 2]
+        if not donor_candidates:
+            raise AssertionError(
+                f"_get_capped_partitions: cannot satisfy {num_partitions} non-empty "
+                f"partitions with {len(seqlen_list)} samples (max_tokens={max_tokens})."
+            )
+        donor_idx = max(donor_candidates, key=lambda i: sums[i])
+        smallest_local = min(
+            range(len(partitions[donor_idx])),
+            key=lambda j: seqlen_list[partitions[donor_idx][j]],
+        )
+        moved_idx = partitions[donor_idx].pop(smallest_local)
+        sums[donor_idx] -= seqlen_list[moved_idx]
+        target = empty_idxs[0]
+        partitions[target].append(moved_idx)
+        sums[target] += seqlen_list[moved_idx]
 
     return [sorted(p) for p in partitions]
 

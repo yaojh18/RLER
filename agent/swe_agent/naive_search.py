@@ -109,15 +109,24 @@ class NaiveSearchConfig:
 
     # ---- Stale-docker kill switch ----------------------------------------
     # When > 0, the runner steps the agent one turn at a time and, between
-    # turns, compares the OLDEST observed SGLang weight_version in the
-    # trajectory against the MOST RECENT observed one. The most-recent turn
-    # was just served by SGLang's CURRENT weights, so
-    # `latest - eldest` is a tight intra-trajectory bound on how stale the
-    # earliest turn is relative to the live actor. If that spread exceeds
-    # this threshold we tear down the docker env (env.cleanup) to abort
-    # the rollout — the next env.execute() raises and the agent loop
-    # exits with status="killed_stale_docker". 0 (default) disables the
-    # check entirely and preserves the legacy single-call agent loop.
+    # turns, polls SGLang's /get_weight_version REST endpoint to read the
+    # CURRENT actor weight version (== the latest version the trainer has
+    # broadcast). It then compares that against the wv stamped on this
+    # trajectory's FIRST observed assistant turn (the "start_wv"). If
+    # (current_actor_wv - start_wv) exceeds this threshold we tear down
+    # the docker env (env.cleanup) to abort the rollout — the next
+    # env.execute() raises and the agent loop exits with
+    # status="killed_stale_docker". 0 (default) disables the check
+    # entirely and preserves the legacy single-call agent loop.
+    #
+    # Polling /get_weight_version is the SAME signal the wandb metric in
+    # collect_naive_rollout_async.py uses at consumption time, so the
+    # in-flight kill threshold and the post-consumption staleness metric
+    # are aligned. Polling (rather than relying on the per-turn wv stamp
+    # from the most recent /generate response) catches the common case
+    # where all of a fast trajectory's turns are served by the same wv
+    # but the actor has nevertheless broadcast many new versions since
+    # the trajectory started.
     kill_stale_docker_threshold: int = 0
 
 
@@ -339,22 +348,46 @@ class NaiveSearchRunner:
         except Exception:
             pass
 
+    def _fetch_current_actor_wv(self) -> int | None:
+        """Poll SGLang's /get_weight_version REST endpoint for the live
+        actor weight version. Returns None on any failure (the watchdog
+        treats that as "no fresh signal, don't kill yet")."""
+        try:
+            import requests as _rq
+            url = self.policy_base_url.rstrip("/")
+            if url.endswith("/v1"):
+                url = url[:-len("/v1")]
+            r = _rq.get(f"{url}/get_weight_version", timeout=5)
+            r.raise_for_status()
+            return int(r.json().get("weight_version"))
+        except Exception:
+            return None
+
     def _step_session_with_stale_check(
         self, session: Any, rollout: "NaiveRollout"
     ) -> dict[str, Any]:
         """Step the agent one turn at a time; abort the rollout (via
-        env.cleanup) if the intra-trajectory weight_version spread exceeds
-        ``config.kill_stale_docker_threshold``. The most recent observed
-        turn was just served by SGLang's current weights, so
-        ``latest - eldest`` is a tight bound on (current_actor_wv -
-        eldest_turn_wv) without needing a cross-process call into the
-        actor.
+        env.cleanup) if the actor has broadcast too many new weight
+        versions since this trajectory's FIRST observed turn (the
+        "start_wv"). Specifically: lag = current_actor_wv - start_wv,
+        where current_actor_wv is polled from SGLang's
+        /get_weight_version REST endpoint between turns.
+
+        Why poll instead of using ``_peek_latest_assistant_weight_version``?
+        Because a fast trajectory whose turns all complete inside a single
+        weight-broadcast window will see the SAME wv on every per-turn
+        response (all 24 turns of rollout_0005/rollout_00 had wv=6), even
+        when the actor has moved on to wv=N+10 by the time the trajectory
+        finishes. Polling /get_weight_version directly captures that
+        wall-clock-driven drift, and is the same source of truth used by
+        the post-consumption wandb metric in
+        collect_naive_rollout_async.py.
 
         Returns the same dict shape as ``_step_session`` — the most recent
         ``run_until_pause`` result, or a copy with ``exit_status`` stamped
         to ``"killed_stale_docker"`` when the kill fires."""
         threshold = int(self.config.kill_stale_docker_threshold)
-        eldest_wv: int | None = None
+        start_wv: int | None = None
         result: dict[str, Any] = {}
         for step_idx in range(int(self.config.step_limit)):
             result = self._step_session(session, max_steps=1)
@@ -362,12 +395,14 @@ class NaiveSearchRunner:
             # — exit_status is set. Hand the result back unmodified.
             if result.get("exit_status"):
                 return result
-            latest_wv = self._peek_latest_assistant_weight_version(session)
-            if latest_wv is None:
+            if start_wv is None:
+                start_wv = self._peek_latest_assistant_weight_version(session)
+                if start_wv is None:
+                    continue
+            current_actor_wv = self._fetch_current_actor_wv()
+            if current_actor_wv is None:
                 continue
-            if eldest_wv is None or latest_wv < eldest_wv:
-                eldest_wv = latest_wv
-            lag = latest_wv - eldest_wv
+            lag = current_actor_wv - start_wv
             if lag > threshold:
                 self._abort_docker_env(session)
                 rollout.killed_stale_docker = True
@@ -377,9 +412,9 @@ class NaiveSearchRunner:
                 result["killed_stale_lag"] = lag
                 logger.info(
                     "[%s] naive r=%d killed_stale_docker after step %d "
-                    "(latest_wv=%d eldest_wv=%d lag=%d > threshold=%d)",
+                    "(current_actor_wv=%d start_wv=%d lag=%d > threshold=%d)",
                     self.task_id, rollout.rollout_index, step_idx + 1,
-                    latest_wv, eldest_wv, lag, threshold,
+                    current_actor_wv, start_wv, lag, threshold,
                 )
                 return result
         return result
