@@ -373,6 +373,11 @@ async def run_generate_with_route_async(
             # `content_no_thinking` for JSON parsing and artifact consumers.
             "content_no_thinking": content_no_thinking,
             "endpoint": "generate",
+            # SGLang per-request weight_version (the version actually serving
+            # this turn). Surfaced so the agent layer can build per-turn
+            # staleness metrics — see swe_agent/*_eldest_weight_lag in
+            # collect_naive_rollout_async.py.
+            "weight_version": meta.get("weight_version"),
         },
         output_token_ids=output_ids,
         output_logprobs=output_logprobs,

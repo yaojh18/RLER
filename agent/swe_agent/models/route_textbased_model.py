@@ -230,6 +230,12 @@ class RouteTextbasedModel(LitellmTextbasedModel):
                 "finish_reason": completion.finish_reason,
                 "route_name": self.config.route_name,
                 "policy_version": self.policy_version,
+                # Per-turn SGLang weight_version (the version actually serving
+                # this turn). Distinct from `policy_version`, which is a
+                # trajectory-pinned label. Surviving into rollout.messages lets
+                # naive_to_grpo_bundle aggregate per-turn staleness for the
+                # swe_agent/*_eldest_weight_lag wandb metrics.
+                "weight_version": completion.metadata.get("weight_version"),
                 "input_token_count": len(completion.input_token_ids),
             },
         }

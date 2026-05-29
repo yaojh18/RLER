@@ -178,6 +178,25 @@ def _build_rollout_sample(
     ]
 
     gt_payload = rollout.gt_payload or {}
+
+    # Collect per-assistant-turn SGLang weight_version (the version actually
+    # serving each turn) for the swe_agent/*_eldest_weight_lag staleness
+    # metrics. None entries (turn served before route_textbased_model.py was
+    # patched, or non-route_textbased model) are dropped here; the consumer
+    # uses an empty list as a sentinel meaning "no per-turn data available".
+    turn_weight_versions: list[int] = []
+    for msg in full_messages:
+        if msg.get("role") != "assistant":
+            continue
+        extra = msg.get("extra") or {}
+        wv = extra.get("weight_version")
+        if wv is None:
+            continue
+        try:
+            turn_weight_versions.append(int(wv))
+        except (TypeError, ValueError):
+            continue
+
     return ExportSample(
         sample_id=rollout.node_id,
         group_id=f"naive-{instance_id}",
@@ -188,6 +207,7 @@ def _build_rollout_sample(
             "rollout_index": rollout.rollout_index,
             "group_index": 0,
             "terminated_early": rollout.terminated_early,
+            "turn_weight_versions": turn_weight_versions,
             "raw_gt_score": rollout.gt_score,
             "raw_rubric_score": None,
             "total_tokens": rollout.total_tokens,

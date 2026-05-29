@@ -905,6 +905,32 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 if isinstance(x, (int, float)):
                     rollout_lps.append(float(x))
 
+    # Per-trajectory eldest weight-version lag (= rollout_id - min(turn_wv)).
+    # Captures within-trajectory staleness: a trajectory that ran for ~25 min
+    # may have its FIRST turn served by SGLang weights N versions older than
+    # the current actor. Sample.metadata['turn_weight_versions'] is populated
+    # by naive_to_grpo_bundle from per-turn extra.weight_version that
+    # route_textbased_model.py stashes on each /generate response.
+    eldest_lags: list[int] = []
+    for s in samples:
+        if not s.metadata:
+            continue
+        wvs = s.metadata.get("turn_weight_versions") or []
+        if not wvs:
+            continue
+        eldest = min(int(v) for v in wvs)
+        eldest_lags.append(rollout_id - eldest)
+    if eldest_lags:
+        avg_eldest_weight_lag = sum(eldest_lags) / len(eldest_lags)
+        min_eldest_weight_lag = min(eldest_lags)
+        max_eldest_weight_lag = max(eldest_lags)
+        eldest_lag_coverage = len(eldest_lags) / len(samples) if samples else 0.0
+    else:
+        avg_eldest_weight_lag = 0.0
+        min_eldest_weight_lag = 0
+        max_eldest_weight_lag = 0
+        eldest_lag_coverage = 0.0
+
     # --- Patch + eval-based ratios over the post-filter training batch ---
     # Denominators:
     #   * patch/submit ratios use all real_samples
@@ -1089,5 +1115,10 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/ratio_fe_gated_trajectories": (
                 (n_fe_gated / n_real) if n_real else 0.0
             ),
+            # --- intra-trajectory staleness (rollout_id - eldest turn wv) ---
+            "swe_agent/avg_eldest_weight_lag": avg_eldest_weight_lag,
+            "swe_agent/min_eldest_weight_lag": min_eldest_weight_lag,
+            "swe_agent/max_eldest_weight_lag": max_eldest_weight_lag,
+            "swe_agent/eldest_lag_coverage": eldest_lag_coverage,
         },
     )
