@@ -927,15 +927,24 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     # consumer's call counter (off-by-one from actor wv at startup, and may
     # diverge under async pacing), and within-trajectory min vs first-turn
     # are equivalent unless turns span weight broadcasts.
+    # /get_weight_version only exists on individual sglang engines, NOT on
+    # sglang_router (which only proxies inference). Pick any per-engine
+    # endpoint from args.sglang_model_engines; fall back to router (404
+    # expected) only if the engine list is empty.
     current_actor_wv: int | None = None
     try:
-        router_ip, router_port = (getattr(args, "sglang_model_routers", None) or {}).get(
-            model_name, (args.sglang_router_ip, args.sglang_router_port),
-        )
+        engines_map = getattr(args, "sglang_model_engines", None) or {}
+        engine_eps = list(engines_map.get(model_name, []))
+        if not engine_eps and len(engines_map) == 1:
+            engine_eps = list(next(iter(engines_map.values())))
+        if engine_eps:
+            host, port = engine_eps[0]
+        else:
+            host, port = (getattr(args, "sglang_model_routers", None) or {}).get(
+                model_name, (args.sglang_router_ip, args.sglang_router_port),
+            )
         import requests as _rq
-        _r = _rq.get(
-            f"http://{router_ip}:{router_port}/get_weight_version", timeout=10
-        )
+        _r = _rq.get(f"http://{host}:{port}/get_weight_version", timeout=10)
         _r.raise_for_status()
         current_actor_wv = int(_r.json().get("weight_version"))
     except Exception as _exc:
