@@ -107,27 +107,6 @@ class NaiveSearchConfig:
     # positive reward through to the policy. 0.0 = disabled.
     format_ok_gate_threshold: float = 0.0
 
-    # ---- Stale-docker kill switch ----------------------------------------
-    # When > 0, the runner steps the agent one turn at a time and, between
-    # turns, polls SGLang's /get_weight_version REST endpoint to read the
-    # CURRENT actor weight version (== the latest version the trainer has
-    # broadcast). It then compares that against the wv stamped on this
-    # trajectory's FIRST observed assistant turn (the "start_wv"). If
-    # (current_actor_wv - start_wv) exceeds this threshold we tear down
-    # the docker env (env.cleanup) to abort the rollout — the next
-    # env.execute() raises and the agent loop exits with
-    # status="killed_stale_docker". 0 (default) disables the check
-    # entirely and preserves the legacy single-call agent loop.
-    #
-    # Polling /get_weight_version is the SAME signal the wandb metric in
-    # collect_naive_rollout_async.py uses at consumption time, so the
-    # in-flight kill threshold and the post-consumption staleness metric
-    # are aligned. Polling (rather than relying on the per-turn wv stamp
-    # from the most recent /generate response) catches the common case
-    # where all of a fast trajectory's turns are served by the same wv
-    # but the actor has nevertheless broadcast many new versions since
-    # the trajectory started.
-    kill_stale_docker_threshold: int = 0
 
 
 @dataclass
@@ -156,12 +135,6 @@ class NaiveRollout:
     terminal_no_action_emitted: bool = False  # True iff zero env actions across rollout
     n_assistant_turns: int = 0  # total assistant turns in this rollout (denominator for FE rate)
     n_format_errors: int = 0  # assistant turns flagged with extra.format_error = True
-    # NaiveSearchConfig.kill_stale_docker_threshold mid-rollout abort:
-    # set True iff the runner tore down env.cleanup() because intra-trajectory
-    # weight_version spread exceeded the threshold. killed_stale_lag records
-    # (max_observed_wv - min_observed_wv) at the moment of the kill.
-    killed_stale_docker: bool = False
-    killed_stale_lag: int | None = None
     error: str | None = None
     gt_score: float | None = None
     gt_payload: dict[str, Any] | None = None
@@ -294,131 +267,6 @@ class NaiveSearchRunner:
     def _step_session(self, session: Any, max_steps: int) -> dict[str, Any]:
         return session.run_until_pause(max_steps=max_steps).model_dump(mode="json")
 
-    # -- stale-docker watchdog ----------------------------------------------
-
-    def _peek_latest_assistant_weight_version(self, session: Any) -> int | None:
-        """Walk this session's live messages in reverse and return the
-        most recent assistant turn's ``extra.weight_version`` (the SGLang
-        weight version that served that turn). Returns None if no asst
-        turn has been observed yet or the field is missing. Tolerates
-        both Pydantic-model and dict message shapes so we don't depend on
-        the agent_rl message class staying static."""
-        try:
-            state = getattr(getattr(session, "agent", None), "state", None)
-            msgs = getattr(state, "messages", None) if state is not None else None
-            if not msgs:
-                return None
-            for m in reversed(msgs):
-                role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
-                if role != "assistant":
-                    continue
-                if isinstance(m, dict):
-                    extra = m.get("extra") or {}
-                    wv = extra.get("weight_version") if isinstance(extra, dict) else None
-                else:
-                    extra = getattr(m, "extra", None) or {}
-                    if isinstance(extra, dict):
-                        wv = extra.get("weight_version")
-                    else:
-                        wv = getattr(extra, "weight_version", None)
-                if wv is None:
-                    return None
-                try:
-                    return int(wv)
-                except (TypeError, ValueError):
-                    return None
-            return None
-        except Exception:
-            return None
-
-    def _abort_docker_env(self, session: Any) -> None:
-        """Tear down the agent's docker env so the next env.execute() call
-        raises and the agent loop exits cleanly. Used by the stale-docker
-        watchdog. Tolerant of partial / already-cleaned state because it
-        runs as a kill signal."""
-        try:
-            env = getattr(getattr(session, "agent", None), "env", None)
-            if env is None:
-                return
-            if hasattr(env, "cleanup"):
-                try:
-                    env.cleanup()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _fetch_current_actor_wv(self) -> int | None:
-        """Poll SGLang's /get_weight_version REST endpoint for the live
-        actor weight version. Returns None on any failure (the watchdog
-        treats that as "no fresh signal, don't kill yet")."""
-        try:
-            import requests as _rq
-            url = self.policy_base_url.rstrip("/")
-            if url.endswith("/v1"):
-                url = url[:-len("/v1")]
-            r = _rq.get(f"{url}/get_weight_version", timeout=5)
-            r.raise_for_status()
-            return int(r.json().get("weight_version"))
-        except Exception:
-            return None
-
-    def _step_session_with_stale_check(
-        self, session: Any, rollout: "NaiveRollout"
-    ) -> dict[str, Any]:
-        """Step the agent one turn at a time; abort the rollout (via
-        env.cleanup) if the actor has broadcast too many new weight
-        versions since this trajectory's FIRST observed turn (the
-        "start_wv"). Specifically: lag = current_actor_wv - start_wv,
-        where current_actor_wv is polled from SGLang's
-        /get_weight_version REST endpoint between turns.
-
-        Why poll instead of using ``_peek_latest_assistant_weight_version``?
-        Because a fast trajectory whose turns all complete inside a single
-        weight-broadcast window will see the SAME wv on every per-turn
-        response (all 24 turns of rollout_0005/rollout_00 had wv=6), even
-        when the actor has moved on to wv=N+10 by the time the trajectory
-        finishes. Polling /get_weight_version directly captures that
-        wall-clock-driven drift, and is the same source of truth used by
-        the post-consumption wandb metric in
-        collect_naive_rollout_async.py.
-
-        Returns the same dict shape as ``_step_session`` — the most recent
-        ``run_until_pause`` result, or a copy with ``exit_status`` stamped
-        to ``"killed_stale_docker"`` when the kill fires."""
-        threshold = int(self.config.kill_stale_docker_threshold)
-        start_wv: int | None = None
-        result: dict[str, Any] = {}
-        for step_idx in range(int(self.config.step_limit)):
-            result = self._step_session(session, max_steps=1)
-            # Agent reached a terminal state (Submitted / errored / etc.)
-            # — exit_status is set. Hand the result back unmodified.
-            if result.get("exit_status"):
-                return result
-            if start_wv is None:
-                start_wv = self._peek_latest_assistant_weight_version(session)
-                if start_wv is None:
-                    continue
-            current_actor_wv = self._fetch_current_actor_wv()
-            if current_actor_wv is None:
-                continue
-            lag = current_actor_wv - start_wv
-            if lag > threshold:
-                self._abort_docker_env(session)
-                rollout.killed_stale_docker = True
-                rollout.killed_stale_lag = lag
-                result = dict(result)
-                result["exit_status"] = "killed_stale_docker"
-                result["killed_stale_lag"] = lag
-                logger.info(
-                    "[%s] naive r=%d killed_stale_docker after step %d "
-                    "(current_actor_wv=%d start_wv=%d lag=%d > threshold=%d)",
-                    self.task_id, rollout.rollout_index, step_idx + 1,
-                    current_actor_wv, start_wv, lag, threshold,
-                )
-                return result
-        return result
-
     def _extract_turn_token_info(
         self, snapshot_dict: dict[str, Any], starting_turn_index: int
     ) -> list[TurnTokenInfo]:
@@ -529,19 +377,9 @@ class NaiveSearchRunner:
                 base_turn_count = 0
                 base_event_count = 0
 
-            if int(self.config.kill_stale_docker_threshold) > 0:
-                result = self._step_session_with_stale_check(session, rollout)
-            else:
-                result = self._step_session(session, max_steps=self.config.step_limit)
+            result = self._step_session(session, max_steps=self.config.step_limit)
             snapshot_after = session.snapshot().model_dump(mode="json")
-            if rollout.killed_stale_docker:
-                # Docker env is gone — _collect_workspace_meta would try to
-                # execute commands against it and raise. Use the empty
-                # workspace meta sentinel; the agent's in-memory snapshot
-                # (messages, step cards, turn token info) is still valid.
-                workspace_meta = copy.deepcopy(EMPTY_WORKSPACE_META)
-            else:
-                workspace_meta = _collect_workspace_meta(session.agent.env)
+            workspace_meta = _collect_workspace_meta(session.agent.env)
             # The training sample wants the FULL chat (sys+user+all asst+tool)
             # so we keep messages from index 0 — the lane-to-grpo path will
             # treat the sys+user prefix as the masked-out parent.
@@ -580,17 +418,9 @@ class NaiveSearchRunner:
             }
             rollout.status = result.get("status", "")
             rollout.terminated_early = result.get("exit_status") == "Submitted"
-            if rollout.killed_stale_docker:
-                # _extract_terminal_patch would shell out to the dead env
-                # to fall back to `git diff`. Skip it: no patch survives a
-                # stale-kill, so report empty + fallback-flagged.
-                rollout.terminal_patch = ""
-                rollout.terminal_patch_from_fallback = True
-                rollout.status = "killed_stale_docker"
-            else:
-                rollout.terminal_patch, rollout.terminal_patch_from_fallback = (
-                    self._extract_terminal_patch(result, session)
-                )
+            rollout.terminal_patch, rollout.terminal_patch_from_fallback = (
+                self._extract_terminal_patch(result, session)
+            )
             rollout._base_msg_count = base_msg_count  # type: ignore[attr-defined]
             logger.info(
                 "[%s] naive r=%d done dt=%.1fs steps=%d submitted=%s status=%s "
@@ -779,18 +609,6 @@ class NaiveSearchRunner:
                     r.gt_score = 0.0
                     r.gt_payload = {"reward": 0.0, "note": "rollout_error"}
                     continue
-                if r.killed_stale_docker:
-                    # No patch is recoverable from a stale-killed rollout
-                    # — env was torn down mid-flight. Skip the harness
-                    # spin-up and tag with a structured note so the
-                    # collector can count it for the wandb metric.
-                    r.gt_score = 0.0
-                    r.gt_payload = {
-                        "reward": 0.0,
-                        "note": "killed_stale_docker",
-                        "killed_stale_lag": r.killed_stale_lag,
-                    }
-                    continue
                 ctx = contextvars.copy_context()
                 gt_futures.append(
                     loop.run_in_executor(
@@ -850,8 +668,6 @@ class NaiveSearchRunner:
                         "n_action_steps": r.n_action_steps,
                         "n_assistant_turns": r.n_assistant_turns,
                         "n_format_errors": r.n_format_errors,
-                        "killed_stale_docker": r.killed_stale_docker,
-                        "killed_stale_lag": r.killed_stale_lag,
                         "terminal_patch_chars": len(r.terminal_patch or ""),
                         "error": r.error,
                         "n_messages": len(r.messages),

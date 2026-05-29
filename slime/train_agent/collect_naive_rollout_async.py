@@ -22,11 +22,6 @@ SLURM script's tunables):
   SWE_AGENT_NAIVE_SEED               int    seed for sampling (optional)
   SWE_AGENT_NAIVE_REWARD_KIND        str    'soft' (raw_reward) or 'delta'
                                             (max(0, raw - baseline)); default 'delta'
-  SWE_AGENT_NAIVE_KILL_STALE_DOCKER_THRESHOLD int  When > 0, naive runner kills
-                                            (env.cleanup) any in-flight
-                                            trajectory whose intra-rollout
-                                            weight_version spread exceeds this
-                                            threshold. 0 (default) disables.
 Per-engine endpoints come from args.sglang_model_engines (populated at engine
 init in slime/ray/rollout.py). The legacy SWE_AGENT_NAIVE_POLICY_PORTS env
 var is no longer consulted.
@@ -153,9 +148,6 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                 "format_error_per_step_penalty", 0.0
             ),
             format_ok_gate_threshold=task.get("format_ok_gate_threshold", 0.0),
-            kill_stale_docker_threshold=task.get(
-                "kill_stale_docker_threshold", 0
-            ),
         )
         run_dir = (
             output_root / instance_id
@@ -451,9 +443,6 @@ def _naive_values_from_env() -> dict[str, Any]:
         ),
         "format_ok_gate_threshold": _float(
             "SWE_AGENT_NAIVE_FORMAT_OK_GATE_THRESHOLD", 0.0
-        ),
-        "kill_stale_docker_threshold": _int(
-            "SWE_AGENT_NAIVE_KILL_STALE_DOCKER_THRESHOLD", 0
         ),
     }
 
@@ -1028,8 +1017,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     fe_rates: list[float] = []
     fe_counts: list[int] = []
     n_fe_gated = 0
-    n_killed_stale = 0
-    killed_stale_lags: list[int] = []
     for s in real_samples:
         if s.metadata and s.metadata.get("n_full_trace_steps") is not None:
             turns_for_avg.append(int(s.metadata.get("n_full_trace_steps") or 0))
@@ -1042,21 +1029,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             # format errors — same signal the runtime gate uses (default 0.5).
             if rate > 0.5:
                 n_fe_gated += 1
-    # Stale-killed dummies live in `samples` (not real_samples — they're
-    # is_dummy=True). They're substituted in by naive_to_grpo_bundle when
-    # the runner abort fires; counting them across the post-filter batch
-    # gives us the wandb ratio for kill_stale_docker_threshold tuning.
-    for s in samples:
-        if not s.metadata:
-            continue
-        if s.metadata.get("killed_stale_docker"):
-            n_killed_stale += 1
-            lag = s.metadata.get("killed_stale_lag")
-            if lag is not None:
-                try:
-                    killed_stale_lags.append(int(lag))
-                except (TypeError, ValueError):
-                    pass
     for s in eval_samples:
         md = s.metadata
         f2p_passed = int(md.get("f2p_passed_count") or 0)
@@ -1208,13 +1180,5 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/eldest_lag_coverage": eldest_lag_coverage,
             "swe_agent/avg_intra_traj_spread": avg_intra_traj_spread,
             "swe_agent/max_intra_traj_spread": max_intra_traj_spread,
-            # --- stale-docker kill watchdog ---
-            "swe_agent/n_killed_stale_docker": n_killed_stale,
-            "swe_agent/ratio_killed_stale_docker": (
-                (n_killed_stale / len(samples)) if samples else 0.0
-            ),
-            "swe_agent/avg_killed_stale_lag": _safe_mean(
-                [float(x) for x in killed_stale_lags]
-            ),
         },
     )

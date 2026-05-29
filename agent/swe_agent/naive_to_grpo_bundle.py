@@ -40,20 +40,6 @@ def _build_rollout_sample(
         tokenize_messages_with_template,
     )
 
-    # Stale-killed rollouts MUST NOT contribute to training. The runner
-    # aborts these mid-flight when intra-trajectory weight_version spread
-    # exceeds kill_stale_docker_threshold; their partial trajectory is
-    # off-policy by construction. Falling through to the regular path
-    # would inject a reward-0 sample into the GRPO group, which would
-    # still occupy a slot in the baseline and (with reward=0) bias the
-    # group mean toward 0. Returning None routes them through the
-    # dummy-substitution path in naive_record_to_bundle — is_dummy=True
-    # excludes them from baseline mean/std AND zeros their loss_mask
-    # (see slime/train_agent/run/grpo.py:84-113), giving the kill the
-    # full "no training contribution" semantics the user asked for.
-    if rollout.killed_stale_docker:
-        return None
-
     if rollout.error is not None:
         reward = 0.0
     else:
@@ -246,8 +232,6 @@ def _build_rollout_sample(
                 (rollout.n_format_errors / rollout.n_assistant_turns)
                 if rollout.n_assistant_turns > 0 else 0.0
             ),
-            "killed_stale_docker": bool(rollout.killed_stale_docker),
-            "killed_stale_lag": rollout.killed_stale_lag,
             "eval_status": gt_payload.get("status"),
             "eval_note": gt_payload.get("note"),
             "f2p_passed_count": gt_payload.get("f2p_passed_count"),
@@ -290,10 +274,7 @@ def _dummy_sample_for_rollout(
             "n_parent_steps": 0,
             "n_full_trace_steps": 0,
             "is_dummy": True,
-            "rollout_error": (
-                "killed_stale_docker" if rollout.killed_stale_docker
-                else (rollout.error or "no_asst_token_ids")
-            ),
+            "rollout_error": (rollout.error or "no_asst_token_ids"),
             "terminal_patch_len": 0,
             "terminal_patch_from_fallback": False,
             "terminal_no_action_emitted": True,
@@ -301,8 +282,6 @@ def _dummy_sample_for_rollout(
             "n_assistant_turns": 0,
             "n_format_errors": 0,
             "format_error_rate": 0.0,
-            "killed_stale_docker": bool(rollout.killed_stale_docker),
-            "killed_stale_lag": rollout.killed_stale_lag,
             "eval_status": None,
             "eval_note": None,
             "f2p_passed_count": None,
@@ -344,27 +323,16 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
     """
     samples: list[ExportSample] = []
     n_real = 0
-    n_killed = 0
     for r in record.rollouts:
         s = _build_rollout_sample(instance_id=record.instance_id, rollout=r)
         if s is None:
             s = _dummy_sample_for_rollout(instance_id=record.instance_id, rollout=r)
-            if r.killed_stale_docker:
-                # Stale-kill dummies are a DESIGNED filter, not an infra
-                # failure — they MUST NOT count against the
-                # too_many_dummies group-drop threshold or the L3
-                # infra-drop circuit-breaker. They still occupy a group
-                # slot (so n_samples_per_prompt=M reshape stays valid)
-                # but contribute zero gradient (is_dummy → loss_mask=0)
-                # and zero baseline weight (is_dummy → excluded from
-                # group mean/std). See grpo.py:84-113.
-                n_killed += 1
         else:
             n_real += 1
         samples.append(s)
 
     n_dummy_total = len(samples) - n_real
-    n_dummy_infra = n_dummy_total - n_killed
+    n_dummy_infra = n_dummy_total
     max_dummy = _max_dummy_per_group()
     group_dropped_reason: str | None = None
     if not samples:
@@ -390,7 +358,6 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
                     "n_real": n_real,
                     "n_dummy": n_dummy_total,
                     "n_dummy_infra": n_dummy_infra,
-                    "n_killed_stale_docker": n_killed,
                 },
             )
         )
@@ -410,7 +377,6 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
             "n_real": n_real,
             "n_dummy": n_dummy_total,
             "n_dummy_infra": n_dummy_infra,
-            "n_killed_stale_docker": n_killed,
             "group_dropped_reason": group_dropped_reason,
         },
     )
