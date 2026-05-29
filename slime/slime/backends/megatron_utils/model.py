@@ -468,20 +468,41 @@ def train_one_step(
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
         keys = losses_reduced[0]["keys"]
+        # Keys ending in "__max" use MAX reduction across microbatches AND DP
+        # (and are reported as-is, not divided by sample count). Used for
+        # true worst-case diagnostics like train_rollout_logprob_abs_diff_max_of_max.
+        # All other keys keep the original SUM+divide-by-samples behavior.
+        has_max_keys = any(k.endswith("__max") for k in keys)
         values = None
+        max_values = None
         for x in losses_reduced:
             if values is None:
                 values = x["values"]
+                if has_max_keys:
+                    max_values = x["values"].clone()
             else:
                 values += x["values"]
+                if has_max_keys:
+                    max_values = torch.maximum(max_values, x["values"])
         assert len(keys) + 1 == values.numel()
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+        if has_max_keys:
+            torch.distributed.all_reduce(
+                max_values,
+                op=torch.distributed.ReduceOp.MAX,
+                group=mpu.get_data_parallel_group(with_context_parallel=True),
+            )
 
         loss_reduced = {}
         values = values.tolist()
+        max_values_list = max_values.tolist() if has_max_keys else None
         num_samples_or_tokens = values[0]
-        for key, value in zip(keys, values[1:], strict=False):
-            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+        for i, key in enumerate(keys):
+            if key.endswith("__max"):
+                # Strip the "__max" suffix from the wandb key name.
+                loss_reduced[key[: -len("__max")]] = max_values_list[i + 1]
+            else:
+                loss_reduced[key] = values[i + 1] * mpu.get_context_parallel_world_size() / num_samples_or_tokens
         return loss_reduced, grad_norm
     return {}, grad_norm
 

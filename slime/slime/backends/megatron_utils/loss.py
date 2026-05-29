@@ -993,9 +993,79 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
+    train_rollout_logprob_abs_diff_avg_of_max = None
+    train_rollout_logprob_abs_diff_max_of_max = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+
+        # Per-sample max abs-diff (worst-case token within each sample), then
+        # aggregated across the global batch two ways:
+        #   - avg_of_max: mean across samples — uses the standard SUM+divide path.
+        #   - max_of_max: max across samples — uses the special "__max" suffix
+        #     so train_one_step in model.py reduces with MAX instead of SUM.
+        # The sample-mean metric above can hide a small number of badly
+        # off-policy tokens; these surface them.
+        with torch.no_grad():
+            cp_size_local = mpu.get_context_parallel_world_size()
+            per_sample_max_list = []
+            for i, (old_lp_i, rollout_lp_i, loss_mask_i, total_len_i, resp_len_i) in enumerate(
+                zip(
+                    batch["log_probs"],
+                    batch["rollout_log_probs"],
+                    batch["loss_masks"],
+                    total_lengths,
+                    response_lengths,
+                    strict=False,
+                )
+            ):
+                diff_i = (old_lp_i - rollout_lp_i).abs()
+                if cp_size_local == 1:
+                    chunked_mask_i = loss_mask_i
+                else:
+                    max_seq_len_i = max_seq_lens[i] if max_seq_lens is not None else None
+                    prompt_len_i = total_len_i - resp_len_i
+                    _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
+                        total_len_i, resp_len_i, args.qkv_format, max_seq_len_i,
+                    )
+                    mask_0 = loss_mask_i[
+                        tokens_offset[0][0] - prompt_len_i : tokens_offset[0][1] - prompt_len_i
+                    ]
+                    mask_1 = loss_mask_i[
+                        tokens_offset[1][0] - prompt_len_i : tokens_offset[1][1] - prompt_len_i
+                    ]
+                    chunked_mask_i = torch.cat([mask_0, mask_1], dim=0)
+                if diff_i.numel() > 0 and chunked_mask_i.numel() > 0:
+                    masked = torch.where(
+                        chunked_mask_i.bool(),
+                        diff_i,
+                        diff_i.new_full(diff_i.shape, float("-inf")),
+                    )
+                    local_max = masked.max()
+                else:
+                    local_max = old_log_probs.new_full((), float("-inf"))
+                per_sample_max_list.append(local_max)
+
+            if per_sample_max_list:
+                per_sample_max = torch.stack(per_sample_max_list)
+                if cp_size_local > 1:
+                    dist.all_reduce(
+                        per_sample_max,
+                        op=dist.ReduceOp.MAX,
+                        group=mpu.get_context_parallel_group(),
+                    )
+                # Replace any -inf (sample with zero loss-mask tokens) with 0
+                # so it doesn't poison sum/max stats.
+                per_sample_max = torch.where(
+                    torch.isinf(per_sample_max),
+                    torch.zeros_like(per_sample_max),
+                    per_sample_max,
+                )
+                train_rollout_logprob_abs_diff_avg_of_max = per_sample_max.sum()
+                train_rollout_logprob_abs_diff_max_of_max = per_sample_max.max()
+            else:
+                train_rollout_logprob_abs_diff_avg_of_max = old_log_probs.new_zeros(())
+                train_rollout_logprob_abs_diff_max_of_max = old_log_probs.new_zeros(())
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -1008,6 +1078,18 @@ def policy_loss_function(
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
+    if train_rollout_logprob_abs_diff_avg_of_max is not None:
+        reported_loss["train_rollout_logprob_abs_diff_avg_of_max"] = (
+            train_rollout_logprob_abs_diff_avg_of_max.clone().detach()
+        )
+    if train_rollout_logprob_abs_diff_max_of_max is not None:
+        # "__max" suffix tells train_one_step to use MAX reduction across
+        # microbatches + DP instead of SUM (and to skip the divide-by-samples).
+        # Suffix is stripped before logging, so wandb key is
+        # train/train_rollout_logprob_abs_diff_max_of_max.
+        reported_loss["train_rollout_logprob_abs_diff_max_of_max__max"] = (
+            train_rollout_logprob_abs_diff_max_of_max.clone().detach()
+        )
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
