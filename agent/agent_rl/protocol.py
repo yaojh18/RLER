@@ -18,7 +18,11 @@ class ConversationMessage(BaseModel):
 class ModelTurn(BaseModel):
     session_id: str
     step_index: int
-    query_messages: List[ConversationMessage]
+    # Legacy field kept for snapshot back-compat (older .pt dumps populated it).
+    # The recording site at backend.py:step() no longer fills it because nothing
+    # downstream reads it and the O(N^2) deepcopy dominated post-LLM phase.
+    # Reconstruct from self.agent.messages[:request_msg_count] if ever needed.
+    query_messages: List[ConversationMessage] = Field(default_factory=list)
     response_message: ConversationMessage
     reward: Optional[float] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)

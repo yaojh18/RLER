@@ -149,11 +149,20 @@ class SWEAgentSession:
             return
 
         step_index = self.last_step_index + 1
-        query_messages = copy.deepcopy(self.agent.messages)
+        # Was: query_messages = copy.deepcopy(self.agent.messages); stored on
+        # both the model_request event and ModelTurn.query_messages. Both are
+        # write-only across agent/ and slime/ (grep'd), and the per-step
+        # deepcopy made the snapshot's events table O(N^2) in total tokens —
+        # dominating post-LLM phase for long traces (60-680s on 120-step
+        # yt-dlp/openmdao trials in 58541). We record a back-pointer
+        # (request_msg_count) so anyone needing the request can reconstruct via
+        # self.agent.messages[:request_msg_count] — agent.messages is
+        # append-only (agents/default.py:add_messages just `extends`).
+        request_msg_count = len(self.agent.messages)
         self._record_event(
             step_index=step_index,
             kind="model_request",
-            payload={"messages": query_messages},
+            payload={"request_msg_count": request_msg_count},
             provenance={
                 "policy_ref": self.spec.policy_ref,
                 "policy_version": self.spec.policy_version,
@@ -172,7 +181,8 @@ class SWEAgentSession:
                 ModelTurn(
                     session_id=self.spec.session_id,
                     step_index=step_index,
-                    query_messages=_messages_to_protocol(query_messages, source="conversation", trainable=False),
+                    # query_messages left empty by default (see protocol.py
+                    # note). Was the second copy of the same O(N^2) blob.
                     response_message=_message_to_protocol(model_message, source="model", trainable=True),
                     metadata={
                         "policy_ref": self.spec.policy_ref,

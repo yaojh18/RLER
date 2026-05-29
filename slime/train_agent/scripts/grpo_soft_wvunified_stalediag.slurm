@@ -67,7 +67,10 @@ NAIVE_FORMAT_OK_GATE_THRESHOLD=0.5        # hard zero when >50% of asst turns ar
 # GRPO baseline. With ROLLOUT_BATCH_SIZE=16 + n_samples_per_prompt=8 (=NAIVE_M):
 #   global_batch_size = 16 * 8 = 128 samples per step.
 ROLLOUT_BATCH_SIZE=16
-OVER_SAMPLING_BATCH_SIZE=32
+# Was 32; dropped to 24 to cut concurrent in-flight instances per node. Pairs
+# with the backend.py O(N^2) deepcopy removal (smaller working set per worker
+# -> less GC/allocator pressure during post-LLM phase).
+OVER_SAMPLING_BATCH_SIZE=24
 NUM_ROLLOUT=60
 NUM_NODES=4
 NUM_GPUS_PER_NODE=8
