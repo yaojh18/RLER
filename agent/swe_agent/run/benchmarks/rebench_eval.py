@@ -115,8 +115,15 @@ def evaluate_rebench_instance(
         # heap-leak runaway also catches file-backed page accumulation under
         # cgroup pressure.
         memory_cap = os.environ.get("MSWEA_EVAL_DOCKER_MEMORY", "256g")
+        # Respect MSWEA_DOCKER_EXECUTABLE so the eval harness uses the lustre
+        # docker wrapper (image load from cached tarballs, flock per-image
+        # against concurrent load races, stderr persistence on failure) the
+        # same way the agent does. Bare "docker" hits /usr/bin/docker via
+        # PATH and bypasses the wrapper entirely — which is how 58672/58673
+        # ate docker-daemon exit-125 stderr that we can't recover.
+        docker_exe = os.environ.get("MSWEA_DOCKER_EXECUTABLE", "docker")
         docker_cmd = [
-            "docker",
+            docker_exe,
             "run",
             "--rm",
             "--memory",
