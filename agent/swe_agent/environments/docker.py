@@ -141,9 +141,15 @@ class DockerEnvironment:
                 )
                 if attempt < max_retries - 1:
                     time.sleep(self.config.start_container_retry_delay * (attempt + 1))
+        last_stderr = ""
+        last_raw = getattr(last_exc, "stderr", "") or ""
+        if isinstance(last_raw, bytes):
+            last_raw = last_raw.decode("utf-8", errors="replace")
+        last_stderr = last_raw.strip()[:2000]
         raise RuntimeError(
             f"docker start_container failed after {max_retries} attempts for "
-            f"image={self.config.image!r}: {type(last_exc).__name__}: {last_exc}"
+            f"image={self.config.image!r}: {type(last_exc).__name__}: {last_exc} "
+            f"| docker_stderr={last_stderr!r}"
         ) from last_exc
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:

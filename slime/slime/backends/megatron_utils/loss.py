@@ -995,7 +995,18 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     train_rollout_logprob_abs_diff_avg_of_max = None
     train_rollout_logprob_abs_diff_max_of_max = None
-    if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
+    # The whole metric block compares Megatron's compute_log_prob output
+    # (batch["log_probs"]) against the rollout-time SGLang logprobs. When
+    # --use-rollout-logprobs is set, actor.py:train_actor SKIPS the
+    # compute_log_prob pass entirely, so batch["log_probs"] is None and the
+    # per-sample-max zip(batch["log_probs"], ...) below would crash with
+    # `TypeError: 'NoneType' object is not iterable`. With use_rollout_logprobs
+    # the metric is also identically 0 by construction (old_log_probs IS
+    # rollout_log_probs), so skip cleanly.
+    if (
+        "rollout_log_probs" in batch and batch["rollout_log_probs"]
+        and batch.get("log_probs") is not None
+    ):
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
 
