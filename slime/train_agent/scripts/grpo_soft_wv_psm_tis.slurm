@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=grpo-soft-wvunified-stalediag
+#SBATCH --job-name=grpo-soft-wv-psm-tis
 #SBATCH --account=ads_cpt
 #SBATCH --qos=ads_cpt
 #SBATCH --partition=a4
@@ -10,20 +10,19 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --time=24:00:00
-#SBATCH --output=/home/sihanzeng_meta_com/rler_runs/_slurm-logs/grpo-soft-wvunified-stalediag-%j.log
+#SBATCH --output=/home/sihanzeng_meta_com/rler_runs/_slurm-logs/grpo-soft-wv-psm-tis-%j.log
 
-# 4-node GRPO async NAIVE — per-sample-mean baseline (post-58541 collapse fix).
+# 4-node GRPO async NAIVE — per-sample-mean + Truncated Importance Sampling.
 #
-# Changes vs 58541:
-#  * CALCULATE_PER_TOKEN_LOSS=0 — switches GRPO loss from per-token to
-#    per-sample weighting (drops the --calculate-per-token-loss flag).
-#    58541 showed monotonic raw_entropy growth (0.38 -> 2.43 in 28 steps)
-#    + format_error_rate explosion (0.6% -> 26%), driven by per-token
-#    weighting amplifying long failed-trajectory gradients.
+# Changes vs grpo_soft_wvunified_stalediag (the per-sample-mean baseline):
+#  * --use-tis — Truncated Importance Sampling for off-policy correction.
+#    Uses rollout_log_probs to compute and clip the importance ratio (TIS
+#    clip default 2.0) without committing to rollout_log_probs as the PPO
+#    "old" reference. Bounds the variance from SGLang/Megatron kernel diff.
 #
-# Killer remains DISABLED — this is the diagnostic baseline. Sibling runs
-# (grpo_soft_wv_psm_{rolloutlp,tis}.slurm) add --use-rollout-logprobs /
-# --use-tis on top of this same per-sample-mean fix.
+# NOTE: --use-tis and --use-rollout-logprobs are mutually exclusive
+# (arguments.py:1601). The rollout-lp variant is in
+# grpo_soft_wv_psm_rolloutlp.slurm.
 #
 # Changes vs 58520:
 #  1) Wandb wv staleness metric now uses sglang's /get_weight_version REST
@@ -104,13 +103,13 @@ RAY_PORT=6379
 RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench
 SUBSET=$BASE/datasets/v2_python_train_plus_sweep_middle_v2
-RUN_DIR=/home/sihanzeng_meta_com/rler_runs/${SLURM_JOB_ID}-grpo-soft-wvunified-stalediag
+RUN_DIR=/home/sihanzeng_meta_com/rler_runs/${SLURM_JOB_ID}-grpo-soft-wv-psm-tis
 SLURM_LOGS=/home/sihanzeng_meta_com/rler_runs/_slurm-logs
 mkdir -p $RUN_DIR $SLURM_LOGS $RUN_DIR/_logs
 
 HF_CHECKPOINT=/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-9B
 LOAD_DIR=/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/slime_qwen35/ckpt/Qwen3.5-9B_torch_dist_latest
-SAVE_DIR=/mnt/localssd/rler-runs/${SLURM_JOB_ID}-grpo-soft-wvunified-stalediag/policy_ckpt
+SAVE_DIR=/mnt/localssd/rler-runs/${SLURM_JOB_ID}-grpo-soft-wv-psm-tis/policy_ckpt
 PROMPT_DATA=$RUN_DIR/grpo_prompts.jsonl
 
 echo "[$(date)] jobid=$SLURM_JOB_ID nodes=$SLURM_JOB_NUM_NODES head=$HEAD_NODE head_ip=$HEAD_IP"
@@ -338,6 +337,7 @@ if [ "$NODE" = "$HEAD_NODE" ]; then
       --naive-no-action-patch-penalty $NAIVE_NO_ACTION_PATCH_PENALTY \
       --naive-format-error-per-step-penalty $NAIVE_FORMAT_ERROR_PER_STEP_PENALTY \
       --naive-format-ok-gate-threshold $NAIVE_FORMAT_OK_GATE_THRESHOLD \
+      --use-tis \
       --naive-output-root $RUN_DIR/naive_out \
       --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std \
       --save-debug-train-data "$RUN_DIR/_train_dumps/{rollout_id}_{rank}.pt" \
