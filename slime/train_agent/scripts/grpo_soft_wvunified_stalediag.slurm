@@ -236,6 +236,12 @@ export SWE_AGENT_NAIVE_M=$NAIVE_M
 export SWE_AGENT_NAIVE_STEP_LIMIT=$NAIVE_STEP_LIMIT
 export SWE_AGENT_NAIVE_INSTANCE_WORKERS=$NAIVE_INSTANCE_WORKERS
 export SWE_AGENT_NAIVE_MAX_PENDING=$OVER_SAMPLING_BATCH_SIZE
+# Defense-in-depth alongside docker.py pull_timeout=600: raise L3 trip
+# threshold from default 0.5 to 0.7 to absorb single-batch infra spikes
+# (e.g. lustre I/O contention briefly slowing docker load). 58775 trended
+# 0 -> 0.39 over 3 batches at the old timeout; 0.7 gives cushion past
+# that range while still tripping on a true cluster-wide outage.
+export NAIVE_INFRA_DROP_RATE_LIMIT=0.7
 # Tell the rollout fn to NOT spawn a NodeWorker on the actor node (head).
 # Without this, the head node would get an instance-subprocess pool on
 # top of Megatron + Ray driver — exactly the round-1 OOM vector.

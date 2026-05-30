@@ -34,8 +34,13 @@ class DockerEnvironmentConfig(BaseModel):
     """
     container_timeout: str = "2h"
     """Max duration to keep container running. Uses the same format as the sleep command."""
-    pull_timeout: int = 120
-    """Timeout in seconds for pulling images."""
+    pull_timeout: int = 600
+    """Timeout in seconds for pulling images. Was 120; bumped to 600 because
+    the lustre wrapper's `docker load < tarball` of a fresh 2.5 GB image over
+    busy Lustre can routinely take 2-5 minutes. 58775 hit infra_drop_rate
+    climbing 0 -> 0.26 -> 0.32 -> 0.39 over 3 batches as cold-cache loads
+    timed out at 120s; raising to 600s gives the wrapper room without
+    waiting for natural cache warm-up."""
     interpreter: list[str] = ["bash", "-lc"]
     """Interpreter to use to execute commands. Default is ["bash", "-lc"].
     The actual command will be appended as argument to this. Override this to e.g., modify shell flags
