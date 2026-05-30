@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -104,10 +105,24 @@ def evaluate_rebench_instance(
                 *test_cmds,
             ]
         )
+        # --memory=256g caps both the agent-side and eval-side containers at
+        # the same per-container ceiling. The agent's DockerEnvironment
+        # already sets this on the interactive container; this here is the
+        # OTHER docker invocation (GT eval pytest), which was previously
+        # uncapped. 58672 OOM root cause: an eval pytest mmap'd a multi-TB
+        # file-backed working set and exhausted host RAM (3.68TB RSS on
+        # a4-65) because no cgroup limit bound. The same cap that catches
+        # heap-leak runaway also catches file-backed page accumulation under
+        # cgroup pressure.
+        memory_cap = os.environ.get("MSWEA_EVAL_DOCKER_MEMORY", "256g")
         docker_cmd = [
             "docker",
             "run",
             "--rm",
+            "--memory",
+            memory_cap,
+            "--memory-swap",
+            memory_cap,
             "--network",
             "host",
             "-e",
