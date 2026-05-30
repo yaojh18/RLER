@@ -91,17 +91,23 @@ class DockerEnvironment:
         produced a stream of dummy rollouts when an image was missing from
         the lustre tarball cache; see slime job 57677.
         """
-        container_name = f"swe_agent-{uuid.uuid4().hex[:8]}"
-        cmd = [
-            self.config.executable,
-            "run",
-            "-d",
-            "--name",
-            container_name,
-        ]
+        # Per-attempt container_name (NOT reused across retries). With a
+        # single name shared by all retries, any attempt where docker
+        # actually started the container but subprocess.run reported a
+        # failure (e.g. timeout from the lustre wrapper's `docker load`
+        # or transient flock contention) leaves attempts N+1, N+2 doomed
+        # to fail with:
+        #   docker: Error response from daemon: Conflict.
+        #   The container name "/swe_agent-XYZ" is already in use by …
+        # Found in 100% (1644/1644) of trial failures in run 58717
+        # @ infra_drop_rate ~30%. A fresh name per attempt is the minimum
+        # fix; the half-started container from the first attempt will exit
+        # cleanly via `--rm` when its `sleep` timer expires.
+        base_cmd = [self.config.executable, "run", "-d"]
+        tail_cmd = []
         if self.config.cwd:
-            cmd.extend(["-w", self.config.cwd])
-        cmd.extend([
+            tail_cmd.extend(["-w", self.config.cwd])
+        tail_cmd.extend([
             *self.config.run_args,
             self.config.image,
             "sleep",
@@ -110,6 +116,8 @@ class DockerEnvironment:
         max_retries = max(1, int(self.config.start_container_retries))
         last_exc: BaseException | None = None
         for attempt in range(max_retries):
+            container_name = f"swe_agent-{uuid.uuid4().hex[:8]}"
+            cmd = [*base_cmd, "--name", container_name, *tail_cmd]
             self.logger.debug(
                 f"Starting container (attempt {attempt + 1}/{max_retries}): {shlex.join(cmd)}"
             )
