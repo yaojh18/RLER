@@ -296,6 +296,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Forwarded to slime train_async.py. TIS upper clip C (default 2.0 inside slime).",
     )
     parser.add_argument(
+        "--use-rollout-logprobs",
+        action="store_true",
+        default=False,
+        help=(
+            "Forwarded to slime train_async.py. Use sampling-time rollout "
+            "log-probs as the PPO 'old' reference instead of running a "
+            "separate Megatron compute_log_prob pass. Mutually exclusive "
+            "with --use-tis (asserted in slime arguments.py)."
+        ),
+    )
+    parser.add_argument(
         "--dynamic-sampling-filter-path",
         type=str,
         default=None,
@@ -356,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.tis_clip is not None:
         tis_arg_parts.extend(["--tis-clip", str(args.tis_clip)])
     tis_arg = shlex.join(tis_arg_parts) if tis_arg_parts else ""
+    rollout_logprobs_arg = "--use-rollout-logprobs" if args.use_rollout_logprobs else ""
     save_debug_arg = (
         shlex.join(["--save-debug-train-data", args.save_debug_train_data])
         if args.save_debug_train_data else ""
@@ -492,6 +504,7 @@ python3 train_async.py \\
   "${{GRPO_MISC_ARGS[@]}}" \\
   {dynamic_filter_arg} \\
   {tis_arg} \\
+  {rollout_logprobs_arg} \\
   {save_debug_arg} \\
   {save_debug_rollout_arg} \\
   {wandb_args}
