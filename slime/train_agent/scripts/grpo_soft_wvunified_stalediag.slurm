@@ -110,7 +110,11 @@ mkdir -p $RUN_DIR $SLURM_LOGS $RUN_DIR/_logs
 
 HF_CHECKPOINT=/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-9B
 LOAD_DIR=/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/slime_qwen35/ckpt/Qwen3.5-9B_torch_dist_latest
-SAVE_DIR=/mnt/localssd/rler-runs/${SLURM_JOB_ID}-grpo-soft-wvunified-stalediag/policy_ckpt
+# Save to lustre so the ckpt survives the slurm job releasing nodes.
+# 58778 saved to /mnt/localssd and was unresumable after its NCCL crash at
+# step 29. Lustre is at 85-95% utilization per tenant; save-interval is 10
+# (configs/grpo.sh:2), giving ~6 saves * ~18 GB = ~108 GB per 60-rollout run.
+SAVE_DIR=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler_ckpts/${SLURM_JOB_ID}-grpo-soft-wvunified-stalediag/policy_ckpt
 PROMPT_DATA=$RUN_DIR/grpo_prompts.jsonl
 
 echo "[$(date)] jobid=$SLURM_JOB_ID nodes=$SLURM_JOB_NUM_NODES head=$HEAD_NODE head_ip=$HEAD_IP"
@@ -242,6 +246,16 @@ export SWE_AGENT_NAIVE_MAX_PENDING=$OVER_SAMPLING_BATCH_SIZE
 # 0 -> 0.39 over 3 batches at the old timeout; 0.7 gives cushion past
 # that range while still tripping on a true cluster-wide outage.
 export NAIVE_INFRA_DROP_RATE_LIMIT=0.7
+# NCCL diagnostics for trainer-side hangs. 58778 died at step 29 on a
+# TENSOR_MODEL_PARALLEL_GROUP ALLGATHER timeout with no stack trace
+# (FlightRecorder was off). Capturing now so the next hang is debuggable.
+# TRACE_BUFFER_SIZE is per-rank in #ops; 2000 covers ~2 min at the observed
+# rate (~17 TP ops/sec). DUMP_ON_TIMEOUT writes the buffer to per-rank
+# files under $TORCH_NCCL_DEBUG_INFO_TEMP_FILE (defaults to /tmp/nccl_trace_*).
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=$RUN_DIR/_logs/nccl_trace
+export NCCL_DEBUG=WARN
 # Tell the rollout fn to NOT spawn a NodeWorker on the actor node (head).
 # Without this, the head node would get an instance-subprocess pool on
 # top of Megatron + Ray driver — exactly the round-1 OOM vector.
