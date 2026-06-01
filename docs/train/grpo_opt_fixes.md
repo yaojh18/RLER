@@ -492,4 +492,4 @@ Run progression validating the stack:
 | 58778  | step 29 / 60      | trainer NCCL hang on TP group (§13) — transient                                    |
 | 58920  | ~21 min / 60      | cancelled — superseded by 58923 to pick up NCCL trace + lustre SAVE_DIR            |
 | **58923** | **step 50 / 60** | **finished 24 h slurm time-limit cleanly**; 5 lustre ckpts saved                   |
-| 59135  | TBD               | resume from 58923's iter_49, target steps 50-59                                    |
+| **59135** | **step 60 / 60** | **resumed from 58923's iter_49, finished cleanly in 1h32m** (sacct COMPLETED 0:0). 10 steps at mean 390 s/step — 3-4× faster than 58923's late-run pace (fresh sglang state + improved policy + fresh actor process). Final ckpt `iter_0000059` saved. Validates the resume launcher pattern (§14) end-to-end. **Combined 58923+59135 = first full 60-rollout curriculum trained on the wvunified-stalediag recipe.** |
