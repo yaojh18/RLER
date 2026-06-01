@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
+from swe_agent.trajectory_search import _build_step_cards
 from swe_agent.trajectory_search_parallel import (
     ForkGroup,
     InstanceRecord,
@@ -308,11 +309,18 @@ def _build_branch_sample(
             if branch_assistants_with_tokens else "rechattemplate",
             # Per-sample step counts — surfaced for wandb aggregation in
             # collect_lanes_rollout_async.generate_rollout's metrics dict.
-            "n_continuation_steps": len(branch.step_cards),
+            # Post chinsengi rubric-bank rebase: LaneBBranch no longer has
+            # `step_cards` (precomputed); we compute it from branch.events
+            # via _build_step_cards using parent_asst_step as the offset.
+            "n_continuation_steps": len(
+                _build_step_cards(branch.events, branch.parent_asst_step)
+            ),
             "n_trainable_asst_turns": n_trainable_asst_turns,
             "steps_per_round_cap": steps_per_round,
             "n_parent_steps": mid_cp.asst_step,
-            "n_full_trace_steps": mid_cp.asst_step + len(branch.step_cards),
+            "n_full_trace_steps": mid_cp.asst_step + len(
+                _build_step_cards(branch.events, branch.parent_asst_step)
+            ),
             # Patch + eval payload fields surfaced for per-batch WandB ratios
             # (ratio_zero_patch, ratio_full_pass, ratio_regression, ...).
             "terminal_patch_len": len(branch.terminal_patch or ""),
