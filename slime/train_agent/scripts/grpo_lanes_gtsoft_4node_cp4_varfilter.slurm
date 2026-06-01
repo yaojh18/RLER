@@ -70,7 +70,7 @@ HEAD_IP=$(getent ahostsv4 $HEAD_NODE | awk '{print $1}' | head -n 1)
 [ -z "$HEAD_IP" ] && HEAD_IP=$(srun --nodes=1 --ntasks=1 -w $HEAD_NODE hostname -I | awk '{print $1}')
 RAY_PORT=6379
 
-RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER-zsh-trim
+RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench
 SUBSET=$BASE/datasets/v2_python_train_plus_sweep_middle
 RUN_DIR=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/${SLURM_JOB_ID}-grpo-lanes-gtsvf

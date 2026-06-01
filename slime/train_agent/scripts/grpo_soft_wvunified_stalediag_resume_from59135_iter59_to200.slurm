@@ -78,7 +78,7 @@ ROLLOUT_BATCH_SIZE=16
 # with the backend.py O(N^2) deepcopy removal (smaller working set per worker
 # -> less GC/allocator pressure during post-LLM phase).
 OVER_SAMPLING_BATCH_SIZE=24
-NUM_ROLLOUT=60
+NUM_ROLLOUT=200
 NUM_NODES=4
 NUM_GPUS_PER_NODE=8
 # Pure-actor / pure-rollout split: node 0 runs the actor on ALL 8 GPUs
