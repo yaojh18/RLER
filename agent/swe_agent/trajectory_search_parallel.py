@@ -205,6 +205,14 @@ class ParallelSearchConfig:
     # the formal submit command and we fell back to `git diff` of the
     # working copy.
     fallback_patch_penalty: float = 1.0
+    # GT scoring formula — mirror of naive_search.NaiveSearchConfig.reward_kind.
+    # 'soft' (default) = raw_reward straight from eval_payload.
+    # 'delta' = max(0, raw_reward - base_score) where base_score is the soft
+    #   score on the unmodified repo (= p2p_total / (p2p_total + f2p_total)).
+    # The delta variant credits only NEW pass-rate over the baseline; matches
+    # naive's v6a recipe (58063 launcher comment). Wired via env var
+    # SWE_AGENT_LANES_REWARD_KIND through collect_lanes_rollout_async.py.
+    reward_kind: str = "soft"
     # When True, skip Lane C (rubric generation + judge scoring) entirely.
     # Paired with lane_to_grpo_bundle.gt_only_reward=True for GT-only GRPO
     # training. The bank-carry-forward index (_next_lane_c_group_index) is
@@ -1393,18 +1401,36 @@ class TrajectorySearchParallelRunner:
                 payload.get(branch.node_id, {}) if isinstance(payload, dict) else {}
             )
             raw_reward = float(branch_payload.get("reward", 0.0))
+            # Mirror of naive_search.py:583-600 — apply reward_kind scoring.
+            # 'delta' = max(0, raw - p2p_total/(p2p_total+f2p_total)).
+            f2p_total = int(branch_payload.get("f2p_total") or 0)
+            p2p_total = int(branch_payload.get("p2p_total") or 0)
+            denom = f2p_total + p2p_total
+            base_score = (p2p_total / denom) if denom > 0 else 0.0
+            delta_reward = max(0.0, raw_reward - base_score)
+            reward_kind = (self.config.reward_kind or "soft").lower()
+            scored_reward = delta_reward if reward_kind == "delta" else raw_reward
             penalty = float(self.config.fallback_patch_penalty)
             if branch.terminal_patch_from_fallback and penalty != 1.0:
-                branch.gt_score = raw_reward * penalty
+                branch.gt_score = scored_reward * penalty
                 branch.gt_payload = {
                     **branch_payload,
                     "raw_reward": raw_reward,
+                    "base_score": base_score,
+                    "delta_reward": delta_reward,
+                    "reward_kind": reward_kind,
                     "fallback_penalty": penalty,
                     "note": "patch_from_git_diff_fallback",
                 }
             else:
-                branch.gt_payload = branch_payload
-                branch.gt_score = raw_reward
+                branch.gt_payload = {
+                    **branch_payload,
+                    "raw_reward": raw_reward,
+                    "base_score": base_score,
+                    "delta_reward": delta_reward,
+                    "reward_kind": reward_kind,
+                }
+                branch.gt_score = scored_reward
             logger.info(
                 "[%s] gt_done node=%s dt=%.1fs reward=%.3f",
                 self.task_id, branch.node_id, time.perf_counter() - t_gt,

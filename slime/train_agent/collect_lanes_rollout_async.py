@@ -161,6 +161,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             lane_b_top_p=task.get("lane_b_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
             disable_rubric=task.get("disable_rubric", False),
+            reward_kind=task.get("reward_kind", "soft"),
         )
         run_dir = (
             output_root / instance_id
@@ -405,6 +406,11 @@ def _lanes_values_from_env() -> dict[str, Any]:
         # GT-only training: skip rubric/judge in trajectory_search_parallel
         # and use branch.gt_score as the reward in the bundler.
         "disable_rubric": _bool("SWE_AGENT_LANES_DISABLE_RUBRIC", False),
+        # GT reward scoring formula (mirror of naive_search.reward_kind):
+        # 'soft' = raw_reward, 'delta' = max(0, raw - base_score) where
+        # base_score = p2p_total / (p2p_total + f2p_total). Applied inside
+        # ParallelSearchRunner._evaluate_gt.
+        "reward_kind": (os.environ.get("SWE_AGENT_LANES_REWARD_KIND") or "soft").lower(),
     }
 
 
