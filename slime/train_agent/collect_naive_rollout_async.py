@@ -151,6 +151,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             format_error_consecutive_kill=task.get(
                 "format_error_consecutive_kill", 0
             ),
+            export_token_id=task.get("export_token_id", False),
         )
         run_dir = (
             output_root / instance_id
@@ -429,6 +430,12 @@ def _naive_values_from_env() -> dict[str, Any]:
         v = os.environ.get(name, "")
         return float(v) if v else default
 
+    def _bool(name, default):
+        v = os.environ.get(name, "")
+        if not v:
+            return default
+        return v.strip().lower() in ("1", "true", "yes", "on")
+
     return {
         "m": _int("SWE_AGENT_NAIVE_M", 8),
         "step_limit": _int("SWE_AGENT_NAIVE_STEP_LIMIT", 120),
@@ -450,6 +457,7 @@ def _naive_values_from_env() -> dict[str, Any]:
         "format_error_consecutive_kill": _int(
             "SWE_AGENT_NAIVE_FORMAT_ERROR_CONSECUTIVE_KILL", 0
         ),
+        "export_token_id": _bool("SWE_AGENT_NAIVE_EXPORT_TOKEN_ID", False),
     }
 
 

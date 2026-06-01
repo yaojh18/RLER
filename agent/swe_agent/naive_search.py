@@ -121,6 +121,15 @@ class NaiveSearchConfig:
     # without paying per-turn HTTP-poll overhead.
     format_error_consecutive_kill: int = 0
 
+    # When True, also write `messages_raw.json` next to `messages.json` in
+    # each rollout dir. The _raw file preserves token-level fields
+    # (prompt_token_ids/token_ids/logprobs/usage/...) that `messages.json`
+    # strips, which makes it 10-100x larger and the dominant footprint of a
+    # GRPO run (job 58923: 180 GB / 205 GB total). Off by default — flip on
+    # only when you need offline trajectory replay or token-age analysis
+    # (e.g. analyze_weight_versions.py, trace_latency_breakdown.py).
+    export_token_id: bool = False
+
 
 
 @dataclass
@@ -741,9 +750,10 @@ class NaiveSearchRunner:
             (rdir / "messages.json").write_text(
                 json.dumps(_strip_token_fields(stamped), indent=2, default=str)
             )
-            (rdir / "messages_raw.json").write_text(
-                json.dumps(stamped, indent=2, default=str)
-            )
+            if self.config.export_token_id:
+                (rdir / "messages_raw.json").write_text(
+                    json.dumps(stamped, indent=2, default=str)
+                )
             (rdir / "terminal_patch.txt").write_text(r.terminal_patch or "")
             (rdir / "gt.json").write_text(
                 json.dumps(
