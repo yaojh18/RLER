@@ -145,10 +145,13 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
 
         cfg = ParallelSearchConfig(
             m=task["m"],
-            max_mid_cps=task["max_mid_cps"],
-            steps_per_round=task["steps_per_round"],
+            # Post chinsengi rubric-bank rebase the field names changed:
+            # max_mid_cps -> max_rounds, steps_per_round -> k, seed removed.
+            # Task dict still uses the old keys (env-set in slurm launcher)
+            # so remap here instead of churning every launcher.
+            max_rounds=task["max_mid_cps"],
+            k=task["steps_per_round"],
             step_limit=task["step_limit"],
-            seed=task.get("seed"),
             gt_eval_workers=task.get("gt_eval_workers", 8),
             lane_b_pool_size=task.get("lane_b_pool_size") or (task["m"] * task["max_mid_cps"]),
             keep_images=False,

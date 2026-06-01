@@ -205,6 +205,14 @@ class ParallelSearchConfig:
     # the formal submit command and we fell back to `git diff` of the
     # working copy.
     fallback_patch_penalty: float = 1.0
+    # When True, skip Lane C (rubric generation + judge scoring) entirely.
+    # Paired with lane_to_grpo_bundle.gt_only_reward=True for GT-only GRPO
+    # training. The bank-carry-forward index (_next_lane_c_group_index) is
+    # still advanced so the group chain doesn't deadlock — see
+    # _run_lane_c_in_order. Originally added in 9b55163, removed in the
+    # chinsengi rubric-bank rebase, and reinstated here so 56451/57510-class
+    # GT-only lanes runs work again post-rebase.
+    disable_rubric: bool = False
 
     def __post_init__(self) -> None:
         if self.p != 1:
@@ -1814,6 +1822,16 @@ class TrajectorySearchParallelRunner:
     async def _run_lane_c_in_order(self, group: ForkGroup) -> None:
         """Run Lane C as soon as this group is terminal, preserving rubric-bank order."""
         condition = self._lane_c_condition
+        # GT-only mode: skip Lane C entirely but still advance the bank-carry
+        # forward index so the next group's wait_for can proceed.
+        if self.config.disable_rubric:
+            async with condition:
+                await condition.wait_for(
+                    lambda: self._next_lane_c_group_index == group.group_index
+                )
+                self._next_lane_c_group_index += 1
+                condition.notify_all()
+            return
         async with condition:
             await condition.wait_for(
                 lambda: self._next_lane_c_group_index == group.group_index
