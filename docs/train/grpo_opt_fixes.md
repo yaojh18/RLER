@@ -234,3 +234,262 @@ needed on docker pull.
   (`slime/train_agent/collect_naive_rollout_async.py:585+`) batches additions
   every ~1 s during the WAITING loop. Drop a `logger.info("[INST] buffered")`
   there if per-trial harvest latency ever becomes a question.
+
+---
+
+## 8. `docker.py` reused `container_name` across retries → 100% of L3 trips
+(commit `6d90e6e`)
+
+**Symptom.** 58673 tripped the L3 circuit-breaker at step 33
+(`infra_drop_rate=69 %`, 56/81). Siblings 58717 (rolloutlp) and 58718 (tis)
+ran with the same buggy module pre-loaded and sustained 30-45 % infra-drop
+the whole way; 58718 eventually tripped at its own step ~33.
+
+**Root cause.** `agent/swe_agent/environments/docker.py:_start_container()`
+generated `container_name = "swe_agent-<uuid_hex[:8]>"` **once** outside the
+retry loop, then reused it for every `start_container_retries` attempt.
+When attempt N actually started the container but `subprocess.run` thought it
+failed (timeout from the lustre wrapper's `docker load`, flock contention
+from the new per-image-flock wrapper, etc.), attempts N+1 and N+2 hit:
+
+```
+docker: Error response from daemon: Conflict.
+The container name "/swe_agent-XYZ" is already in use by container "..."
+```
+
+100 % (1644/1644) of trial-level RuntimeError failures in 58717's
+training.log had this exact signature.
+
+**Fix.** Move `container_name` generation INSIDE the retry loop and rebuild
+`cmd` per attempt. The half-started container from the first attempt exits
+cleanly via `--rm` when its `sleep` timer expires; no need for active
+`docker rm -f`.
+
+**Validation.** 58775 (post-fix, before pull_timeout fix below): **0 name
+conflicts in 492 trial failures**. The name-conflict bug never re-appeared
+in 58923's full 50-step run either.
+
+---
+
+## 9. `pull_timeout` 120 → 600 s
+(commit `d69c178`)
+
+**Symptom (uncovered by 58775).** After the container-name fix held, a new
+failure class surfaced: trials failing with
+`TimeoutExpired: ... timed out after 120 seconds | docker_stderr=''`.
+Cold lustre cache + 2.5 GB image tarballs routinely take >120 s to
+`docker load`. 58775's `infra_drop_rate` climbed 0 → 0.26 → 0.32 → 0.39 over
+3 batches; cancelled preemptively to prevent the (then-default) 0.5 L3 trip.
+
+**Fix.** `pull_timeout: int = 120` → `pull_timeout: int = 600` in
+`agent/swe_agent/environments/docker.py:37`. Same retry contract (3
+attempts), each now has 10 min to complete `docker load` + container start.
+
+**Caveat.** Some specific images still time out at 600 s under lustre
+contention (observed in 58923: `meltano__sdk-2144`, `aio-libs__aiohttp-9318`,
+`pymodbus-dev__pymodbus-2678`, `banesullivan__localtileserver-236`,
+`getmoto__moto-8796`, `pythainlp__pythainlp-1062` — each lost 8/8 trials).
+Single bad-image instances do not trip L3; cumulative ~1000 trial failures
+across 50 steps in 58923 stayed under the cap.
+
+---
+
+## 10. `NAIVE_INFRA_DROP_RATE_LIMIT` 0.5 → 0.7
+(commit `d69c178`, set in launcher)
+
+**Why.** Defense in depth alongside §9. Even with pull_timeout=600 the
+infra-drop trajectory can spike to ~0.3-0.5 transiently when many workers
+hit the same cold image simultaneously. Default 0.5 trips on those spikes;
+0.7 absorbs them while still tripping on cluster-wide outages.
+
+**Where.** Exported in
+`slime/train_agent/scripts/grpo_soft_wvunified_stalediag.slurm:248`
+(close to `SWE_AGENT_NAIVE_MAX_PENDING`). Read by
+`collect_naive_rollout_async.py:1090` via `os.getenv`.
+
+**Validation.** 58923 saw a single-batch spike to **0.534** at step 24 (the
+veth-bridge incident in §12) — would have tripped the default 0.5, was
+absorbed by 0.7. Run continued and finished 50 steps.
+
+---
+
+## 11. NCCL FlightRecorder + lustre SAVE_DIR
+(commit `72e31b8`)
+
+**Symptom.** 58778 (post §8 + §9 fixes) ran 13.5 h, trained 29 steps, then
+died on a `MegatronTrainRayActor` NCCL ALLGATHER timeout on
+`TENSOR_MODEL_PARALLEL_GROUP`. The slurm log said *"Stack trace of the
+failed collective not found, potentially because FlightRecorder is
+disabled"* — nothing actionable. Memory was rock-stable across the run
+(allocated_GB 65.22 → 65.28 over 13.5 h; reserved_GB 129.85 throughout),
+ruling out OOM/leak. Most likely transient IB/RDMA blip on
+`TENSOR_MODEL_PARALLEL_GROUP` rank 0.
+
+**Fix part A — NCCL diagnostics.** Added to the launcher (after
+`NAIVE_INFRA_DROP_RATE_LIMIT`):
+
+```bash
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=$RUN_DIR/_logs/nccl_trace
+export NCCL_DEBUG=WARN
+```
+
+Per-rank ring buffer of last 2000 NCCL ops (~2 min at the observed
+~17 TP-ops/sec rate). Next hang will write per-rank stack-traced dumps
+under `$RUN_DIR/_logs/nccl_trace_*`.
+
+**Fix part B — Lustre SAVE_DIR.** 58778's `SAVE_DIR=/mnt/localssd/...` was
+unrecoverable post-crash. The compute nodes' `/mnt/localssd` *isn't* wiped
+by slurm (verified — old job dirs from 57661/57673/57827 still present on
+a4-2's localssd), BUT 58778's `iter_*` directories were gone anyway from
+all 4 of its assigned nodes (a4-138/120/65/36). The slurm log explicitly
+reported `successfully saved checkpoint from iteration 9` and `... 19` to
+localssd, but follow-up `find` on every job node showed only `wandb/` and
+`rollout/` subdirs — no `iter_*`, no `latest_checkpointed_iteration.txt`.
+Most likely an out-of-band cleanup hits localssd asynchronously (another
+tenant's prolog, kernel pressure, or a node reboot between jobs).
+
+The fix moves SAVE_DIR to lustre:
+```
+SAVE_DIR=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler_ckpts/${SLURM_JOB_ID}-...
+```
+With `save-interval=10` and Qwen3.5-9B bf16 (~18 GB/ckpt), a 60-rollout run
+uses ~108 GB on lustre — acceptable given lustre is at 85-95 % per tenant.
+
+**Validation.** 58923 produced **5 resumable lustre checkpoints**:
+`iter_9`, `iter_19`, `iter_29`, `iter_39`, `iter_49`. All persist after job
+end, all readable for resume.
+
+---
+
+## 12. Docker veth bridge exhaustion (NOT FIXED — documented)
+
+**Symptom (surfaced in 58923 step 24).** A single batch hit
+`infra_drop_rate=0.534` with **0** new `TimeoutExpired` errors. Inspecting
+the actual error stack:
+
+```
+docker: Error response from daemon: failed to set up container networking:
+failed to create endpoint swe_agent-XXX on network bridge:
+adding interface vethXXXX to bridge docker0 failed: exchange full
+```
+
+Linux kernel limits the number of veth interfaces a single bridge can
+hold (`docker0` default ≤ 1024). With ~1000+ short-lived containers churning
+during long runs and `--rm` cleanup running asynchronously, veth pairs
+accumulate faster than they can be torn down.
+
+**Current behaviour.** Self-recovers as containers cycle out — 58923's
+0.534 spike at step 24 was followed by 0.0 for the next several batches.
+Bounded enough that the 0.7 L3 limit absorbs it.
+
+**Fix candidates (none landed yet).**
+1. Periodic `docker network prune -f` on each compute node — needs a slurm
+   prolog or background cron alongside the worker processes.
+2. Raise the kernel bridge limit
+   (`sysctl net.bridge.bridge-nf-call-iptables=0` won't do it directly;
+   need to bump `MAX_BRIDGE_PORTS` which is compile-time).
+3. Use `--network=none` for trials that don't need network egress (most
+   swe-rebench instances don't talk to anything external — the sglang HTTP
+   endpoints are reached via the agent process, not from inside the
+   per-trial container).
+4. Spin up containers in a per-node user-namespace network rather than
+   sharing `docker0`.
+
+For now: tolerate the occasional spike. If sustained >0.3 across many
+batches becomes the norm, prioritise option (1).
+
+---
+
+## 13. Trainer NCCL hang post-mortem (one-off; recovery validated)
+
+**58778's actual failure mode** (detail backing §11). The crashing op:
+
+```
+[Rank 0] Watchdog caught collective operation timeout:
+  WorkNCCL(SeqNum=809868, OpType=ALLGATHER,
+           NumelIn=100663296, NumelOut=100663296,
+           Timeout(ms)=600000) ran for 600018 ms
+  [PG ID 5 PG GUID 22(TENSOR_MODEL_PARALLEL_GROUP) Rank 0]
+  last enqueued work: 809948, last completed work: 809867
+```
+
+Rank 0 had **enqueued 80 ops AHEAD** of the one that hung — its CUDA queue
+was healthy. The hang was on collective communication with a peer rank.
+The 100,663,296 = 96 × 1024² elements ≈ 200 MB bf16 → normal Megatron
+column-parallel ALLGATHER, not an anomalous tensor size. Work seq 809 868
+on TP group → ~17 ops/sec over 13.5 h, normal Megatron op rate.
+
+Other rank logs showed `Last enqueued NCCL work: 58, last completed: 58`
+for `default_pg` — red herring. Those are different communicators; the
+"58" count just means those ranks had been quiescent on default_pg,
+blocked downstream of the actual culprit (the TP-group ALLGATHER).
+
+**Verdict.** Transient IB/RDMA blip on actor node `a4-138` during
+58778's step 29 training. Memory profile across the entire run was flat;
+broadcast 2 s before the hang was healthy; backend.py / docker.py changes
+don't touch NCCL paths.
+
+58923 — same code, same hyperparameters, different actor node — ran 50
+steps over 24 h without any NCCL timeout. Confirms one-off. The
+FlightRecorder hook (§11) is in place for the next occurrence.
+
+---
+
+## 14. Resume launcher pattern
+(commit `c3db812`, validated by 59135)
+
+**Why.** 58923 hit the 24 h slurm time-limit at step 50/60. The
+`grpo_resume_from50.sh` + `..._resume_from58923_iter49.slurm` pair finishes
+the last 10 rollouts from iter_49 ckpt **without touching the canonical
+launcher**. Pattern is reusable for any future time-truncated run.
+
+**Two-file diff:**
+- `configs/grpo_resume_from50.sh` — copy of `grpo.sh` with
+  `--start-rollout-id 0` → `--start-rollout-id 50`. `--finetune` kept
+  (weights-only resume — the path validated in 58514 per
+  `project_slime_grpo_resume_gotcha` memory; optimizer state restarts fresh).
+- `scripts/grpo_soft_wvunified_stalediag_resume_from58923_iter49.slurm` —
+  copy of the canonical launcher with `LOAD_DIR` → 58923's saved ckpt,
+  job name + SAVE_DIR retagged, `--config-path` pointing at the resume
+  config.
+
+**Slime's resume contract** (read off `slime/utils/arguments.py:1560-1584`):
+- If `args.load` points at a dir with `latest_checkpointed_iteration.txt`
+  → keep `args.start_rollout_id` as set; Megatron loads the iter dir.
+- If `args.load` is missing or HF-only → force `start_rollout_id=0` and
+  `args.finetune=True, no_load_optim=True, no_load_rng=True`.
+
+So the resume just needs both:
+(a) `--load` pointing at a real Megatron ckpt dir with `latest_checkpointed_iteration.txt`,
+(b) `--start-rollout-id N` set to the next rollout index.
+
+---
+
+## 15. Combined fix tally as of `c3db812`
+
+| commit  | file                                                  | what                                                          |
+|---------|-------------------------------------------------------|---------------------------------------------------------------|
+| 9b7c2bf | `agent/swe_agent/backend.py` + `agent_rl/protocol.py` | drop O(N²) `query_messages` deepcopy in `step()` (§1)         |
+| 9b7c2bf | `grpo_soft_wvunified_stalediag.slurm`                 | OVER_SAMPLING_BATCH_SIZE 32 → 24 (§2)                         |
+| 6d90e6e | `agent/swe_agent/environments/docker.py`              | fresh container_name per retry attempt (§8)                   |
+| d69c178 | `agent/swe_agent/environments/docker.py`              | pull_timeout 120 → 600 s (§9)                                 |
+| d69c178 | `grpo_soft_wvunified_stalediag.slurm`                 | NAIVE_INFRA_DROP_RATE_LIMIT 0.5 → 0.7 (§10)                   |
+| 72e31b8 | `grpo_soft_wvunified_stalediag.slurm`                 | NCCL FlightRecorder env + lustre SAVE_DIR (§11)               |
+| c3db812 | `configs/grpo_resume_from50.sh` (new)                 | resume config: --start-rollout-id 50 (§14)                    |
+| c3db812 | `scripts/..._resume_from58923_iter49.slurm` (new)     | resume launcher: LOAD_DIR → 58923's iter_49 ckpt (§14)        |
+
+Run progression validating the stack:
+
+| run    | died/finished at | failure / outcome                                                                  |
+|--------|-------------------|------------------------------------------------------------------------------------|
+| 58541  | step 33 / 60      | L3 trip 69 % (container_name retry bug — §8)                                       |
+| 58673  | step 33 / 60      | same bug (the original; spawned this investigation)                                |
+| 58717  | step ~33 / 60     | same bug with old module pre-loaded (per-sample-mean + rolloutlp variant)          |
+| 58718  | step ~33 / 60     | same bug with old module pre-loaded (per-sample-mean + tis variant)                |
+| 58775  | step 9 / 60       | cancelled — pull_timeout (§9) climbing toward L3                                   |
+| 58778  | step 29 / 60      | trainer NCCL hang on TP group (§13) — transient                                    |
+| 58920  | ~21 min / 60      | cancelled — superseded by 58923 to pick up NCCL trace + lustre SAVE_DIR            |
+| **58923** | **step 50 / 60** | **finished 24 h slurm time-limit cleanly**; 5 lustre ckpts saved                   |
+| 59135  | TBD               | resume from 58923's iter_49, target steps 50-59                                    |
