@@ -217,6 +217,21 @@ export SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY=$LANES_FALLBACK_PATCH_PENALTY
 export SWE_AGENT_LANES_DISABLE_RUBRIC=$LANES_DISABLE_RUBRIC
 export RLER_REWARD_SCHEME=$REWARD_SCHEME
 
+# Ported from naive wvunified-stalediag fixes (docs/train/grpo_opt_fixes.md
+# §10 + §11). Lanes uses the same docker.py + Megatron NCCL paths as naive,
+# so the same fixes apply:
+#   - NAIVE_INFRA_DROP_RATE_LIMIT 0.5 -> 0.7: absorb transient docker spikes
+#     (veth-bridge exhaustion §12, pull-timeout bursts §9). Default 0.5 was
+#     tripping the L3 guard on bursty failure batches.
+#   - NCCL FlightRecorder: 58778's TENSOR_MODEL_PARALLEL_GROUP ALLGATHER
+#     timeout (§13) gave no stack trace because FlightRecorder was off; this
+#     captures per-rank ring buffer of last N ops for the next hang.
+export NAIVE_INFRA_DROP_RATE_LIMIT=0.7
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=$RUN_DIR/_logs/nccl_trace
+export NCCL_DEBUG=WARN
+
 MY_IP=$(hostname -I | awk '{print $1}')
 echo "[node=$NODE] my_ip=$MY_IP head=$HEAD_NODE head_ip=$HEAD_IP"
 
