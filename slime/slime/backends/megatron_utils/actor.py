@@ -144,9 +144,19 @@ class MegatronTrainRayActor(TrainRayActor):
         # empty cache after initialization
         clear_memory()
 
-        if self.args.offload_train:
-            # recover to actor in the end.
+        # recover to actor in the end. Needed unconditionally:
+        # train_async.py does an initial actor_model.update_weights() right
+        # after init (so sglang has the loaded weights before the first
+        # rollout), and update_weight_from_distributed iterates self.model
+        # .parameters() directly — not the weights_backuper.get("actor")
+        # lambda. After load_other_checkpoint("ref", base) above, self.model
+        # holds ref weights, so without this switch the initial broadcast
+        # sends ref to sglang. Only bites when ref_load != load (e.g. resume
+        # from mid-training ckpt while keeping the pretrained base as KL
+        # anchor); the previous offload_train-only gate hid the bug.
+        if self._active_model_tag != "actor":
             self._switch_model("actor")
+        if self.args.offload_train:
             self.sleep()
 
         self.rollout_engines = None
