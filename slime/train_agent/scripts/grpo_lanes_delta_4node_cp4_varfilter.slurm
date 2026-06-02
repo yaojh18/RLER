@@ -50,7 +50,16 @@ LANES_LANE_B_TOP_P=0.95
 LANES_FALLBACK_PATCH_PENALTY=0.5
 LANES_DISABLE_RUBRIC=1
 ROLLOUT_BATCH_SIZE=16
-OVER_SAMPLING_BATCH_SIZE=48
+# Concurrency cap on in-flight INSTANCES. With LANES_MAX_MID_CPS=6 and avg
+# ~3 fork groups per instance, 16 instances saturate the cluster and yield
+# ~48 groups in flight — more than enough to fill OVER_SAMPLING_GROUPS=24.
+OVER_SAMPLING_BATCH_SIZE=16
+# Group-units buffer target. Dispatch stops once
+# buffer_groups + pending_instances * est_groups_per_instance >= this.
+# 24 groups = 16 trainable groups (ROLLOUT_BATCH_SIZE) + 50% filter headroom.
+# Lanes' fork groups are independent GRPO units, so we count GROUPS here,
+# not instances (matches naive's per-trial accounting in spirit).
+OVER_SAMPLING_GROUPS=24
 NUM_ROLLOUT=200
 NUM_NODES=4
 NUM_GPUS_PER_NODE=8
@@ -136,6 +145,7 @@ LANES_DISABLE_RUBRIC=$LANES_DISABLE_RUBRIC
 LANES_REWARD_KIND=$LANES_REWARD_KIND
 ROLLOUT_BATCH_SIZE=$ROLLOUT_BATCH_SIZE
 OVER_SAMPLING_BATCH_SIZE=$OVER_SAMPLING_BATCH_SIZE
+OVER_SAMPLING_GROUPS=$OVER_SAMPLING_GROUPS
 NUM_ROLLOUT=$NUM_ROLLOUT
 NUM_NODES=$NUM_NODES
 NUM_GPUS_PER_NODE=$NUM_GPUS_PER_NODE
@@ -209,6 +219,7 @@ export SWE_AGENT_LANES_STEPS_PER_ROUND=$LANES_STEPS_PER_ROUND
 export SWE_AGENT_LANES_STEP_LIMIT=$LANES_STEP_LIMIT
 export SWE_AGENT_LANES_INSTANCE_WORKERS=$LANES_INSTANCE_WORKERS
 export SWE_AGENT_LANES_MAX_PENDING=$OVER_SAMPLING_BATCH_SIZE
+export SWE_AGENT_LANES_OVER_SAMPLING_GROUPS=$OVER_SAMPLING_GROUPS
 export SWE_AGENT_LANES_GT_EVAL_WORKERS=$LANES_GT_EVAL_WORKERS
 export SWE_AGENT_LANES_COMPLETION_MAX_TOKENS=$LANES_COMPLETION_MAX_TOKENS
 export SWE_AGENT_LANES_POLICY_TEMPERATURE=$LANES_POLICY_TEMPERATURE
@@ -300,7 +311,7 @@ if [ "$NODE" = "$HEAD_NODE" ]; then
       --search-output-root $RUN_DIR/lane_out \
       --student-model "$GRPO_MODEL_NAME" \
       --rollout-batch-size $ROLLOUT_BATCH_SIZE \
-      --over-sampling-batch-size $OVER_SAMPLING_BATCH_SIZE \
+      --over-sampling-batch-size $OVER_SAMPLING_GROUPS \
       --global-batch-size $((ROLLOUT_BATCH_SIZE * LANES_M)) \
       --num-rollout $NUM_ROLLOUT \
       --num-nodes $NUM_NODES \

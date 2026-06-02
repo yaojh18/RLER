@@ -213,6 +213,14 @@ class ParallelSearchConfig:
     # naive's v6a recipe (58063 launcher comment). Wired via env var
     # SWE_AGENT_LANES_REWARD_KIND through collect_lanes_rollout_async.py.
     reward_kind: str = "soft"
+    # When True, truncate the per-branch training sample to the first k
+    # assistant turns AFTER the fork point. The branch still RUNS to step_limit
+    # (we need the final patch for GT scoring), but the trainable tail beyond
+    # step k is dropped from both token_ids and loss_mask. Cuts megatron
+    # forward/backward by ~5x for k=20, step_limit=120 — matches the original
+    # design intent (loss only on the diverging first k steps; later steps are
+    # only there to materialize a scorable patch).
+    train_first_k_only: bool = True
     # When True, skip Lane C (rubric generation + judge scoring) entirely.
     # Paired with lane_to_grpo_bundle.gt_only_reward=True for GT-only GRPO
     # training. The bank-carry-forward index (_next_lane_c_group_index) is
@@ -446,6 +454,16 @@ class LaneGRPOCollector:
             and message.get("prompt_token_ids")
             and message.get("token_ids")
         ]
+        # Trainable-tail truncation: keep loss/forward on first k assistant
+        # turns AFTER the fork point. The remaining turns ran only to
+        # materialize a scorable terminal patch — they get no gradient signal
+        # and shouldn't bloat the megatron batch tensor.
+        if (
+            self.config.train_first_k_only
+            and self.config.k > 0
+            and len(branch_assistants_with_tokens) > self.config.k
+        ):
+            branch_assistants_with_tokens = branch_assistants_with_tokens[: self.config.k]
         token_ids: list[int]
         loss_mask: list[int]
         response_length: int
@@ -488,7 +506,21 @@ class LaneGRPOCollector:
             token_source = "sglang_stored"
         else:
             parent_norm = [self._export_message(message) for message in parent_messages]
-            branch_norm = [self._export_message(message) for message in branch_messages]
+            branch_msgs_for_training = branch_messages
+            if self.config.train_first_k_only and self.config.k > 0:
+                # Keep everything up to AND including the k-th assistant message;
+                # following tool/user/assistant turns existed only to materialize
+                # a terminal patch and add no gradient signal.
+                kept: list[dict[str, Any]] = []
+                seen_asst = 0
+                for msg in branch_messages:
+                    kept.append(msg)
+                    if msg.get("role") == "assistant":
+                        seen_asst += 1
+                        if seen_asst >= self.config.k:
+                            break
+                branch_msgs_for_training = kept
+            branch_norm = [self._export_message(message) for message in branch_msgs_for_training]
             parent_ids = (
                 tokenize_messages_with_template(
                     parent_norm,
@@ -777,6 +809,7 @@ class TrajectorySearchParallelRunner:
         api_key: str = "EMPTY",
         score_banks: dict[str, ScoreRubricBank] | None = None,
         experience_banks: dict[str, ExperienceRubricBank] | None = None,
+        policy_base_urls: list[str] | None = None,
     ) -> None:
         self.instance = copy.deepcopy(instance)
         self.backend = backend
@@ -789,6 +822,13 @@ class TrajectorySearchParallelRunner:
         self.policy_base_url = policy_base_url.rstrip("/")
         self.rubric_base_url = rubric_base_url.rstrip("/")
         self.api_key = api_key
+        # Per-fork-group endpoint pool. Each fork group gets its own pinned
+        # sglang endpoint so the cluster's DP=N replicas all get useful work
+        # when a single instance generates many groups in parallel. Without
+        # this, all branches of a single instance hammer one engine while the
+        # others sit idle. Lane A uses the first URL. policy_base_url is the
+        # legacy single-endpoint fallback.
+        self.policy_base_urls = [u.rstrip("/") for u in (policy_base_urls or [self.policy_base_url])]
 
         self.task = instance["problem_statement"]
         self.task_id = instance["instance_id"]
@@ -1193,9 +1233,14 @@ class TrajectorySearchParallelRunner:
         if mid_cp.snapshot.get("memory") is not None:
             resumed["memory"] = mid_cp.snapshot["memory"]
         resumed["spec"]["session_id"] = session_id
+        # Per-fork-group endpoint pinning: rotate across the URL pool by
+        # mid_cp.idx so each group's m branches stick to one engine (keeps
+        # the per-group prefix warm in radix cache) but different groups
+        # spread across the cluster's sglang replicas.
+        group_url = self.policy_base_urls[mid_cp.idx % len(self.policy_base_urls)]
         self._override_model_kwargs(
             resumed,
-            self.policy_base_url,
+            group_url,
             temperature=temperature,
             top_p=top_p,
         )
