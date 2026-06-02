@@ -2273,6 +2273,22 @@ class TrajectorySearchParallelRunner:
                         pass
                     break
 
+                # Bail out if the session is finished/error WITHOUT formal
+                # submission. Without this, _run_lane_a_chunk keeps returning
+                # (executed_steps=0, status='finished') forever — the outer
+                # `while cumulative_steps < step_limit` condition never trips
+                # because cumulative_steps stops advancing. Each empty chunk
+                # produces no fork emit (n_step_cards check below) and the
+                # instance bundle never completes -> infinite hang.
+                # Best-effort patch is still extracted at the post-loop `finally`.
+                if lane_a.status in ("finished", "error"):
+                    logger.info(
+                        "[%s] lane_a exit chunk=%d status=%s submitted=False "
+                        "cumulative=%d (early termination without submission)",
+                        self.task_id, chunks_emitted, lane_a.status, cumulative_steps,
+                    )
+                    break
+
                 # Emit a MidCp at this boundary IFF we still have room and
                 # the chunk produced at least one new step. Empty chunks
                 # mean the agent stalled inside its loop — no point forking
