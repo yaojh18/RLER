@@ -50,12 +50,11 @@ LANES_LANE_B_TOP_P=0.95
 LANES_FALLBACK_PATCH_PENALTY=0.5
 LANES_DISABLE_RUBRIC=1
 ROLLOUT_BATCH_SIZE=16
-# Concurrency cap on in-flight INSTANCES (was 48, sized for instance-units
-# over-sampling). With group-units gating below, 16 saturates the cluster.
-OVER_SAMPLING_BATCH_SIZE=16
+# Concurrency cap on in-flight INSTANCES.
+OVER_SAMPLING_BATCH_SIZE=24
 # Group-units buffer target — see grpo_lanes_delta_*_varfilter.slurm for
-# the rationale. 24 groups = 16 trainable + 50% filter headroom.
-OVER_SAMPLING_GROUPS=24
+# the rationale. 48 groups = 16 trainable × 3x variance-filter headroom.
+OVER_SAMPLING_GROUPS=48
 NUM_ROLLOUT=60
 NUM_NODES=4
 NUM_GPUS_PER_NODE=8

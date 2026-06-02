@@ -50,16 +50,16 @@ LANES_LANE_B_TOP_P=0.95
 LANES_FALLBACK_PATCH_PENALTY=0.5
 LANES_DISABLE_RUBRIC=1
 ROLLOUT_BATCH_SIZE=16
-# Concurrency cap on in-flight INSTANCES. With LANES_MAX_MID_CPS=6 and avg
-# ~3 fork groups per instance, 16 instances saturate the cluster and yield
-# ~48 groups in flight — more than enough to fill OVER_SAMPLING_GROUPS=24.
-OVER_SAMPLING_BATCH_SIZE=16
+# Concurrency cap on in-flight INSTANCES.
+OVER_SAMPLING_BATCH_SIZE=24
 # Group-units buffer target. Dispatch stops once
 # buffer_groups + pending_instances * est_groups_per_instance >= this.
-# 24 groups = 16 trainable groups (ROLLOUT_BATCH_SIZE) + 50% filter headroom.
-# Lanes' fork groups are independent GRPO units, so we count GROUPS here,
-# not instances (matches naive's per-trial accounting in spirit).
-OVER_SAMPLING_GROUPS=24
+# 48 groups = 16 trainable groups (ROLLOUT_BATCH_SIZE) × 3x variance-filter
+# headroom. Variance filter drop rate is ~60% on lanes (check_reward_nonzero_std
+# rejects all-positive and all-negative reward groups). 24 was too tight —
+# left the filter with no shallow-fork choices, biasing toward long
+# parent_prefix samples (15k vs 10k tokens) and inflating train step time.
+OVER_SAMPLING_GROUPS=48
 NUM_ROLLOUT=200
 NUM_NODES=4
 NUM_GPUS_PER_NODE=8
