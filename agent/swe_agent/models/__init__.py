@@ -148,6 +148,20 @@ def get_model_class(model_name: str, model_class: str = "") -> type:
             from swe_agent.models.test_models import DeterministicModel
 
             return DeterministicModel
+        # Dynamic-import fallback for arbitrary dotted paths (matches the
+        # docstring's "full import path" promise). Lets external wrappers like
+        # sticky_dp_model_rler.StickyDPLitellmTextbasedModel be selected via
+        # --model-class without registry edits, as long as the containing
+        # module is importable from PYTHONPATH.
+        if "." in full_path:
+            import importlib
+            module_path, _, cls_name = full_path.rpartition(".")
+            try:
+                module = importlib.import_module(module_path)
+                return getattr(module, cls_name)
+            except (ImportError, AttributeError) as e:
+                msg = f"Unknown model class: {model_class} (resolved to {full_path}, dynamic import failed: {e})"
+                raise ValueError(msg) from e
         msg = f"Unknown model class: {model_class} (resolved to {full_path}, available: {_MODEL_CLASS_MAPPING})"
         raise ValueError(msg)
 
