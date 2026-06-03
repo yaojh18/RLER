@@ -182,11 +182,12 @@ class DockerEnvironment:
         cmd.extend([self.container_id, *self.config.interpreter, command])
 
         _t_exec_start = time.perf_counter()
+        _effective_timeout = timeout or self.config.timeout
         try:
             result = subprocess.run(
                 cmd,
                 text=True,
-                timeout=timeout or self.config.timeout,
+                timeout=_effective_timeout,
                 encoding="utf-8",
                 errors="replace",
                 stdout=subprocess.PIPE,
@@ -198,6 +199,48 @@ class DockerEnvironment:
                 _cid = (self.container_id or "")[:12]
                 _cmd_short = (command or "").splitlines()[0][:80] if command else ""
                 self.logger.info(f"[TIMING] docker_exec took={_dt:.2f}s container={_cid} cmd={_cmd_short!r}")
+        except subprocess.TimeoutExpired as e:
+            # CRITICAL: subprocess.run kills the docker exec CLIENT on host
+            # but the command INSIDE the container keeps running indefinitely.
+            # Real-world example: getmoto pytest, weasyprint test_text, and
+            # slackapi oauth tests are known to hang for 10+ hours, pinning
+            # CPU at 99% and keeping the container's PID 1 alive. Without
+            # this kill, leaked pytest accumulates on each node until docker
+            # daemon thread pool is exhausted and every NEW docker_exec call
+            # itself times out at 60s (death spiral observed in 59305 / 59762).
+            # Nuking the container reaps the leaked process; the owning trial
+            # gets returncode=-1 and treats this step as failed, which is the
+            # correct outcome — once any command hangs, the container is
+            # effectively dead to that trial anyway.
+            try:
+                subprocess.Popen(
+                    f"({self.config.executable} kill {self.container_id} 2>/dev/null || "
+                    f" {self.config.executable} rm -f {self.container_id} 2>/dev/null) "
+                    f">/dev/null 2>&1 &",
+                    shell=True,
+                )
+                _cid = (self.container_id or "")[:12]
+                _cmd_short = (command or "").splitlines()[0][:80] if command else ""
+                self.logger.warning(
+                    f"docker_exec TIMEOUT {_effective_timeout}s container={_cid} cmd={_cmd_short!r} "
+                    f"-> killing container to reap leaked in-container process"
+                )
+            except Exception:
+                pass
+            raw_output = getattr(e, "output", None)
+            raw_output = (
+                raw_output.decode("utf-8", errors="replace") if isinstance(raw_output, bytes) else (raw_output or "")
+            )
+            output = {
+                "output": raw_output,
+                "returncode": -1,
+                "exception_info": f"docker_exec timeout after {_effective_timeout}s, container killed: {e}",
+                "extra": {
+                    "exception_type": "TimeoutExpired",
+                    "exception": str(e),
+                    "container_killed": True,
+                },
+            }
         except Exception as e:
             raw_output = getattr(e, "output", None)
             raw_output = (

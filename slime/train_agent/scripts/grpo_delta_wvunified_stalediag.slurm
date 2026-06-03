@@ -135,18 +135,30 @@ chmod -R 777 $CACHE_BASE 2>/dev/null || true
 python3 - <<EOF
 import json, os
 from datasets import load_from_disk
+# Known-hang instances. pytest inside these instances spins forever on
+# specific test files (network polling without timeout, font-rendering bugs,
+# auth race conditions). Each leaked pytest pins ~1 CPU core for 10+ hours
+# on its host and accumulates docker containers that slow the daemon to
+# 60s exec latency (death spiral observed in 59305 / 59762 - see
+# docker.py exec-timeout fix in commit a7XXX). Filter at prompt
+# selection time so we never dispatch them.
+DENYLIST = {
+    "getmoto__moto-7283",            # tests/test_awslambda/test_lambda_eventsourcemapping.py - infinite AWS poll
+    "kozea__weasyprint-2405",        # tests/draw/test_text.py - font rendering hang
+    "slackapi__python-slack-sdk-1638",  # tests/slack_sdk/oauth/installation_store - auth race
+}
 candidate = "$SUBSET/train" if os.path.isdir("$SUBSET/train") else "$SUBSET"
 ds = load_from_disk(candidate)
 if hasattr(ds, "keys") and "train" in ds.keys():
     ds = ds["train"]
-ids = sorted([r["instance_id"] for r in ds])[:$PROMPT_BUDGET]
+ids = sorted([r["instance_id"] for r in ds if r["instance_id"] not in DENYLIST])[:$PROMPT_BUDGET]
 with open("$PROMPT_DATA", "w") as f:
     for iid in ids:
         f.write(json.dumps({
             "input": [{"role": "user", "content": iid}],
             "metadata": {"instance_id": iid, "subset": "$SUBSET", "split": "train"},
         }) + "\n")
-print("Wrote", len(ids), "prompt rows to $PROMPT_DATA")
+print("Wrote", len(ids), "prompt rows to $PROMPT_DATA (denylist drops:", len(DENYLIST), ")")
 EOF
 
 # ----- Per-node setup script (run inside container on each node) -----

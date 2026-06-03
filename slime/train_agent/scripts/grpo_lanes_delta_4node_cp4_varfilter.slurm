@@ -109,18 +109,24 @@ chmod -R 777 $CACHE_BASE 2>/dev/null || true
 python3 - <<EOF
 import json, os
 from datasets import load_from_disk
+# Known-hang instances — see grpo_delta_wvunified_stalediag.slurm for rationale.
+DENYLIST = {
+    "getmoto__moto-7283",
+    "kozea__weasyprint-2405",
+    "slackapi__python-slack-sdk-1638",
+}
 candidate = "$SUBSET/train" if os.path.isdir("$SUBSET/train") else "$SUBSET"
 ds = load_from_disk(candidate)
 if hasattr(ds, "keys") and "train" in ds.keys():
     ds = ds["train"]
-ids = sorted([r["instance_id"] for r in ds])[:$PROMPT_BUDGET]
+ids = sorted([r["instance_id"] for r in ds if r["instance_id"] not in DENYLIST])[:$PROMPT_BUDGET]
 with open("$PROMPT_DATA", "w") as f:
     for iid in ids:
         f.write(json.dumps({
             "input": [{"role": "user", "content": iid}],
             "metadata": {"instance_id": iid, "subset": "$SUBSET", "split": "train"},
         }) + "\n")
-print("Wrote", len(ids), "prompt rows to $PROMPT_DATA")
+print("Wrote", len(ids), "prompt rows to $PROMPT_DATA (denylist drops:", len(DENYLIST), ")")
 EOF
 
 PER_NODE=$RUN_DIR/_snapshot/per_node.sh
