@@ -63,7 +63,7 @@ NAIVE_POLICY_TEMPERATURE=1.0    # naive baseline — single sampling temp
 NAIVE_POLICY_TOP_P=0.95
 NAIVE_FALLBACK_PATCH_PENALTY=0.5
 NAIVE_NO_ACTION_PATCH_PENALTY=0.0  # v2: hard-zero reward for rollouts with zero env actions
-NAIVE_REWARD_KIND=delta             # v6b: scored = raw_reward (no baseline subtraction)
+NAIVE_REWARD_KIND=scaled_delta      # max(0, raw - base) / (1 - base) — headroom-normalized delta
 # v7b: format-error mitigation (job 58062 mode-collapse fix).
 NAIVE_FORMAT_ERROR_PER_STEP_PENALTY=0.02  # linear decay; zeros reward at 50 FE turns
 NAIVE_FORMAT_OK_GATE_THRESHOLD=0.5        # hard zero when >50% of asst turns are FormatError
@@ -78,7 +78,7 @@ ROLLOUT_BATCH_SIZE=16
 # with the backend.py O(N^2) deepcopy removal (smaller working set per worker
 # -> less GC/allocator pressure during post-LLM phase).
 OVER_SAMPLING_BATCH_SIZE=24
-NUM_ROLLOUT=200
+NUM_ROLLOUT=120
 NUM_NODES=4
 NUM_GPUS_PER_NODE=8
 # Pure-actor / pure-rollout split: node 0 runs the actor on ALL 8 GPUs

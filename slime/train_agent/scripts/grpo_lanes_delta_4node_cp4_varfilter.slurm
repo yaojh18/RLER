@@ -60,7 +60,7 @@ OVER_SAMPLING_BATCH_SIZE=24
 # left the filter with no shallow-fork choices, biasing toward long
 # parent_prefix samples (15k vs 10k tokens) and inflating train step time.
 OVER_SAMPLING_GROUPS=48
-NUM_ROLLOUT=200
+NUM_ROLLOUT=120
 NUM_NODES=4
 NUM_GPUS_PER_NODE=8
 ACTOR_NUM_NODES=1
@@ -71,7 +71,7 @@ GRPO_MODEL_NAME="Qwen/Qwen3.5-9B"
 PROMPT_BUDGET=1316
 CONTEXT_PARALLEL_SIZE=4
 REWARD_SCHEME=soft   # gt formula
-LANES_REWARD_KIND=delta              # delta = max(0, raw - p2p/(p2p+f2p))
+LANES_REWARD_KIND=scaled_delta       # max(0, raw - base) / (1 - base) — headroom-normalized delta
 # ====================================================================
 
 NODES=$(scontrol show hostnames $SLURM_JOB_NODELIST)

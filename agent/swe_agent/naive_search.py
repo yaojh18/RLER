@@ -587,11 +587,24 @@ class NaiveSearchRunner:
             denom = f2p_total + p2p_total
             base_score = (p2p_total / denom) if denom > 0 else 0.0
             delta_reward = max(0.0, raw_reward - base_score)
+            # scaled_delta = delta / headroom = "fraction of available headroom
+            # achieved". Always in [0, 1] regardless of how high baseline is, so
+            # full_pass earns ~1.0 on a high-baseline prompt instead of ~0.05.
+            # GRPO group-std normalization equalizes magnitudes either way, but
+            # this shape makes gt_mean legible across mixed-baseline batches and
+            # second-order metrics (KL term, entropy) more comparable. headroom
+            # collapses when baseline == 1.0 (no learning signal possible); we
+            # set scaled_delta = 0 in that case so the variance filter naturally
+            # rejects those groups.
+            headroom = max(0.0, 1.0 - base_score)
+            scaled_delta_reward = (delta_reward / headroom) if headroom > 0 else 0.0
             penalty = float(self.config.fallback_patch_penalty)
             no_action_penalty = float(self.config.no_action_patch_penalty)
             reward_kind = (self.config.reward_kind or "delta").lower()
             if reward_kind == "soft":
                 scored_reward = raw_reward
+            elif reward_kind == "scaled_delta":
+                scored_reward = scaled_delta_reward
             else:
                 scored_reward = delta_reward
             notes: list[str] = []
@@ -629,6 +642,7 @@ class NaiveSearchRunner:
                 "raw_reward": raw_reward,
                 "base_score": base_score,
                 "delta_reward": delta_reward,
+                "scaled_delta_reward": scaled_delta_reward,
                 "reward_kind": reward_kind,
                 "n_format_errors": fe_count,
                 "n_assistant_turns": n_asst,

@@ -1448,13 +1448,22 @@ class TrajectorySearchParallelRunner:
             raw_reward = float(branch_payload.get("reward", 0.0))
             # Mirror of naive_search.py:583-600 — apply reward_kind scoring.
             # 'delta' = max(0, raw - p2p_total/(p2p_total+f2p_total)).
+            # 'scaled_delta' = delta / (1 - base_score) — same shape but
+            # normalized to "fraction of available headroom achieved" in [0,1].
             f2p_total = int(branch_payload.get("f2p_total") or 0)
             p2p_total = int(branch_payload.get("p2p_total") or 0)
             denom = f2p_total + p2p_total
             base_score = (p2p_total / denom) if denom > 0 else 0.0
             delta_reward = max(0.0, raw_reward - base_score)
+            headroom = max(0.0, 1.0 - base_score)
+            scaled_delta_reward = (delta_reward / headroom) if headroom > 0 else 0.0
             reward_kind = (self.config.reward_kind or "soft").lower()
-            scored_reward = delta_reward if reward_kind == "delta" else raw_reward
+            if reward_kind == "delta":
+                scored_reward = delta_reward
+            elif reward_kind == "scaled_delta":
+                scored_reward = scaled_delta_reward
+            else:
+                scored_reward = raw_reward
             penalty = float(self.config.fallback_patch_penalty)
             if branch.terminal_patch_from_fallback and penalty != 1.0:
                 branch.gt_score = scored_reward * penalty
@@ -1463,6 +1472,7 @@ class TrajectorySearchParallelRunner:
                     "raw_reward": raw_reward,
                     "base_score": base_score,
                     "delta_reward": delta_reward,
+                    "scaled_delta_reward": scaled_delta_reward,
                     "reward_kind": reward_kind,
                     "fallback_penalty": penalty,
                     "note": "patch_from_git_diff_fallback",
@@ -1473,6 +1483,7 @@ class TrajectorySearchParallelRunner:
                     "raw_reward": raw_reward,
                     "base_score": base_score,
                     "delta_reward": delta_reward,
+                    "scaled_delta_reward": scaled_delta_reward,
                     "reward_kind": reward_kind,
                 }
                 branch.gt_score = scored_reward
