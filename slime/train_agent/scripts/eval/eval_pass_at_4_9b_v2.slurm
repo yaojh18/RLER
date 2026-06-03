@@ -55,8 +55,16 @@ WORKERS_PER_ATTEMPT=${WORKERS_PER_ATTEMPT:-2}
 TOTAL_WORKERS=$((ATTEMPTS * WORKERS_PER_ATTEMPT))
 BASE_SEED=${BASE_SEED:-13}
 STEP_LIMIT=${STEP_LIMIT:-120}
+# Sticky DP routing: pin each per-instance mini-swe-agent model object to
+# one sglang DP rank so the multi-turn conversation prefix (up to 120 steps
+# of growing observation/action history) keeps hitting that rank's radix
+# KV cache. Without it, sglang round-robins each of the 100+ requests in a
+# trajectory across all 8 DP ranks, paying a full reprefill on most steps.
+# 0 disables. Wrapper class lives in $STICKY_MODEL_DIR/sticky_dp_model_rler.py.
+STICKY_DP_SIZE=${STICKY_DP_SIZE:-8}
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench
 RLER=${RLER:-$BASE/RLER-naive}
+STICKY_MODEL_DIR=${STICKY_MODEL_DIR:-$RLER/slime/train_agent/scripts/eval}
 EVAL_DATA=${EVAL_DATA:-$BASE/datasets/v2_python1k_split_eval}
 HF_BASE=/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-9B
 
@@ -68,13 +76,14 @@ mkdir -p $RUN_DIR/_logs $RUN_DIR/_snapshot $HF_OUT $SLURM_LOGS $CACHE_BASE
 
 ( cd $RLER && git rev-parse HEAD ) > $RUN_DIR/_snapshot/RLER_HEAD.txt 2>/dev/null || true
 cp $0 $RUN_DIR/_snapshot/ 2>/dev/null || true
+cp $STICKY_MODEL_DIR/sticky_dp_model_rler.py $RUN_DIR/_snapshot/ 2>/dev/null || true
 
 CONTAINER_IMAGE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/images/slime_v0_2_4_baked.sqsh
 
 echo "[$(date)] evp4v2-9b job=$SLURM_JOB_ID  tag=$TAG  ckpt=$CKPT  baseline=$BASELINE"
 echo "[$(date)] attempts=$ATTEMPTS  workers_per_attempt=$WORKERS_PER_ATTEMPT  total_workers=$TOTAL_WORKERS"
-echo "[$(date)] base_seed=$BASE_SEED  step_limit=$STEP_LIMIT  eval_data=$EVAL_DATA"
-echo "[$(date)] container=$CONTAINER_IMAGE  run_dir=$RUN_DIR  rler=$RLER"
+echo "[$(date)] base_seed=$BASE_SEED  step_limit=$STEP_LIMIT  sticky_dp_size=$STICKY_DP_SIZE  eval_data=$EVAL_DATA"
+echo "[$(date)] container=$CONTAINER_IMAGE  run_dir=$RUN_DIR  rler=$RLER  sticky_model_dir=$STICKY_MODEL_DIR"
 
 INNER=$RUN_DIR/_snapshot/inner.sh
 cat > $INNER <<EOF
@@ -88,11 +97,13 @@ ATTEMPTS=$ATTEMPTS
 TOTAL_WORKERS=$TOTAL_WORKERS
 BASE_SEED=$BASE_SEED
 STEP_LIMIT=$STEP_LIMIT
+STICKY_DP_SIZE=$STICKY_DP_SIZE
 EVAL_DATA="$EVAL_DATA"
 RUN_DIR="$RUN_DIR"
 HF_BASE="$HF_BASE"
 HF_OUT="$HF_OUT"
 RLER="$RLER"
+STICKY_MODEL_DIR="$STICKY_MODEL_DIR"
 BASE="$BASE"
 CACHE_BASE="$CACHE_BASE"
 
@@ -112,7 +123,8 @@ export TMPDIR=\$CACHE_BASE/tmp
 export TMP=\$TMPDIR
 export TEMP=\$TMPDIR
 
-export PYTHONPATH=\$BASE/SWE-rebench-V2:\$RLER:\$RLER/agent:\$RLER/slime:/root/Megatron-LM:\${PYTHONPATH:-}
+export PYTHONPATH=\$BASE/SWE-rebench-V2:\$RLER:\$RLER/agent:\$RLER/slime:\$STICKY_MODEL_DIR:/root/Megatron-LM:\${PYTHONPATH:-}
+export STICKY_DP_SIZE=\$STICKY_DP_SIZE
 
 # Lustre docker shim
 export PATH=\$BASE/bin:\$PATH
@@ -209,17 +221,21 @@ export OPENAI_API_BASE=http://localhost:20000/v1
 export OPENAI_API_KEY=dummy
 SINGLE_OUT=\$RUN_DIR/single_run
 mkdir -p \$SINGLE_OUT
-echo "[\$(date)] step 4: single mini run, --workers \$TOTAL_WORKERS over 50 x \$ATTEMPTS = \$((50 * \$ATTEMPTS)) tasks"
+echo "[\$(date)] step 4: single mini run, --workers \$TOTAL_WORKERS over 50 x \$ATTEMPTS = \$((50 * \$ATTEMPTS)) tasks  sticky_dp_size=\$STICKY_DP_SIZE"
 # Per-task seed: each row's instance_id ends with __a{1..ATTEMPTS}; we can't easily
 # pass per-row seed via mini's CLI (it sets one model.model_kwargs.seed). The
 # diversity across attempts on the same instance comes from T=1.0 + sglang's
 # internal RNG, which is already independent across calls. (sglang_random_seed
 # above only sets the engine's startup RNG, not per-request determinism.)
+# Model class: sticky_dp_model_rler.StickyDPLitellmTextbasedModel pins each
+# per-instance model object to one sglang DP rank via extra_body.data_parallel_rank,
+# keeping the multi-turn conversation prefix warm in that rank's radix cache.
+# Drops to round-robin behavior when STICKY_DP_SIZE=0.
 python -m swe_agent.run.benchmarks.swebench \\
   --subset \$EVAL_PARQUET_DIR \\
   --split train \\
   --workers \$TOTAL_WORKERS \\
-  --model-class swe_agent.models.litellm_textbased_model.LitellmTextbasedModel \\
+  --model-class sticky_dp_model_rler.StickyDPLitellmTextbasedModel \\
   --model openai/\$MODEL_DIR \\
   -c \$RLER/agent/swe_agent/config/benchmarks/swebench_backticks.yaml \\
   -c agent.step_limit=\$STEP_LIMIT \\

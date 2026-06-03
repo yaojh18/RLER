@@ -19,6 +19,7 @@
 # Other env knobs (with defaults):
 #   ATTEMPTS=4
 #   TIME_CAP=10:00:00
+#   STICKY_DP_SIZE=8  (sticky-DP per-instance pinning; 0 disables)
 #   RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER
 #
 # Example:
@@ -36,6 +37,7 @@ RLER=${RLER:-/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER}
 WORKERS_PER_ATTEMPT=${WORKERS_PER_ATTEMPT:-16}
 ATTEMPTS=${ATTEMPTS:-4}
 TIME_CAP=${TIME_CAP:-10:00:00}
+STICKY_DP_SIZE=${STICKY_DP_SIZE:-8}
 SLURM=$RLER/slime/train_agent/scripts/eval/eval_pass_at_4_9b_v2.slurm
 
 [ ! -f "$SLURM" ] && { echo "ERROR: SLURM=$SLURM not found"; exit 1; }
@@ -44,7 +46,7 @@ LOG=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/evp4v
 mkdir -p "$(dirname $LOG)"
 
 echo "RLER=$RLER" | tee $LOG
-echo "WORKERS_PER_ATTEMPT=$WORKERS_PER_ATTEMPT  ATTEMPTS=$ATTEMPTS  TIME_CAP=$TIME_CAP" | tee -a $LOG
+echo "WORKERS_PER_ATTEMPT=$WORKERS_PER_ATTEMPT  ATTEMPTS=$ATTEMPTS  TIME_CAP=$TIME_CAP  STICKY_DP_SIZE=$STICKY_DP_SIZE" | tee -a $LOG
 echo "SLURM=$SLURM" | tee -a $LOG
 echo "" | tee -a $LOG
 
@@ -63,7 +65,7 @@ while read -r CKPT TAG _rest; do
     SKIP=$((SKIP+1)); continue
   fi
   JID=$(sbatch --parsable --time=$TIME_CAP \
-    --export=ALL,CKPT=$CKPT,TAG=$TAG,WORKERS_PER_ATTEMPT=$WORKERS_PER_ATTEMPT,ATTEMPTS=$ATTEMPTS,RLER=$RLER \
+    --export=ALL,CKPT=$CKPT,TAG=$TAG,WORKERS_PER_ATTEMPT=$WORKERS_PER_ATTEMPT,ATTEMPTS=$ATTEMPTS,STICKY_DP_SIZE=$STICKY_DP_SIZE,RLER=$RLER \
     $SLURM)
   echo "  $JID  $TAG  ckpt=$CKPT" | tee -a $LOG
   COUNT=$((COUNT+1))
