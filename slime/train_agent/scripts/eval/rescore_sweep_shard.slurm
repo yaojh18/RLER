@@ -18,7 +18,7 @@ ATTEMPTS_LIST="${ATTEMPTS_LIST:?must set ATTEMPTS_LIST e.g. 2,3,4}"
 DOCKER_WORKERS="${DOCKER_WORKERS:-8}"
 
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench
-INNER=$BASE/RLER-eval/slime/train_agent/scripts/eval/rescore_sweep_inner.sh
+INNER=${INNER:-$BASE/RLER/slime/train_agent/scripts/eval/rescore_sweep_inner.sh}
 CONTAINER_IMAGE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/images/slime_v0_2_4_baked.sqsh
 
 echo "[$(date)] rescore-sweep job=$SLURM_JOB_ID  run_dir=$RUN_DIR  attempts=$ATTEMPTS_LIST"

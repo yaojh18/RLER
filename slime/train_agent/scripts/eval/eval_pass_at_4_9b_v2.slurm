@@ -99,11 +99,18 @@ CACHE_BASE="$CACHE_BASE"
 # writable cache (HOME inside container is RO without this)
 export HOME=\$CACHE_BASE
 export XDG_CACHE_HOME=\$CACHE_BASE
-mkdir -p \$CACHE_BASE/{flashinfer,triton,hf,torch}
+mkdir -p \$CACHE_BASE/{flashinfer,triton,hf,torch,tmp}
 export FLASHINFER_WORKSPACE_DIR=\$CACHE_BASE/flashinfer
 export TRITON_CACHE_DIR=\$CACHE_BASE/triton
 export HF_HOME=\$CACHE_BASE/hf
 export TORCH_HOME=\$CACHE_BASE/torch
+# TMPDIR must point at a host-visible (bind-mounted) path so dump_specs_and_score's
+# host-docker `-v \$TMPFILE:...` invocations resolve. The container's default /tmp
+# is an isolated enroot tmpfs that the host can't see -> docker mounts go silently
+# empty and eval.py exits 128 (see feedback_set_tmpdir_for_host_docker.md).
+export TMPDIR=\$CACHE_BASE/tmp
+export TMP=\$TMPDIR
+export TEMP=\$TMPDIR
 
 export PYTHONPATH=\$BASE/SWE-rebench-V2:\$RLER:\$RLER/agent:\$RLER/slime:/root/Megatron-LM:\${PYTHONPATH:-}
 
