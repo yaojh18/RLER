@@ -195,6 +195,7 @@ python3 train_async.py \
    --apply-chat-template \
    --rollout-shuffle \
    --rm-type dapo \
+   --reward-key score \
    --num-rollout $NUM_ROLLOUT \
    --rollout-batch-size $ROLLOUT_BATCH_SIZE \
    --n-samples-per-prompt $N_SAMPLES_PER_PROMPT \
