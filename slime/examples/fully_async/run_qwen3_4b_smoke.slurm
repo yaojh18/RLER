@@ -148,6 +148,16 @@ NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 echo "[node=$NODE] HAS_NVLINK=$HAS_NVLINK"
 
+# Match the example's runtime env via plain shell exports BEFORE `ray
+# start` so the raylet inherits them — Ray actors spawned by the driver
+# (e.g. RolloutManager) then see PYTHONPATH and can import
+# `fully_async_rollout`. Job 60247 failed here because exports happened
+# AFTER `ray start`.
+EXAMPLE_DIR=$RLER/slime/examples/fully_async
+export PYTHONPATH="/root/Megatron-LM:${EXAMPLE_DIR}:${PYTHONPATH:-}"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_NVLS_ENABLE=$HAS_NVLINK
+
 # Ray on localhost (single-node). Disable dashboard — its MetricsHead
 # module crashes in this container (job 60246), and we don't need it
 # since we invoke train_async.py directly with RAY_ADDRESS instead of
@@ -162,12 +172,6 @@ ray start --head --node-ip-address=$MY_IP --port=$RAY_PORT \
     --disable-usage-stats --include-dashboard=false
 sleep 3
 
-EXAMPLE_DIR=$RLER/slime/examples/fully_async
-# Match the example's runtime env via plain shell exports — the driver
-# inherits them because we invoke python directly (no `ray job submit`).
-export PYTHONPATH="/root/Megatron-LM:${EXAMPLE_DIR}:${PYTHONPATH:-}"
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export NCCL_NVLS_ENABLE=$HAS_NVLINK
 export RAY_ADDRESS=$MY_IP:$RAY_PORT
 
 DRIVER_LOG=$RUN_DIR/_logs/training.log
