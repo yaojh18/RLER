@@ -218,6 +218,22 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                 )
                 do_print = False
 
+            # Drop groups containing any pathological sample whose token count
+            # exceeds the Megatron per-GPU cap — they would crash the
+            # _get_capped_partitions first-fit packer downstream. This is a
+            # workaround for cases where sglang occasionally returns a response
+            # longer than max_new_tokens (observed up to 33K with cap=8192).
+            cap_tokens = getattr(args, "max_tokens_per_gpu", 0) * max(getattr(args, "context_parallel_size", 1), 1)
+            if cap_tokens > 0:
+                too_long = [len(getattr(s, "tokens", []) or []) for s in group]
+                if any(t > cap_tokens for t in too_long):
+                    print(
+                        f"Dropping group {group_id}: token lengths {too_long} "
+                        f"exceed max_tokens_per_gpu*cp={cap_tokens}",
+                        flush=True,
+                    )
+                    continue
+
             # Simplified: directly add samples, no filters used
             data.append(group)
             processed_any = True
