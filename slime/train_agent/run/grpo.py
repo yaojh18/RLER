@@ -259,9 +259,21 @@ def main(argv: list[str] | None = None) -> int:
                         "brought up externally, e.g. by SLURM srun).")
     parser.add_argument("--context-parallel-size", type=int)
     parser.add_argument("--tensor-model-parallel-size", type=int)
+    parser.add_argument("--pipeline-model-parallel-size", type=int)
+    parser.add_argument("--decoder-last-pipeline-num-layers", type=int,
+                        help="Pass to megatron when PP>1 with an unbalanced layer split "
+                             "(e.g. 64 layers across PP=2 with last stage holding 30).")
+    parser.add_argument("--rollout-num-gpus-per-engine", type=int,
+                        help="sglang TP per engine. Default 1 from grpo.sh; bump to 2+ "
+                             "when the model weights don't fit on a single 80GB GPU "
+                             "alongside KV cache (e.g. Qwen3.5-27B BF16 is 54GB).")
     parser.add_argument("--max-tokens-per-gpu", type=int)
     parser.add_argument("--log-probs-chunk-size", type=int)
     parser.add_argument("--sglang-context-length", type=int)
+    parser.add_argument("--model-config-name", type=str, default="qwen3.5-9B",
+                        help="Basename (no .sh) of a preset under "
+                             "$RLER/slime/train_agent/configs/ to source for MODEL_ARGS. "
+                             "Default 'qwen3.5-9B' preserves 59762-era behavior.")
     parser.add_argument("--rollout-instance-workers", type=int, default=2)
     parser.add_argument("--ray-num-cpus", type=int, default=32)
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
@@ -381,6 +393,16 @@ def main(argv: list[str] | None = None) -> int:
         override_lines.append(f"GRPO_PARALLEL_ARGS+=(--context-parallel-size {args.context_parallel_size})")
     if args.tensor_model_parallel_size is not None:
         override_lines.append(f"GRPO_PARALLEL_ARGS+=(--tensor-model-parallel-size {args.tensor_model_parallel_size})")
+    if args.pipeline_model_parallel_size is not None:
+        override_lines.append(f"GRPO_PARALLEL_ARGS+=(--pipeline-model-parallel-size {args.pipeline_model_parallel_size})")
+    if args.decoder_last_pipeline_num_layers is not None:
+        override_lines.append(
+            f"GRPO_PARALLEL_ARGS+=(--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers})"
+        )
+    if args.rollout_num_gpus_per_engine is not None:
+        override_lines.append(
+            f"GRPO_ROLLOUT_ARGS+=(--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine})"
+        )
     if args.max_tokens_per_gpu is not None:
         override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
     if args.log_probs_chunk_size is not None:
@@ -456,7 +478,7 @@ export SWE_AGENT_PYTHON="{rler_root}/agent/.venv/bin/python"
 {ray_trap_line}
 {ray_stop_line}
 cd {rler_root}/slime
-source {rler_root}/slime/train_agent/configs/qwen3.5-9B.sh
+source {rler_root}/slime/train_agent/configs/{args.model_config_name}.sh
 source {shlex.quote(str(args.config_path))}
 {config_overrides}
 if [ {shlex.quote(args.target)} = "rubric" ]; then
