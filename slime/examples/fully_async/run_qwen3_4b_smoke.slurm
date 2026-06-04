@@ -196,6 +196,7 @@ python3 train_async.py \
    --rollout-shuffle \
    --rm-type dapo \
    --reward-key score \
+   --rollout-max-prompt-len 2048 \
    --num-rollout $NUM_ROLLOUT \
    --rollout-batch-size $ROLLOUT_BATCH_SIZE \
    --n-samples-per-prompt $N_SAMPLES_PER_PROMPT \
@@ -213,7 +214,7 @@ python3 train_async.py \
    --recompute-method uniform \
    --recompute-num-layers 1 \
    --use-dynamic-batch-size \
-   --max-tokens-per-gpu 16384 \
+   --max-tokens-per-gpu 12288 \
    --advantage-estimator grpo \
    --use-kl-loss \
    --kl-loss-coef 0.00 \
