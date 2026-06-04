@@ -213,7 +213,7 @@ python3 train_async.py \
    --recompute-method uniform \
    --recompute-num-layers 1 \
    --use-dynamic-batch-size \
-   --max-tokens-per-gpu 9216 \
+   --max-tokens-per-gpu 16384 \
    --advantage-estimator grpo \
    --use-kl-loss \
    --kl-loss-coef 0.00 \
