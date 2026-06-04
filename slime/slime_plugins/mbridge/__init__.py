@@ -1,3 +1,4 @@
+from . import _qwen3_5_autoconfig  # noqa: F401 -- registers qwen3_5 with transformers AutoConfig
 from .deepseek_v32 import DeepseekV32Bridge
 from .glm4 import GLM4Bridge
 from .glm4moe import GLM4MoEBridge
