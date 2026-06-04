@@ -9,6 +9,17 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 
+# Eagerly register qwen3_5 / qwen3_5_text with transformers AutoConfig so
+# _load_hf_config(...) below (called from get_qwen3_5_spec during model
+# provider init) doesn't fall into the JSON fallback for Qwen3.5 models.
+# The fallback returns a SimpleNamespace-ish dict that lacks the methods
+# downstream code uses (.to_dict, sub-config typing). See the shim file
+# for the full why.
+try:
+    from slime_plugins.mbridge import _qwen3_5_autoconfig  # noqa: F401
+except Exception:
+    pass
+
 
 def _load_hf_config(checkpoint_path):
     """Load HF config with fallback for unsupported model types."""
