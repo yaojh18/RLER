@@ -18,22 +18,26 @@
 #   * NUM_NODES 4 -> 5
 #   * ACTOR_NUM_NODES 1 -> 2 (16 actor GPUs)
 #   * ROLLOUT_NUM_GPUS unchanged at 24 (3 rollout nodes)
-#   * Actor parallelism: TP=4 PP=2 CP=2 DP=1 (TP*PP*CP*DP = 16). The 9B's
-#     TP=1 CP=4 DP=2 layout can't host a 27B weight+Adam shard on 80GB H100;
-#     TP=4*PP=2 = weight-shard factor 8 -> ~54GB per rank for fp32 master +
-#     Adam states, fits with room for activations under recompute=full.
+#   * Actor parallelism: TP=2 PP=2 CP=4 DP=1 (TP*PP*CP*DP = 16). Weight-shard
+#     factor TP*PP = 4 only -> 432GB Adam state / 4 = 108GB per rank, does NOT
+#     fit on 80GB H100. We offload optimizer state to CPU
+#     (--optimizer-cpu-offload + --use-precision-aware-optimizer) per slime's
+#     reference 27B recipe: GPU holds only BF16 weights (13.5GB), transient
+#     fp32 grads (~27GB), and activations (~15-20GB) -- ~55-65GB total, fits.
+#     CP=4 gives the per-sample 90k cap we need so 27B's verbose CoT rollouts
+#     don't hit the sglang context wall the way 60273 did at CP=2 (32k cap ->
+#     75% drop rate by step 5 -> L3 breaker).
 #   * sglang per-engine TP 1 -> 2 (27B BF16 = 54GB; one GPU can't hold weights
 #     + an 80k KV cache). 24 rollout GPUs / TP=2 -> 12 inference engines.
 #   * --decoder-last-pipeline-num-layers 30 mirrors slime's reference 27B
 #     launcher (first PP stage gets 34 layers including embedding, last 30
 #     including output head).
 #
-# Per-sample sequence cap is max_tokens_per_gpu * CP_SIZE. CP dropped 4 -> 2
-# halves the cap; we keep max_tokens_per_gpu at 16384 (= 32k per sample) and
-# lower sglang context to 32k to match. Long-tail rollouts that pushed past
-# 80k under 9B WILL truncate here -- this is the cost of running 27B with
-# 5 nodes instead of slime's reference 7+. Bump CP=4 (requires +2 actor
-# nodes) once the recipe is otherwise validated.
+# Per-sample sequence cap = max_tokens_per_gpu * CP = 22528 * 4 = 90112,
+# matching 59762's 9B recipe exactly. sglang context = 80960, also matching
+# 59762. Long-tail rollouts above 80k still 400 from sglang, but with 80k
+# headroom the rate should stay low enough to fit under the 70% L3 limit.
+# (See 60273 postmortem in driver log for why CP=2 was wrong here.)
 #
 # All other reward/search knobs (delta, format-error penalty, infra drop
 # rate, KL anchor, variance filter, debug dumps) are unchanged from 59762.
@@ -71,23 +75,24 @@ GRPO_MODEL_NAME="Qwen/Qwen3.5-27B"
 MODEL_CONFIG_NAME=qwen3.5-27B
 PROMPT_BUDGET=1150
 
-# Actor parallel layout
-TENSOR_PARALLEL_SIZE=4
+# Actor parallel layout. CPU optimizer offload (set below) is what makes
+# TP*PP=4 viable for 27B Adam state; without it we'd need TP*PP>=8.
+TENSOR_PARALLEL_SIZE=2
 PIPELINE_PARALLEL_SIZE=2
-CONTEXT_PARALLEL_SIZE=2
+CONTEXT_PARALLEL_SIZE=4
 # 27B has 64 decoder layers. PP=2 even split would be 32/32; slime's
 # reference launcher uses 34/30 to balance the embedding (first stage) and
 # output head (last stage) overhead.
 DECODER_LAST_PIPELINE_NUM_LAYERS=30
 
 # sglang per-engine TP. 27B BF16 weights = 54 GB; TP=2 -> 27 GB shard +
-# room for KV cache at 32k context. 24 rollout GPUs / 2 = 12 engines.
+# room for KV cache at 80k context. 24 rollout GPUs / 2 = 12 engines.
 ROLLOUT_NUM_GPUS_PER_ENGINE=2
 
-# Memory / context tuning for 27B + CP=2.
-# per-sample seq cap = MAX_TOKENS_PER_GPU * CP_SIZE = 32768
-MAX_TOKENS_PER_GPU=16384
-SGLANG_CONTEXT_LENGTH=32768
+# Memory / context tuning. Matches 59762 (9B) recipe:
+# per-sample seq cap = MAX_TOKENS_PER_GPU * CP_SIZE = 22528 * 4 = 90112
+MAX_TOKENS_PER_GPU=22528
+SGLANG_CONTEXT_LENGTH=80960
 # ====================================================================
 
 # === IP-sorted node ordering ===
@@ -357,6 +362,9 @@ if [ "$NODE" = "$HEAD_NODE" ]; then
       --rollout-num-gpus-per-engine $ROLLOUT_NUM_GPUS_PER_ENGINE \
       --max-tokens-per-gpu $MAX_TOKENS_PER_GPU \
       --sglang-context-length $SGLANG_CONTEXT_LENGTH \
+      --optimizer-cpu-offload \
+      --overlap-cpu-optimizer-d2h-h2d \
+      --use-precision-aware-optimizer \
       --ray-external \
       --naive-instance-workers $NAIVE_INSTANCE_WORKERS \
       --naive-m $NAIVE_M \

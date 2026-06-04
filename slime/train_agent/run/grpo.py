@@ -274,6 +274,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="Basename (no .sh) of a preset under "
                              "$RLER/slime/train_agent/configs/ to source for MODEL_ARGS. "
                              "Default 'qwen3.5-9B' preserves 59762-era behavior.")
+    parser.add_argument("--optimizer-cpu-offload", action="store_true", default=False,
+                        help="Offload Adam optimizer state (master weights + m + v) to CPU. "
+                             "Slime ref 27B recipe — needed when TP*PP weight shard factor "
+                             "is too small to fit Adam state on 80GB H100.")
+    parser.add_argument("--overlap-cpu-optimizer-d2h-h2d", action="store_true", default=False,
+                        help="Overlap CPU<->GPU optimizer state transfer with compute. Pairs "
+                             "with --optimizer-cpu-offload.")
+    parser.add_argument("--use-precision-aware-optimizer", action="store_true", default=False,
+                        help="Keep master weights in BF16 + Adam states in FP32; reduces "
+                             "optimizer memory by ~25%. Pairs with --optimizer-cpu-offload.")
     parser.add_argument("--rollout-instance-workers", type=int, default=2)
     parser.add_argument("--ray-num-cpus", type=int, default=32)
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
@@ -403,6 +413,12 @@ def main(argv: list[str] | None = None) -> int:
         override_lines.append(
             f"GRPO_ROLLOUT_ARGS+=(--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine})"
         )
+    if args.optimizer_cpu_offload:
+        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--optimizer-cpu-offload)")
+    if args.overlap_cpu_optimizer_d2h_h2d:
+        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--overlap-cpu-optimizer-d2h-h2d)")
+    if args.use_precision_aware_optimizer:
+        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--use-precision-aware-optimizer)")
     if args.max_tokens_per_gpu is not None:
         override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
     if args.log_probs_chunk_size is not None:
