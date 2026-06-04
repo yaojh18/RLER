@@ -23,8 +23,11 @@ RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench
 
 # === paths to fill ===
-# Where the HF Qwen3.5-27B snapshot lives on Lustre.
-HF_CHECKPOINT=${HF_CHECKPOINT:-/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-27B}
+# Where the HF Qwen3.5-27B snapshot lives on Lustre. The shared HF cache
+# under /mnt/lustre/metavmds0lstre/share/hf/hub/ resolves the snapshot via
+# Qwen--Qwen3.5-27B/snapshots/<rev>; pin the current rev so the converter
+# sees the same blobs as eval/serving paths.
+HF_CHECKPOINT=${HF_CHECKPOINT:-/mnt/lustre/metavmds0lstre/share/hf/hub/models--Qwen--Qwen3.5-27B/snapshots/b7ca741b86de18df552fd2cc952861e04621a4bd}
 # Where to write the torch_dist conversion (re-used by the GRPO launcher).
 SAVE_DIR=${SAVE_DIR:-/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/slime_qwen35/ckpt/Qwen3.5-27B_torch_dist_latest}
 

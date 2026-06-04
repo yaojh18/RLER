@@ -120,7 +120,8 @@ SLURM_LOGS=/home/sihanzeng_meta_com/rler_runs/_slurm-logs
 mkdir -p $RUN_DIR $SLURM_LOGS $RUN_DIR/_logs
 
 # 27B HF + torch_dist locations -- override at sbatch time if these change.
-HF_CHECKPOINT=${HF_CHECKPOINT:-/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-27B}
+# HF rev pinned to b7ca741... (matches convert_qwen3.5-27B_hf_to_torch_dist.slurm).
+HF_CHECKPOINT=${HF_CHECKPOINT:-/mnt/lustre/metavmds0lstre/share/hf/hub/models--Qwen--Qwen3.5-27B/snapshots/b7ca741b86de18df552fd2cc952861e04621a4bd}
 LOAD_DIR=${LOAD_DIR:-/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/slime_qwen35/ckpt/Qwen3.5-27B_torch_dist_latest}
 SAVE_DIR=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler_ckpts/${SLURM_JOB_ID}-grpo-delta-wvunified-stalediag-27b/policy_ckpt
 PROMPT_DATA=$RUN_DIR/grpo_prompts.jsonl
