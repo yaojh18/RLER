@@ -25,11 +25,11 @@
 set -u
 
 # --- Tunables ---
-NUM_ROLLOUT=30
+NUM_ROLLOUT=60
 ROLLOUT_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=8
 GLOBAL_BATCH_SIZE=256
-SAVE_INTERVAL=10
+SAVE_INTERVAL=20
 # ----------------
 
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng
@@ -214,7 +214,7 @@ python3 train_async.py \
    --recompute-method uniform \
    --recompute-num-layers 1 \
    --use-dynamic-batch-size \
-   --max-tokens-per-gpu 12288 \
+   --max-tokens-per-gpu 16384 \
    --advantage-estimator grpo \
    --use-kl-loss \
    --kl-loss-coef 0.00 \
