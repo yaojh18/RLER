@@ -9,7 +9,7 @@
 #SBATCH --mem=0
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
-#SBATCH --exclude=metavmds1-a4-21
+#SBATCH --exclude=metavmds1-a4-21,metavmds1-a4-9
 #SBATCH --time=06:00:00
 #SBATCH --output=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/slime-q35-9b-dapo-eval-%j.log
 
