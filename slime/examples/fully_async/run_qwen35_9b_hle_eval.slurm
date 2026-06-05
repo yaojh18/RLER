@@ -222,7 +222,6 @@ python3 train_async.py \
    --entropy-coef 0.00 \
    --eps-clip 0.2 \
    --eps-clip-high 0.28 \
-   --use-tis \
    --optimizer adam \
    --lr 1e-6 \
    --lr-decay-style constant \
