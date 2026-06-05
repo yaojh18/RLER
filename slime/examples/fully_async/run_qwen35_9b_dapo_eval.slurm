@@ -91,6 +91,9 @@ export HOME=$NODE_CACHE/home
 export TMPDIR=$NODE_CACHE
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export SGLANG_DISABLE_CUDNN_CHECK=1
+# 9B + sglang on a single 4-GPU placement group fragments PyTorch's
+# allocator and OOMs without expandable_segments (matches miles 9B fix).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 WANDB_KEY_FILE=/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/secrets/wandb_api_key
 if [ -r "$WANDB_KEY_FILE" ]; then
