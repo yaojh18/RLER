@@ -215,6 +215,7 @@ python3 train_async.py \
    --adam-beta1 0.9 \
    --adam-beta2 0.98 \
    --rollout-num-gpus-per-engine 1 \
+   --sglang-mem-fraction-static 0.5 \
    --attention-dropout 0.0 \
    --hidden-dropout 0.0 \
    --accumulate-allreduce-grads-in-fp32 \
