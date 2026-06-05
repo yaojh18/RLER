@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=slime-q3-4b-dapo-eval
+#SBATCH --job-name=slime-q35-9b-dapo-eval
 #SBATCH --account=ads_cpt
 #SBATCH --qos=ads_cpt
 #SBATCH --partition=a4
@@ -11,18 +11,13 @@
 #SBATCH --exclusive
 #SBATCH --exclude=metavmds1-a4-21
 #SBATCH --time=06:00:00
-#SBATCH --output=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/slime-q3-4b-dapo-eval-%j.log
+#SBATCH --output=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/slime-q35-9b-dapo-eval-%j.log
 
-# Slime GRPO on Qwen3-4B-Instruct-2507 + DAPO-Math-17k with periodic
-# held-out eval every 5 rollouts. Uses train_async.py (~3x faster than
-# train.py because rollout and training overlap) AND the miles trick of
-# pointing `--eval-function-path` at slime's standard sglang rollout
-# (the fully_async custom rollout fn doesn't implement eval mode).
-#
-# Single-node 8-GPU (actor=4 + rollout=4). 1.79M-row DAPO train split +
-# 256-row eval split (last 256 rows of the dataset).
-# Watch wandb for eval/* curves to see whether GRPO is actually lifting
-# the held-out reward over time.
+# Slime GRPO on Qwen3.5-9B + DAPO-Math-17k with periodic held-out eval
+# every 5 rollouts. Mirrors the 4B wrapper but swaps in the 9B HF
+# checkpoint + torch_dist + Qwen3.5 model args (requires the qwen3_5
+# MCore spec from slime_plugins). TP=2 + DP=2 inside the actor's 4 GPUs
+# (matches the miles 9B recipe).
 
 set -u
 
@@ -37,11 +32,11 @@ EVAL_INTERVAL=5
 
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng
 RLER=$BASE/swe-rebench/RLER
-HF_CHECKPOINT=$BASE/models/Qwen3-4B-Instruct-2507
-TORCH_DIST=$BASE/models/Qwen3-4B-Instruct-2507_torch_dist
+HF_CHECKPOINT=/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-9B
+TORCH_DIST=/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/slime_qwen35/ckpt/Qwen3.5-9B_torch_dist_latest
 PROMPT_DATA=$BASE/datasets/dapo-math-17k/dapo_train.jsonl
 EVAL_DATA=$BASE/datasets/dapo-math-17k/dapo_eval.jsonl
-RUN_DIR=$BASE/rler-runs/${SLURM_JOB_ID}-slime-q3-4b-dapo-eval
+RUN_DIR=$BASE/rler-runs/${SLURM_JOB_ID}-slime-q35-9b-dapo-eval
 SLURM_LOGS=$BASE/rler-runs/_slurm-logs
 SAVE_DIR=$RUN_DIR/policy_ckpt
 LOAD_DIR=$SAVE_DIR
@@ -102,7 +97,7 @@ if [ -r "$WANDB_KEY_FILE" ]; then
     export WANDB_API_KEY=$(cat "$WANDB_KEY_FILE" | tr -d '[:space:]')
     export WANDB_MODE=online
     export WANDB_ENTITY=chenqinghan2003-university-of-washington
-    WANDB_FLAGS=(--use-wandb --wandb-project slime-fully-async --wandb-group qwen3-4b-Instruct-2507-dapo-eval --wandb-run-name "dapo-eval-${SLURM_JOB_ID}")
+    WANDB_FLAGS=(--use-wandb --wandb-project slime-fully-async --wandb-group qwen3.5-9B-dapo-eval --wandb-run-name "q35-9b-dapo-eval-${SLURM_JOB_ID}")
     echo "[node=$NODE] wandb online enabled"
 else
     export WANDB_MODE=offline
@@ -116,7 +111,7 @@ if [ ! -f "$TORCH_DIST/latest_checkpointed_iteration.txt" ]; then
     TMP_TD=${TORCH_DIST}.tmp.${SLURM_JOB_ID}
     rm -rf $TMP_TD && mkdir -p $TMP_TD
     cd $RLER/slime
-    source scripts/models/qwen3-4B-Instruct-2507.sh
+    source train_agent/configs/qwen3.5-9B.sh
     export PYTHONPATH="/root/Megatron-LM:${PYTHONPATH:-}"
     set -o pipefail
     python tools/convert_hf_to_torch_dist.py \
@@ -133,7 +128,7 @@ echo "[node=$NODE] torch_dist ready at $TORCH_DIST"
 
 # === Step 2: source model args + launch training ===
 cd $RLER/slime
-source scripts/models/qwen3-4B-Instruct-2507.sh
+source train_agent/configs/qwen3.5-9B.sh
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
@@ -204,7 +199,7 @@ python3 train_async.py \
    --recompute-method uniform \
    --recompute-num-layers 1 \
    --use-dynamic-batch-size \
-   --max-tokens-per-gpu 16384 \
+   --max-tokens-per-gpu 9216 \
    --advantage-estimator grpo \
    --use-kl-loss \
    --kl-loss-coef 0.00 \
