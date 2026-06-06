@@ -10,7 +10,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --exclude=metavmds1-a4-21,metavmds1-a4-9
-#SBATCH --time=06:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/slime-q35-9b-hle-%j.log
 
 # Slime GRPO on Qwen3.5-9B + HLE multi-choice (464 train / 117 eval) with
@@ -29,11 +29,11 @@
 set -u
 
 # --- Tunables ---
-NUM_ROLLOUT=60
+NUM_ROLLOUT=500
 ROLLOUT_BATCH_SIZE=32
 N_SAMPLES_PER_PROMPT=8
 GLOBAL_BATCH_SIZE=256
-SAVE_INTERVAL=20
+SAVE_INTERVAL=50
 EVAL_INTERVAL=5
 DYNAMIC_FILTER=${DYNAMIC_FILTER:-on}
 # ----------------
