@@ -151,7 +151,7 @@ python3 train.py \
    --eval-prompt-data hle-held-out $EVAL_DATA \
    --n-samples-per-eval-prompt 1 \
    --eval-max-response-len 65536 \
-   --eval-top-k 1 \
+   --eval-temperature 1.0 \
    --tensor-model-parallel-size 2 \
    --sequence-parallel \
    --pipeline-model-parallel-size 1 \
