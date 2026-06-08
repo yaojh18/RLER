@@ -38,7 +38,8 @@ PROMPT_DATA=$BASE/datasets/hle/hle_mc_train.jsonl  # required by slime even when
 RUN_DIR=$BASE/rler-runs/${SLURM_JOB_ID}-slime-q35-9b-hle-evalonly-64k
 SLURM_LOGS=$BASE/rler-runs/_slurm-logs
 DUMP_DIR=$RUN_DIR/_eval_dumps
-mkdir -p $RUN_DIR/_logs $RUN_DIR/_snapshot $SLURM_LOGS $DUMP_DIR
+EMPTY_LOAD=$RUN_DIR/empty_load
+mkdir -p $RUN_DIR/_logs $RUN_DIR/_snapshot $SLURM_LOGS $DUMP_DIR $EMPTY_LOAD
 
 ( cd $RLER && git rev-parse HEAD ) > $RUN_DIR/_snapshot/RLER_HEAD.txt 2>/dev/null || true
 cp $0 $RUN_DIR/_snapshot/ 2>/dev/null || true
@@ -63,6 +64,7 @@ TORCH_DIST=$TORCH_DIST
 PROMPT_DATA=$PROMPT_DATA
 EVAL_DATA=$EVAL_DATA
 DUMP_DIR=$DUMP_DIR
+EMPTY_LOAD=$EMPTY_LOAD
 TOP
 cat >> $INNER <<'EOF'
 
@@ -128,7 +130,7 @@ python3 train.py \
    "${MODEL_ARGS[@]}" \
    --hf-checkpoint $HF_CHECKPOINT \
    --ref-load $TORCH_DIST \
-   --load $TORCH_DIST \
+   --load $EMPTY_LOAD \
    --prompt-data $PROMPT_DATA \
    --input-key prompt \
    --label-key label \
