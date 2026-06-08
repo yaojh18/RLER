@@ -9,7 +9,7 @@
 #SBATCH --mem=0
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
-#SBATCH --exclude=metavmds1-a4-21,metavmds1-a4-9
+#SBATCH --exclude=metavmds1-a4-21,metavmds1-a4-9,metavmds1-a4-94
 #SBATCH --time=48:00:00
 #SBATCH --output=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/q35-9b-hle-train-200-thinkOFF-temp1-trncpen-%j.log
 

@@ -10,7 +10,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --time=24:00:00
-#SBATCH --output=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/grpo-naive-cp4-v2-%j.log
+#SBATCH --output=/home/sihanzeng_meta_com/rler_runs/_slurm-logs/grpo-naive-cp4-v2-%j.log
 
 # 4-node GRPO async NAIVE — V2: anti-collapse fixes on top of cp4_varfilter.
 # Diff vs v1 (run 56724 mode-collapsed at step 27):
@@ -77,16 +77,16 @@ HEAD_IP=$(getent ahostsv4 $HEAD_NODE | awk '{print $1}' | head -n 1)
 [ -z "$HEAD_IP" ] && HEAD_IP=$(srun --nodes=1 --ntasks=1 -w $HEAD_NODE hostname -I | awk '{print $1}')
 RAY_PORT=6379
 
-RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER-naive
+RLER=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench/RLER
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/swe-rebench
 SUBSET=$BASE/datasets/v2_python_train_plus_sweep_middle
-RUN_DIR=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/${SLURM_JOB_ID}-grpo-naive-cp4-v2
-SLURM_LOGS=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs
+RUN_DIR=/home/sihanzeng_meta_com/rler_runs/${SLURM_JOB_ID}-grpo-naive-cp4-v2
+SLURM_LOGS=/home/sihanzeng_meta_com/rler_runs/_slurm-logs
 mkdir -p $RUN_DIR $SLURM_LOGS $RUN_DIR/_logs
 
 HF_CHECKPOINT=/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-9B
 LOAD_DIR=/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/slime_qwen35/ckpt/Qwen3.5-9B_torch_dist_latest
-SAVE_DIR=$RUN_DIR/policy_ckpt
+SAVE_DIR=/mnt/localssd/rler-runs/${SLURM_JOB_ID}-grpo-naive-cp4-v2/policy_ckpt
 PROMPT_DATA=$RUN_DIR/grpo_prompts.jsonl
 
 echo "[$(date)] jobid=$SLURM_JOB_ID nodes=$SLURM_JOB_NUM_NODES head=$HEAD_NODE head_ip=$HEAD_IP"
@@ -166,8 +166,8 @@ LOAD_DIR=${10}
 SAVE_DIR=${11}
 
 NODE=$(hostname)
-NODE_CACHE=$CACHE_BASE/$NODE
-mkdir -p $NODE_CACHE/{flashinfer,triton,hf,torch}
+NODE_CACHE=/mnt/localssd/grpo-${SLURM_JOB_ID}/$NODE
+mkdir -p $NODE_CACHE/{flashinfer,triton,hf,torch} $SAVE_DIR
 export FLASHINFER_WORKSPACE_DIR=$NODE_CACHE/flashinfer
 export TRITON_CACHE_DIR=$NODE_CACHE/triton
 export HF_HOME=$NODE_CACHE/hf
@@ -337,7 +337,7 @@ chmod +x $PER_NODE
 echo "[$(date)] === srun fan-out across $SLURM_JOB_NUM_NODES nodes ==="
 srun --ntasks=$SLURM_JOB_NUM_NODES --ntasks-per-node=1 \
     --container-image=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/images/slime_v0_2_4_baked.sqsh \
-    --container-mounts=/mnt/lustre/metavmds0lstre:/mnt/lustre/metavmds0lstre,/var/run/docker.sock:/var/run/docker.sock,/usr/bin/docker:/usr/bin/docker \
+    --container-mounts=/mnt/lustre/metavmds0lstre:/mnt/lustre/metavmds0lstre,/var/run/docker.sock:/var/run/docker.sock,/usr/bin/docker:/usr/bin/docker,/mnt/localssd:/mnt/localssd,/home/sihanzeng_meta_com:/home/sihanzeng_meta_com \
     --container-workdir=$RLER/slime \
     bash $PER_NODE \
         "$HEAD_NODE" "$HEAD_IP" "$RAY_PORT" \
