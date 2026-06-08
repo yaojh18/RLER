@@ -139,6 +139,7 @@ python3 train.py \
    --apply-chat-template-kwargs '{"enable_thinking": false}' \
    --rollout-shuffle \
    --rm-type gpqa \
+   --custom-rm-path truncation_penalty_rm.custom_rm \
    --rollout-max-prompt-len 8192 \
    --num-rollout 1 \
    --rollout-batch-size 32 \

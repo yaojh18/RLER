@@ -191,6 +191,7 @@ python3 train_async.py \
    --apply-chat-template \
    --rollout-shuffle \
    --rm-type gpqa \
+   --custom-rm-path truncation_penalty_rm.custom_rm \
    --rollout-max-prompt-len 8192 \
    --num-rollout $NUM_ROLLOUT \
    --rollout-batch-size $ROLLOUT_BATCH_SIZE \
