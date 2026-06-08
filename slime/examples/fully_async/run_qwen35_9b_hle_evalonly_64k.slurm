@@ -136,6 +136,7 @@ python3 train.py \
    --label-key label \
    --metadata-key metadata \
    --apply-chat-template \
+   --apply-chat-template-kwargs '{"enable_thinking": false}' \
    --rollout-shuffle \
    --rm-type gpqa \
    --rollout-max-prompt-len 8192 \
