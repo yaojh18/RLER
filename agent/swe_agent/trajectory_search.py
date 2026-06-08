@@ -28,6 +28,7 @@ from swe_agent.parallel_utils import (
     RubricArtifactBundle,
     _atomic_write_json,
     gap_redundancy,
+    rubric_score_record,
 )
 from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches, make_evaluation_payload
 from swe_agent.models.litellm_model import LitellmModel
@@ -39,6 +40,7 @@ from swe_agent.rubric_bank import (
     RubricRecord,
     ScoreRubricBank,
     _convert_generated_rubric,
+    _truncate_middle,
 )
 
 
@@ -47,7 +49,6 @@ RETURN_CODE_RE = re.compile(r"<returncode>(.*?)</returncode>", re.DOTALL)
 EXCEPTION_RE = re.compile(r"<exception>(.*?)</exception>", re.DOTALL)
 OUTPUT_RE = re.compile(r"<output>\s*(.*?)</output>", re.DOTALL)
 PR_DESCRIPTION_RE = re.compile(r"<pr_description>\s*(.*?)\s*</pr_description>", re.DOTALL)
-OBSERVATION_TRUNCATION_MARKER = "\n[... Observation truncated due to length ...]\n"
 MAX_OBSERVATION_CHARS = 512
 MIN_OBSERVATION_SECTION_CHARS = 128
 MAX_RUBRICS = 6
@@ -96,21 +97,6 @@ class SearchNode:
     exit_status: str = ""
     policy_source: Literal["teacher", "student"] = "teacher"
     policy_model_name: str = ""
-
-
-def _truncate_middle(text: str, limit: int) -> str:
-    if limit <= 0:
-        return ""
-    if len(text) <= limit:
-        return text
-    if limit <= len(OBSERVATION_TRUNCATION_MARKER):
-        return text[:limit]
-    remaining = limit - len(OBSERVATION_TRUNCATION_MARKER)
-    head = max(1, remaining // 2)
-    tail = max(1, remaining - head)
-    if head + tail >= len(text):
-        return text
-    return text[:head] + OBSERVATION_TRUNCATION_MARKER + text[-tail:]
 
 
 def _render_structured_observation(
@@ -306,6 +292,13 @@ PY"""
     workspace_meta["status"] = list(workspace_meta.get("status", []))
     workspace_meta["current_patch_chars"] = int(workspace_meta.get("current_patch_chars", 0) or 0)
     return workspace_meta
+
+
+def _normalize_terminal_patch_text(patch: Any) -> str:
+    text = "" if patch is None else str(patch)
+    if not text.strip():
+        return ""
+    return text if text.endswith("\n") else text + "\n"
 
 
 async def _update_persistent_state(
@@ -567,24 +560,7 @@ async def _score_round(
     errors: list[dict[str, str]] = []
     for (view_index, node_id, rubric), response in zip(mapping, responses):
         score_raw, error, judge_message = response
-        normalized = max(0.0, min(1.0, (score_raw - 1.0) / 4.0))
-        record = {
-            "rubric_id": rubric.rubric_id,
-            "rubric": {
-                "rubric_id": rubric.rubric_id,
-                "title": rubric.title,
-                "direction": rubric.direction,
-                "description": rubric.description,
-                "metadata": copy.deepcopy(rubric.metadata),
-                "scale": copy.deepcopy(rubric.scale),
-                "weight": rubric.weight,
-                "source_round": rubric.source_round,
-            },
-            "score_raw": score_raw,
-            "score_normalized": normalized,
-            "weighted_score": float(rubric.weight) * normalized,
-            "judge_message": judge_message,
-        }
+        record = rubric_score_record(rubric, score_raw, judge_message)
         per_view_scores[view_index].append(record)
         if error is not None:
             errors.append(
@@ -666,6 +642,24 @@ async def _generate_and_score_rubric_batch(
         "sample_generated_rubrics": sample_generated_rubrics,
         "generated_score_results": generated_score_results,
     }
+
+
+def _combine_score_results(
+    left: tuple[list[list[dict[str, Any]]], list[dict[str, str]]] | None,
+    right: tuple[list[list[dict[str, Any]]], list[dict[str, str]]] | None,
+    *,
+    continuation_count: int,
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, str]]]:
+    combined_scores: list[list[dict[str, Any]]] = [[] for _ in range(continuation_count)]
+    combined_errors: list[dict[str, str]] = []
+    for score_result in (left, right):
+        if score_result is None:
+            continue
+        per_view_scores, errors = score_result
+        for index in range(min(continuation_count, len(per_view_scores))):
+            combined_scores[index].extend(copy.deepcopy(per_view_scores[index]))
+        combined_errors.extend(copy.deepcopy(errors))
+    return combined_scores, combined_errors
 
 
 def _rubric_sample_evaluation(
@@ -983,12 +977,14 @@ class TrajectorySearchRunner:
         self.user_prompt = ""
         self.best_node_id: str | None = None
         self.finished_node_ids: list[str] = []
+        self.peaceful_exit_triggered = False
         self.image_repository = f"rler-search/{self.task_id.replace('__', '-').lower()}"
         self.artifact_writer = ArtifactWriter(write_artifacts=self.search_config.write_artifacts)
         self._manifest_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="search-manifest")
         self._manifest_futures: list[Future] = []
         self._node_judge_cache: dict[str, dict[str, Any]] = {}
         self._node_snapshot_cache: dict[str, dict[str, Any]] = {}
+        self._node_rubric_round_cache: dict[str, dict[str, Any]] = {}
         self.grpo_collector = (
             GRPOCollector(instance_id=self.task_id, run_dir=self.run_dir)
             if self.search_config.export_grpo_bundles or not self.search_config.write_artifacts
@@ -1034,7 +1030,13 @@ class TrajectorySearchRunner:
             patch_eval_payloads = []
             if self.patch_eval_manager is not None:
                 patch_eval_payloads = self.patch_eval_manager.wait()
-            self._update_experience_banks(rubric_update_records, patch_eval_payloads)
+            if not self.peaceful_exit_triggered:
+                self._update_experience_banks(rubric_update_records, patch_eval_payloads)
+            elif any(bank is not None for bank in self.experience_banks.values()):
+                logger.warning(
+                    "Skipping experience bank update for %s because peaceful_exit was triggered.",
+                    self.task_id,
+                )
             self._finalize_outputs()
         finally:
             if self.patch_eval_manager is not None:
@@ -1108,6 +1110,12 @@ class TrajectorySearchRunner:
                     scope: payload
                     for (scope, _), payload in zip(experience_update_jobs, update_payloads)
                 }
+                records_by_scope_round: dict[tuple[str, int], list[dict[str, Any]]] = {}
+                for record in rubric_update_records:
+                    if not isinstance(record.get("rubric_payload"), dict):
+                        continue
+                    key = (str(record.get("scope")), int(record["round_index"]))
+                    records_by_scope_round.setdefault(key, []).append(record)
                 for scope, payload in scoped_updates.items():
                     _atomic_write_json(
                         self.run_dir / f"{scope}_rubric_bank.json",
@@ -1118,19 +1126,24 @@ class TrajectorySearchRunner:
                     )
                     for update in payload.get("groups", []):
                         round_index = int(update["round_index"])
-                        update_dir = self.rubrics_dir / scope / f"round_{round_index:03d}"
-                        _atomic_write_json(
-                            update_dir / "rubric_bank.json",
-                            {
-                                "before": copy.deepcopy(update.get("before", [])),
-                                "actions": copy.deepcopy(update.get("actions", [])),
-                                "after": copy.deepcopy(update.get("after", [])),
-                            },
-                        )
-                        _atomic_write_json(
-                            update_dir / "rubric_bank_message.json",
-                            copy.deepcopy(update.get("messages", [])),
-                        )
+                        for record in records_by_scope_round.get((scope, round_index), []):
+                            rubric_payload = record["rubric_payload"]
+                            rubric_list_id = rubric_payload.get("rubric_list_id")
+                            if not rubric_list_id:
+                                continue
+                            update_dir = self.rubrics_dir / scope / str(rubric_list_id)
+                            _atomic_write_json(
+                                update_dir / "rubric_bank.json",
+                                {
+                                    "before": copy.deepcopy(update.get("before", [])),
+                                    "after": copy.deepcopy(update.get("after", [])),
+                                    "generated": copy.deepcopy(rubric_payload.get("generated", [])),
+                                },
+                            )
+                            _atomic_write_json(
+                                update_dir / "rubric_bank_message.json",
+                                copy.deepcopy(update.get("messages", [])),
+                            )
 
 
     def _save_manifest(self) -> None:
@@ -1151,6 +1164,7 @@ class TrajectorySearchRunner:
             "best_node_id": self.best_node_id,
             "finished_node_ids": list(self.finished_node_ids),
             "current_round": self.current_round,
+            "peaceful_exit_triggered": self.peaceful_exit_triggered,
             "system_prompt": self.system_prompt,
             "user_prompt": self.user_prompt,
             "node_ids": sorted(self.nodes),
@@ -1190,6 +1204,7 @@ class TrajectorySearchRunner:
         self.best_node_id = manifest.get("best_node_id")
         self.finished_node_ids = list(manifest.get("finished_node_ids", []))
         self.current_round = int(manifest.get("current_round", 0))
+        self.peaceful_exit_triggered = bool(manifest.get("peaceful_exit_triggered", False))
         self.system_prompt = manifest.get("system_prompt", "")
         self.user_prompt = manifest.get("user_prompt", "")
         if self.rubric_bank is not None:
@@ -1327,6 +1342,7 @@ class TrajectorySearchRunner:
         self.nodes[root_node.node_id] = root_node
         self._node_judge_cache[root_node.node_id] = copy.deepcopy(root_judge)
         self._node_snapshot_cache[root_node.node_id] = copy.deepcopy(root_snapshot)
+        self._node_rubric_round_cache[root_node.node_id] = copy.deepcopy(root_rubric_round)
         root_bundle = NodeArtifactBundle(
             node_id=root_node.node_id,
             node_dir=self.nodes_dir / root_node.node_id,
@@ -1388,8 +1404,10 @@ class TrajectorySearchRunner:
         extra_prompt_sections: list[str] = []
         retrieved_experiences = []
         retrieve_messages: list[dict[str, Any]] = []
+        active_bank_rubrics: list[RubricRecord] = []
         if score_bank is not None:
             score_context = score_bank.build_generation_context()
+            active_bank_rubrics = copy.deepcopy(score_context.existing_rubrics)
             extra_prompt_sections.extend(score_context.extra_prompt_sections)
         if experience_bank is not None:
             experience_context = await experience_bank.build_generation_context(
@@ -1406,6 +1424,17 @@ class TrajectorySearchRunner:
             extra_prompt_sections.extend(experience_context.extra_prompt_sections)
             retrieved_experiences = copy.deepcopy(experience_context.retrieved)
             retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
+
+        active_score_result = None
+        if active_bank_rubrics:
+            active_score_result = await _score_round(
+                question=question,
+                shared_context=shared_context,
+                continuations=continuations,
+                rubrics=active_bank_rubrics,
+                **judge_kwargs,
+                judge_prompt=scope_spec["judge_prompt"],
+            )
 
         score_batch = await _generate_and_score_rubric_batch(
             sample_count=self.search_config.n,
@@ -1425,33 +1454,46 @@ class TrajectorySearchRunner:
         valid_rubric_samples: list[dict[str, Any]] = []
         for sample_index, generated_sample in enumerate(score_batch["generated_samples"]):
             generated_rubrics = score_batch["sample_generated_rubrics"][sample_index]
+            scoring_rubrics = active_bank_rubrics + generated_rubrics
+            combined_score_batch = {
+                "generated_score_results": {
+                    sample_index: _combine_score_results(
+                        active_score_result,
+                        score_batch["generated_score_results"][sample_index],
+                        continuation_count=len(continuations),
+                    )
+                },
+            }
             evaluation = _rubric_sample_evaluation(
-                score_batch=score_batch,
+                score_batch=combined_score_batch,
                 sample_index=sample_index,
                 node_ids=node_ids,
-                scoring_rubrics=generated_rubrics,
+                scoring_rubrics=scoring_rubrics,
                 include_variance_reward=bool(scope_spec["include_variance_reward"]),
             )
             metrics = evaluation["metrics"]
-            bank_update = (
-                score_bank.update_after_round(
+            active_before = []
+            active_after = []
+            inactive_after = []
+            if score_bank is not None:
+                bank_update = score_bank.update_after_round(
                     generated=generated_rubrics,
                     rewards=metrics["reward_by_rubric"],
                 )
-                if score_bank is not None
-                else None
-            )
+                active_before = bank_update.active_before
+                active_after = bank_update.active_after
+                inactive_after = bank_update.inactive_after
             if scope_spec["scope"] == "pc":
                 avg_scores = _pc_avg_scores_from_rubrics(
                     node_ids=node_ids,
                     score_lookup_by_node=evaluation["score_lookup_by_node"],
-                    rubrics=generated_rubrics,
+                    rubrics=scoring_rubrics,
                 )
             else:
                 avg_scores = _avg_scores_from_rubrics(
                     node_ids=node_ids,
                     score_lookup_by_node=evaluation["score_lookup_by_node"],
-                    rubrics=generated_rubrics,
+                    rubrics=scoring_rubrics,
                 )
             generated_ids = {rubric.rubric_id for rubric in generated_sample.generated}
             sample_payload = {
@@ -1459,14 +1501,13 @@ class TrajectorySearchRunner:
                 "sample_index": generated_sample.sample_index,
                 "round_index": round_index,
                 "rubric_list_id": generated_sample.rubric_list_id,
-                "has_scoring_rubrics": bool(generated_rubrics),
                 "generated": generated_sample.generated,
                 "messages": generated_sample.messages,
                 "format_errors": copy.deepcopy(generated_sample.format_errors or []),
                 "terminal_error": generated_sample.terminal_error,
                 "generated_titles": [rubric.title for rubric in generated_sample.generated],
                 **_rubric_metrics_payload(metrics, generated_ids),
-                "avg_scores": avg_scores,
+                "average_rubric_judged_scores": avg_scores,
                 "judge_errors": evaluation["judge_errors"],
                 "selected": False,
             }
@@ -1477,16 +1518,16 @@ class TrajectorySearchRunner:
                         "retrieve_messages": copy.deepcopy(retrieve_messages),
                     }
                 )
-            if bank_update is not None:
+            if score_bank is not None:
                 sample_payload.update(
                     {
-                        "active_before": bank_update.active_before,
-                        "active_after": bank_update.active_after,
-                        "inactive_after": bank_update.inactive_after,
+                        "active_before": active_before,
+                        "active_after": active_after,
+                        "inactive_after": inactive_after,
                     }
                 )
             rubric_samples.append(sample_payload)
-            if generated_rubrics:
+            if scoring_rubrics:
                 valid_rubric_samples.append(sample_payload)
         return {
             "scope": scope_spec["scope"],
@@ -1596,12 +1637,9 @@ class TrajectorySearchRunner:
             pc_rubric_samples = None
             valid_pc_rubric_samples = None
 
-        if len(valid_rubric_samples) < min(2, self.search_config.n) or compare_parent and len(valid_pc_rubric_samples) < min(2, self.search_config.n):
-            return {
-                "rubric_samples": rubric_samples,
-                "pc_rubric_samples": pc_rubric_samples,
-                "stop_search": True,
-            }
+        valid_rubric_samples = valid_rubric_samples or rubric_samples
+        if compare_parent:
+            valid_pc_rubric_samples = valid_pc_rubric_samples or pc_rubric_samples
 
         selected_sample = random.choice(valid_rubric_samples)
         selected_sample["selected"] = True
@@ -1611,31 +1649,24 @@ class TrajectorySearchRunner:
             selected_pc_sample["selected"] = True
 
         sibling_scores = [
-            sum(sample["avg_scores"][branch["node_id"]] for sample in valid_rubric_samples) / len(valid_rubric_samples)
+            sum(sample["average_rubric_judged_scores"][branch["node_id"]] for sample in valid_rubric_samples) / len(valid_rubric_samples)
             for branch in branch_records
         ]
         if compare_parent:
             pc_scores = [
-                sum(sample["avg_scores"][branch["node_id"]] for sample in valid_pc_rubric_samples) / len(valid_pc_rubric_samples)
+                sum(sample["average_rubric_judged_scores"][branch["node_id"]] for sample in valid_pc_rubric_samples) / len(valid_pc_rubric_samples)
                 for branch in branch_records
-            ]
-            combined_scores = [
-                (sibling_reward + pc_reward) / 2.0
-                for sibling_reward, pc_reward in zip(sibling_scores, pc_scores)
             ]
         else:
             pc_scores = None
-            combined_scores = sibling_scores
         return {
             "rubric_samples": rubric_samples,
             "pc_rubric_samples": pc_rubric_samples,
-            "combined_scores": combined_scores,
             "siblings_scores": sibling_scores,
             "pc_scores": pc_scores,
             "selected_sample_index": selected_sample["sample_index"],
             "selected_sample": selected_sample,
             "selected_pc_sample": selected_pc_sample,
-            "stop_search": False,
         }
 
     def _rubric_bank_payload_fields(self, sample: dict[str, Any]) -> dict[str, Any]:
@@ -1678,7 +1709,7 @@ class TrajectorySearchRunner:
             **self._rubric_round_payload(sample),
             "parent_node_id": parent_id,
             "score_by_rubric": copy.deepcopy(sample["score_by_rubric"]),
-            "avg_scores": copy.deepcopy(sample["avg_scores"]),
+            "average_rubric_judged_scores": copy.deepcopy(sample["average_rubric_judged_scores"]),
             "generated_titles": list(sample["generated_titles"]),
             "selected": bool(sample["selected"]),
             "gt_by_rubric": {},
@@ -1694,7 +1725,7 @@ class TrajectorySearchRunner:
             raise RuntimeError(f"Node {parent_id} does not have a cached judge payload")
         parent_snapshot = copy.deepcopy(self._node_snapshot_cache[parent_id])
         parent_judge = copy.deepcopy(self._node_judge_cache[parent_id])
-        parent_rubric_round = parent_judge.get("rubric_round", {})
+        parent_rubric_round = copy.deepcopy(self._node_rubric_round_cache.get(parent_id))
         if self.rubric_bank is not None:
             active_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("active_bank_after", [])]
             inactive_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("inactive_bank_after", [])]
@@ -1831,21 +1862,19 @@ class TrajectorySearchRunner:
                 compare_parent=parent_id != "root",
             )
         )
-        if bool(judged.get("stop_search")):
-            self.peaceful_exit(branch_records, parent_id)
-            return []
         node_round_records = []
         valid_branches: list[dict[str, Any]] = []
         pc_scores = judged.get("pc_scores")
         pc_regression_threshold = 0.5 + self.search_config.regression_margin
-        for index, (branch, avg_score) in enumerate(zip(valid_branch_records, judged["combined_scores"])):
-            branch["score"] = float(avg_score)
-            pc_score = float(pc_scores[index]) if pc_scores is not None else None
+        for branch, sibling_score, pc_score in zip(valid_branch_records, judged["siblings_scores"], pc_scores if pc_scores is not None else [None] * len(valid_branch_records)):
+            branch["score"] = float(sibling_score)
             branch["regressed_vs_parent"] = parent_id != "root" and pc_score is not None and pc_score < pc_regression_threshold
             valid_branches.append(branch)
             node_round_records.append({
                 "node_id": branch["node_id"],
                 "score": branch["score"],
+                "siblings_score": branch["score"],
+                "pc_score": float(pc_score) if pc_score is not None else None,
                 "regressed_vs_parent": branch["regressed_vs_parent"],
             })
         valid_branches.sort(key=lambda branch: (branch["score"], branch["result"]["status"] == "finished"), reverse=True)
@@ -1949,7 +1978,6 @@ class TrajectorySearchRunner:
                     "pc_inactive_bank_after": [asdict(rubric) for rubric in self.pc_rubric_bank.inactive_bank],
                 }
             )
-
         for branch in valid_branch_records:
             branch["keep_snapshot"] = branch["node_id"] in kept_child_ids
             branch["image_tag"] = None
@@ -2037,7 +2065,7 @@ class TrajectorySearchRunner:
                     model_name=branch["policy_model_name"],
                     preserve_token_fields=True,
                 )
-                _patch = (terminal_result.get("submission", "") or "").strip()
+                _patch = _normalize_terminal_patch_text(terminal_result.get("submission", ""))
                 if not _patch:
                     # Agent didn't explicitly submit (ran out of step budget mid-edit).
                     # Fall back to the actual git diff inside the docker container so we
@@ -2054,7 +2082,7 @@ class TrajectorySearchRunner:
                             },
                             timeout=30,
                         )
-                        _patch = (_diff.get("output") or "").strip()
+                        _patch = _normalize_terminal_patch_text(_diff.get("output") or "")
                     except Exception:
                         _patch = ""
                 terminal_patch = {
@@ -2076,6 +2104,7 @@ class TrajectorySearchRunner:
             )
             self.nodes[node.node_id] = node
             self._node_judge_cache[node.node_id] = copy.deepcopy(judge_payload)
+            self._node_rubric_round_cache[node.node_id] = copy.deepcopy(round_payload)
             if snapshot_payload is not None:
                 self._node_snapshot_cache[node.node_id] = copy.deepcopy(snapshot_payload)
             else:
@@ -2204,6 +2233,7 @@ class TrajectorySearchRunner:
         self._save_manifest()
 
     def peaceful_exit(self, branch_records, parent_id: str) -> None:
+        self.peaceful_exit_triggered = True
         error_records = [
             {"node_id": branch.get("node_id"), "error": branch.get("error")}
             for branch in branch_records

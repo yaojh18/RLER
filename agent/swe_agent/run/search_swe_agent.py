@@ -49,6 +49,26 @@ from swe_agent.prompt import PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT, PC_RUBRIC_EX
 from swe_agent.rubric_bank import ExperienceRubricBank
 from swe_agent.trajectory_search import SearchConfig, TrajectorySearchRunner
 from swe_agent.serving import SGLangChatService
+from swe_agent.parallel_utils import _atomic_write_json
+
+
+def _flush_experience_bank_summaries(
+    *,
+    run_root: Path,
+    experience_banks: dict[str, ExperienceRubricBank] | None,
+    initial_snapshots: dict[str, list[dict[str, Any]]],
+    write_artifacts: bool,
+) -> None:
+    if not write_artifacts or not experience_banks:
+        return
+    for scope, bank in experience_banks.items():
+        _atomic_write_json(
+            run_root / f"{scope}_rubric_bank.json",
+            {
+                "before": copy.deepcopy(initial_snapshots.get(scope, [])),
+                "after": copy.deepcopy(bank.to_list()),
+            },
+        )
 
 
 def _run_single_instance(
@@ -63,7 +83,6 @@ def _run_single_instance(
     rubric_model_kwargs: dict[str, Any],
     judge_model_kwargs: dict[str, Any],
     search_config: SearchConfig,
-    rubric_bank: ExperienceRubricBank | None,
     experience_banks: dict[str, ExperienceRubricBank] | None,
     resume: bool,
 ) -> None:
@@ -89,14 +108,13 @@ def _run_single_instance(
         rubric_model_kwargs=rubric_model_kwargs,
         judge_model_kwargs=judge_model_kwargs,
         harness_namespace=get_swebench_harness_namespace(instance),
-        rubric_bank=rubric_bank,
         experience_banks=experience_banks,
         resume=resume,
     )
     try:
         runner.run()
     except Exception:
-        if search_config.export_grpo_bundles:
+        if search_config.export_grpo_bundles and not search_config.write_artifacts:
             bundle = runner.grpo_collector.bundle
             if bundle.policy_groups or bundle.rubric_groups:
                 return bundle
@@ -236,10 +254,11 @@ def run_search(
         )
     errors: list[str] = []
     try:
+        agent_model_class = "litellm_textbased" if args.backend == "openai" else DEFAULT_MODEL_CLASS
         config = build_swebench_config(
             config_spec=[str(SWE_AGENT_TEXTBASED_CONFIG)],
             model=model_name,
-            model_class=DEFAULT_MODEL_CLASS,
+            model_class=agent_model_class,
             extra_overrides={
                 "agent": {
                     "step_limit": args.step_limit,
@@ -289,7 +308,6 @@ def run_search(
         judge_model_name = args.judge_model or model_name
         rubric_model_kwargs = dict(shared_model_kwargs)
         judge_model_kwargs = dict(shared_model_kwargs)
-        rubric_bank = None
         experience_banks = None
         if search_config.rubric_bank_strategy in {"experience", "both"}:
             experience_banks = {
@@ -304,6 +322,16 @@ def run_search(
                     scope="pc",
                 ),
             }
+        experience_bank_initial_snapshots = {
+            scope: copy.deepcopy(bank.to_list())
+            for scope, bank in (experience_banks or {}).items()
+        }
+        _flush_experience_bank_summaries(
+            run_root=run_root,
+            experience_banks=experience_banks,
+            initial_snapshots=experience_bank_initial_snapshots,
+            write_artifacts=search_config.write_artifacts,
+        )
         with temporary_env({"MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": str(args.model_retry_attempts), "LITELLM_LOG": "ERROR"}):
             with tee_console(run_log_path):
                 for instance in instances:
@@ -321,9 +349,14 @@ def run_search(
                             rubric_model_kwargs=rubric_model_kwargs,
                             judge_model_kwargs=judge_model_kwargs,
                             search_config=search_config,
-                            rubric_bank=rubric_bank,
                             experience_banks=experience_banks,
                             resume=bool(args.resume_run_dir),
+                        )
+                        _flush_experience_bank_summaries(
+                            run_root=run_root,
+                            experience_banks=experience_banks,
+                            initial_snapshots=experience_bank_initial_snapshots,
+                            write_artifacts=search_config.write_artifacts,
                         )
                     except Exception as exc:
                         errors.append(f"{instance['instance_id']}: {exc}")
@@ -333,6 +366,7 @@ def run_search(
                             error=exc,
                             log_path=run_log_path,
                         )
+                        raise
         if errors:
             raise RuntimeError("; ".join(errors))
         return run_dir, grpo_bundle
@@ -379,12 +413,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-temperature", type=float, default=0.1)
     parser.add_argument("--judge-top-p", type=float, default=0.95)
     parser.add_argument("--judge-max-tokens", type=int, default=4096)
-    parser.add_argument("--regression-margin", type=float, default=-100.0)
+    parser.add_argument("--regression-margin", type=float, default=0.0)
     parser.add_argument("--rubric-model", default=None)
     parser.add_argument("--judge-model", default=None)
-    parser.add_argument("--calculate-gt-reward", action="store_true", default=True)
+    parser.add_argument("--calculate-gt-reward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--strategy", choices=["best", "probability", "random"], default="random")
-    parser.add_argument("--rubric-bank-strategy", choices=["score", "experience", "both"], default="score")
+    parser.add_argument("--rubric-bank-strategy", choices=["score", "experience", "both"], default="both")
     parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
     parser.add_argument("--student-model", default=None)
     parser.add_argument("--evaluate-final-patch", action="store_true", default=True)

@@ -21,6 +21,7 @@ from swe_agent.models.utils.openai_multimodal import expand_multimodal_content
 from swe_agent.models.utils.retry import retry
 
 logger = logging.getLogger("litellm_model")
+DEFAULT_LITELLM_TIMEOUT_SECONDS = float(os.getenv("MSWEA_LITELLM_TIMEOUT", "300"))
 
 
 def _message_contents(message: Any) -> tuple[str, str]:
@@ -87,13 +88,28 @@ class LitellmModel:
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
+    def _completion_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        merged = self.config.model_kwargs | kwargs
+        if DEFAULT_LITELLM_TIMEOUT_SECONDS > 0 and "timeout" not in merged and "request_timeout" not in merged:
+            merged["timeout"] = DEFAULT_LITELLM_TIMEOUT_SECONDS
+        merged.setdefault("stream", False)
+        if (
+            DEFAULT_LITELLM_TIMEOUT_SECONDS > 0
+            and "client" not in merged
+            and any(name in self.config.model_name.lower() for name in ("gemini", "vertex"))
+        ):
+            from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+            merged["client"] = HTTPHandler(timeout=DEFAULT_LITELLM_TIMEOUT_SECONDS)
+        return merged
+
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
             return litellm.completion(
                 model=self.config.model_name,
                 messages=messages,
                 tools=[BASH_TOOL],
-                **(self.config.model_kwargs | kwargs),
+                **self._completion_kwargs(kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."

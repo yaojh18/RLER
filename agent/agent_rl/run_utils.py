@@ -57,6 +57,21 @@ def _get_litellm_semaphore() -> asyncio.Semaphore:
     return sem
 
 
+def _default_litellm_timeout_seconds() -> float:
+    return float(os.environ.get("LITELLM_DEFAULT_TIMEOUT", os.environ.get("MSWEA_LITELLM_TIMEOUT", "600")))
+
+
+def _litellm_outer_timeout_seconds(timeout: Any) -> float:
+    try:
+        timeout_seconds = float(timeout)
+    except (TypeError, ValueError):
+        return 0.0
+    if timeout_seconds <= 0:
+        return 0.0
+    grace = float(os.environ.get("LITELLM_OUTER_TIMEOUT_GRACE", "5"))
+    return timeout_seconds + max(0.0, grace)
+
+
 def configure_model_route(name: str, config: ModelRouteConfig) -> None:
     _MODEL_ROUTE_CONFIGS[name] = config
 
@@ -167,12 +182,15 @@ async def run_litellm_completion_async(
 ) -> ChatCompletion:
     msgs = _build_messages(system_prompt=system_prompt, user_prompt=user_prompt, messages=messages)
     chat_kwargs["num_retries"] = chat_kwargs.get("num_retries", 4)
-    chat_kwargs["timeout"] = chat_kwargs.get(
-        "timeout", float(os.environ.get("LITELLM_DEFAULT_TIMEOUT", "600"))
-    )
+    chat_kwargs["timeout"] = chat_kwargs.get("timeout", _default_litellm_timeout_seconds())
     try:
         async with _get_litellm_semaphore():
-            response = await asyncio.to_thread(litellm.completion, messages=msgs, model=model_name, **chat_kwargs)
+            completion_call = asyncio.to_thread(litellm.completion, messages=msgs, model=model_name, **chat_kwargs)
+            outer_timeout = _litellm_outer_timeout_seconds(chat_kwargs.get("timeout"))
+            if outer_timeout > 0:
+                response = await asyncio.wait_for(completion_call, timeout=outer_timeout)
+            else:
+                response = await completion_call
     except Exception as exc:
         if isinstance(exc, litellm.JSONSchemaValidationError):
             raw_content = exc.raw_response if isinstance(exc.raw_response, str) else str(exc.raw_response)
@@ -205,7 +223,15 @@ async def run_litellm_completion_async(
             print(f"Error in run_litellm_completion_async (FATAL, raising): {exc}")
             raise
         print(f"Error in run_litellm_completion_async: {exc}")
-        return ChatCompletion(content="", model_name=model_name, metadata={"timestamp": time.time()})
+        return ChatCompletion(
+            content="",
+            model_name=model_name,
+            metadata={
+                "timestamp": time.time(),
+                "error": f"{type(exc).__name__}: {exc}",
+                "timeout": chat_kwargs.get("timeout") if isinstance(exc, asyncio.TimeoutError) else None,
+            },
+        )
     choice = response.choices[0]
     message = choice.message
     inline_content = message.content or ""

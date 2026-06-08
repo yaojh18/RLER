@@ -24,7 +24,23 @@ from swe_agent.prompt import (
 
 
 logger = logging.getLogger(__name__)
+OBSERVATION_TRUNCATION_MARKER = "\n[... Observation truncated due to length ...]\n"
 MAX_TERMINAL_PATCH_SECTION_CHARS = 4096
+
+
+def _truncate_middle(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit <= len(OBSERVATION_TRUNCATION_MARKER):
+        return text[:limit]
+    remaining = limit - len(OBSERVATION_TRUNCATION_MARKER)
+    head = max(1, remaining // 2)
+    tail = max(1, remaining - head)
+    if head + tail >= len(text):
+        return text
+    return text[:head] + OBSERVATION_TRUNCATION_MARKER + text[-tail:]
 
 
 @dataclass
@@ -189,8 +205,7 @@ def gold_patch_skeleton(gold_patch: str, max_chars: int = 4096) -> str:
     text = "\n".join(rows)
     if len(text) <= max_chars:
         return text
-    half = max_chars // 2
-    return text[:half].rstrip() + "\n...[truncated]...\n" + text[-half:].lstrip()
+    return _truncate_middle(text, max_chars)
 
 
 def build_terminal_update_evidence(
@@ -230,10 +245,7 @@ def build_terminal_update_evidence(
     terminal_patch_rows: list[str] = []
     passed_test_rows: list[str] = []
     for item in participants:
-        patch = str(item["patch"] or "")
-        if len(patch) > MAX_TERMINAL_PATCH_SECTION_CHARS:
-            half = MAX_TERMINAL_PATCH_SECTION_CHARS // 2
-            patch = patch[:half].rstrip() + "\n...[truncated]...\n" + patch[-half:].lstrip()
+        patch = _truncate_middle(str(item["patch"] or ""), MAX_TERMINAL_PATCH_SECTION_CHARS)
         diff_tests = set(item["passed_tests"]) - common_passed
         terminal_patch_rows.extend([f"## {item['title']}:", patch.strip() if patch.strip() else "<empty>"])
         passed_test_rows.extend(
@@ -544,17 +556,17 @@ class ScoreRubricBank:
     ) -> RubricBankRoundUpdate:
         active_before = copy.deepcopy(self.active_bank)
         deduped_by_title: dict[str, RubricRecord] = {}
-        kept_active_bank = [rubric for rubric in self.active_bank if rubric.reward is not None and rubric.reward > 0.0]
+        kept_active_bank = [rubric for rubric in self.active_bank if rewards.get(rubric.rubric_id, 0.0) > 0.0]
         for rubric in kept_active_bank + generated:
-            candidate = RubricRecord(**{**asdict(rubric), "reward": rewards.get(rubric.rubric_id, rubric.reward or 0.0)})
+            candidate = RubricRecord(**{**asdict(rubric), "reward": rewards.get(rubric.rubric_id, 0.0)})
             title_key = candidate.title.strip().casefold()
             existing = deduped_by_title.get(title_key)
-            if existing is None or (candidate.reward or 0.0) > (existing.reward or 0.0) or (
-                (candidate.reward or 0.0) == (existing.reward or 0.0) and candidate.source_round > existing.source_round
+            if existing is None or (candidate.reward) > (existing.reward) or (
+                candidate.reward == existing.reward and candidate.source_round > existing.source_round
             ):
                 deduped_by_title[title_key] = candidate
         ranked = list(deduped_by_title.values())
-        ranked.sort(key=lambda rubric: (rubric.reward or 0.0), reverse=True)
+        ranked.sort(key=lambda rubric: rubric.reward, reverse=True)
         active_after = ranked[: self.max_active_rubrics]
         active_ids = {rubric.rubric_id for rubric in active_after}
         inactive_after = [rubric for rubric in ranked + self.inactive_bank if rubric.rubric_id not in active_ids]
@@ -876,7 +888,7 @@ class ExperienceRubricBank:
         attempts = []
         for payload in rubric_payloads:
             generation_context = _extract_generation_context_from_messages(payload.get("messages"))
-            avg_scores = payload.get("avg_scores", {})
+            avg_scores = payload.get("average_rubric_judged_scores", {})
             ordered_node_ids = [str(node_id) for node_id in avg_scores]
             generated = payload.get("generated", [])
             ground_truth_by_node = (

@@ -58,6 +58,7 @@ from swe_agent.parallel_utils import (
     _ensure_litellm_prefix,
     _stamp_steps,
     _atomic_write_json,
+    extract_terminal_patch_from_session,
     progress_reward,
     gap_corr,
     TurnTokenInfo,
@@ -207,8 +208,8 @@ class ParallelSearchConfig:
     fallback_patch_penalty: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.p != 1:
-            raise ValueError("trajectory_search_parallel currently supports p=1 only.")
+        if self.p <= 0:
+            raise ValueError("trajectory_search_parallel requires p > 0.")
         if self.m <= 0:
             raise ValueError("trajectory_search_parallel requires m > 0.")
         if self.n <= 0:
@@ -370,7 +371,7 @@ class LaneGRPOCollector:
     def _branch_overall_rubric_score(branch: LaneBBranch, samples: list[dict[str, Any]]) -> float | None:
         scores: list[float] = []
         for sample in samples:
-            avg_scores = sample["avg_scores"]
+            avg_scores = sample["average_rubric_judged_scores"]
             if branch.node_id in avg_scores:
                 scores.append(float(avg_scores[branch.node_id]))
         if not scores:
@@ -985,28 +986,7 @@ class TrajectorySearchParallelRunner:
         self, result: dict[str, Any], session: Any
     ) -> tuple[str, bool]:
         """(patch_text, is_fallback). Same recipe as v0."""
-
-        def _normalize(p: str) -> str:
-            p = p.rstrip()
-            return p + "\n" if p else ""
-
-        patch = _normalize(result.get("submission") or "")
-        if patch:
-            return patch, False
-        try:
-            diff = session.agent.env.execute(
-                {
-                    "command": (
-                        'repo=$(git -C /testbed rev-parse --show-toplevel 2>/dev/null '
-                        '|| git rev-parse --show-toplevel 2>/dev/null || pwd); '
-                        'cd "$repo" && git add -N . >/dev/null 2>&1; git diff'
-                    )
-                },
-                timeout=30,
-            )
-            return _normalize(diff.get("output") or ""), True
-        except Exception:
-            return "", True
+        return extract_terminal_patch_from_session(result, session)
 
     @staticmethod
     def _is_context_window_error(exc: Exception) -> bool:
@@ -1608,7 +1588,7 @@ class TrajectorySearchParallelRunner:
                 "generated_titles": [rubric.title for rubric in generated_sample.generated],
                 "scoring_rubrics": [asdict(rubric) for rubric in scoring_rubrics],
                 **_rubric_metrics_payload(metrics, generated_ids),
-                "avg_scores": avg_scores,
+                "average_rubric_judged_scores": avg_scores,
                 "judge_errors": evaluation["judge_errors"],
                 "judge_response": judge_response_for_sample,
                 "gt_by_rubric": {
@@ -2401,8 +2381,18 @@ class TrajectorySearchParallelRunner:
                         condition.notify_all()
                 return None
             self._dump_group(grp)
-            await self._run_lane_c_in_order(grp)
-            self._dump_group(grp)
+            if getattr(self, "skip_lane_c", False):
+                now = time.perf_counter()
+                grp.lane_c_started_at = grp.lane_c_started_at or now
+                grp.lane_c_done_at = grp.lane_c_done_at or now
+                logger.info(
+                    "[%s] lane_c g=%d skipped by trajectory-only mode",
+                    self.task_id,
+                    grp.group_index,
+                )
+            else:
+                await self._run_lane_c_in_order(grp)
+                self._dump_group(grp)
             if on_group_done is not None:
                 try:
                     on_group_done(grp)
@@ -2463,6 +2453,30 @@ class TrajectorySearchParallelRunner:
                     time.perf_counter() - t_drain,
                     len(instance_record.groups),
                 )
+            if getattr(self, "skip_lane_c", False):
+                for scope in self.rubric_scopes:
+                    bank_state = self.experience_banks[scope].to_list()
+                    _atomic_write_json(
+                        self.run_dir / f"{scope}_rubric_bank.json",
+                        {
+                            "before": copy.deepcopy(bank_state),
+                            "after": copy.deepcopy(bank_state),
+                            "lane_c_skipped": True,
+                        },
+                    )
+                instance_record.completed = (
+                    instance_record.lane_a.error is None
+                    and all(
+                        all(b.error is None for b in g.branches)
+                        for g in instance_record.groups
+                    )
+                )
+                if not instance_record.completed and instance_record.error is None:
+                    instance_record.error = (
+                        instance_record.lane_a.error
+                        or "one or more lane_b branches errored"
+                    )
+                return instance_record
             experience_update_attrs = {
                 "siblings": {
                     "samples_attr": "rubric_samples",
@@ -2620,13 +2634,19 @@ class TrajectorySearchParallelRunner:
             else gdir / "branches" / f"branch_{branch.branch_index:02d}"
         )
         bdir.mkdir(parents=True, exist_ok=True)
+        branch_model_name = branch.policy_model_name or self.policy_model_name
+        branch_policy_source = getattr(
+            branch,
+            "policy_source",
+            "parent_baseline" if branch.is_parent_baseline else "student",
+        )
         branch_step_cards = _build_step_cards(branch.events, branch.parent_asst_step)
         stamped, _ = _stamp_steps(branch.messages, start_step=0)
         _atomic_write_json(
             bdir / "message.json",
             build_messages(
                 stamped,
-                model_name=self.policy_model_name,
+                model_name=branch_model_name,
                 preserve_token_fields=True,
             ),
         )
@@ -2634,7 +2654,7 @@ class TrajectorySearchParallelRunner:
             bdir / "terminal_patch.json",
             {
                 self.task_id: {
-                    "model_name_or_path": self.policy_model_name,
+                    "model_name_or_path": branch_model_name,
                     "instance_id": self.task_id,
                     "model_patch": branch.terminal_patch or "",
                     "terminal_error": branch.error,
@@ -2666,9 +2686,9 @@ class TrajectorySearchParallelRunner:
                     else ""
                 ),
                 "exit_status": "Submitted" if branch.terminated_early else "",
-                "policy_source": "parent_baseline" if branch.is_parent_baseline else "student",
+                "policy_source": branch_policy_source,
                 "is_parent_baseline": branch.is_parent_baseline,
-                "policy_model_name": self.policy_model_name,
+                "policy_model_name": branch_model_name,
                 "branch_index": branch.branch_index,
                 "group_index": group.group_index,
                 "parent_image_tag": branch.parent_image_tag,
@@ -2732,6 +2752,7 @@ class TrajectorySearchParallelRunner:
                 "completed": instance_record.completed,
                 "error": instance_record.error,
                 "seconds": instance_record.seconds,
+                "lane_c_skipped": bool(getattr(self, "skip_lane_c", False)),
                 "num_groups": len(instance_record.groups),
                 "num_mid_cps": len(instance_record.lane_a.mid_cps),
                 "config": instance_record.config,

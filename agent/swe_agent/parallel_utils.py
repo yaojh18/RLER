@@ -4,6 +4,7 @@ import json
 import math
 import os
 import tempfile
+import copy
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,17 @@ from swe_agent.rubric_bank import build_terminal_update_evidence
 INVALID_SAMPLE_REWARD = -1.0
 RUBRIC_FORMAT_ERROR_REWARD = -1.0
 RUBRIC_TERMINAL_ERROR_REWARD = -0.2
+
+
+def _evaluation_error_payload(error: Any) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "resolved": False,
+        "reward": 0.0,
+        "passed_tests": [],
+        "failed_tests": [],
+        "error": f"{type(error).__name__}: {error}" if isinstance(error, BaseException) else str(error),
+    }
 
 
 # NOTE: I am not sure if current reward design is approciate, we can iterate on this later.
@@ -36,6 +48,8 @@ def progress_reward(
             rewards.append(prediction - 0.5)
         elif label < 0.5:
             rewards.append(0.5 - prediction)        
+    if not rewards:
+        return 0.0
     return float(sum(rewards) / len(rewards))
 
 
@@ -108,6 +122,62 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         if os.path.exists(temp_path):
             os.remove(temp_path)
         raise
+
+
+def extract_terminal_patch_from_session(result: dict[str, Any], session: Any) -> tuple[str, bool]:
+    def normalize_patch_text(patch: str) -> str:
+        patch = (patch or "").rstrip()
+        return patch + "\n" if patch else ""
+
+    patch = normalize_patch_text(str(result.get("submission") or ""))
+    if patch:
+        return patch, False
+    try:
+        diff = session.agent.env.execute(
+            {
+                "command": (
+                    'repo=$(git -C /testbed rev-parse --show-toplevel 2>/dev/null '
+                    '|| git rev-parse --show-toplevel 2>/dev/null || pwd); '
+                    'cd "$repo" && git add -N . >/dev/null 2>&1; git diff'
+                )
+            },
+            timeout=30,
+        )
+        return normalize_patch_text(str(diff.get("output") or "")), True
+    except Exception:
+        return "", True
+
+
+def compact_workspace_meta(workspace_meta: dict[str, Any], *, file_limit: int = 8) -> dict[str, Any]:
+    return {
+        "head_commit": workspace_meta.get("head_commit", ""),
+        "changed_files": list(workspace_meta.get("changed_files", []))[:file_limit],
+        "untracked_files": list(workspace_meta.get("untracked_files", []))[:file_limit],
+        "diff_stat": workspace_meta.get("diff_stat", ""),
+        "current_patch_chars": int(workspace_meta.get("current_patch_chars", 0) or 0),
+    }
+
+
+def rubric_score_record(rubric: Any, score_raw: int, judge_message: Any) -> dict[str, Any]:
+    normalized = max(0.0, min(1.0, (float(score_raw) - 1.0) / 4.0))
+    return {
+        "rubric_id": rubric.rubric_id,
+        "rubric": {
+            "rubric_id": rubric.rubric_id,
+            "title": rubric.title,
+            "direction": rubric.direction,
+            "description": rubric.description,
+            "metadata": copy.deepcopy(getattr(rubric, "metadata", {}) or {}),
+            "scale": copy.deepcopy(rubric.scale),
+            "weight": rubric.weight,
+            "source_round": rubric.source_round,
+        },
+        "score_raw": int(score_raw),
+        "score_normalized": normalized,
+        "weighted_score": float(rubric.weight) * normalized,
+        "judge_message": judge_message,
+    }
+
 
 def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
     item = {
@@ -250,7 +320,7 @@ class GRPOCollector:
             reward = (
                 INVALID_SAMPLE_REWARD
                 if bundle.judge_payload.get("is_valid") is False
-                else bundle.judge_payload.get("overall_reward") # NOTE: if we want to add gt reward: + bundle.judge_payload.get("ground_truth_reward")
+                else bundle.judge_payload.get("overall_reward", bundle.judge_payload.get("overall_score"))
             )
             if not turns or reward is None:
                 continue
@@ -462,14 +532,20 @@ class PatchEvalManager:
 
         evaluations: dict[str, dict[str, Any]] = {}
         if patches_by_node_id:
-            evaluations = self.evaluate_patches_fn(
-                instance=self.instance,
-                patches_by_key=patches_by_node_id,
-                model_name=self.model_name,
-                max_workers=1,
-                namespace=self.namespace,
-                work_dir=self.work_dir,
-            )
+            try:
+                evaluations = self.evaluate_patches_fn(
+                    instance=self.instance,
+                    patches_by_key=patches_by_node_id,
+                    model_name=self.model_name,
+                    max_workers=1,
+                    namespace=self.namespace,
+                    work_dir=self.work_dir,
+                )
+            except Exception as exc:
+                evaluations = {node_id: _evaluation_error_payload(exc) for node_id in patches_by_node_id}
+            for node_id in patches_by_node_id:
+                if node_id not in evaluations:
+                    evaluations[node_id] = _evaluation_error_payload("Missing node evaluation")
         for node_id in empty_node_ids:
             evaluations[node_id] = {"reward": 0.0}
         for bundle in bundles:
@@ -493,7 +569,7 @@ class PatchEvalManager:
         gt_by_node_id = {node_id: float(payload.get("reward", 0.0)) for node_id, payload in evaluations.items()}
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
-            avg_scores = payload["avg_scores"]
+            avg_scores = payload["average_rubric_judged_scores"]
             score_by_rubric = payload["score_by_rubric"]
             ordered_node_ids = sorted(node_id for node_id in avg_scores if node_id in gt_by_node_id)
             gt_by_ordered_node_id = {node_id: gt_by_node_id[node_id] for node_id in ordered_node_ids}

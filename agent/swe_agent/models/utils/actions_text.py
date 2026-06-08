@@ -12,11 +12,37 @@ from swe_agent.exceptions import FormatError
 from swe_agent.models.utils.openai_multimodal import expand_multimodal_content
 
 
+def _invalid_content_error(content) -> str:
+    content_type = type(content).__name__
+    if content is None:
+        return (
+            "Expected assistant content to be a text string containing exactly one action, "
+            "but the provider returned content=None. Your previous response had no textual "
+            "message body, so the command parser could not inspect it. Please respond again "
+            "with normal text and exactly one fenced bash command."
+        )
+    preview = repr(content)
+    if len(preview) > 500:
+        preview = preview[:500] + "...<truncated>"
+    return (
+        "Expected assistant content to be a text string containing exactly one action, "
+        f"but got content of type {content_type}: {preview}. Please respond again with "
+        "normal text and exactly one fenced bash command."
+    )
+
+
 def parse_regex_actions(content: str, *, action_regex: str, format_error_template: str) -> list[dict]:
     """Parse actions from text content using regex. Raises FormatError if not exactly one action."""
+    content_error = None
+    model_response = content
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", errors="replace")
+    elif not isinstance(content, str):
+        content_error = _invalid_content_error(content)
+        content = ""
     actions = [a.strip() for a in re.findall(action_regex, content, re.DOTALL)]
     if len(actions) != 1:
-        error_msg = f"Expected exactly 1 action, found {len(actions)}."
+        error_msg = content_error or f"Expected exactly 1 action, found {len(actions)}."
         raise FormatError(
             {
                 "role": "user",
@@ -26,7 +52,8 @@ def parse_regex_actions(content: str, *, action_regex: str, format_error_templat
                 "extra": {
                     "interrupt_type": "FormatError",
                     "n_actions": len(actions),
-                    "model_response": content,
+                    "model_response": model_response,
+                    **({"content_type_error": True} if content_error else {}),
                 },
             }
         )
