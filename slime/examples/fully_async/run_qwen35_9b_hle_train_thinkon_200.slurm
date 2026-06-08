@@ -175,14 +175,14 @@ python3 train_async.py \
    --num-rollout $NUM_ROLLOUT \
    --rollout-batch-size $ROLLOUT_BATCH_SIZE \
    --n-samples-per-prompt $N_SAMPLES_PER_PROMPT \
-   --rollout-max-response-len 65536 \
+   --rollout-max-response-len 32768 \
    --rollout-temperature 1 \
    --global-batch-size $GLOBAL_BATCH_SIZE \
    --balance-data \
    --eval-interval $EVAL_INTERVAL \
    --eval-prompt-data hle-held-out $EVAL_DATA \
    --n-samples-per-eval-prompt 1 \
-   --eval-max-response-len 65536 \
+   --eval-max-response-len 32768 \
    --eval-temperature 1.0 \
    --tensor-model-parallel-size 2 \
    --sequence-parallel \
@@ -194,7 +194,7 @@ python3 train_async.py \
    --recompute-method uniform \
    --recompute-num-layers 1 \
    --use-dynamic-batch-size \
-   --max-tokens-per-gpu 73728 \
+   --max-tokens-per-gpu 49152 \
    --advantage-estimator grpo \
    --use-kl-loss \
    --kl-loss-coef 0.00 \
