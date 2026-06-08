@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=slime-q35-9b-hle-evalonly-64k
+#SBATCH --job-name=q35-9b-hle-train-200-thinkON-temp1-trncpen
 #SBATCH --account=ads_cpt
 #SBATCH --qos=ads_cpt
 #SBATCH --partition=a4
@@ -10,66 +10,87 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --exclude=metavmds1-a4-21,metavmds1-a4-9
-#SBATCH --time=06:00:00
-#SBATCH --output=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/slime-q35-9b-hle-evalonly-64k-%j.log
+#SBATCH --time=48:00:00
+#SBATCH --output=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/rler-runs/_slurm-logs/q35-9b-hle-train-200-thinkON-temp1-trncpen-%j.log
 
-# Eval-only run on HLE 117-prompt held-out set with the cold Qwen3.5-9B
-# (no GRPO updates). Goal: characterize the per-sample response-length
-# distribution at a much larger 64K response cap to see (a) how the
-# truncated_ratio at 24K (~44%) breaks down — model genuinely needs more
-# than 24K vs stuck in infinite generation, and (b) typical length of
-# CORRECT (reward=1) vs INCORRECT (reward=0) answers.
+# Full 200-step GRPO training on Qwen3.5-9B + HLE with thinking ENABLED
+# (default Qwen3.5 chat template prepends <think>\n to every turn) at
+# 64K context budget,
+# temp=1.0 sampling (both rollout and eval), and the truncation-penalty
+# custom RM (truncated samples score 0, no free credit for "Final
+# Answer: A" generation loops).
 #
-# Uses train.py (NOT train_async.py) which natively supports eval-only
-# via `num_rollout=0` (train.py:40-41 short-circuits to a single
-# rollout_manager.eval call and exits). No filter, no training.
+# Single-node 8-GPU (actor=4 + rollout=4), train_async.py with
+# fully_async_rollout for training + slime.rollout.sglang_rollout for
+# eval (miles trick). DYNAMIC_FILTER on by default; toggle via env.
 #
-# Also enables --save-debug-rollout-data so the per-sample Sample
-# objects are dumped to disk for post-hoc length-distribution analysis.
+#   sbatch --export=ALL,DYNAMIC_FILTER=on  run_qwen35_9b_hle_train_thinkoff_200.slurm
+#   sbatch --export=ALL,DYNAMIC_FILTER=off run_qwen35_9b_hle_train_thinkoff_200.slurm
 
 set -u
+
+# --- Tunables ---
+NUM_ROLLOUT=200
+ROLLOUT_BATCH_SIZE=32
+N_SAMPLES_PER_PROMPT=8
+GLOBAL_BATCH_SIZE=256
+SAVE_INTERVAL=50
+EVAL_INTERVAL=5
+DYNAMIC_FILTER=${DYNAMIC_FILTER:-on}
+# ----------------
 
 BASE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng
 RLER=$BASE/swe-rebench/RLER
 HF_CHECKPOINT=/mnt/lustre/metavmds0lstre/teams/mrs_ranking_core_modeling/daili1/deepeyes/models/Qwen3.5-9B
 TORCH_DIST=/mnt/lustre/metavmds0lstre/share/sihanzeng_meta_com/slime_qwen35/ckpt/Qwen3.5-9B_torch_dist_latest
+PROMPT_DATA=$BASE/datasets/hle/hle_mc_train.jsonl
 EVAL_DATA=$BASE/datasets/hle/hle_mc_eval.jsonl
-PROMPT_DATA=$BASE/datasets/hle/hle_mc_train.jsonl  # required by slime even when num_rollout=0
-RUN_DIR=$BASE/rler-runs/${SLURM_JOB_ID}-slime-q35-9b-hle-evalonly-64k
+RUN_DIR=$BASE/rler-runs/${SLURM_JOB_ID}-q35-9b-hle-train-200-thinkON-temp1-trncpen-${DYNAMIC_FILTER}
 SLURM_LOGS=$BASE/rler-runs/_slurm-logs
-DUMP_DIR=$RUN_DIR/_eval_dumps
-EMPTY_LOAD=$RUN_DIR/empty_load
-mkdir -p $RUN_DIR/_logs $RUN_DIR/_snapshot $SLURM_LOGS $DUMP_DIR $EMPTY_LOAD
+SAVE_DIR=$RUN_DIR/policy_ckpt
+LOAD_DIR=$SAVE_DIR
+DUMP_DIR=$RUN_DIR/_dumps
+mkdir -p $RUN_DIR/_logs $RUN_DIR/_snapshot $SLURM_LOGS $SAVE_DIR $DUMP_DIR
 
 ( cd $RLER && git rev-parse HEAD ) > $RUN_DIR/_snapshot/RLER_HEAD.txt 2>/dev/null || true
 cp $0 $RUN_DIR/_snapshot/ 2>/dev/null || true
 
 [ ! -d "$HF_CHECKPOINT" ] && { echo "ERROR: HF_CHECKPOINT=$HF_CHECKPOINT missing"; exit 1; }
+[ ! -f "$PROMPT_DATA" ]   && { echo "ERROR: PROMPT_DATA=$PROMPT_DATA missing";   exit 1; }
 [ ! -f "$EVAL_DATA" ]     && { echo "ERROR: EVAL_DATA=$EVAL_DATA missing";       exit 1; }
 
 CONTAINER_IMAGE=/mnt/lustre/metavmds0lstre/checkpoints/sihanzeng/images/slime_v0_2_4_baked.sqsh
 
-echo "[$(date)] jobid=$SLURM_JOB_ID host=$(hostname) (eval-only, 64K response cap)"
+echo "[$(date)] jobid=$SLURM_JOB_ID host=$(hostname) DYNAMIC_FILTER=$DYNAMIC_FILTER (thinkON temp=1 200steps trncpen)"
 echo "[$(date)] HF=$HF_CHECKPOINT  TORCH_DIST=$TORCH_DIST"
-echo "[$(date)] EVAL=$EVAL_DATA  DUMP=$DUMP_DIR"
+echo "[$(date)] TRAIN=$PROMPT_DATA  EVAL=$EVAL_DATA"
+echo "[$(date)] RUN_DIR=$RUN_DIR"
 
 INNER=$RUN_DIR/_snapshot/inner.sh
 cat > $INNER <<TOP
 #!/bin/bash
 set -eu
+NUM_ROLLOUT=$NUM_ROLLOUT
+ROLLOUT_BATCH_SIZE=$ROLLOUT_BATCH_SIZE
+N_SAMPLES_PER_PROMPT=$N_SAMPLES_PER_PROMPT
+GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE
+SAVE_INTERVAL=$SAVE_INTERVAL
+EVAL_INTERVAL=$EVAL_INTERVAL
+DYNAMIC_FILTER=$DYNAMIC_FILTER
 RLER=$RLER
 RUN_DIR=$RUN_DIR
 HF_CHECKPOINT=$HF_CHECKPOINT
 TORCH_DIST=$TORCH_DIST
 PROMPT_DATA=$PROMPT_DATA
 EVAL_DATA=$EVAL_DATA
+SAVE_DIR=$SAVE_DIR
+LOAD_DIR=$LOAD_DIR
 DUMP_DIR=$DUMP_DIR
-EMPTY_LOAD=$EMPTY_LOAD
 TOP
 cat >> $INNER <<'EOF'
 
 NODE=$(hostname)
-echo "[node=$NODE] inner start (eval-only 64K)"
+echo "[node=$NODE] inner start (thinkON temp=1 200steps trncpen, filter=$DYNAMIC_FILTER)"
 
 NODE_CACHE=/mnt/localssd/.cache/slime-${SLURM_JOB_ID}
 mkdir -p $NODE_CACHE/{flashinfer,triton,hf,torch,home,ray_tmp}
@@ -89,13 +110,19 @@ if [ -r "$WANDB_KEY_FILE" ]; then
     export WANDB_API_KEY=$(cat "$WANDB_KEY_FILE" | tr -d '[:space:]')
     export WANDB_MODE=online
     export WANDB_ENTITY=chenqinghan2003-university-of-washington
-    WANDB_FLAGS=(--use-wandb --wandb-project slime-fully-async --wandb-group qwen3.5-9B-hle-evalonly --wandb-run-name "q35-9b-hle-evalonly-64k-${SLURM_JOB_ID}")
+    WANDB_FLAGS=(--use-wandb --wandb-project slime-fully-async --wandb-group qwen3.5-9B-hle-train-200 --wandb-run-name "q35-9b-hle-train-200-thinkON-temp1-trncpen-filter${DYNAMIC_FILTER}-${SLURM_JOB_ID}")
+    echo "[node=$NODE] wandb online enabled"
 else
     export WANDB_MODE=offline
     WANDB_FLAGS=()
 fi
 
-# torch_dist must exist already (we have the cached one)
+if [ "$DYNAMIC_FILTER" = "on" ]; then
+    FILTER_FLAGS=(--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std)
+else
+    FILTER_FLAGS=()
+fi
+
 [ ! -f "$TORCH_DIST/latest_checkpointed_iteration.txt" ] && { echo "FATAL: torch_dist missing"; exit 1; }
 
 cd $RLER/slime
@@ -104,7 +131,8 @@ source train_agent/configs/qwen3.5-9B.sh
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
 
-export PYTHONPATH="/root/Megatron-LM:${PYTHONPATH:-}"
+EXAMPLE_DIR=$RLER/slime/examples/fully_async
+export PYTHONPATH="/root/Megatron-LM:${EXAMPLE_DIR}:${PYTHONPATH:-}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_NVLS_ENABLE=$HAS_NVLINK
 
@@ -120,35 +148,38 @@ sleep 3
 export RAY_ADDRESS=$MY_IP:$RAY_PORT
 
 DRIVER_LOG=$RUN_DIR/_logs/training.log
-echo "[node=$NODE] launching train.py (eval-only, num_rollout=0) -> $DRIVER_LOG"
+echo "[node=$NODE] launching train_async.py -> $DRIVER_LOG"
 
 set -o pipefail
-python3 train.py \
+python3 train_async.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4 \
    --rollout-num-gpus 4 \
    "${MODEL_ARGS[@]}" \
    --hf-checkpoint $HF_CHECKPOINT \
    --ref-load $TORCH_DIST \
-   --load $EMPTY_LOAD \
+   --load $LOAD_DIR \
+   --save $SAVE_DIR \
+   --save-interval $SAVE_INTERVAL \
+   --rollout-function-path fully_async_rollout.generate_rollout_fully_async \
+   --eval-function-path slime.rollout.sglang_rollout.generate_rollout \
    --prompt-data $PROMPT_DATA \
    --input-key prompt \
    --label-key label \
    --metadata-key metadata \
    --apply-chat-template \
-   --apply-chat-template-kwargs '{"enable_thinking": false}' \
    --rollout-shuffle \
    --rm-type gpqa \
    --custom-rm-path truncation_penalty_rm.custom_rm \
    --rollout-max-prompt-len 8192 \
-   --num-rollout 1 \
-   --rollout-batch-size 32 \
-   --n-samples-per-prompt 8 \
+   --num-rollout $NUM_ROLLOUT \
+   --rollout-batch-size $ROLLOUT_BATCH_SIZE \
+   --n-samples-per-prompt $N_SAMPLES_PER_PROMPT \
    --rollout-max-response-len 65536 \
    --rollout-temperature 1 \
-   --global-batch-size 256 \
+   --global-batch-size $GLOBAL_BATCH_SIZE \
    --balance-data \
-   --eval-interval 1 \
+   --eval-interval $EVAL_INTERVAL \
    --eval-prompt-data hle-held-out $EVAL_DATA \
    --n-samples-per-eval-prompt 1 \
    --eval-max-response-len 65536 \
@@ -185,6 +216,7 @@ python3 train.py \
    --attention-softmax-in-fp32 \
    --attention-backend flash \
    --save-debug-rollout-data "${DUMP_DIR}/{rollout_id}.pt" \
+   "${FILTER_FLAGS[@]}" \
    "${WANDB_FLAGS[@]}" \
    2>&1 | tee $DRIVER_LOG
 DRIVER_RC=${PIPESTATUS[0]}
