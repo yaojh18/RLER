@@ -137,7 +137,7 @@ python3 train.py \
    --rollout-shuffle \
    --rm-type gpqa \
    --rollout-max-prompt-len 8192 \
-   --num-rollout 0 \
+   --num-rollout 1 \
    --rollout-batch-size 32 \
    --n-samples-per-prompt 8 \
    --rollout-max-response-len 65536 \
