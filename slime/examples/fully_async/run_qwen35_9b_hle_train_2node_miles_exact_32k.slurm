@@ -282,6 +282,24 @@ fi
 EOF
 chmod +x $INNER
 
+echo "[$(date)] === pre-clean: killing leaked GPU processes on $SLURM_JOB_NODELIST ==="
+# Why: 62064 died at startup because a leaked tenant process (PID 3119372) was
+# holding 164 GiB on GPU 0 of metavmds1-a4-23. Slurm hands us the node but does
+# not clean up previous tenants on these shared a4 boxes. Surgically nuke any
+# obvious leftovers (ray actors, sglang servers, Megatron workers) on each
+# allocated node, then sanity-print free memory.
+srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 --label bash -c "
+    pkill -9 -f 'ray::'       2>/dev/null || true
+    pkill -9 -f 'raylet'      2>/dev/null || true
+    pkill -9 -f 'gcs_server'  2>/dev/null || true
+    pkill -9 -f 'sglang'      2>/dev/null || true
+    pkill -9 -f 'Megatron'    2>/dev/null || true
+    pkill -9 -f 'torchrun'    2>/dev/null || true
+    fuser -k -SIGKILL /dev/nvidia* 2>/dev/null || true
+    sleep 3
+    nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader,nounits
+"
+
 echo "[$(date)] === srun fan-out across $SLURM_NNODES nodes ==="
 srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
     --container-image=$CONTAINER_IMAGE \
