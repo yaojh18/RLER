@@ -205,8 +205,12 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     # asking for the full max_new_tokens, blowing past sglang context_length
     # and returning 400 — which trips the sgl-router circuit breaker and
     # kills the run. Mirrors miles/rollout/sglang_rollout.py:155-156.
-    if len(sample.response) > 0:
-        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)
+    # _prepare_prompt_ids() above returns sample.tokens directly on continuation
+    # (line 60), so len(sample.tokens) - len(prompt_ids) is always 0 in slime
+    # (unlike miles which re-tokenizes sample.prompt). Use sample.response_length
+    # which slime increments at sglang_rollout.py:61 for each completed forward.
+    if sample.response_length > 0:
+        sampling_params["max_new_tokens"] -= sample.response_length
 
     assert (
         sampling_params["max_new_tokens"] >= 0
