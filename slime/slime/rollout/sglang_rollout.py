@@ -199,6 +199,15 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
 
+    # On continuation (sglang aborted mid-generation due to weight update),
+    # sample.tokens carries the prompt + partial response. Without this cap
+    # the request sends prompt+partial_response as input_ids while still
+    # asking for the full max_new_tokens, blowing past sglang context_length
+    # and returning 400 — which trips the sgl-router circuit breaker and
+    # kills the run. Mirrors miles/rollout/sglang_rollout.py:155-156.
+    if len(sample.response) > 0:
+        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)
+
     assert (
         sampling_params["max_new_tokens"] >= 0
     ), f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
