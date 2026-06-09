@@ -295,8 +295,7 @@ srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 --label bash -c "
     pkill -9 -f 'sglang'      2>/dev/null || true
     pkill -9 -f 'Megatron'    2>/dev/null || true
     pkill -9 -f 'torchrun'    2>/dev/null || true
-    fuser -k -SIGKILL /dev/nvidia* 2>/dev/null || true
-    sleep 3
+    sleep 2
     nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader,nounits
 "
 
