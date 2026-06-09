@@ -283,21 +283,28 @@ EOF
 chmod +x $INNER
 
 echo "[$(date)] === pre-clean: killing leaked GPU processes on $SLURM_JOB_NODELIST ==="
-# Why: 62064 died at startup because a leaked tenant process (PID 3119372) was
-# holding 164 GiB on GPU 0 of metavmds1-a4-23. Slurm hands us the node but does
-# not clean up previous tenants on these shared a4 boxes. Surgically nuke any
-# obvious leftovers (ray actors, sglang servers, Megatron workers) on each
-# allocated node, then sanity-print free memory.
-srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 --label bash -c "
-    pkill -9 -f 'ray::'       2>/dev/null || true
-    pkill -9 -f 'raylet'      2>/dev/null || true
-    pkill -9 -f 'gcs_server'  2>/dev/null || true
-    pkill -9 -f 'sglang'      2>/dev/null || true
-    pkill -9 -f 'Megatron'    2>/dev/null || true
-    pkill -9 -f 'torchrun'    2>/dev/null || true
-    sleep 2
-    nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader,nounits
-"
+# Why: 62064 died at startup because a leaked tenant process (PID 3119372) held
+# 164/178 GiB on GPU 0 of metavmds1-a4-23. Slurm hands us the node but does not
+# clean up previous tenants on these shared a4 boxes.
+#
+# CRITICAL: the cleanup MUST live in a file rather than `srun ... bash -c 'pkill -f sglang'`,
+# because pkill -f matches the FULL command line and pkill -f sglang would
+# match its own wrapper bash invocation (which contains the literal string
+# 'sglang'), suicide the srun process, and break the slurm GRES state ->
+# subsequent main srun fails with "Invalid gres specification" (jobs
+# 62184-62199 all died this way before this fix).
+PRECLEAN=$RUN_DIR/_snapshot/preclean.sh
+cat > $PRECLEAN <<'PRECLEAN_EOF'
+#!/bin/bash
+# Kill leaked tenant processes that survived a previous SLURM job on this node.
+# pgrep|grep -v $$ excludes our own PID so we don't suicide.
+PAT='ray::|raylet|gcs_server|sglang|Megatron|torchrun'
+pgrep -f "$PAT" 2>/dev/null | grep -v "^$$\$" | xargs -r kill -9 2>/dev/null || true
+sleep 2
+nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader,nounits
+PRECLEAN_EOF
+chmod +x $PRECLEAN
+srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 --label bash $PRECLEAN
 
 echo "[$(date)] === srun fan-out across $SLURM_NNODES nodes ==="
 srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
