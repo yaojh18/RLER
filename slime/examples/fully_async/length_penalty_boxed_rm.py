@@ -1,19 +1,33 @@
-"""Length-penalized boxed-letter scorer for HLE MC.
+"""DAPO-style Soft Overlong Punishment for HLE MC.
+
+Reference: DAPO paper, Eq. (13) -- Soft Overlong Punishment.
 
 Base reward
 -----------
 1.0 if the last ``\\boxed{LETTER}`` in the response matches the ground-truth
-label (case-insensitive), else 0.0. Truncated samples without an extractable
-boxed answer get 0.0.
+label (case-insensitive), else 0.0.
 
-Length penalty (multiplier on base reward)
-------------------------------------------
-- ``response_length <= 32768``: 1.0 (no penalty)
-- ``response_length >= 40960``: 0.0 (full penalty -> reward is 0)
-- in between:  ``(40960 - response_length) / (40960 - 32768)`` (linear)
+Length penalty (added to base, NOT multiplied)
+----------------------------------------------
+Let ``Lmax = 40960`` and ``Lcache = 8192`` (so ``Lmax - Lcache = 32768``).
+``R_length(|y|) =``
 
-Final reward = ``base_reward * multiplier``. We multiply rather than subtract
-so a wrong answer never sneaks above 0 just because it was short.
+  - 0,                               if ``|y| <= Lmax - Lcache``  (= 32768)
+  - ``(Lmax - Lcache - |y|) / Lcache``,  if ``Lmax - Lcache < |y| <= Lmax``
+  - -1,                              if ``Lmax < |y|``
+
+Final reward = ``base + R_length(|y|)``.
+
+Semantics (with Lmax=40960, Lcache=8192):
+  short correct  (|y|<=32K)  -> base=1 + 0    =  1.00
+  short wrong               -> base=0 + 0    =  0.00
+  edge correct (|y|=40K)    -> base=1 + (-1) =  0.00
+  edge wrong   (|y|=40K)    -> base=0 + (-1) = -1.00
+  >40K correct/wrong         -> base + (-1)   = (negative or 0)
+
+Wrong answers can therefore go negative; the linear region punishes both
+correctness classes but never pushes a correct answer below 0 (since
+R_length >= -1 and base = 1 at the edge).
 
 Wire via ``--custom-rm-path length_penalty_boxed_rm.custom_rm``.
 """
@@ -26,8 +40,8 @@ from slime.utils.types import Sample
 
 _BOXED_LETTER_RE = re.compile(r"\\boxed\{\s*([A-Za-z])\s*\}")
 
-LEN_FULL = 32768  # reward unaffected at or below this token count
-LEN_ZERO = 40960  # reward zeroed at or above this token count
+LMAX = 40960   # response length at/above which R_length is clamped to -1
+LCACHE = 8192  # width of the soft-penalty interval
 
 
 async def custom_rm(args, sample_or_samples, **kwargs):
@@ -37,10 +51,7 @@ async def custom_rm(args, sample_or_samples, **kwargs):
 
 
 def _score_one(sample: Sample) -> float:
-    base = _base_reward(sample)
-    if base == 0.0:
-        return 0.0
-    return base * _length_mult(sample.response_length)
+    return _base_reward(sample) + _length_penalty(sample.response_length)
 
 
 def _base_reward(sample: Sample) -> float:
@@ -55,9 +66,11 @@ def _base_reward(sample: Sample) -> float:
     return 1.0 if matches[-1].upper() == label_letter else 0.0
 
 
-def _length_mult(rlen: int) -> float:
-    if rlen <= LEN_FULL:
-        return 1.0
-    if rlen >= LEN_ZERO:
+def _length_penalty(rlen: int) -> float:
+    threshold = LMAX - LCACHE  # = 32768
+    if rlen <= threshold:
         return 0.0
-    return (LEN_ZERO - rlen) / (LEN_ZERO - LEN_FULL)
+    if rlen > LMAX:
+        return -1.0
+    # Linear ramp from 0 (at threshold) to -1 (at LMAX).
+    return (threshold - rlen) / LCACHE
