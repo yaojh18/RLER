@@ -27,9 +27,9 @@
 #     to the original allocation's IP and hung 24h waiting for a placement
 #     group that could never form.
 #
-# Reward = soft (legacy) — weighted avg of F2P/P2P pass rates (smaller
-# advantage variance than joint frac_F2P*frac_P2P; validated for 29 steps
-# on job 56451 with no grad-norm spikes before that run was preempted).
+# Raw harness reward uses the soft F2P/P2P pass-rate payload; the policy
+# reward is then headroom-normalized by LANES_REWARD_KIND=scaled_delta below.
+# This is not the legacy GT-soft run; use grpo_lanes_gtsoft_* for that.
 
 set -u
 
@@ -70,7 +70,7 @@ GRPO_TARGET=policy
 GRPO_MODEL_NAME="Qwen/Qwen3.5-9B"
 PROMPT_BUDGET=1316
 CONTEXT_PARALLEL_SIZE=4
-REWARD_SCHEME=soft   # gt formula
+REWARD_SCHEME=soft   # raw harness payload; LANES_REWARD_KIND selects policy reward shape
 LANES_REWARD_KIND=scaled_delta       # max(0, raw - base) / (1 - base) — headroom-normalized delta
 # ====================================================================
 

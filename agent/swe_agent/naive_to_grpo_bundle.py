@@ -317,9 +317,10 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
     placeholder. The group is dropped when n_dummy >= NAIVE_MAX_DUMMY_PER_GROUP
     (default 2) — too many dummies signal an infra issue (cache miss,
     docker daemon, etc.) and the group's baseline cannot be trusted.
-    A single transient dummy is tolerated; downstream advantage
-    normalization (slime/train_agent/run/grpo.py) excludes is_dummy
-    samples from the group mean/std so the baseline stays clean.
+    A single transient dummy is tolerated; Slime's group normalization does
+    not special-case is_dummy samples, so that dummy still participates in
+    the group mean/std. Groups with too many dummies are dropped above to
+    avoid trusting a baseline dominated by failed rollouts.
 
     rubric_groups: always empty (naive baseline has no rubric/judge).
     """
