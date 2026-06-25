@@ -350,6 +350,10 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
         env_config["image"] = image_name
     elif env_config["environment_class"] in ["singularity", "contree"]:
         env_config["image"] = "docker://" + image_name
+    if _is_rebench_instance(instance):
+        repo = instance.get("repo") or ""
+        if "/" in repo:
+            env_config["cwd"] = f"/{repo.split('/', 1)[1]}"
 
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):

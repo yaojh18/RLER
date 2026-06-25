@@ -56,6 +56,17 @@ def convert_samples_to_train_data(args, samples):
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     rewards = list(raw_rewards)
+    # is_dummy samples (infra-failure placeholders with token_ids=[0,0],
+    # loss_mask=[0,0], reward=0.0) MUST be excluded from group reward
+    # mean/std — otherwise they drag the baseline toward 0 and inflate
+    # std, biasing every other sample's advantage. They still occupy a
+    # slot in the group to keep group_size consistent for downstream
+    # bookkeeping; their loss_mask is zeroed below so they contribute
+    # no gradient.
+    is_dummy_flags: list[bool] = [
+        bool(sample.metadata and sample.metadata.get("is_dummy"))
+        for sample in samples
+    ]
     # Track samples in degenerate groups (singleton or all-same reward).
     # These carry no GRPO signal and would produce NaN in whitening:
     #   * n=1: PyTorch unbiased std of a single element is NaN
@@ -70,15 +81,19 @@ def convert_samples_to_train_data(args, samples):
         and args.rewards_normalization
     ):
         for indices in grouped_indices.values():
-            group_raw = [raw_rewards[index] for index in indices]
-            n = len(group_raw)
+            real_indices = [i for i in indices if not is_dummy_flags[i]]
+            dummy_indices = [i for i in indices if is_dummy_flags[i]]
+            n = len(real_indices)
             if n < 2:
-                # Singleton group → no GRPO comparison. Zero advantage + drop.
+                # Insufficient real samples for GRPO comparison.
+                # naive_record_to_bundle drops most of these upstream, but
+                # singleton survivors of partial-drop still land here.
                 for idx in indices:
                     rewards[idx] = 0.0
                     samples_to_drop.add(idx)
                 continue
-            group_rewards = torch.tensor(group_raw, dtype=torch.float).view(1, -1)
+            real_group_raw = [raw_rewards[i] for i in real_indices]
+            group_rewards = torch.tensor(real_group_raw, dtype=torch.float).view(1, -1)
             # unbiased=False is the population std — finite even for tiny groups.
             std = group_rewards.std(dim=-1, keepdim=True, unbiased=False)
             if torch.isnan(std).any() or (std <= 1e-9).all():
@@ -90,8 +105,12 @@ def convert_samples_to_train_data(args, samples):
             centered = group_rewards - group_rewards.mean(dim=-1, keepdim=True)
             if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
                 centered = centered / (std + 1e-6)
-            for sample_index, reward in zip(indices, centered.flatten().tolist(), strict=False):
+            for sample_index, reward in zip(real_indices, centered.flatten().tolist(), strict=False):
                 rewards[sample_index] = reward
+            # Dummies: zero advantage + drop (loss_mask zeroed below).
+            for idx in dummy_indices:
+                rewards[idx] = 0.0
+                samples_to_drop.add(idx)
 
     train_data = {
         "tokens": [sample.tokens for sample in samples],
@@ -261,6 +280,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wandb-project", default="swe-agent-grpo")
     parser.add_argument("--wandb-group")
     parser.add_argument(
+        "--use-tis",
+        action="store_true",
+        default=False,
+        help=(
+            "Forwarded to slime train_async.py. Enable Truncated Importance "
+            "Sampling for off-policy correction "
+            "(https://fengyao.notion.site/off-policy-rl)."
+        ),
+    )
+    parser.add_argument(
+        "--tis-clip",
+        type=float,
+        default=None,
+        help="Forwarded to slime train_async.py. TIS upper clip C (default 2.0 inside slime).",
+    )
+    parser.add_argument(
+        "--dynamic-sampling-filter-path",
+        type=str,
+        default=None,
+        help=(
+            "Forwarded to slime train_async.py. Import path to a function that "
+            "decides per-group whether to keep or drop the M siblings (e.g. "
+            "slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
+            "drops groups whose rewards have zero std → zero gradient)."
+        ),
+    )
+    parser.add_argument(
         "--save-debug-train-data",
         type=str,
         default=None,
@@ -300,6 +346,16 @@ def main(argv: list[str] | None = None) -> int:
         shlex.join(["--over-sampling-batch-size", str(args.over_sampling_batch_size)])
         if args.over_sampling_batch_size is not None else ""
     )
+    dynamic_filter_arg = (
+        shlex.join(["--dynamic-sampling-filter-path", args.dynamic_sampling_filter_path])
+        if args.dynamic_sampling_filter_path else ""
+    )
+    tis_arg_parts: list[str] = []
+    if args.use_tis:
+        tis_arg_parts.append("--use-tis")
+    if args.tis_clip is not None:
+        tis_arg_parts.extend(["--tis-clip", str(args.tis_clip)])
+    tis_arg = shlex.join(tis_arg_parts) if tis_arg_parts else ""
     save_debug_arg = (
         shlex.join(["--save-debug-train-data", args.save_debug_train_data])
         if args.save_debug_train_data else ""
@@ -322,11 +378,25 @@ def main(argv: list[str] | None = None) -> int:
     config_overrides = "\n".join(override_lines)
     wandb_args = ""
     if args.wandb_mode != "disabled":
+        # Default the wandb group/run-name to the SLURM job name when running
+        # under SLURM (so each launched job shows up in WandB as its job name
+        # like "grpo-naive-cp4vftis-56612" rather than every run colliding on
+        # "policy-grpo"). Falls back to <target>-grpo for non-SLURM launches.
+        slurm_job_name = os.environ.get("SLURM_JOB_NAME") or ""
+        slurm_job_id = os.environ.get("SLURM_JOB_ID") or ""
+        if args.wandb_group:
+            wandb_group = args.wandb_group
+        elif slurm_job_name:
+            wandb_group = (
+                f"{slurm_job_name}-{slurm_job_id}" if slurm_job_id else slurm_job_name
+            )
+        else:
+            wandb_group = f"{args.target}-grpo"
         pieces = [
             "--use-wandb",
             "--wandb-mode", args.wandb_mode,
             "--wandb-project", args.wandb_project,
-            "--wandb-group", args.wandb_group or f"{args.target}-grpo",
+            "--wandb-group", wandb_group,
             "--wandb-dir", str(wandb_dir),
             "--disable-wandb-random-suffix",
         ]
@@ -420,6 +490,8 @@ python3 train_async.py \\
   "${{GRPO_ROLLOUT_ARGS[@]}}" \\
   "${{GRPO_SGLANG_ARGS[@]}}" \\
   "${{GRPO_MISC_ARGS[@]}}" \\
+  {dynamic_filter_arg} \\
+  {tis_arg} \\
   {save_debug_arg} \\
   {save_debug_rollout_arg} \\
   {wandb_args}

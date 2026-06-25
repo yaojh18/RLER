@@ -11,16 +11,12 @@ Selects target='policy' (rubric_groups not generated in v1 first pass).
 ENV CONTRACT (set by slime/train_agent/run/grpo_async_lanes.py to match
 the SLURM script's tunables):
   SWE_AGENT_LANES_M                  int    forks per mid_cp (default 8)
-	  SWE_AGENT_LANES_MAX_ROUNDS         int    fork-group cap per instance, root counts (default 5)
-	  SWE_AGENT_LANES_K                  int    asst turns between mid_cps (default 20)
-	  SWE_AGENT_LANES_P                  int    active parents, currently must be 1
-  SWE_AGENT_LANES_STEP_LIMIT         int    hard cap for the whole trajectory (default 100)
+  SWE_AGENT_LANES_MAX_MID_CPS        int    mid_cps cap per instance (default 6)
+  SWE_AGENT_LANES_STEPS_PER_ROUND    int    asst turns between mid_cps (default 20)
+  SWE_AGENT_LANES_STEP_LIMIT         int    hard cap per Lane B branch (default 120)
   SWE_AGENT_LANES_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
   SWE_AGENT_LANES_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
   SWE_AGENT_LANES_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 4096)
-  SWE_AGENT_LANES_POLICY_GT_WEIGHT   float  policy GT reward weight (default 0.0)
-  SWE_AGENT_LANES_POLICY_SIBLINGS_WEIGHT float sibling rubric reward weight (default 0.5)
-  SWE_AGENT_LANES_POLICY_PC_WEIGHT   float  parent-child rubric reward weight (default 0.5)
   SWE_AGENT_LANES_POLICY_TEMPERATURE float  Lane A sampling temp (default 1.0)
   SWE_AGENT_LANES_POLICY_TOP_P       float  default 0.95
   SWE_AGENT_LANES_LANE_B_TEMPERATURE float  Lane B sampling temp (default 1.0)
@@ -38,6 +34,7 @@ import atexit
 import logging
 import os
 import random
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -48,6 +45,8 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from slime.rollout.filter_hub.base_types import call_dynamic_filter
+from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
 # Reuse v0's tokenizer cache + rollout-sample assembler — they're independent
@@ -77,6 +76,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         # Imports inside the subprocess so env-var-dependent module init runs
         # AFTER we've set the slime API base.
         from swe_agent.backend import SWEAgentRolloutBackend
+        from swe_agent.lane_to_grpo_bundle import instance_record_to_bundle
         from swe_agent.run.benchmarks.swebench import (
             build_swebench_config,
             get_swebench_docker_image_name,
@@ -85,7 +85,6 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         )
         from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
         from swe_agent.trajectory_search_parallel import (
-            LaneGRPOCollector,
             ParallelSearchConfig,
             TrajectorySearchParallelRunner,
         )
@@ -146,20 +145,19 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
 
         cfg = ParallelSearchConfig(
             m=task["m"],
-            n=task["n"],
-            k=task["k"],
-            p=task["p"],
-            max_rounds=task["max_rounds"],
+            max_mid_cps=task["max_mid_cps"],
+            steps_per_round=task["steps_per_round"],
             step_limit=task["step_limit"],
-            max_active_rubrics=task["max_active_rubrics"],
+            seed=task.get("seed"),
             gt_eval_workers=task.get("gt_eval_workers", 8),
-            lane_b_pool_size=task.get("lane_b_pool_size") or (task["m"] * task["max_rounds"]),
+            lane_b_pool_size=task.get("lane_b_pool_size") or (task["m"] * task["max_mid_cps"]),
             keep_images=False,
             policy_temperature=task.get("policy_temperature", 1.0),
             policy_top_p=task.get("policy_top_p", 0.95),
             lane_b_temperature=task.get("lane_b_temperature", 1.0),
             lane_b_top_p=task.get("lane_b_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
+            disable_rubric=task.get("disable_rubric", False),
         )
         run_dir = (
             output_root / instance_id
@@ -182,11 +180,12 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             api_key=api_key,
         )
         record = asyncio.run(runner.run())
-        bundle = LaneGRPOCollector(
-            policy_gt_weight=task.get("policy_gt_weight", 0.0),
-            policy_siblings_weight=task.get("policy_siblings_weight", 0.5),
-            policy_pc_weight=task.get("policy_pc_weight", 0.5),
-        ).instance_record_to_bundle(record)
+        # steps_per_round is read from record.config inside the converter;
+        # task["steps_per_round"] is honored as an explicit override.
+        bundle = instance_record_to_bundle(
+            record, steps_per_round=task.get("steps_per_round"),
+            gt_only_reward=task.get("disable_rubric", False),
+        )
         result = {
             "index": task["index"],
             "instance_id": instance_id,
@@ -250,6 +249,8 @@ _WARMUP_DONE = False
 _STALE_DROPPED_GROUPS = 0
 _FAILED_INSTANCES = 0
 _DROPPED_OVERSIZED = 0
+_FILTER_DROPPED_GROUPS = 0
+_FILTER_DROP_REASONS: dict[str, int] = {}
 
 _NODE_WORKERS: list[Any] = []          # list[ray.actor.ActorHandle]
 _NODE_WORKER_IPS: list[str] = []
@@ -378,28 +379,29 @@ def _lanes_values_from_env() -> dict[str, Any]:
         v = os.environ.get(name, "")
         return float(v) if v else default
 
+    def _bool(name, default):
+        v = os.environ.get(name, "")
+        if not v:
+            return default
+        return v.strip().lower() in ("1", "true", "yes", "on")
+
     return {
         "m": _int("SWE_AGENT_LANES_M", 8),
-        "n": _int("SWE_AGENT_LANES_N", 1),
-        "k": _int("SWE_AGENT_LANES_K", 20),
-        "p": _int("SWE_AGENT_LANES_P", 1),
-        "max_rounds": _int("SWE_AGENT_LANES_MAX_ROUNDS", 5),
-        "step_limit": _int("SWE_AGENT_LANES_STEP_LIMIT", 100),
-        "max_active_rubrics": _int("SWE_AGENT_LANES_MAX_ACTIVE_RUBRICS", 6),
+        "max_mid_cps": _int("SWE_AGENT_LANES_MAX_MID_CPS", 6),
+        "steps_per_round": _int("SWE_AGENT_LANES_STEPS_PER_ROUND", 20),
+        "step_limit": _int("SWE_AGENT_LANES_STEP_LIMIT", 120),
+        "seed": _int("SWE_AGENT_LANES_SEED"),
         "gt_eval_workers": _int("SWE_AGENT_LANES_GT_EVAL_WORKERS", 8),
         "lane_b_pool_size": _int("SWE_AGENT_LANES_LANE_B_POOL_SIZE"),
         "completion_max_tokens": _int("SWE_AGENT_LANES_COMPLETION_MAX_TOKENS", 4096),
-        "policy_gt_weight": _float(
-            "SWE_AGENT_LANES_POLICY_GT_WEIGHT",
-            _float("SWE_AGENT_LANES_POLICY_ALPHA", 0.0),
-        ),
-        "policy_siblings_weight": _float("SWE_AGENT_LANES_POLICY_SIBLINGS_WEIGHT", 0.5),
-        "policy_pc_weight": _float("SWE_AGENT_LANES_POLICY_PC_WEIGHT", 0.5),
         "policy_temperature": _float("SWE_AGENT_LANES_POLICY_TEMPERATURE", 1.0),
         "policy_top_p": _float("SWE_AGENT_LANES_POLICY_TOP_P", 0.95),
         "lane_b_temperature": _float("SWE_AGENT_LANES_LANE_B_TEMPERATURE", 1.0),
         "lane_b_top_p": _float("SWE_AGENT_LANES_LANE_B_TOP_P", 0.95),
         "fallback_patch_penalty": _float("SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY", 0.5),
+        # GT-only training: skip rubric/judge in trajectory_search_parallel
+        # and use branch.gt_score as the reward in the bundler.
+        "disable_rubric": _bool("SWE_AGENT_LANES_DISABLE_RUBRIC", False),
     }
 
 
@@ -410,8 +412,39 @@ def _hash_to_index(s: str, n: int) -> int:
 
 
 def _route_for_instance(instance_id: str, ports: list[int], host: str) -> str:
+    """LEGACY hash-based routing. Kept for back-compat but superseded
+    by _route_least_loaded — hash is uneven on small N (e.g. 4 servers,
+    30 instances → can dump 12/6/6/6 or worse).
+    """
     p = ports[_hash_to_index(instance_id, len(ports))]
     return f"{host.rstrip('/')}:{p}"
+
+
+# Per-port in-flight counters for least-loaded routing. Lock-protected
+# because _submit_until_full runs on the rollout coordinator thread but
+# completion (which releases the counter) happens in _harvest_ready —
+# they may interleave with future async tweaks.
+_ENDPOINT_LOAD: dict[str, int] = {}
+_ENDPOINT_LOAD_LOCK = threading.Lock()
+
+
+def _route_least_loaded(ports: list[int], host: str) -> str:
+    """Pick the endpoint with fewest in-flight instances. Increments the
+    counter — caller MUST call _release_endpoint() when the instance
+    completes (success OR failure)."""
+    candidates = [f"{host.rstrip('/')}:{p}" for p in ports]
+    with _ENDPOINT_LOAD_LOCK:
+        for c in candidates:
+            _ENDPOINT_LOAD.setdefault(c, 0)
+        url = min(candidates, key=lambda c: _ENDPOINT_LOAD[c])
+        _ENDPOINT_LOAD[url] += 1
+        return url
+
+
+def _release_endpoint(url: str) -> None:
+    with _ENDPOINT_LOAD_LOCK:
+        if url in _ENDPOINT_LOAD:
+            _ENDPOINT_LOAD[url] = max(0, _ENDPOINT_LOAD[url] - 1)
 
 
 def _submit_until_full(
@@ -456,8 +489,16 @@ def _submit_until_full(
         # first duplicate. n_samples_per_prompt MUST equal SWE_AGENT_LANES_M.
         metadata = prompt_group[0].metadata
         instance_id = metadata["instance_id"]
-        policy_base_url = _route_for_instance(instance_id, policy_ports, api_host)
-        rubric_base_url = _route_for_instance(instance_id, rubric_ports, api_host)
+        # LEAST-LOADED routing — pin THIS instance's policy AND rubric
+        # to the same lightest-loaded endpoint. Policy and rubric pin
+        # together so radix prefix cache stays warm within the instance.
+        # _release_endpoint is called when the task's bundle is reaped
+        # in _harvest_ready below.
+        policy_base_url = _route_least_loaded(policy_ports, api_host)
+        if rubric_ports == policy_ports:
+            rubric_base_url = policy_base_url
+        else:
+            rubric_base_url = _route_least_loaded(rubric_ports, api_host)
 
         task = {
             "index": _TASK_INDEX,
@@ -474,6 +515,12 @@ def _submit_until_full(
             "api_key": api_key,
             **lanes_values,
         }
+        # Stash for release on completion.
+        task["_pinned_endpoints"] = (
+            [policy_base_url]
+            if rubric_base_url == policy_base_url
+            else [policy_base_url, rubric_base_url]
+        )
         _TASK_INDEX += 1
         worker = _NODE_WORKERS[_DISPATCH_COUNTER % len(_NODE_WORKERS)]
         _DISPATCH_COUNTER += 1
@@ -494,6 +541,11 @@ def _harvest_ready(
     """Reap Ray Futures whose subprocess fully returned. For each completed
     bundle, expand its policy_groups into Samples and append to _BUFFER."""
     global _FAILED_INSTANCES, _STALE_DROPPED_GROUPS, _DROPPED_OVERSIZED
+    global _FILTER_DROPPED_GROUPS, _FILTER_DROP_REASONS
+    dynamic_filter = (
+        load_function(args.dynamic_sampling_filter_path)
+        if getattr(args, "dynamic_sampling_filter_path", None) else None
+    )
     harvested = 0
     max_sample_tokens: int | None = None
     try:
@@ -513,6 +565,11 @@ def _harvest_ready(
         ready, _ = ray.wait(pending_refs, num_returns=len(pending_refs), timeout=0)
     for ref in ready:
         task = _PENDING.pop(ref)
+        # Release this task's pinned endpoint(s) from the least-loaded
+        # counter — must happen regardless of success/error so the
+        # counter stays correct.
+        for ep in task.get("_pinned_endpoints", []):
+            _release_endpoint(ep)
         try:
             result = ray.get(ref)
         except Exception as exc:
@@ -561,6 +618,13 @@ def _harvest_ready(
                     "source_rollout_id": task["rollout_id"],
                     "instance_id": task["instance_id"],
                 }
+            if dynamic_filter is not None and samples:
+                filter_out = call_dynamic_filter(dynamic_filter, args, samples)
+                if not filter_out.keep:
+                    _FILTER_DROPPED_GROUPS += 1
+                    reason = filter_out.reason or "unspecified"
+                    _FILTER_DROP_REASONS[reason] = _FILTER_DROP_REASONS.get(reason, 0) + 1
+                    continue
             _BUFFER.append(
                 _BufferedGroup(rollout_id=task["rollout_id"], samples=samples)
             )
@@ -726,7 +790,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         sample.index = index
 
     # --- per-batch metrics aggregated from sample.metadata + sample fields ---
-    # Stashed by LaneGRPOCollector._build_branch_sample:
+    # Stashed by lane_to_grpo_bundle._build_branch_sample:
     #   n_continuation_steps, n_parent_steps, n_full_trace_steps,
     #   raw_gt_score, terminated_early, instance_id, is_dummy
     def _safe_mean(xs: list[float]) -> float:
@@ -782,7 +846,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         _safe_mean([c // m for c in inst_group_count.values()])
         if inst_group_count else 0.0
     )
-    # Truncation rate: fraction of samples whose status reached the trajectory
+    # Truncation rate: fraction of samples whose status reached the per-branch
     # step_limit without submitting (slime sets Sample.Status.TRUNCATED in that
     # case; we approximate from .status if available).
     try:
@@ -804,6 +868,61 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 if isinstance(x, (int, float)):
                     rollout_lps.append(float(x))
 
+    # --- patch + eval ratios over post-filter batch (parity with naive) -----
+    n_real = len(real_samples)
+    formal_submit = sum(
+        1 for s in real_samples
+        if s.metadata and s.metadata.get("terminated_early")
+    )
+    informal_submit = sum(
+        1 for s in real_samples
+        if s.metadata
+        and not s.metadata.get("terminated_early")
+        and int(s.metadata.get("terminal_patch_len") or 0) > 0
+    )
+    zero_patch = sum(
+        1 for s in real_samples
+        if s.metadata and int(s.metadata.get("terminal_patch_len") or 0) == 0
+    )
+    eval_samples = [
+        s for s in real_samples
+        if s.metadata
+        and s.metadata.get("eval_status") in ("resolved", "unresolved")
+        and s.metadata.get("f2p_passed_count") is not None
+        and s.metadata.get("p2p_passed_count") is not None
+    ]
+    n_eval = len(eval_samples)
+    full_pass = 0
+    zero_new_pass = 0
+    zero_pass = 0
+    regression = 0
+    some_pass = 0
+    p2p_pass_rates: list[float] = []
+    turns_for_avg: list[int] = []
+    for s in real_samples:
+        if s.metadata and s.metadata.get("n_full_trace_steps") is not None:
+            turns_for_avg.append(int(s.metadata.get("n_full_trace_steps") or 0))
+    for s in eval_samples:
+        md = s.metadata
+        f2p_passed = int(md.get("f2p_passed_count") or 0)
+        f2p_total = int(md.get("f2p_total") or 0)
+        p2p_passed = int(md.get("p2p_passed_count") or 0)
+        p2p_total = int(md.get("p2p_total") or 0)
+        if (f2p_total + p2p_total) > 0 \
+                and f2p_passed == f2p_total \
+                and p2p_passed == p2p_total:
+            full_pass += 1
+        if f2p_total > 0 and f2p_passed == 0 and p2p_passed == p2p_total:
+            zero_new_pass += 1
+        if f2p_passed == 0 and p2p_passed == 0:
+            zero_pass += 1
+        if p2p_total > 0 and p2p_passed < p2p_total:
+            regression += 1
+        if f2p_total > 0 and 0 < f2p_passed < f2p_total:
+            some_pass += 1
+        if p2p_total > 0:
+            p2p_pass_rates.append(p2p_passed / p2p_total)
+
     return RolloutFnTrainOutput(
         samples=samples,
         metrics={
@@ -816,6 +935,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/failed_instances_total": _FAILED_INSTANCES,
             "swe_agent/stale_dropped_groups_total": _STALE_DROPPED_GROUPS,
             "swe_agent/dropped_oversized_samples_total": _DROPPED_OVERSIZED,
+            "swe_agent/filter_dropped_groups_total": _FILTER_DROPPED_GROUPS,
             "swe_agent/wait_seconds": time.perf_counter() - wait_started,
             "swe_agent/seconds": time.perf_counter() - started,
             "swe_agent/source": "lanes",
@@ -834,5 +954,17 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/dummy_sample_rate": (n_dummy / len(samples)) if samples else 0.0,
             "swe_agent/rollout_logprob_mean": _safe_mean(rollout_lps),
             "swe_agent/rollout_logprob_token_count": len(rollout_lps),
+            # --- patch + eval ratios over post-filter batch ---
+            "swe_agent/ratio_formal_submit": (formal_submit / n_real) if n_real else 0.0,
+            "swe_agent/ratio_informal_submit": (informal_submit / n_real) if n_real else 0.0,
+            "swe_agent/ratio_zero_patch": (zero_patch / n_real) if n_real else 0.0,
+            "swe_agent/eval_samples_in_batch": n_eval,
+            "swe_agent/ratio_full_pass": (full_pass / n_eval) if n_eval else 0.0,
+            "swe_agent/ratio_zero_new_pass": (zero_new_pass / n_eval) if n_eval else 0.0,
+            "swe_agent/ratio_zero_pass": (zero_pass / n_eval) if n_eval else 0.0,
+            "swe_agent/ratio_regression": (regression / n_eval) if n_eval else 0.0,
+            "swe_agent/ratio_some_pass": (some_pass / n_eval) if n_eval else 0.0,
+            "swe_agent/avg_turns": _safe_mean([float(x) for x in turns_for_avg]),
+            "swe_agent/avg_existing_utest_pass_rate": _safe_mean(p2p_pass_rates),
         },
     )

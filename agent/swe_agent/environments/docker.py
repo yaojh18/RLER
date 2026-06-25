@@ -28,7 +28,7 @@ class DockerEnvironmentConfig(BaseModel):
     """Timeout for executing commands in the container."""
     executable: str = os.getenv("MSWEA_DOCKER_EXECUTABLE", "docker")
     """Path to the docker/container executable."""
-    run_args: list[str] = ["--rm"]
+    run_args: list[str] = ["--rm", "--memory=256g", "--memory-swap=256g"]
     """Additional arguments to pass to the docker/container executable.
     Default is ["--rm"], which removes the container after it exits.
     """
@@ -43,6 +43,11 @@ class DockerEnvironmentConfig(BaseModel):
     """
     reuse_container_id: str | None = None
     """Reuse an existing container instead of starting a new one."""
+    start_container_retries: int = 3
+    """Retries for `docker run` (handles transient registry/daemon errors,
+    e.g. missing image in lustre cache → docker.io fallback rate-limit)."""
+    start_container_retry_delay: float = 5.0
+    """Initial backoff between start-container retries; scaled by attempt#."""
 
 
 class DockerEnvironment:
@@ -79,7 +84,13 @@ class DockerEnvironment:
         }
 
     def _start_container(self):
-        """Start the Docker container and return the container ID."""
+        """Start the Docker container and return the container ID.
+
+        Retries transient `docker run` failures (exit 125, timeouts) up to
+        `start_container_retries` times. The original silent-fail behavior
+        produced a stream of dummy rollouts when an image was missing from
+        the lustre tarball cache; see slime job 57677.
+        """
         container_name = f"swe_agent-{uuid.uuid4().hex[:8]}"
         cmd = [
             self.config.executable,
@@ -96,17 +107,44 @@ class DockerEnvironment:
             "sleep",
             self.config.container_timeout,
         ])
-        self.logger.debug(f"Starting container with command: {shlex.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=self.config.pull_timeout,  # docker pull might take a while
-            check=True,
-        )
-        self.logger.info(f"Started container {container_name} with ID {result.stdout.strip()}")
-        self.container_id = result.stdout.strip()
-        self._owns_container = True
+        max_retries = max(1, int(self.config.start_container_retries))
+        last_exc: BaseException | None = None
+        for attempt in range(max_retries):
+            self.logger.debug(
+                f"Starting container (attempt {attempt + 1}/{max_retries}): {shlex.join(cmd)}"
+            )
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.pull_timeout,  # docker pull might take a while
+                    check=True,
+                )
+                self.logger.info(
+                    f"Started container {container_name} with ID {result.stdout.strip()}"
+                )
+                self.container_id = result.stdout.strip()
+                self._owns_container = True
+                return
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                last_exc = exc
+                stderr = ""
+                raw = getattr(exc, "stderr", "") or ""
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                stderr = raw[:300]
+                rc = getattr(exc, "returncode", "?")
+                self.logger.warning(
+                    f"start_container attempt {attempt + 1}/{max_retries} failed for image "
+                    f"{self.config.image!r}: {type(exc).__name__} rc={rc} stderr={stderr!r}"
+                )
+                if attempt < max_retries - 1:
+                    time.sleep(self.config.start_container_retry_delay * (attempt + 1))
+        raise RuntimeError(
+            f"docker start_container failed after {max_retries} attempts for "
+            f"image={self.config.image!r}: {type(last_exc).__name__}: {last_exc}"
+        ) from last_exc
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         """Execute a command in the Docker container and return the result as a dict."""

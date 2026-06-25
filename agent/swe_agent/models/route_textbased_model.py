@@ -17,7 +17,7 @@ from typing import Any
 from agent_rl.model_service import run_async
 from agent_rl.run_utils import compact_completion_response, run_generate_with_route_async
 
-from swe_agent.exceptions import FormatError
+from swe_agent.exceptions import FormatError, LimitsExceeded
 from swe_agent.models import GLOBAL_MODEL_STATS
 from swe_agent.models.litellm_model import LitellmModel, logger
 from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel, LitellmTextbasedModelConfig
@@ -28,6 +28,12 @@ from swe_agent.tokenization import get_stop_token_ids, tokenize_messages_with_te
 
 class RouteTextbasedModelConfig(LitellmTextbasedModelConfig):
     route_name: str = "policy"
+    context_length: int = 80960
+    """Hard context cap of the served sglang model. Pre-flight check raises
+    LimitsExceeded if len(input_ids)+max_new_tokens would exceed this, so the
+    rollout terminates cleanly with exit_status=ContextWindowExceeded and the
+    partial trace is preserved (instead of sglang returning 400 mid-rollout
+    and the exception killing the messages snapshot)."""
 
 
 class RouteTextbasedModel(LitellmTextbasedModel):
@@ -80,6 +86,27 @@ class RouteTextbasedModel(LitellmTextbasedModel):
             enable_thinking=enable_thinking,
             model_path=self.config.model_name,
         )
+        # === PRE-FLIGHT CONTEXT WINDOW CHECK ===
+        # We already tokenized exactly what sglang will run, so we know the
+        # request will be rejected with 400 before issuing it. Raising
+        # LimitsExceeded here (a structured InterruptAgentFlow subclass) lets
+        # the agent's run() loop catch it cleanly, append an exit message,
+        # and break out — `_step_session` returns normally, `rollout.messages`
+        # is populated with the partial trace, and the bundle builds a real
+        # sample with reward=0 instead of an empty dummy. Mirrors the existing
+        # step_limit / cost_limit / wall_clock checks in agents/default.py:query.
+        if len(input_ids) + int(max_tokens) > self.config.context_length:
+            raise LimitsExceeded({
+                "role": "exit",
+                "content": (
+                    f"ContextWindowExceeded (pre-flight: input_ids={len(input_ids)} + "
+                    f"max_new={max_tokens} > context={self.config.context_length})"
+                ),
+                "extra": {
+                    "exit_status": "ContextWindowExceeded",
+                    "submission": "",
+                },
+            })
         # === PREFIX INVARIANT CHECK ===
         # The custom chat template in swe_agent.tokenization is designed so that
         # every successive call's input_ids EXTENDS the previous call's

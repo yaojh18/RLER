@@ -12,6 +12,7 @@ from typing import Any, Sequence
 from agent_rl import clear_model_services, register_model_service
 from agent_rl.run_utils import ModelRouteConfig, clear_model_routes, configure_model_route
 from swe_agent.backend import SWEAgentRolloutBackend
+from swe_agent.run.benchmarks.rebench_eval import is_rebench_instance, rebench_workdir
 from swe_agent.run.benchmarks.swebench import (
     build_swebench_config,
     get_swebench_docker_image_name,
@@ -90,6 +91,8 @@ def _run_single_instance(
     environment_config = instance_config.setdefault("environment", {})
     if environment_config.get("environment_class", "docker") == "docker":
         environment_config["image"] = get_swebench_docker_image_name(instance)
+    if is_rebench_instance(instance):
+        environment_config["cwd"] = rebench_workdir(instance)
     runner = TrajectorySearchRunner(
         instance=instance,
         backend=SWEAgentRolloutBackend(
@@ -185,6 +188,17 @@ def run_search(
         required_env = infer_litellm_api_env(args.openai_model)
         if required_env and not os.getenv(required_env):
             raise RuntimeError(f"{required_env} is not set for model {args.openai_model}")
+        # RouteTextbasedModel takes the token-in/token-out path against sglang
+        # /generate; it requires api_base in model_kwargs. When the openai
+        # backend points at a local OpenAI-compatible sglang server (e.g. a
+        # DSv4 teacher hosted on a GCP node), pick up the same endpoint
+        # litellm uses (OPENAI_API_BASE) so RouteTextbasedModel can post to
+        # /generate on it. Fallback env SEARCH_SWE_OPENAI_API_BASE lets the
+        # caller override without disturbing litellm's own routing.
+        openai_api_base = os.environ.get("SEARCH_SWE_OPENAI_API_BASE") or os.environ.get("OPENAI_API_BASE")
+        if openai_api_base:
+            shared_model_kwargs["api_base"] = openai_api_base
+            shared_model_kwargs.setdefault("api_key", os.environ.get("OPENAI_API_KEY", "EMPTY"))
     else:
         service_name = SLIME_SERVICE_NAME
         register_model_service(

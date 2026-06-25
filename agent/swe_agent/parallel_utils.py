@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import logging
 import math
 import os
+import re
 import tempfile
 import copy
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -11,6 +15,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import openai
+from agent_rl.run_utils import extract_json_from_response
 from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
 from swe_agent.prompt import SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT
 from swe_agent.rubric_bank import build_terminal_update_evidence
@@ -18,6 +24,9 @@ from swe_agent.rubric_bank import build_terminal_update_evidence
 INVALID_SAMPLE_REWARD = -1.0
 RUBRIC_FORMAT_ERROR_REWARD = -1.0
 RUBRIC_TERMINAL_ERROR_REWARD = -0.2
+
+MAX_RUBRICS = 6
+MAX_RUBRIC_GENERATION_ROUNDS = 10
 
 
 def _evaluation_error_payload(error: Any) -> dict[str, Any]:
@@ -655,91 +664,3 @@ class PatchEvalManager:
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=False)
-
-
-# ===========================================================================
-# Shared lane/PDS helpers
-# ===========================================================================
-
-
-@dataclass
-class TurnTokenInfo:
-    turn_index: int
-    role: str
-    prompt_tokens: int
-    completion_tokens: int
-    output_token_ids: list[int]
-    output_logprobs: list[float]
-
-
-def _stamp_steps(
-    messages: list[dict[str, Any]], *, start_step: int
-) -> tuple[list[dict[str, Any]], int]:
-    """Annotate each message with a `step` field and return (stamped, last_step).
-
-    Each assistant message bumps the counter; observation / user / tool
-    messages inherit the step of the assistant they follow. Mirrors the
-    agent loop's iteration count.
-    """
-    stamped: list[dict[str, Any]] = []
-    step = start_step
-    for m in messages:
-        item = dict(m)
-        if item.get("role") == "assistant":
-            step += 1
-        item["step"] = step
-        stamped.append(item)
-    return stamped, step
-
-
-def _ensure_litellm_prefix(model_name: str) -> str:
-    """litellm.completion() routes by provider prefix — bare 'Qwen/...' raises
-    BadRequestError. Prefix with 'openai/' so litellm uses the OpenAI-compatible
-    HTTP path against the api_base we pin (our sglang server)."""
-    for prefix in ("openai/", "azure/", "anthropic/", "huggingface/", "hosted_vllm/"):
-        if model_name.startswith(prefix):
-            return model_name
-    return "openai/" + model_name
-
-
-def _build_rubric_prompt(
-    *,
-    system_prompt: str,
-    user_prompt: str,
-    previous_state: dict[str, Any],
-    latest_shared_segment: dict[str, Any] | None,
-    continuations: list[dict[str, Any]],
-    generation_prompt: str = SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
-) -> str:
-    latest_text = json.dumps(latest_shared_segment, indent=2, ensure_ascii=False) if latest_shared_segment else "None"
-    parts = [
-        generation_prompt.strip(),
-        "\n\n## Question:",
-        f"System Prompt:\n{system_prompt}",
-        "",
-        f"User Prompt:\n{user_prompt}",
-        "",
-        "## Previous Persistent State:",
-        json.dumps(previous_state, ensure_ascii=False, indent=2),
-        "",
-        "## Parent Trajectory:",
-        latest_text,
-        "",
-        "## Agent Trajectory Continuations:",
-    ]
-    for idx, continuation in enumerate(continuations, start=1):
-        parts.extend(
-            [
-                f"## Continuation {idx}:",
-                json.dumps(
-                    {
-                        "summary": continuation.get("summary", {}),
-                        "trajectory_continuation": continuation.get("trajectory_continuation"),
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-                "",
-            ]
-        )
-    return "\n".join(parts)

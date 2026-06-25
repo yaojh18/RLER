@@ -32,7 +32,9 @@ LANES_STEP_LIMIT=120            # hard cap per Lane B branch
 LANES_INSTANCE_WORKERS=24       # concurrent instance subprocesses across 4 nodes
 LANES_GT_EVAL_WORKERS=8         # per-instance GT eval threads
 LANES_COMPLETION_MAX_TOKENS=4096
-LANES_POLICY_ALPHA=1.0          # 1.0 = pure GT reward; (1-alpha) goes to rubric
+LANES_POLICY_ALPHA=1.0          # DEPRECATED — reward is now pure rubric in
+                                # lane_to_grpo_bundle._build_branch_sample;
+                                # this knob is ignored. Kept for sbatch back-compat.
 LANES_POLICY_TEMPERATURE=0.5    # Lane A (spine) sampling — match v0 51639 known-good
 LANES_POLICY_TOP_P=0.95
 LANES_LANE_B_TEMPERATURE=0.5    # Lane B (forks) sampling — temp=1.0 caused NaN
