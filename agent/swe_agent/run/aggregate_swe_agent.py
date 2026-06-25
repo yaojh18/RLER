@@ -93,7 +93,7 @@ from swe_agent.trajectory_search import (
     _avg_scores_from_rubrics,
     _build_step_cards,
     _collect_workspace_meta,
-    _convert_generated_rubric,
+    _convert_rubric_item,
     _parse_judge_score,
 )
 from swe_agent.models.litellm_model import LitellmModel
@@ -108,7 +108,7 @@ AGGREGATE_RUBRIC_CONTINUE_PROMPT = "Generate the next best aggregate-trajectory 
 def _aggregate_rubric_response_format(*, require_rubric: bool) -> dict[str, Any]:
     response_format = copy.deepcopy(RUBRIC_GENERATION_RESPONSE_FORMAT)
     if require_rubric:
-        response_format["json_schema"]["schema"]["required"] = ["rubric"]
+        response_format["json_schema"]["schema"]["required"] = ["polarity", "title", "description", "metadata", "scale"]
     return response_format
 
 
@@ -292,7 +292,7 @@ async def _generate_aggregate_rubrics(
                     if not isinstance(parsed, dict):
                         last_error = "Expected a JSON object or {}, but no JSON object could be parsed."
                         raise ValueError("InvalidAggregateRubricJSON")
-                    parsed_rubric = _convert_generated_rubric(task_text, parsed, round_index)
+                    parsed_rubric = _convert_rubric_item(task_text, parsed, round_index)
                     if parsed_rubric is None:
                         last_error = "Expected a rubric object with polarity, title, description, and a 1-5 scale."
                         raise ValueError("InvalidAggregateRubric")
@@ -572,7 +572,6 @@ class AggregateTrajectoryRunner:
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="aggregate-rollout") as executor:
             future_map = {executor.submit(self._run_candidate, index): index for index in range(self.num_trajectories)}
             for future in as_completed(future_map):
-                index = future_map[future]
                 try:
                     candidates.append(future.result())
                 except Exception:
@@ -593,13 +592,9 @@ class AggregateTrajectoryRunner:
                 question=question,
                 step_cards=candidate["step_cards"],
                 trajectory_metadata={
-                    "node_id": candidate["node_id"],
                     "step_count": len(candidate["step_cards"]),
                     "result_status": candidate["result"].get("status", ""),
                     "exit_status": candidate["result"].get("exit_status", ""),
-                    "terminal_patch_chars": len(candidate.get("terminal_patch") or ""),
-                    "terminal_patch_from_fallback": bool(candidate.get("terminal_patch_from_fallback")),
-                    "model_stats": candidate["result"].get("metadata", {}),
                 },
                 model_name=self.rubric_model_name,
                 temperature=self.search_config.rubric_temperature,
@@ -615,21 +610,9 @@ class AggregateTrajectoryRunner:
             candidate["summary_messages"] = summary_result["messages"]
             candidate["summary_format_error"] = summary_result.get("format_error")
             candidate["compressed_view"] = {
-                "node_id": candidate["node_id"],
-                "meta_info": {
-                    "node_id": candidate["node_id"],
-                    "sample_index": candidate["candidate_index"],
-                    "step_count": int(candidate["result"].get("metadata", {}).get("n_calls", 0) or 0),
-                    "result_status": candidate["result"].get("status", ""),
-                    "exit_status": candidate["result"].get("exit_status", ""),
-                    "terminal_patch_chars": len(candidate.get("terminal_patch") or ""),
-                    "terminal_patch_from_fallback": bool(candidate.get("terminal_patch_from_fallback")),
-                    "terminal_error": candidate.get("terminal_error"),
-                },
-                "trajectory": {
-                    "compressed_trajectory": state,
-                    "workspace_meta": compact_workspace_meta(candidate["workspace_meta"], file_limit=12),
-                },
+                "compressed_trajectory": state,
+                "submited_patch": candidate.get("terminal_patch"),
+                "workspace_meta": compact_workspace_meta(candidate["workspace_meta"], file_limit=12),
             }
             _write_json(
                 candidate["node_dir"] / "summary.json",
@@ -681,7 +664,6 @@ class AggregateTrajectoryRunner:
         return {
             "rubric_sample": rubric_sample,
             "scoring_rubrics": scoring_rubrics,
-            "variances": variances,
             "judge_errors": judge_errors,
             "average_rubric_judged_scores": average_scores,
         }

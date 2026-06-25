@@ -208,50 +208,53 @@ def gold_patch_skeleton(gold_patch: str, max_chars: int = 4096) -> str:
     return _truncate_middle(text, max_chars)
 
 
+def evaluation_tests_not_shared(items: list[dict[str, Any]], *, test_key: str) -> dict[str, list[str]]:
+    rows: list[tuple[str, set[str], bool]] = []
+    evaluated_sets: list[set[str]] = []
+    for item in items:
+        label = str(item.get("title", ""))
+        evaluation = item.get("evaluation")
+        has_evaluation = isinstance(evaluation, dict)
+        tests = {str(test) for test in evaluation.get(test_key, []) if str(test)} if has_evaluation else set()
+        if has_evaluation:
+            evaluated_sets.append(tests)
+        rows.append((label, tests, has_evaluation))
+    common_tests = set.intersection(*evaluated_sets) if evaluated_sets else set()
+    return {label: sorted(tests - common_tests) if has_evaluation else [] for label, tests, has_evaluation in rows}
+
+
 def build_terminal_update_evidence(
     *,
     parent_patch: str = "",
     parent_evaluation: dict[str, Any] | None = None,
     continuations: list[dict[str, Any]],
 ) -> dict[str, str]:
-    participants = [
+    items = [
         {
             "title": "Parent",
             "patch": parent_patch or "",
-            "passed_tests": (
-                {str(test) for test in parent_evaluation.get("passed_tests", []) if str(test)}
-                if isinstance(parent_evaluation, dict)
-                else set()
-            ),
-            "has_evaluation": parent_evaluation is not None,
+            "evaluation": parent_evaluation,
         }
     ]
     for index, continuation in enumerate(continuations, start=1):
-        evaluation = continuation.get("evaluation")
-        participants.append(
+        items.append(
             {
                 "title": f"Continuation {index}",
                 "patch": str(continuation.get("patch") or ""),
-                "passed_tests": (
-                    {str(test) for test in evaluation.get("passed_tests", []) if str(test)}
-                    if isinstance(evaluation, dict)
-                    else set()
-                ),
-                "has_evaluation": evaluation is not None,
+                "evaluation": continuation.get("evaluation"),
             }
         )
-    test_participants = [item for item in participants if item["has_evaluation"]]
-    common_passed = set.intersection(*(item["passed_tests"] for item in test_participants)) if test_participants else set()
+    passed_tests_by_title = evaluation_tests_not_shared(items, test_key="passed_tests")
     terminal_patch_rows: list[str] = []
     passed_test_rows: list[str] = []
-    for item in participants:
+    for item in items:
         patch = _truncate_middle(str(item["patch"] or ""), MAX_TERMINAL_PATCH_SECTION_CHARS)
-        diff_tests = set(item["passed_tests"]) - common_passed
+        diff_tests = passed_tests_by_title.get(item["title"], [])
         terminal_patch_rows.extend([f"## {item['title']}:", patch.strip() if patch.strip() else "<empty>"])
         passed_test_rows.extend(
             [
                 f"## {item['title']}:",
-                "\n".join(sorted(diff_tests)) if diff_tests else "<none>",
+                "\n".join(diff_tests) if diff_tests else "<none>",
             ]
         )
     return {
@@ -285,6 +288,12 @@ def _convert_experience(payload: dict[str, Any], experience_id: str | None = Non
         return None
     for key, expected_type in required_metadata_types.items():
         if not isinstance(metadata.get(key), expected_type):
+            return None
+    for rubric in metadata["generated_rubrics"]:
+        if not isinstance(rubric, dict) or _convert_rubric_item("generated", rubric, 0) is None:
+            return None
+    for rubric in metadata["reference_golden_rubrics"]:
+        if not isinstance(rubric, dict) or _convert_rubric_item("reference", rubric, 0) is None:
             return None
     body = {
         "title": str(title).strip(),
@@ -337,7 +346,9 @@ def _convert_action(
         return {"action": "delete", "title": title}
     if action not in {"add", "update"}:
         return None
-    expected_keys = {"action", "experience"} if action == "add" else {"action", "target_title", "experience"}
+    expected_keys = {"action", "title", "description", "metadata", "context", "experience"}
+    if action == "update":
+        expected_keys.add("target_title")
     if expected_keys - set(payload):
         return None
     target_title = payload.get("target_title")
@@ -349,9 +360,10 @@ def _convert_action(
         if target_title not in experiences:
             return None
         experience_id = experiences[target_title].experience_id
-    experience_payload = copy.deepcopy(payload.get("experience"))
-    if not isinstance(experience_payload, dict):
-        return None
+    experience_payload = {
+        key: copy.deepcopy(payload.get(key))
+        for key in ("title", "description", "metadata", "context", "experience")
+    }
     title = experience_payload.get("title")
     if title is None or not str(title).strip():
         return None
@@ -361,25 +373,36 @@ def _convert_action(
         return None
     if action == "update" and title != target_title and title in experiences:
         return None
-    metadata = experience_payload.get("metadata")
+    metadata = experience_payload.get("metadata", {})
     if not isinstance(metadata, dict):
         return None
-    analysis = metadata.get("analysis")
+    analysis = metadata.get("analysis", "")
     reference_golden_rubrics = metadata.get("reference_golden_rubrics")
-    if not isinstance(analysis, str) or not analysis.strip():
-        return None
     if not isinstance(reference_golden_rubrics, list) or not reference_golden_rubrics:
         return None
+    validated_reference_golden_rubrics = []
     for reference in reference_golden_rubrics:
-        if not isinstance(reference, dict) or _convert_generated_rubric("reference", reference, 0) is None:
+        if not isinstance(reference, dict):
             return None
+        rubric = _convert_rubric_item("reference", reference, 0)
+        if rubric is None:
+            return None
+        validated_reference_golden_rubrics.append(
+            {
+                "polarity": rubric.direction,
+                "title": rubric.title,
+                "description": rubric.description,
+                "metadata": copy.deepcopy(rubric.metadata or {}),
+                "scale": copy.deepcopy(rubric.scale),
+            }
+        )
     experience_payload["metadata"] = {
         "generated_rubrics": copy.deepcopy(attempt_evidence["generated_rubrics"]),
         "gt_skeleton": attempt_evidence["gt_skeleton"],
         "generated_rubric_accuracy": copy.deepcopy(attempt_evidence["generated_rubric_accuracy"]),
         "gt_scores": copy.deepcopy(attempt_evidence["gt_scores"]),
         "analysis": analysis,
-        "reference_golden_rubrics": copy.deepcopy(reference_golden_rubrics),
+        "reference_golden_rubrics": validated_reference_golden_rubrics,
     }
     experience = _convert_experience(experience_payload, experience_id)
     if experience is None:
@@ -457,9 +480,8 @@ def _seed_experience_records(scope: str = "siblings") -> dict[str, RubricExperie
     }
 
 
-def _convert_generated_rubric(task: str, payload: dict[str, Any], round_index: int) -> RubricRecord | None:
-    item = payload.get("rubric", None)
-    if item is None or not isinstance(item, dict):
+def _convert_rubric_item(task: str, item: dict[str, Any], round_index: int) -> RubricRecord | None:
+    if not isinstance(item, dict):
         return None
     direction = item.get("polarity", None)
     if direction not in {"positive", "negative"}:
@@ -507,7 +529,7 @@ def _convert_generated_rubric(task: str, payload: dict[str, Any], round_index: i
 
 
 def _seed_rubric_records(task: str, scope: str = "siblings") -> list[RubricRecord]:
-    return [rubric for seed in _seed_rubrics(scope=scope) if (rubric := _convert_generated_rubric(task, seed, 0)) is not None]
+    return [rubric for seed in _seed_rubrics(scope=scope) if (rubric := _convert_rubric_item(task, seed, 0)) is not None]
 
 
 class ScoreRubricBank:
@@ -648,7 +670,7 @@ class ExperienceRubricBank:
                         "description": item.description,
                         "context": item.context,
                         "experience": item.experience,
-                        "reference_golden_rubric": item.metadata.get("reference_golden_rubrics", None),
+                        "reference_golden_rubrics": item.metadata.get("reference_golden_rubrics", None),
                     }
                     for item in retrieved
                 ])
@@ -899,13 +921,11 @@ class ExperienceRubricBank:
                 continue
             generated_rubrics = [
                 {
-                    "rubric": {
-                        "polarity": rubric["direction"],
-                        "title": rubric["title"],
-                        "description": rubric["description"],
-                        "metadata": copy.deepcopy(rubric["metadata"]),
-                        "scale": copy.deepcopy(rubric["scale"]),
-                    }
+                    "polarity": rubric["direction"],
+                    "title": rubric["title"],
+                    "description": rubric["description"],
+                    "metadata": copy.deepcopy(rubric["metadata"]),
+                    "scale": copy.deepcopy(rubric["scale"]),
                 }
                 for rubric in generated
             ]
@@ -969,6 +989,7 @@ class ExperienceRubricBank:
                 ]
             )
             messages = [{"role": "user", "content": initial_prompt}]
+            add_update_count = 0
             for _ in range(8):
                 async for attempt in retry(
                     logger=logger,
@@ -991,6 +1012,17 @@ class ExperienceRubricBank:
                 messages.append(assistant_message)
                 parsed = extract_json_from_response(response)
                 if parsed == {}:
+                    if add_update_count == 0:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Generate at least one add or update action with concrete observable rubric-generation guidance, "
+                                    "or retrieve an existing experience first if needed."
+                                ),
+                            }
+                        )
+                        continue
                     break
                 converted_action = _convert_action(parsed, experiences=self.experiences, attempt_evidence=attempt_evidence)
                 if converted_action is None:
@@ -1000,8 +1032,8 @@ class ExperienceRubricBank:
                             "role": "user",
                             "content": (
                                 "The response did not match a valid retrieve/add/update/delete action schema, or it referenced an invalid bank title. "
-                                "For add/update, experience.metadata.analysis must be non-empty and "
-                                "experience.metadata.reference_golden_rubrics must be in the correct rubric format. "
+                                "For add/update, title, description, context, experience, metadata.analysis, and "
+                                "metadata.reference_golden_rubrics must be top-level fields in the new flat format. "
                                 "Current valid experience titles are: "
                                 + json.dumps(valid_titles, ensure_ascii=False)
                                 + ". Generate a corrected single action or return {}."
@@ -1035,10 +1067,11 @@ class ExperienceRubricBank:
                     if action == "update":
                         del self.experiences[converted_action["target_title"]]
                     self.experiences[experience.title] = experience
-                    applied_action = {"action": action, "experience": _public_experience(experience)}
+                    applied_action = {"action": action, **_public_experience(experience)}
                     if action == "update":
                         applied_action["target_title"] = converted_action["target_title"]
                     applied.append(applied_action)
+                    add_update_count += 1
                 messages.append(
                     {
                         "role": "user",

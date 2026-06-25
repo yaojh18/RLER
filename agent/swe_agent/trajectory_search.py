@@ -39,7 +39,7 @@ from swe_agent.rubric_bank import (
     RubricGenerationSample,
     RubricRecord,
     ScoreRubricBank,
-    _convert_generated_rubric,
+    _convert_rubric_item,
     _truncate_middle,
 )
 
@@ -382,6 +382,7 @@ async def _generate_round_rubrics(
     generation_prompt: str = SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
     continue_prompt: str = RUBRIC_GENERATION_CONTINUE_PROMPT,
     rubric_list_prefix: str = "rubric",
+    require_first_rubric: bool = False,
 ) -> RubricGenerationSample:
     latest_shared_segment_text = json.dumps(latest_shared_segment, indent=2, ensure_ascii=False) if latest_shared_segment else "None"
     prompt_parts = [
@@ -440,26 +441,44 @@ async def _generate_round_rubrics(
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
-                    response_format=copy.deepcopy(RUBRIC_GENERATION_RESPONSE_FORMAT),
+                    response_format=copy.deepcopy(
+                        REQUIRED_RUBRIC_GENERATION_RESPONSE_FORMAT
+                        if require_first_rubric and not generated
+                        else RUBRIC_GENERATION_RESPONSE_FORMAT
+                    ),
                     model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
                 )
         assistant_content = assistant_message.get("content_no_thinking")
         conversation_messages.append(assistant_message)
         parsed_candidate = extract_json_from_response(assistant_content)
         if parsed_candidate == {}:
-            break
+            if require_first_rubric and not generated:
+                last_error = "Expected one complete rubric before returning {}."
+            else:
+                break
         elif parsed_candidate is None:
             last_error = "Expected a JSON object or {}, but no JSON object could be parsed."
         else:
-            parsed = _convert_generated_rubric(task_text, parsed_candidate, round_index)
+            parsed = _convert_rubric_item(task_text, parsed_candidate, round_index)
             if parsed is None:
                 last_error = "Expected a rubric object with polarity, title, description, and a 1-5 scale."
         if parsed is None:
             format_errors.append({"turn_index": turn_index, "error": last_error})
-            conversation_messages.append({"role": "user", "content": last_error + f" {continue_prompt}"})
+            conversation_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        last_error
+                        + " Return a single complete flat JSON rubric with polarity, title, description, metadata, "
+                        + f"and scale fields, or return {{}} only after at least one complete rubric has been generated. {continue_prompt}"
+                    ),
+                }
+            )
             turn_index += 1
             continue
         generated.append(parsed)
+        if require_first_rubric:
+            break
         if len(generated) >= MAX_RUBRICS:
             length_error = f"Reached max rubrics={MAX_RUBRICS}."
             break
@@ -586,6 +605,7 @@ async def _generate_and_score_rubric_batch(
     extra_prompt_sections: list[str],
     judge_kwargs: dict[str, Any],
     judge_prompt: str = SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+    require_first_rubric: bool = False,
 ) -> dict[str, Any]:
     generated_samples = await asyncio.gather(
         *[
@@ -600,6 +620,7 @@ async def _generate_and_score_rubric_batch(
                 sample_index=sample_index,
                 generation_prompt=generation_prompt,
                 rubric_list_prefix=rubric_list_prefix,
+                require_first_rubric=require_first_rubric,
             )
             for sample_index in range(sample_count)
         ],
@@ -1137,7 +1158,7 @@ class TrajectorySearchRunner:
                                 {
                                     "before": copy.deepcopy(update.get("before", [])),
                                     "after": copy.deepcopy(update.get("after", [])),
-                                    "generated": copy.deepcopy(rubric_payload.get("generated", [])),
+                                    "actions": copy.deepcopy(update.get("actions", [])),
                                 },
                             )
                             _atomic_write_json(
@@ -1424,6 +1445,7 @@ class TrajectorySearchRunner:
             extra_prompt_sections.extend(experience_context.extra_prompt_sections)
             retrieved_experiences = copy.deepcopy(experience_context.retrieved)
             retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
+        extra_prompt_sections.extend(section for section in scope_spec.get("extra_prompt_sections", []) if section)
 
         active_score_result = None
         if active_bank_rubrics:
@@ -1448,6 +1470,7 @@ class TrajectorySearchRunner:
             extra_prompt_sections=extra_prompt_sections,
             judge_kwargs=judge_kwargs,
             judge_prompt=scope_spec["judge_prompt"],
+            require_first_rubric=bool(scope_spec.get("require_first_rubric")),
         )
 
         rubric_samples: list[dict[str, Any]] = []
@@ -1495,7 +1518,7 @@ class TrajectorySearchRunner:
                     score_lookup_by_node=evaluation["score_lookup_by_node"],
                     rubrics=scoring_rubrics,
                 )
-            generated_ids = {rubric.rubric_id for rubric in generated_sample.generated}
+            scored_rubric_ids = {rubric.rubric_id for rubric in scoring_rubrics}
             sample_payload = {
                 "scope": scope_spec["scope"],
                 "sample_index": generated_sample.sample_index,
@@ -1506,7 +1529,7 @@ class TrajectorySearchRunner:
                 "format_errors": copy.deepcopy(generated_sample.format_errors or []),
                 "terminal_error": generated_sample.terminal_error,
                 "generated_titles": [rubric.title for rubric in generated_sample.generated],
-                **_rubric_metrics_payload(metrics, generated_ids),
+                **_rubric_metrics_payload(metrics, scored_rubric_ids),
                 "average_rubric_judged_scores": avg_scores,
                 "judge_errors": evaluation["judge_errors"],
                 "selected": False,

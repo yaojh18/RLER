@@ -84,7 +84,6 @@ Represent this choice using the `polarity` field in the rubric object.
 ## Output Format
 ```json
 {
-  "rubric": {
     "polarity": "<positive|negative>",
     "description": "<detailed excellence/failure description>",
     "title": "<abstract label>",
@@ -98,7 +97,6 @@ Represent this choice using the `polarity` field in the rubric object.
       "4": "<positive rubric: strong evidence / negative rubric: clear evidence of the flaw>",
       "5": "<positive rubric: strongest evidence / negative rubric: most severe evidence of the flaw>"
     }
-  }
 }
 ```
 If no new high-impact, non-redundant rubric should be added, output:
@@ -221,7 +219,6 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
 ## Output Format
 ```json
 {
-  "rubric": {
     "polarity": "<positive|negative>",
     "description": "<detailed parent-child progress criterion>",
     "title": "<abstract label>",
@@ -235,7 +232,6 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
       "4": "<positive rubric: strong progress evidence / negative rubric: clear evidence of the flaw or regression>",
       "5": "<positive rubric: strongest progress evidence / negative rubric: most severe evidence of the flaw or regression>"
     }
-  }
 }
 ```
 If no new high-impact, non-redundant rubric should be added, output:
@@ -355,7 +351,7 @@ Store only durable lessons that improve future agent progress rubric generation.
 
 ## Input Explanation
 - `generation_context`: the context that was shown to the rubric generator, including problem statement, the current history, previous generated rubrics and sampled agent continuations.
-- `retrieved`: historical experiences retrieved before this rubric generation attempt.
+- `retrieved`: historical experiences retrieved before this rubric generation attempt. Use them to diagnose whether an experience helped, was too broad, or should be refined.
 - `generated_rubrics`: the full rubric list generated in that attempt.
 - `gt_skeleton`: ground-truth patch skeleton for diagnosis only.
 - `terminal_patch`: the final patch for the parent and each continuation if they continue to run until submission in the same sample order as `generation_context`. Use it only for diagnosis, not as a reusable lesson; do not save an experience that relies on terminal patch visibility.
@@ -395,7 +391,7 @@ Output is a retrieve/add/update/delete action on the experience bank with the fo
 - Add or update only high-impact experiences likely to improve future rubric generation.
 - Use delete only for experiences that are redundant, misleading, or unsafe to retrieve.
 - If you need full context for existing experiences before updating or deleting them, output a retrieve action first using their titles.
-- Return an empty object `{}` when no high-impact reusable experience can be generated.
+- Add or update at least one grounded experience before returning `{}` unless the evidence is internally contradictory.
 - Prefer quality over quantity: one reusable experience is better than several narrow instance notes.
 - `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton`, `gt_scores`, exact accuracy values, or phrases such as "ground truth evaluates", "high-scoring sample", or "low-scoring sample." Put GT-based justification only in `metadata.analysis`.
 - Before returning an add/update action, rewrite the retrievable fields as behavior clusters, not score clusters. Bad: "High-scoring samples implement X while low-scoring samples do Y." Good: "One cluster implements X in the source files; another cluster leaves no source patch or only edits a scratch script." If you cannot state the lesson without score or GT language in retrievable fields, return `{}` instead of adding/updating an experience.
@@ -418,7 +414,6 @@ For add:
 ```json
 {
     "action": "add",
-    "experience": {
     "title": "a new unique experience title",
     "description": "...",
     "context": "...",
@@ -426,7 +421,6 @@ For add:
     "metadata": {
         "analysis": "...",
         "reference_golden_rubrics": []
-    }
     }
 }
 ```
@@ -436,7 +430,6 @@ For update:
 {
     "action": "update",
     "target_title": "an existing experience title",
-    "experience": {
     "title": "the existing experience title or a new unique title",
     "description": "...",
     "context": "...",
@@ -445,7 +438,6 @@ For update:
         "analysis": "...",
         "reference_golden_rubrics": []
     }
-    },
 }
 ```
 
@@ -461,21 +453,22 @@ For delete:
 ```json
 [
     {
-        "rubric": {
-            "polarity": "<positive|negative>",
-            "description": "<detailed excellence/failure description>",
-            "title": "<abstract label>",
-            "metadata": {
-            <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
-            },
-            "scale": {
-                "1": "<positive rubric: weakest progress evidence / negative rubric: no evidence of the flaw or regression>",
-                "2": "<positive rubric: weak progress evidence / negative rubric: minor evidence of the flaw or regression>",
-                "3": "<the moderate anchor for equivalent parent-child behavior>",
-                "4": "<positive rubric: strong progress evidence / negative rubric: clear evidence of the flaw or regression>",
-                "5": "<positive rubric: strongest progress evidence / negative rubric: most severe evidence of the flaw or regression>"
-            }
+        "polarity": "<positive|negative>",
+        "description": "<detailed excellence/failure description>",
+        "title": "<abstract label>",
+        "metadata": {
+        <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
+        },
+        "scale": {
+            "1": "<positive rubric: weakest progress evidence / negative rubric: no evidence of the flaw or regression>",
+            "2": "<positive rubric: weak progress evidence / negative rubric: minor evidence of the flaw or regression>",
+            "3": "<the moderate anchor for equivalent parent-child behavior>",
+            "4": "<positive rubric: strong progress evidence / negative rubric: clear evidence of the flaw or regression>",
+            "5": "<positive rubric: strongest progress evidence / negative rubric: most severe evidence of the flaw or regression>"
         }
+    },
+    {
+    ...
     }
 ]
 ```
@@ -566,12 +559,13 @@ RUBRIC_ITEM_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
+        "polarity": {"type": "string", "enum": ["positive", "negative"]},
         "title": {"type": "string"},
         "description": {"type": "string"},
         "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
         "scale": RUBRIC_SCALE_JSON_SCHEMA,
     },
-    "required": ["title", "description", "scale"],
+    "required": ["polarity", "title", "description", "metadata", "scale"],
 }
 
 PERSISTENT_STATE_RESPONSE_FORMAT = {
@@ -588,29 +582,24 @@ PERSISTENT_STATE_RESPONSE_FORMAT = {
     },
 }
 
+RUBRIC_GENERATION_RESPONSE_SCHEMA = copy.deepcopy(RUBRIC_ITEM_JSON_SCHEMA)
+RUBRIC_GENERATION_RESPONSE_SCHEMA.pop("required", None)
+
+REQUIRED_RUBRIC_GENERATION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "adaptive_rubric_generation_required",
+        "strict": True,
+        "schema": RUBRIC_ITEM_JSON_SCHEMA,
+    },
+}
+
 RUBRIC_GENERATION_RESPONSE_FORMAT = {
     "type": "json_schema",
     "json_schema": {
         "name": "adaptive_rubric_generation",
         "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "rubric": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "polarity": {"type": "string", "enum": ["positive", "negative"]},
-                        "title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
-                        "scale": RUBRIC_SCALE_JSON_SCHEMA,
-                    },
-                    "required": ["polarity", "title", "description", "metadata", "scale"],
-                },
-            },
-        },
+        "schema": RUBRIC_GENERATION_RESPONSE_SCHEMA,
     },
 }
 
@@ -688,7 +677,7 @@ Store only durable lessons that improve future rubric generation. Do not create 
 
 ## Input Explanation
 - `generation_context`: the context that was shown to the rubric generator, including problem statement, the current history, previous generated rubrics and sampled agent continuations.
-- `retrieved_experience`: historical experiences retrieved before this rubric generation attempt.
+- `retrieved_experience`: historical experiences retrieved before this rubric generation attempt. Use them to diagnose whether an experience helped, was too broad, or should be refined.
 - `generated_rubrics`: the full rubric list generated in that attempt.
 - `gt_skeleton`: ground-truth patch skeleton for diagnosis only.
 - `terminal_patch`: the final patch for the parent and each continuation if they continue to run until submission in the same sample order as `generation_context`. Use it only for diagnosis, not as a reusable lesson; do not save an experience that relies on terminal patch visibility.
@@ -727,7 +716,7 @@ Output is a retrieve/add/update/delete action on the experience bank with the fo
 - Add or update only high-impact experiences likely to improve future rubric generation.
 - Use delete only for experiences that are redundant, misleading, or unsafe to retrieve.
 - If you need full context for existing experiences before updating or deleting them, output a retrieve action first using their titles.
-- Return an empty object `{}` when no high-impact reusable experience can be generated.
+- Add or update at least one grounded experience before returning `{}` unless the evidence is internally contradictory.
 - Prefer quality over quantity: one reusable experience is better than several narrow instance notes.
 - `title`, `description`, `context`, and `experience` will be retrieved in future non-privileged rubric generation and should not include any ground-truth information, including `gt_skeleton`, `gt_scores`, exact accuracy values, or phrases such as "ground truth evaluates", "high-scoring sample", or "low-scoring sample." Put GT-based justification only in `metadata.analysis`.
 - Before returning an add/update action, rewrite the retrievable fields as behavior clusters, not score clusters. Bad: "High-scoring samples implement X while low-scoring samples do Y." Good: "One cluster implements X in the source files; another cluster leaves no source patch or only edits a scratch script." If you cannot state the lesson without score or GT language in retrievable fields, return `{}` instead of adding/updating an experience.
@@ -749,7 +738,6 @@ For add:
 ```json
 {
     "action": "add",
-    "experience": {
     "title": "a new unique experience title",
     "description": "...",
     "context": "...",
@@ -757,7 +745,6 @@ For add:
     "metadata": {
         "analysis": "...",
         "reference_golden_rubrics": []
-    }
     }
 }
 ```
@@ -767,7 +754,6 @@ For update:
 {
     "action": "update",
     "target_title": "an existing experience title",
-    "experience": {
     "title": "the existing experience title or a new unique title",
     "description": "...",
     "context": "...",
@@ -776,7 +762,6 @@ For update:
         "analysis": "...",
         "reference_golden_rubrics": []
     }
-    },
 }
 ```
 
@@ -792,21 +777,22 @@ For delete:
 ```json
 [
     {
-        "rubric": {
-            "polarity": "<positive|negative>",
-            "description": "<detailed excellence/failure description>",
-            "title": "<abstract label>",
-            "metadata": {
-            <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
-            },
-            "scale": {
-                "1": "<positive rubric: weakest evidence / negative rubric: flaw absent or minimal>",
-                "2": "<positive rubric: weak evidence / negative rubric: minor evidence of the flaw>",
-                "3": "<the moderate anchor>",
-                "4": "<positive rubric: strong evidence / negative rubric: clear evidence of the flaw>",
-                "5": "<positive rubric: strongest evidence / negative rubric: most severe evidence of the flaw>"
-            }
+        "polarity": "<positive|negative>",
+        "description": "<detailed excellence/failure description>",
+        "title": "<abstract label>",
+        "metadata": {
+        <a dict of any other relevant structured context and evidence needed for judging, including but not limited to current working stage, focus, targeted test code or pseudo-test, code review, etc.>
+        },
+        "scale": {
+            "1": "<positive rubric: weakest evidence / negative rubric: flaw absent or minimal>",
+            "2": "<positive rubric: weak evidence / negative rubric: minor evidence of the flaw>",
+            "3": "<the moderate anchor>",
+            "4": "<positive rubric: strong evidence / negative rubric: clear evidence of the flaw>",
+            "5": "<positive rubric: strongest evidence / negative rubric: most severe evidence of the flaw>"
         }
+    },
+    {
+    ...
     }
 ]
 ```
@@ -837,126 +823,118 @@ RUBRIC_EXPERIENCE_UPDATE_RESPONSE_FORMAT = {"type": "json_object"}
 def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
     if scope == "pc":
         parent_relative_semantic_progress = {
-            "rubric": {
-                "polarity": "positive",
-                "title": "Parent-Relative Semantic Progress",
-                "description": (
-                    "Scores whether the continuation changes the real owner code to add task-relevant behavior that the parent lacked, rather than merely "
-                    "looking cleaner, testing more, or matching a preferred implementation shape."
+            "polarity": "positive",
+            "title": "Parent-Relative Semantic Progress",
+            "description": (
+                "Scores whether the continuation changes the real owner code to add task-relevant behavior that the parent lacked, rather than merely "
+                "looking cleaner, testing more, or matching a preferred implementation shape."
+            ),
+            "metadata": {
+                "source_groups": (
+                    "wtforms__wtforms-614::20260505-235109::round_002; elastic__synthetics-316::20260505-234609::round_003; "
+                    "keras-team__keras-19955::20260506-031156::round_002"
                 ),
-                "metadata": {
-                    "source_groups": (
-                        "wtforms__wtforms-614::20260505-235109::round_002; elastic__synthetics-316::20260505-234609::round_003; "
-                        "keras-team__keras-19955::20260506-031156::round_002"
-                    ),
-                    "visible_boundary": (
-                        "real owner-code changes such as WTForms HTML5 field/widget migration, Elastic runner hook-error propagation, or KerasVariable "
-                        "magic-method behavior versus partial default tweaks, empty patches, or non-owner work"
-                    ),
-                    "positive_evidence": (
-                        "terminal diff in the task owner path that changes API contract, state mutation, lifecycle event emission, schema handling, compatibility "
-                        "boundary, or backend behavior missing from the parent"
-                    ),
-                    "non_evidence": (
-                        "extra validation, longer reasoning, cleaner edits, synthetic reproduction files, or residual imperfections that do not make the child "
-                        "worse than a wrong/no-op parent"
-                    ),
-                },
-                "scale": {
-                    "1": "The child loses useful parent behavior, targets the wrong workspace, or replaces the task with synthetic/no-op work.",
-                    "2": "The child edits real files but misses the owner behavior or introduces likely harmful semantics compared with the parent.",
-                    "3": "The child is behaviorally equivalent to the parent for the visible task objective, including no meaningful patch over a no-op parent.",
-                    "4": "The child adds a partial but real owner-code behavior missing from the parent, even if validation or edge-case handling is imperfect.",
-                    "5": "The child clearly implements the parent-missing behavior in the real owner code while preserving relevant parent constraints.",
-                },
-            }
+                "visible_boundary": (
+                    "real owner-code changes such as WTForms HTML5 field/widget migration, Elastic runner hook-error propagation, or KerasVariable "
+                    "magic-method behavior versus partial default tweaks, empty patches, or non-owner work"
+                ),
+                "positive_evidence": (
+                    "terminal diff in the task owner path that changes API contract, state mutation, lifecycle event emission, schema handling, compatibility "
+                    "boundary, or backend behavior missing from the parent"
+                ),
+                "non_evidence": (
+                    "extra validation, longer reasoning, cleaner edits, synthetic reproduction files, or residual imperfections that do not make the child "
+                    "worse than a wrong/no-op parent"
+                ),
+            },
+            "scale": {
+                "1": "The child loses useful parent behavior, targets the wrong workspace, or replaces the task with synthetic/no-op work.",
+                "2": "The child edits real files but misses the owner behavior or introduces likely harmful semantics compared with the parent.",
+                "3": "The child is behaviorally equivalent to the parent for the visible task objective, including no meaningful patch over a no-op parent.",
+                "4": "The child adds a partial but real owner-code behavior missing from the parent, even if validation or edge-case handling is imperfect.",
+                "5": "The child clearly implements the parent-missing behavior in the real owner code while preserving relevant parent constraints.",
+            },
         }
         parent_equivalence_preservation = {
-            "rubric": {
-                "polarity": "positive",
-                "title": "Sitemap Index Patch Equivalence Preservation",
-                "description": (
-                    "Scores whether the continuation preserves the parent's sitemap-index parser behavior: flushing a buffered <loc> when a closing loc or "
-                    "sitemap boundary is reached, ignoring blank loc text, and keeping the XMLIndexHandler/DelegatorHandler edits in the real patch. "
-                    "Different validation logs, final stdout, or harmless structure should tie unless they change this parser behavior."
+            "polarity": "positive",
+            "title": "Sitemap Index Patch Equivalence Preservation",
+            "description": (
+                "Scores whether the continuation preserves the parent's sitemap-index parser behavior: flushing a buffered <loc> when a closing loc or "
+                "sitemap boundary is reached, ignoring blank loc text, and keeping the XMLIndexHandler/DelegatorHandler edits in the real patch. "
+                "Different validation logs, final stdout, or harmless structure should tie unless they change this parser behavior."
+            ),
+            "metadata": {
+                "source_case": "crawler-commons__crawler-commons-227::20260506-000111::round_003",
+                "stage": "near-correct parent parser patch",
+                "judge_focus": (
+                    "Compare the XMLIndexHandler.java loc-buffer handling, maybeAddSiteMap call sites, DelegatorHandler.isAllBlank helper, and the final "
+                    "terminal patch artifact against the parent workspace."
                 ),
-                "metadata": {
-                    "source_case": "crawler-commons__crawler-commons-227::20260506-000111::round_003",
-                    "stage": "near-correct parent parser patch",
-                    "judge_focus": (
-                        "Compare the XMLIndexHandler.java loc-buffer handling, maybeAddSiteMap call sites, DelegatorHandler.isAllBlank helper, and the final "
-                        "terminal patch artifact against the parent workspace."
-                    ),
-                    "evidence": (
-                        "Useful child variants keep the sitemap parser edits in src/main/java/crawlercommons/sitemaps/sax/XMLIndexHandler.java and "
-                        "DelegatorHandler.java; empty final diffs or losing those edits are regressions."
-                    ),
-                },
-                "scale": {
-                    "1": "The child loses the parent sitemap parser edits or submits an empty/wrong-target patch.",
-                    "2": "The child keeps part of the parser change but drops an important loc-buffer or blank-loc condition.",
-                    "3": "The child preserves the same sitemap parsing behavior as the parent despite different logs, command syntax, or patch shape.",
-                    "4": "The child preserves the parent behavior and fixes a visible remaining parser edge case.",
-                    "5": "The child clearly improves the sitemap-index parser while preserving the parent loc-buffer and blank-loc behavior.",
-                },
-            }
+                "evidence": (
+                    "Useful child variants keep the sitemap parser edits in src/main/java/crawlercommons/sitemaps/sax/XMLIndexHandler.java and "
+                    "DelegatorHandler.java; empty final diffs or losing those edits are regressions."
+                ),
+            },
+            "scale": {
+                "1": "The child loses the parent sitemap parser edits or submits an empty/wrong-target patch.",
+                "2": "The child keeps part of the parser change but drops an important loc-buffer or blank-loc condition.",
+                "3": "The child preserves the same sitemap parsing behavior as the parent despite different logs, command syntax, or patch shape.",
+                "4": "The child preserves the parent behavior and fixes a visible remaining parser edge case.",
+                "5": "The child clearly improves the sitemap-index parser while preserving the parent loc-buffer and blank-loc behavior.",
+            },
         }
         invalid_artifact_or_parent_work_loss = {
-            "rubric": {
-                "polarity": "negative",
-                "title": "WTForms HTML5 Patch Artifact Integrity",
-                "description": (
-                    "Penalizes continuations that lose or fake the WTForms HTML5 migration patch when the parent already has useful source edits. The key "
-                    "artifact is the real repository diff that moves HTML5 fields/widgets into core WTForms modules and preserves the core source behavior; "
-                    "missing docs or noisy submission stdout alone should not be treated as complete parent-work loss."
+            "polarity": "negative",
+            "title": "WTForms HTML5 Patch Artifact Integrity",
+            "description": (
+                "Penalizes continuations that lose or fake the WTForms HTML5 migration patch when the parent already has useful source edits. The key "
+                "artifact is the real repository diff that moves HTML5 fields/widgets into core WTForms modules and preserves the core source behavior; "
+                "missing docs or noisy submission stdout alone should not be treated as complete parent-work loss."
+            ),
+            "metadata": {
+                "source_case": "wtforms__wtforms-614::20260505-235109::round_004",
+                "stage": "useful parent source patch with fragile final artifact",
+                "judge_focus": (
+                    "Inspect the terminal patch and workspace diff for src/wtforms/fields/core.py, src/wtforms/widgets/core.py, and related import moves. "
+                    "Separate core source-loss from docs-only omissions or malformed final command output."
                 ),
-                "metadata": {
-                    "source_case": "wtforms__wtforms-614::20260505-235109::round_004",
-                    "stage": "useful parent source patch with fragile final artifact",
-                    "judge_focus": (
-                        "Inspect the terminal patch and workspace diff for src/wtforms/fields/core.py, src/wtforms/widgets/core.py, and related import moves. "
-                        "Separate core source-loss from docs-only omissions or malformed final command output."
-                    ),
-                    "failure_mode": (
-                        "Empty patch, fake natural-language patch, wrong target, or losing the core field/widget edits is a regression; a real partial patch "
-                        "that keeps the core HTML5 migration should tie the parent."
-                    ),
-                },
-                "scale": {
-                    "1": "No artifact flaw: the child submits a real WTForms patch preserving the core HTML5 field/widget source edits.",
-                    "2": "Minor submission or peripheral-file issue, but the core WTForms source migration remains present.",
-                    "3": "Ambiguous artifact completeness: some real core edits remain, but an important source file may be missing.",
-                    "4": "Clear artifact regression: the child loses substantial parent WTForms source work or targets the wrong files.",
-                    "5": "Severe artifact failure: empty/no-op patch, fake summary patch, synthetic-only edit, or complete loss of the parent source changes.",
-                },
-            }
+                "failure_mode": (
+                    "Empty patch, fake natural-language patch, wrong target, or losing the core field/widget edits is a regression; a real partial patch "
+                    "that keeps the core HTML5 migration should tie the parent."
+                ),
+            },
+            "scale": {
+                "1": "No artifact flaw: the child submits a real WTForms patch preserving the core HTML5 field/widget source edits.",
+                "2": "Minor submission or peripheral-file issue, but the core WTForms source migration remains present.",
+                "3": "Ambiguous artifact completeness: some real core edits remain, but an important source file may be missing.",
+                "4": "Clear artifact regression: the child loses substantial parent WTForms source work or targets the wrong files.",
+                "5": "Severe artifact failure: empty/no-op patch, fake summary patch, synthetic-only edit, or complete loss of the parent source changes.",
+            },
         }
         implementation_of_core_error_propagation = {
-            "rubric": {
-                "polarity": "positive",
-                "title": "Implementation of Core Error Propagation",
-                "description": (
-                    "Scores whether the continuation successfully catches errors from the hooks and propagates them to the test reporter or result state, "
-                    "resolving the issue missing in the parent."
+            "polarity": "positive",
+            "title": "Implementation of Core Error Propagation",
+            "description": (
+                "Scores whether the continuation successfully catches errors from the hooks and propagates them to the test reporter or result state, "
+                "resolving the issue missing in the parent."
+            ),
+            "metadata": {
+                "judge_focus": (
+                    "Check if try/catch blocks are added for beforeAll/afterAll hooks, and if the error is recorded, emitted, or assigned to the journey "
+                    "results. Accept various valid approaches like throwing the caught error after handling, or emitting it via synthetic or registered journeys."
                 ),
-                "metadata": {
-                    "judge_focus": (
-                        "Check if try/catch blocks are added for beforeAll/afterAll hooks, and if the error is recorded, emitted, or assigned to the journey "
-                        "results. Accept various valid approaches like throwing the caught error after handling, or emitting it via synthetic or registered journeys."
-                    ),
-                    "evidence": "Terminal patch modifications in the runner file.",
-                },
-                "scale": {
-                    "1": "The continuation introduces broken logic or syntax errors that make the code unrunnable, regressing from the parent.",
-                    "2": "The continuation attempts to catch errors but fails to propagate them to any results or reporters.",
-                    "3": "The continuation leaves the code functionally identical to the empty parent.",
-                    "4": "The continuation partially implements error propagation but misses one of the hooks or has minor logical gaps.",
-                    "5": (
-                        "The continuation successfully catches errors from both hooks and propagates them to the result state or reporters, clearly improving over "
-                        "the empty parent regardless of specific stylistic choices."
-                    ),
-                },
-            }
+                "evidence": "Terminal patch modifications in the runner file.",
+            },
+            "scale": {
+                "1": "The continuation introduces broken logic or syntax errors that make the code unrunnable, regressing from the parent.",
+                "2": "The continuation attempts to catch errors but fails to propagate them to any results or reporters.",
+                "3": "The continuation leaves the code functionally identical to the empty parent.",
+                "4": "The continuation partially implements error propagation but misses one of the hooks or has minor logical gaps.",
+                "5": (
+                    "The continuation successfully catches errors from both hooks and propagates them to the result state or reporters, clearly improving over "
+                    "the empty parent regardless of specific stylistic choices."
+                ),
+            },
         }
         return [
             {
@@ -978,51 +956,47 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                 "metadata": {
                     "generated_rubrics": [
                         {
-                            "rubric": {
-                                "polarity": "positive",
-                                "title": "Graceful Hook Error Event Emission",
-                                "description": (
-                                    "Scores whether the continuation implements the core semantic fix (missing from the empty parent) by catching hook errors "
-                                    "and emitting 'journey:end' events using valid registered journeys, without throwing errors that disrupt graceful return."
+                            "polarity": "positive",
+                            "title": "Graceful Hook Error Event Emission",
+                            "description": (
+                                "Scores whether the continuation implements the core semantic fix (missing from the empty parent) by catching hook errors "
+                                "and emitting 'journey:end' events using valid registered journeys, without throwing errors that disrupt graceful return."
+                            ),
+                            "metadata": {
+                                "judge_focus": (
+                                    "Check if try/catch blocks are added for both hooks. Verify that 'journey:end' is emitted using 'this.journeys' "
+                                    "(not synthetic journeys) and that the runner gracefully returns 'result' instead of throwing the error."
                                 ),
-                                "metadata": {
-                                    "judge_focus": (
-                                        "Check if try/catch blocks are added for both hooks. Verify that 'journey:end' is emitted using 'this.journeys' "
-                                        "(not synthetic journeys) and that the runner gracefully returns 'result' instead of throwing the error."
-                                    ),
-                                    "evidence": "Terminal patch files (src/core/runner.ts) - look for catch blocks, 'this.emit', and 'throw'.",
-                                },
-                                "scale": {
-                                    "1": "The continuation introduces severe syntax or build errors, regressing below the empty parent.",
-                                    "2": "The continuation adds a patch that fails to emit 'journey:end' events or otherwise prevents reporter consumption.",
-                                    "3": "The continuation provides no meaningful terminal patch, remaining equivalent to the empty parent trajectory.",
-                                    "4": "The continuation successfully catches hook errors and emits 'journey:end' events, but disrupts graceful execution.",
-                                    "5": "The continuation catches hook errors and gracefully emits 'journey:end' events using valid registered journeys.",
-                                },
-                            }
+                                "evidence": "Terminal patch files (src/core/runner.ts) - look for catch blocks, 'this.emit', and 'throw'.",
+                            },
+                            "scale": {
+                                "1": "The continuation introduces severe syntax or build errors, regressing below the empty parent.",
+                                "2": "The continuation adds a patch that fails to emit 'journey:end' events or otherwise prevents reporter consumption.",
+                                "3": "The continuation provides no meaningful terminal patch, remaining equivalent to the empty parent trajectory.",
+                                "4": "The continuation successfully catches hook errors and emits 'journey:end' events, but disrupts graceful execution.",
+                                "5": "The continuation catches hook errors and gracefully emits 'journey:end' events using valid registered journeys.",
+                            },
                         },
                         {
-                            "rubric": {
-                                "polarity": "negative",
-                                "title": "Journey Execution Despite beforeAll Failure",
-                                "description": (
-                                    "Penalizes continuations that catch the `beforeAll` hook error but fail to prevent the subsequent execution of journeys."
+                            "polarity": "negative",
+                            "title": "Journey Execution Despite beforeAll Failure",
+                            "description": (
+                                "Penalizes continuations that catch the `beforeAll` hook error but fail to prevent the subsequent execution of journeys."
+                            ),
+                            "metadata": {
+                                "judge_focus": (
+                                    "Check if the code immediately following the `runBeforeAllHook` catch block allows the journey execution loop to run "
+                                    "when a `beforeAllError` is present."
                                 ),
-                                "metadata": {
-                                    "judge_focus": (
-                                        "Check if the code immediately following the `runBeforeAllHook` catch block allows the journey execution loop to run "
-                                        "when a `beforeAllError` is present."
-                                    ),
-                                    "evidence": "Terminal patch file (`src/core/runner.ts`)",
-                                },
-                                "scale": {
-                                    "1": "No evidence of the flaw; the continuation prevents journey execution when a beforeAll hook fails.",
-                                    "2": "Minor evidence; the continuation skips journey execution but with convoluted or edge-case-prone logic.",
-                                    "3": "Moderate evidence; the continuation attempts to prevent execution but may allow partial execution.",
-                                    "4": "Clear evidence; the continuation catches the beforeAll error but allows normal journey execution.",
-                                    "5": "Most severe evidence; journey results overwrite or hide the beforeAll failure.",
-                                },
-                            }
+                                "evidence": "Terminal patch file (`src/core/runner.ts`)",
+                            },
+                            "scale": {
+                                "1": "No evidence of the flaw; the continuation prevents journey execution when a beforeAll hook fails.",
+                                "2": "Minor evidence; the continuation skips journey execution but with convoluted or edge-case-prone logic.",
+                                "3": "Moderate evidence; the continuation attempts to prevent execution but may allow partial execution.",
+                                "4": "Clear evidence; the continuation catches the beforeAll error but allows normal journey execution.",
+                                "5": "Most severe evidence; journey results overwrite or hide the beforeAll failure.",
+                            },
                         }
                     ],
                     "gt_skeleton": (
@@ -1084,47 +1058,43 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                 "metadata": {
                     "generated_rubrics": [
                         {
-                            "rubric": {
-                                "polarity": "negative",
-                                "title": "Invalid Patch Artifact Submission",
-                                "description": (
-                                    "Penalizes continuations that fail to properly submit the final git patch, either by constructing a malformed submission "
-                                    "command that emits empty output, getting distracted by test compilation errors, or terminating without submitting the "
-                                    "parent's visible codebase progress."
-                                ),
-                                "metadata": {
-                                    "regression_signal": "Submission rejected due to empty output, malformed shell pipes, or failure to reach the submission step.",
-                                    "evidence": "The final COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT command, its system observation, and terminal patch content.",
-                                },
-                                "scale": {
-                                    "1": "No evidence of submission failure; the continuation emits a valid patch preserving the intended fixes.",
-                                    "2": "The continuation submits the patch but includes minor extraneous files alongside source modifications.",
-                                    "3": "The continuation maintains the parent baseline, submitting an equivalent valid patch without artifact corruption.",
-                                    "4": "The continuation gets caught in test errors or debugging loops and fails to submit before terminating.",
-                                    "5": "The continuation attempts to submit but a malformed command yields a rejected or empty patch where the parent had useful work.",
-                                },
-                            }
+                            "polarity": "negative",
+                            "title": "Invalid Patch Artifact Submission",
+                            "description": (
+                                "Penalizes continuations that fail to properly submit the final git patch, either by constructing a malformed submission "
+                                "command that emits empty output, getting distracted by test compilation errors, or terminating without submitting the "
+                                "parent's visible codebase progress."
+                            ),
+                            "metadata": {
+                                "regression_signal": "Submission rejected due to empty output, malformed shell pipes, or failure to reach the submission step.",
+                                "evidence": "The final COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT command, its system observation, and terminal patch content.",
+                            },
+                            "scale": {
+                                "1": "No evidence of submission failure; the continuation emits a valid patch preserving the intended fixes.",
+                                "2": "The continuation submits the patch but includes minor extraneous files alongside source modifications.",
+                                "3": "The continuation maintains the parent baseline, submitting an equivalent valid patch without artifact corruption.",
+                                "4": "The continuation gets caught in test errors or debugging loops and fails to submit before terminating.",
+                                "5": "The continuation attempts to submit but a malformed command yields a rejected or empty patch where the parent had useful work.",
+                            },
                         },
                         {
-                            "rubric": {
-                                "polarity": "negative",
-                                "title": "Submission Failure and Patch Loss",
-                                "description": (
-                                    "Penalizes continuations that attempt to submit but fail to emit a valid patch artifact, such as executing malformed "
-                                    "submission commands that yield empty output, or abandoning the parent's valid codebase progress due to broken test loops."
-                                ),
-                                "metadata": {
-                                    "regression_signal": "Rejected submission command, 0-byte terminal patch, or loops that prevent successful finalization.",
-                                    "evidence": "Final submission command syntax, system rejection messages, terminal patch size, and unresolved test compilation errors.",
-                                },
-                                "scale": {
-                                    "1": "No evidence of submission failure; the continuation cleanly submits the parent baseline or refined source modifications.",
-                                    "2": "Minor workflow issues, but the agent preserves source modifications and avoids an invalid artifact.",
-                                    "3": "The continuation remains equivalent to the parent, neither successfully submitting nor explicitly destroying the patch.",
-                                    "4": "The continuation gets trapped in broken tests or compilation errors and fails to submit productive codebase work.",
-                                    "5": "The continuation explicitly submits with a malformed command or empty diff, entirely losing the parent's useful work.",
-                                },
-                            }
+                            "polarity": "negative",
+                            "title": "Submission Failure and Patch Loss",
+                            "description": (
+                                "Penalizes continuations that attempt to submit but fail to emit a valid patch artifact, such as executing malformed "
+                                "submission commands that yield empty output, or abandoning the parent's valid codebase progress due to broken test loops."
+                            ),
+                            "metadata": {
+                                "regression_signal": "Rejected submission command, 0-byte terminal patch, or loops that prevent successful finalization.",
+                                "evidence": "Final submission command syntax, system rejection messages, terminal patch size, and unresolved test compilation errors.",
+                            },
+                            "scale": {
+                                "1": "No evidence of submission failure; the continuation cleanly submits the parent baseline or refined source modifications.",
+                                "2": "Minor workflow issues, but the agent preserves source modifications and avoids an invalid artifact.",
+                                "3": "The continuation remains equivalent to the parent, neither successfully submitting nor explicitly destroying the patch.",
+                                "4": "The continuation gets trapped in broken tests or compilation errors and fails to submit productive codebase work.",
+                                "5": "The continuation explicitly submits with a malformed command or empty diff, entirely losing the parent's useful work.",
+                            },
                         }
                     ],
                     "gt_skeleton": (
@@ -1189,32 +1159,30 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                 "metadata": {
                     "generated_rubrics": [
                         {
-                            "rubric": {
-                                "polarity": "negative",
-                                "title": "Invalid Artifact Or Parent Work Loss",
-                                "description": (
-                                    "Penalizes continuations that fail to successfully submit the complete set of modifications prepared in the parent "
-                                    "trajectory. This includes failing to output the patch content during the final submission command, or omitting necessary "
-                                    "modified files in the generated diff."
+                            "polarity": "negative",
+                            "title": "Invalid Artifact Or Parent Work Loss",
+                            "description": (
+                                "Penalizes continuations that fail to successfully submit the complete set of modifications prepared in the parent "
+                                "trajectory. This includes failing to output the patch content during the final submission command, or omitting necessary "
+                                "modified files in the generated diff."
+                            ),
+                            "metadata": {
+                                "failure_mode": (
+                                    "Failing to print the patch content during submission or excluding key files from the final diff, leading to a loss "
+                                    "of useful parent work."
                                 ),
-                                "metadata": {
-                                    "failure_mode": (
-                                        "Failing to print the patch content during submission or excluding key files from the final diff, leading to a loss "
-                                        "of useful parent work."
-                                    ),
-                                    "judge_focus": (
-                                        "Check the terminal patch artifact for completeness. Look for missing modified files compared to the parent baseline, "
-                                        "or an empty patch caused by an incorrect submission command."
-                                    ),
-                                },
-                                "scale": {
-                                    "1": "No evidence of the flaw. The continuation successfully generates and submits a complete patch containing all intended modifications.",
-                                    "2": "Minor evidence of the flaw. The continuation encounters slight issues generating the patch but recovers to submit the full intended changes.",
-                                    "3": "Equivalent to the parent baseline: successfully submits the full, complete patch artifact without losing parent work.",
-                                    "4": "Clear evidence of the flaw. The continuation successfully submits a patch but omits important files that were correctly modified in the parent trajectory.",
-                                    "5": "Most severe evidence. The continuation completely fails to submit the patch or submits an entirely empty or invalid artifact.",
-                                },
-                            }
+                                "judge_focus": (
+                                    "Check the terminal patch artifact for completeness. Look for missing modified files compared to the parent baseline, "
+                                    "or an empty patch caused by an incorrect submission command."
+                                ),
+                            },
+                            "scale": {
+                                "1": "No evidence of the flaw. The continuation successfully generates and submits a complete patch containing all intended modifications.",
+                                "2": "Minor evidence of the flaw. The continuation encounters slight issues generating the patch but recovers to submit the full intended changes.",
+                                "3": "Equivalent to the parent baseline: successfully submits the full, complete patch artifact without losing parent work.",
+                                "4": "Clear evidence of the flaw. The continuation successfully submits a patch but omits important files that were correctly modified in the parent trajectory.",
+                                "5": "Most severe evidence. The continuation completely fails to submit the patch or submits an entirely empty or invalid artifact.",
+                            },
                         }
                     ],
                     "gt_skeleton": (
@@ -1256,7 +1224,6 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
             },
         ]
     selective_compatibility_boundary = {
-        "rubric": {
             "polarity": "positive",
             "title": "Selective Compatibility Boundary",
             "description": (
@@ -1282,10 +1249,8 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                 "4": "Mostly preserves the correct boundary with minor omissions.",
                 "5": "Clearly implements the intended behavior while preserving the compatibility-sensitive cases supported by evidence.",
             },
-        },
     }
     fabricated_workspace_patch = {
-        "rubric": {
             "polarity": "negative",
             "title": "Fabricated Workspace Patch",
             "description": (
@@ -1311,10 +1276,8 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                 "4": "Primarily patches generated dummy files while showing some awareness of the real task.",
                 "5": "Submits a solution built on fabricated files or a synthetic project as if it were the target repository.",
             },
-        },
     }
     post_modification_regression_testing = {
-        "rubric": {
             "polarity": "positive",
             "title": "Post-Modification Regression Testing",
             "description": (
@@ -1330,10 +1293,8 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                 "4": "Actively invokes the project's official test suite to validate changes, using the test output to identify broken functionality or regressions.",
                 "5": "Methodically and iteratively runs the project's official test suite after making changes, successfully using test failures to pinpoint regressions and driving the subsequent fix process entirely through test feedback.",
             },
-        },
     }
     destructive_test_appeasement = {
-        "rubric": {
             "polarity": "negative",
             "title": "Destructive Test Appeasement",
             "description": (
@@ -1350,10 +1311,8 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                 "4": "The agent partially degrades the requested feature, adding hacky workarounds or reverting minor parts of the correct implementation in an attempt to pacify the outdated test.",
                 "5": "The agent explicitly and completely reverts its valid, required feature modifications in the source code solely to make the obsolete test pass, fundamentally failing the task objective.",
             },
-        },
     }
     targeting_fabricated_code = {
-        "rubric": {
             "polarity": "negative",
             "title": "Targeting Fabricated Code",
             "description": (
@@ -1369,7 +1328,6 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                 "4": "The agent focuses heavily on fixing a fabricated project and drafts patches for the synthetic code, indicating deep confusion about the target repository.",
                 "5": "The agent completely fails to locate or ignores the real repository, builds a synthetic project from scratch, applies a fix to the fabricated files, and generates a patch against its own creation.",
             },
-        },
     }
     wtforms_gt_skeleton = """diff --git a/CHANGES.rst b/CHANGES.rst
 CHANGES.rst: @@ -34,7 +34,7 @@ Unreleased
@@ -1573,7 +1531,6 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
     if scope == "pc":
         return [
             {
-                "rubric": {
                     "polarity": "positive",
                     "title": "Parent-Relative Semantic Progress",
                     "description": (
@@ -1591,10 +1548,8 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                         "judge_focus": "parent baseline, terminal semantic delta, and whether the child changes the behavior hidden tests are likely to exercise",
                         "evidence": "terminal diff, changed owner path, API/state/control-flow/data-flow behavior, and validation output only as supporting evidence",
                     },
-                }
             },
             {
-                "rubric": {
                     "polarity": "positive",
                     "title": "Owner-Surface Integration Progress",
                     "description": (
@@ -1613,10 +1568,8 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                         "judge_focus": "whether the patched files are the real owner surface and whether adjacent interfaces, adapters, or call sites remain consistent",
                         "evidence": "diff paths, import/export or call-chain changes, public API boundary, and behavior reached by normal execution",
                     },
-                }
             },
             {
-                "rubric": {
                     "polarity": "positive",
                     "title": "Correct Target Workspace Progress",
                     "description": (
@@ -1634,10 +1587,8 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                         "judge_focus": "workspace targeting, final diff paths, created scratch files, and whether patched files belong to the actual task",
                         "evidence": "repository discovery commands, current working directory, final patch paths, and distinction between reproduction artifacts and solution files",
                     },
-                }
             },
             {
-                "rubric": {
                     "polarity": "negative",
                     "title": "Invalid Artifact Or Parent Work Loss",
                     "description": (
@@ -1655,10 +1606,8 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                         "judge_focus": "whether useful parent work remains in the workspace or final artifact",
                         "evidence": "terminal patch artifact, diff paths, workspace edits, final submission output, and distinction between malformed stdout and true work loss",
                     },
-                }
             },
             {
-                "rubric": {
                     "polarity": "negative",
                     "title": "Unsafe Broad Edit Regression",
                     "description": (
@@ -1676,12 +1625,10 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                         "judge_focus": "whether the child regresses preserved behavior through uncontrolled editing rather than task semantics",
                         "evidence": "large unrelated deletions, syntax corruption, lost imports/exports/configuration, or broad replacement commands",
                     },
-                }
             },
         ]
     return [
         {
-            "rubric": {
                 "polarity": "negative",
                 "title": "Target Workspace Bypass",
                 "description": (
@@ -1698,10 +1645,8 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                 "metadata": {
                     "judge_focus": "workspace root, target ownership, final diff paths, and whether reproduction artifacts are separated from solution files",
                 },
-            }
         },
         {
-            "rubric": {
                 "polarity": "negative",
                 "title": "Unsupported Environment Assumption",
                 "description": (
@@ -1718,10 +1663,8 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                 "metadata": {
                     "judge_focus": "whether search/tool/test choices are grounded in repository evidence before they drive the trajectory",
                 },
-            }
         },
         {
-            "rubric": {
                 "polarity": "positive",
                 "title": "Targeted Behavior Validation",
                 "description": (
@@ -1738,10 +1681,8 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                 "metadata": {
                     "judge_focus": "validation target, exercised behavior, asserted outcome, and whether the check distinguishes plausible fixes",
                 },
-            }
         },
         {
-            "rubric": {
                 "polarity": "positive",
                 "title": "Compatibility Boundary Preservation",
                 "description": (
@@ -1758,10 +1699,8 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                 "metadata": {
                     "judge_focus": "changed behavior, preserved public contract, ordering/lifecycle/schema constraints, and evidence for compatibility-sensitive edge cases",
                 },
-            }
         },
         {
-            "rubric": {
                 "polarity": "negative",
                 "title": "Unsafe Source Modification",
                 "description": (
@@ -1778,7 +1717,6 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
                 "metadata": {
                     "judge_focus": "edit locality, diff hunks, syntax integrity, unrelated deletions, and preservation of existing behavior",
                 },
-            }
         },
     ]
 
@@ -1877,20 +1815,18 @@ Generate the single most useful non-redundant criterion for ranking the provided
 ## Output Format
 ```json
 {
-  "rubric": {
-    "polarity": "<positive|negative>",
-    "description": "<detailed aggregate trajectory ranking criterion>",
-    "title": "<abstract label>",
-    "metadata": {
-      <structured evidence needed for judging>
-    },
-    "scale": {
-      "1": "<positive rubric: weakest evidence / negative rubric: no evidence of the flaw>",
-      "2": "<positive rubric: weak evidence / negative rubric: minor evidence of the flaw>",
-      "3": "<moderate or mixed evidence>",
-      "4": "<positive rubric: strong evidence / negative rubric: clear evidence of the flaw>",
-      "5": "<positive rubric: strongest evidence / negative rubric: most severe evidence of the flaw>"
-    }
+  "polarity": "<positive|negative>",
+  "description": "<detailed aggregate trajectory ranking criterion>",
+  "title": "<abstract label>",
+  "metadata": {
+    <structured evidence needed for judging>
+  },
+  "scale": {
+    "1": "<positive rubric: weakest evidence / negative rubric: no evidence of the flaw>",
+    "2": "<positive rubric: weak evidence / negative rubric: minor evidence of the flaw>",
+    "3": "<moderate or mixed evidence>",
+    "4": "<positive rubric: strong evidence / negative rubric: clear evidence of the flaw>",
+    "5": "<positive rubric: strongest evidence / negative rubric: most severe evidence of the flaw>"
   }
 }
 ```
