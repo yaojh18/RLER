@@ -42,7 +42,10 @@ from swe_agent.run.benchmarks.swebench import (
     build_swebench_config,
     get_swebench_harness_namespace,
     get_swebench_docker_image_name,
+    get_swebench_singularity_image_name,
+    load_swebench_instances_by_id,
     load_swebench_instances,
+    select_container_environment_class,
 )
 from swe_agent.run.run_swe_agent import (
     DEFAULT_COMPLETION_MAX_TOKENS,
@@ -65,7 +68,7 @@ from swe_agent.run.run_swe_agent import (
     SWE_AGENT_TEXTBASED_CONFIG,
     VLLM_SERVICE_NAME,
     _openai_server_ready,
-    _qwen_model_kwargs,
+    _litellm_model_kwargs,
     _start_sglang_server,
     _stop_sglang_server,
     build_messages,
@@ -737,13 +740,12 @@ def run_aggregate(
     instance_ids: Sequence[str] | None,
 ) -> None:
     model_name = _resolve_model_name(args)
-    available_instances = load_swebench_instances(args.subset, args.split)
-    by_id = {instance["instance_id"]: instance for instance in available_instances}
-    selected_ids = list(instance_ids or by_id)
-    missing = [instance_id for instance_id in selected_ids if instance_id not in by_id]
-    if missing:
-        raise RuntimeError(f"Instances not found in {args.subset}/{args.split}: {', '.join(missing)}")
-    instances = [by_id[instance_id] for instance_id in selected_ids]
+    selected_ids = list(instance_ids or [])
+    instances = (
+        load_swebench_instances_by_id(args.subset, args.split, selected_ids)
+        if selected_ids
+        else load_swebench_instances(args.subset, args.split)
+    )
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     run_root = args.output_root / (
         f"{re.sub(r'[^A-Za-z0-9._-]+', '_', args.subset.replace('/', '__'))}_"
@@ -771,7 +773,7 @@ def run_aggregate(
             allow_long_max_model_len=args.allow_long_max_model_len,
         )
         configure_policy_route(backend_name=args.backend, model_name=model_name, base_url=vllm_handle.base_url)
-        shared_model_kwargs = {"api_base": vllm_handle.base_url, "api_key": "EMPTY", **_qwen_model_kwargs(model_name)}
+        shared_model_kwargs = {"api_base": vllm_handle.base_url, "api_key": "EMPTY", **_litellm_model_kwargs(model_name)}
     elif args.backend == "sglang":
         if args.use_existing_sglang_server:
             wait_for_openai_server(args.sglang_api_base, args.sglang_api_key, timeout=args.server_timeout)
@@ -786,14 +788,14 @@ def run_aggregate(
         shared_model_kwargs = {
             "api_base": args.sglang_api_base,
             "api_key": args.sglang_api_key,
-            **_qwen_model_kwargs(model_name),
+            **_litellm_model_kwargs(model_name),
         }
     else:
         required_env = infer_litellm_api_env(args.openai_model)
         if required_env and not os.getenv(required_env):
             raise RuntimeError(f"{required_env} is not set for model {args.openai_model}")
         configure_policy_route(backend_name=args.backend, model_name=model_name)
-        shared_model_kwargs = _qwen_model_kwargs(model_name)
+        shared_model_kwargs = _litellm_model_kwargs(model_name)
 
     if args.backend == "vllm":
         configure_model_route("rubric_generation", ModelRouteConfig(backend="service", service_name=VLLM_SERVICE_NAME, model_name=model_name))
@@ -853,8 +855,17 @@ def run_aggregate(
                     run_dir.mkdir(parents=True, exist_ok=True)
                     instance_config = copy.deepcopy(config)
                     environment_config = instance_config.setdefault("environment", {})
-                    if environment_config.get("environment_class", "docker") == "docker":
-                        environment_config["image"] = get_swebench_docker_image_name(instance)
+                    environment_config["environment_class"] = select_container_environment_class(
+                        environment_config.get("environment_class", "docker")
+                    )
+                    image_name = get_swebench_docker_image_name(instance)
+                    if environment_config.get("environment_class") == "docker":
+                        environment_config["image"] = image_name
+                    elif environment_config.get("environment_class") == "singularity":
+                        environment_config["image"] = get_swebench_singularity_image_name(instance)
+                    if instance.get("expected_output_json"):
+                        environment_config["cwd"] = "/testbed"
+                        environment_config.setdefault("dataset_name", "r2egym")
                     try:
                         runner = AggregateTrajectoryRunner(
                             instance=instance,

@@ -33,10 +33,17 @@ from swe_agent.run.benchmarks.rebench_eval import (
     is_rebench_dataset_name,
     is_rebench_instance,
 )
+from swe_agent.run.benchmarks.r2egym_eval import (
+    evaluate_r2egym_instances,
+    is_r2egym_dataset_name,
+    is_r2egym_instance,
+)
 from swe_agent.run.benchmarks.swebench import (
     DATASET_MAPPING,
     build_swebench_config,
+    load_swebench_instances_by_id,
     load_swebench_instances,
+    load_swebench_instances_slice,
     run_swebench_instances,
 )
 
@@ -115,20 +122,9 @@ def _resolve_model_name(args: argparse.Namespace) -> str:
 
 
 def select_instances(args: argparse.Namespace) -> list[dict[str, Any]]:
-    from datasets import load_dataset
-
-    dataset_path = DATASET_MAPPING.get(args.subset, args.subset)
     if args.instance_id:
-        instances = load_swebench_instances(args.subset, args.split)
-        wanted = set(args.instance_id)
-        found = {instance["instance_id"]: instance for instance in instances if instance["instance_id"] in wanted}
-        missing = [instance_id for instance_id in args.instance_id if instance_id not in found]
-        if missing:
-            raise RuntimeError(f"Instances not found in {args.subset}/{args.split}: {', '.join(missing)}")
-        return [found[instance_id] for instance_id in args.instance_id]
-    if args.offset < 0 or args.limit < 1:
-        raise ValueError("--offset must be non-negative and --limit must be positive")
-    instances = list(load_dataset(dataset_path, split=f"{args.split}[{args.offset}:{args.offset + args.limit}]"))
+        return load_swebench_instances_by_id(args.subset, args.split, list(args.instance_id))
+    instances = load_swebench_instances_slice(args.subset, args.split, args.offset, args.limit)
     if not instances:
         raise RuntimeError(f"No instances selected from {args.subset}/{args.split} at offset={args.offset}")
     return instances
@@ -212,6 +208,14 @@ def find_free_port(start_port: int) -> int:
 def _openai_models_url(base_url: str) -> str:
     base = base_url.rstrip("/")
     return f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+
+
+def _litellm_api_base(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    suffix = "/chat/completions"
+    if base.endswith(suffix):
+        base = base[: -len(suffix)]
+    return base
 
 
 def wait_for_openai_server(base_url: str, api_key: str, *, timeout: int = 60) -> None:
@@ -554,23 +558,38 @@ def run_harness_evaluation(
     by_id = instances_by_id
     if by_id is None:
         subset = next((key for key, value in DATASET_MAPPING.items() if value == dataset_name), dataset_name)
-        by_id = {instance["instance_id"]: instance for instance in load_swebench_instances(subset, split)}
+        instance_ids = [run_dir.parent.name for run_dir in run_dirs]
+        by_id = {
+            instance["instance_id"]: instance
+            for instance in load_swebench_instances_by_id(subset, split, instance_ids)
+        }
     rebench = is_rebench_dataset_name(dataset_name)
+    r2egym = is_r2egym_dataset_name(dataset_name)
 
     def evaluate(run_dir: Path) -> tuple[Path, dict[str, Any]]:
         instance_id = run_dir.parent.name
         patch_path = run_dir / "model_patch.json"
         patch_record = json.loads(patch_path.read_text(encoding="utf-8")).get(instance_id, {}) if patch_path.exists() else {}
         patch = str(patch_record.get("model_patch") or "")
-        if not patch:
-            return run_dir, make_evaluation_payload("empty")
         if instance_id not in by_id:
             return run_dir, make_evaluation_payload("error", error=f"Instance not found: {instance_id}")
+        instance = by_id[instance_id]
+        if r2egym or is_r2egym_instance(instance):
+            result = evaluate_r2egym_instances(
+                instance=instance,
+                patches_by_key={str(run_dir): patch},
+                max_workers=1,
+                timeout=timeout,
+                work_dir=run_dir.resolve(),
+            )[str(run_dir)]
+            return run_dir, _r2egym_result_payload(result)
+        if not patch:
+            return run_dir, make_evaluation_payload("empty")
         if rebench:
-            result = evaluate_rebench_prediction(instance=by_id[instance_id], patch_text=patch, timeout=timeout, work_dir=run_dir.resolve())
+            result = evaluate_rebench_prediction(instance=instance, patch_text=patch, timeout=timeout, work_dir=run_dir.resolve())
             return run_dir, _rebench_result_payload(result)
         evaluations = evaluate_swebench_instance_patches(
-            instance=by_id[instance_id],
+            instance=instance,
             patches_by_key={str(run_dir): patch},
             model_name=model_name,
             max_workers=1,
@@ -609,6 +628,20 @@ def _rebench_result_payload(result: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _r2egym_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+    resolved = bool(result.get("resolved"))
+    payload = make_evaluation_payload(
+        status="resolved" if resolved else "unresolved",
+        passed_tests=result.get("passed_actual", []),
+        failed_tests=result.get("failed_actual", []),
+        output=result.get("evaluation_output") or "",
+        pass_to_pass_expected=result.get("pass_to_pass_expected", []),
+        fail_to_pass_expected=result.get("fail_to_pass_expected", []),
+    )
+    payload["reward"] = float(result.get("reward", 1.0 if resolved else 0.0))
+    return payload
+
+
 def _swebench_report_payload(
     report: dict[str, Any],
     instance_id: str,
@@ -643,9 +676,10 @@ def evaluate_swebench_instance_patches(
     patches_by_key: dict[str, str],
     model_name: str,
     max_workers: int,
-    namespace: str | None,
-    work_dir: Path,
+    namespace: str | None = None,
+    work_dir: Path | None = None,
 ) -> dict[str, dict[str, Any]]:
+    eval_work_dir = Path(work_dir or Path.cwd()).resolve()
     if is_rebench_instance(instance):
         evaluations: dict[str, dict[str, Any]] = {}
         unique_patches: dict[str, dict[str, Any]] = {}
@@ -662,7 +696,7 @@ def evaluate_swebench_instance_patches(
                     instance=instance,
                     patch_text=entry["patch"],
                     timeout=600,
-                    work_dir=Path(work_dir).resolve(),
+                    work_dir=eval_work_dir,
                 ): entry["keys"]
                 for entry in unique_patches.values()
             }
@@ -673,6 +707,25 @@ def evaluate_swebench_instance_patches(
                     payload = make_evaluation_payload("error", error=exc)
                 for key in keys:
                     evaluations[key] = payload
+        return evaluations
+
+    if is_r2egym_instance(instance):
+        evaluations: dict[str, dict[str, Any]] = {}
+        try:
+            results = evaluate_r2egym_instances(
+                instance=instance,
+                patches_by_key=patches_by_key,
+                max_workers=max_workers,
+                timeout=600,
+                work_dir=eval_work_dir,
+            )
+        except Exception as exc:
+            return {key: make_evaluation_payload("error", error=exc) for key in patches_by_key}
+        for key, result in results.items():
+            try:
+                evaluations[key] = _r2egym_result_payload(result)
+            except Exception as exc:
+                evaluations[key] = make_evaluation_payload("error", error=exc)
         return evaluations
 
     unique_patches: dict[str, dict[str, Any]] = {}
@@ -690,7 +743,7 @@ def evaluate_swebench_instance_patches(
         return evaluations
 
     previous_eval_root = swebench_run_evaluation.RUN_EVALUATION_LOG_DIR
-    with tempfile.TemporaryDirectory(prefix=".node-eval-", dir=Path(work_dir).resolve()) as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix=".node-eval-", dir=eval_work_dir) as tmp_dir:
         temp_root = Path(tmp_dir)
         eval_log_root = temp_root / "logs" / "run_evaluation"
         swebench_run_evaluation.RUN_EVALUATION_LOG_DIR = eval_log_root
@@ -770,13 +823,10 @@ def run_swe_instance_multi(
     timestamp: str | None = None,
     run_log_path: Path | None = None,
 ) -> None:
-    instances = load_swebench_instances(benchmark_name, split)
     if instance_ids is not None:
-        by_id = {instance["instance_id"]: instance for instance in instances}
-        missing = [instance_id for instance_id in instance_ids if instance_id not in by_id]
-        if missing:
-            raise RuntimeError(f"Instances not found in {benchmark_name}/{split}: {', '.join(missing)}")
-        instances = [by_id[instance_id] for instance_id in instance_ids]
+        instances = load_swebench_instances_by_id(benchmark_name, split, list(instance_ids))
+    else:
+        instances = load_swebench_instances(benchmark_name, split)
     timestamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
     output_root.mkdir(parents=True, exist_ok=True)
     effective_run_log_path = run_log_path or (DEFAULT_LOG_ROOT / f"{timestamp}.log")
@@ -868,8 +918,12 @@ def run_swe_instance_multi(
         ) from evaluation_errors[0]
 
 
-def _qwen_model_kwargs(model_name: str) -> dict[str, Any]:
-    return {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}} if "qwen" in model_name.lower() else {}
+def _litellm_model_kwargs(model_name: str) -> dict[str, Any]:
+    model_lower = model_name.lower()
+    kwargs = {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}} if "qwen" in model_lower else {}
+    if model_lower.startswith("nvidia/"):
+        kwargs["custom_llm_provider"] = "openai"
+    return kwargs
 
 
 def configure_policy_route(
@@ -917,7 +971,11 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
     if args._evaluation_only:
         selected_instances = getattr(args, "_selected_instances", None)
         if selected_instances is None:
-            selected_instances = load_swebench_instances(args.subset, args.split)
+            selected_instances = (
+                load_swebench_instances_by_id(args.subset, args.split, list(instance_ids))
+                if instance_ids is not None
+                else load_swebench_instances(args.subset, args.split)
+            )
         by_id = {instance["instance_id"]: instance for instance in selected_instances}
         run_root = make_run_root(
             output_root=args.output_root,
@@ -993,10 +1051,18 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
         route_configured = True
 
     try:
+        litellm_model_kwargs: dict[str, Any] = {}
+        agent_model_class = DEFAULT_MODEL_CLASS
+        if args.backend == "openai":
+            agent_model_class = "litellm_textbased"
+            if args.litellm_api_base:
+                litellm_model_kwargs["api_base"] = _litellm_api_base(args.litellm_api_base)
+            if args.litellm_api_key:
+                litellm_model_kwargs["api_key"] = args.litellm_api_key
         config = build_swebench_config(
             config_spec=[str(SWE_AGENT_TEXTBASED_CONFIG)],
             model=model_name,
-            model_class=DEFAULT_MODEL_CLASS,
+            model_class=agent_model_class,
             extra_overrides={
                 "agent": {
                     "step_limit": args.step_limit,
@@ -1012,7 +1078,8 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
                         "temperature": args.temperature,
                         "top_p": args.top_p,
                         "max_tokens": DEFAULT_COMPLETION_MAX_TOKENS,
-                        **_qwen_model_kwargs(model_name),
+                        **litellm_model_kwargs,
+                        **_litellm_model_kwargs(model_name),
                     },
                     "cost_tracking": "ignore_errors",
                 },
@@ -1074,6 +1141,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-long-max-model-len", action="store_true")
     parser.add_argument("--vllm-model", default=DEFAULT_SERVE_MODEL)
     parser.add_argument("--openai-model", default=DEFAULT_OPENAI_MODEL)
+    parser.add_argument(
+        "--litellm-api-base",
+        default=os.environ.get("LITELLM_API_BASE", os.environ.get("OPENAI_API_BASE", os.environ.get("NVIDIA_API_BASE", ""))),
+    )
+    parser.add_argument(
+        "--litellm-api-key",
+        default=os.environ.get(
+            "LITELLM_API_KEY",
+            os.environ.get("NVIDIA_API_KEY", os.environ.get("NVIDIA_NIM_API_KEY", os.environ.get("OPENAI_API_KEY", ""))),
+        ),
+    )
     parser.add_argument("--sglang-model", default=DEFAULT_SERVE_MODEL)
     parser.add_argument("--sglang-api-base", default=SLIME_API_BASE)
     parser.add_argument("--sglang-api-key", default=SLIME_API_KEY)

@@ -17,8 +17,10 @@ from swe_agent.run.benchmarks.swebench import (
     build_swebench_config,
     get_swebench_docker_image_name,
     get_swebench_harness_namespace,
+    get_swebench_singularity_image_name,
     load_swebench_instances_by_id,
     load_swebench_instances,
+    select_container_environment_class,
 )
 from swe_agent.run.run_swe_agent import (
     DEFAULT_COMPLETION_MAX_TOKENS,
@@ -43,6 +45,7 @@ from swe_agent.run.run_swe_agent import (
     temporary_env,
     terminate_process,
     write_failure_artifacts,
+    _litellm_model_kwargs,
     _resolve_model_name
 )
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
@@ -89,10 +92,20 @@ def _run_single_instance(
 ) -> None:
     instance_config = copy.deepcopy(config)
     environment_config = instance_config.setdefault("environment", {})
-    if environment_config.get("environment_class", "docker") == "docker":
-        environment_config["image"] = get_swebench_docker_image_name(instance)
+    environment_config["environment_class"] = select_container_environment_class(
+        environment_config.get("environment_class", "docker")
+    )
+    image_name = get_swebench_docker_image_name(instance)
+    if environment_config.get("environment_class") == "docker":
+        environment_config["image"] = image_name
+    elif environment_config.get("environment_class") == "singularity":
+        environment_config["image"] = get_swebench_singularity_image_name(instance)
     if is_rebench_instance(instance):
         environment_config["cwd"] = rebench_workdir(instance)
+        environment_config.setdefault("dataset_name", "rebench")
+    elif instance.get("expected_output_json"):
+        environment_config["cwd"] = "/testbed"
+        environment_config.setdefault("dataset_name", "r2egym")
     runner = TrajectorySearchRunner(
         instance=instance,
         backend=SWEAgentRolloutBackend(
@@ -153,9 +166,7 @@ def run_search(
     gpu_ids: list[int] = []
     vllm_handle = None
     service_name: str | None = None
-    shared_model_kwargs: dict[str, Any] = {}
-    if "qwen" in model_name.lower():
-        shared_model_kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
+    shared_model_kwargs: dict[str, Any] = _litellm_model_kwargs(model_name)
     slime_api_base = os.environ.get("SEARCH_SWE_SLIME_API_BASE", SLIME_API_BASE)
     slime_api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", SLIME_API_KEY)
     if args.backend == "vllm":

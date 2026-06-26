@@ -29,6 +29,7 @@ keywords = ["agents", "ai", "research", "tools", "rag", "deep-research"]
 
 dependencies = [
     "fastmcp==2.11.3",
+    "fire",
     "python-dotenv",
     "requests",
     "pydantic",
@@ -49,14 +50,17 @@ dependencies = [
     "cohere",
     "litellm",
     "diskcache",
+    "docker",
     "jinja2",
     "jsonlines",
+    "kubernetes",
     "typer",
     "rich",
     "omegaconf",
     "datasets",
     "prompt_toolkit",
     "retry",
+    "swebench",
 ]
 
 [project.optional-dependencies]

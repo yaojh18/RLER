@@ -13,6 +13,21 @@ from swe_agent.exceptions import Submitted
 from swe_agent.utils.serialize import recursive_merge
 
 
+def docker_available(executable: str | None = None) -> bool:
+    executable = executable or os.getenv("MSWEA_DOCKER_EXECUTABLE", "docker")
+    try:
+        result = subprocess.run(
+            [executable, "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 class DockerEnvironmentConfig(BaseModel):
     image: str
     cwd: str = "/"

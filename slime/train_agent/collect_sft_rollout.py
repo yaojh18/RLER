@@ -178,7 +178,9 @@ def collect_teacher_student_export_parallel(
         build_swebench_config,
         get_swebench_docker_image_name,
         get_swebench_harness_namespace,
-        load_swebench_instances,
+        get_swebench_singularity_image_name,
+        load_swebench_instances_by_id,
+        select_container_environment_class,
     )
     from swe_agent.run.run_swe_agent import (
         DEFAULT_COMPLETION_MAX_TOKENS,
@@ -191,11 +193,7 @@ def collect_teacher_student_export_parallel(
         TrajectorySearchParallelRunner,
     )
 
-    instances = load_swebench_instances(subset, split)
-    matching = [inst for inst in instances if str(inst["instance_id"]) == instance_id]
-    if not matching:
-        raise RuntimeError(f"instance not found in {subset}/{split}: {instance_id}")
-    instance = matching[0]
+    instance = load_swebench_instances_by_id(subset, split, [instance_id])[0]
 
     run_dir = output_root / "teacher_student_parallel" / f"{instance_id}-{time.strftime('%Y%m%d-%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -204,6 +202,18 @@ def collect_teacher_student_export_parallel(
     # (matches search_swe_agent.py's openai backend path so token-vocab
     # mismatch is avoided when teacher is DSv4 and tokenizer is local Qwen).
     image_name = get_swebench_docker_image_name(instance)
+    environment_class = select_container_environment_class("docker")
+    environment_overrides = {
+        "image": image_name if environment_class == "docker" else get_swebench_singularity_image_name(instance),
+        "cwd": "/testbed" if instance.get("expected_output_json") else "",
+        "timeout": DEFAULT_ENV_TIMEOUT,
+        "pull_timeout": DEFAULT_PULL_TIMEOUT,
+        "environment_class": environment_class,
+    }
+    if environment_class == "docker":
+        environment_overrides["executable"] = os.environ.get("MSWEA_DOCKER_EXECUTABLE", "docker")
+    if instance.get("expected_output_json"):
+        environment_overrides["dataset_name"] = "r2egym"
     api_base = (
         teacher_base_url if teacher_base_url.endswith("/v1")
         else teacher_base_url.rstrip("/") + "/v1"
@@ -214,13 +224,7 @@ def collect_teacher_student_export_parallel(
         model_class="litellm_textbased",
         extra_overrides={
             "agent": {"step_limit": step_limit, "cost_limit": 0},
-            "environment": {
-                "image": image_name,
-                "cwd": "",
-                "timeout": DEFAULT_ENV_TIMEOUT,
-                "pull_timeout": DEFAULT_PULL_TIMEOUT,
-                "executable": os.environ.get("MSWEA_DOCKER_EXECUTABLE", "docker"),
-            },
+            "environment": environment_overrides,
             "model": {
                 "model_kwargs": {
                     "api_base": api_base,

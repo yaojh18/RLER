@@ -75,7 +75,9 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             build_swebench_config,
             get_swebench_docker_image_name,
             get_swebench_harness_namespace,
+            get_swebench_singularity_image_name,
             load_swebench_instances_by_id,
+            select_container_environment_class,
         )
         from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
         from swe_agent.utils.serialize import recursive_merge
@@ -108,6 +110,17 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             model=model_name,
             model_class="route_textbased",
         )
+        image_name = get_swebench_docker_image_name(instance)
+        environment_class = select_container_environment_class(
+            base_config.get("environment", {}).get("environment_class", "docker")
+        )
+        environment_overrides = {
+            "image": image_name if environment_class == "docker" else get_swebench_singularity_image_name(instance),
+            "environment_class": environment_class,
+        }
+        if instance.get("expected_output_json"):
+            environment_overrides["cwd"] = "/testbed"
+            environment_overrides["dataset_name"] = "r2egym"
         overrides = {
             "agent": {"step_limit": task["step_limit"]},
             "model": {
@@ -121,7 +134,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                     ),
                 }
             },
-            "environment": {"image": get_swebench_docker_image_name(instance)},
+            "environment": environment_overrides,
         }
         config = recursive_merge(base_config, overrides)
         backend = SWEAgentRolloutBackend(

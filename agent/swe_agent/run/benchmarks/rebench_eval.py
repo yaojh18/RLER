@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from swe_agent.run.benchmarks.swebench import get_swebench_docker_image_name
-from swe_agent.run.benchmarks.swe_rebench_v2.lib.agent import log_parsers
 
 REBENCH_DATASET_NAMES = {
     "nebius/SWE-rebench",
@@ -80,6 +79,8 @@ def evaluate_rebench_instance(
     parser_name = install_config.get("log_parser")
     if not parser_name:
         raise ValueError(f"Task {instance_id} missing install_config.log_parser.")
+
+    from swe_agent.run.benchmarks.swe_rebench_v2.lib.agent import log_parsers
 
     parser = log_parsers.NAME_TO_PARSER.get(parser_name) or getattr(log_parsers, parser_name, None)
     if parser is None:

@@ -12,7 +12,8 @@ from swe_agent.run.benchmarks.swebench import (
     DATASET_MAPPING,
     build_swebench_config,
     get_sb_environment,
-    load_swebench_instances,
+    load_swebench_instances_by_id,
+    load_swebench_instances_slice,
 )
 from swe_agent.utils.log import logger
 from swe_agent.utils.serialize import UNSET
@@ -58,13 +59,10 @@ def main(
     # fmt: on
     """Run on a single SWE-Bench instance."""
     logger.info(f"Loading dataset from {DATASET_MAPPING.get(subset, subset)}, split {split}...")
-    instances = {
-        inst["instance_id"]: inst  # type: ignore
-        for inst in load_swebench_instances(subset, split)
-    }
     if instance_spec.isnumeric():
-        instance_spec = sorted(instances.keys())[int(instance_spec)]
-    instance: dict = instances[instance_spec]  # type: ignore
+        instance = load_swebench_instances_slice(subset, split, int(instance_spec), 1)[0]
+    else:
+        instance = load_swebench_instances_by_id(subset, split, [instance_spec])[0]
 
     config = build_swebench_config(
         config_spec=config_spec,

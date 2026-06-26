@@ -27,8 +27,15 @@ from swebench.harness.test_spec.test_spec import make_test_spec
 from swe_agent import Environment
 from swe_agent.agents.default import DefaultAgent
 from swe_agent.config import builtin_config_dir, get_config_from_spec
+from swe_agent.environments.docker import docker_available
 from swe_agent.environments import get_environment
+from swe_agent.environments.singularity import resolve_singularity_image, singularity_available
 from swe_agent.models import get_model
+from swe_agent.run.benchmarks.r2egym_eval import (
+    convert_r2egym_instance,
+    is_r2egym_instance,
+    r2egym_instance_id,
+)
 from swe_agent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
 from swe_agent.utils.log import add_file_handler, logger
 from swe_agent.utils.serialize import UNSET, recursive_merge
@@ -68,6 +75,7 @@ DATASET_MAPPING = {
     "_test": "klieret/swe-bench-dummy-test-dataset",
     "rebench": "nebius/SWE-rebench",
     "rebench_v2": "nebius/SWE-rebench-V2",
+    "r2egym": "R2E-Gym/R2E-Gym-Subset",
 }
 
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
@@ -97,6 +105,11 @@ class ProgressTrackingAgent(DefaultAgent):
 def get_swebench_docker_image_name(instance: dict) -> str:
     """Get the image name for a SWEBench instance."""
     return resolve_swebench_image(instance)[0]
+
+
+def get_swebench_singularity_image_name(instance: dict) -> str:
+    """Get the Apptainer/Singularity image for a SWEBench-style instance."""
+    return resolve_singularity_image(get_swebench_docker_image_name(instance), instance)
 
 
 def get_swebench_harness_namespace(instance: dict) -> str | None:
@@ -155,6 +168,19 @@ def _resolve_generated_swebench_image(instance: dict) -> tuple[str, str | None]:
 
 def _is_rebench_instance(instance: dict) -> bool:
     return bool(instance.get("image_name")) and isinstance(instance.get("install_config"), dict)
+
+
+def select_container_environment_class(requested: str | None) -> str:
+    if requested is not None:
+        if requested == "docker" and docker_available():
+            return "docker"
+        if requested == "singularity" and singularity_available():
+            return "singularity"
+    if docker_available():
+        return "docker"
+    if singularity_available():
+        return "singularity"
+    raise RuntimeError(f"No supported container environment is available on this system")
 
 
 def _local_image_exists(image_name: str) -> bool:
@@ -344,16 +370,20 @@ def _infer_harness_namespace(image_name: str, instance: dict) -> str | None:
 
 def get_sb_environment(config: dict, instance: dict) -> Environment:
     env_config = config.setdefault("environment", {})
-    env_config["environment_class"] = env_config.get("environment_class", "docker")
+    env_config["environment_class"] = select_container_environment_class(env_config.get("environment_class", "docker"))
     image_name = get_swebench_docker_image_name(instance)
     if env_config["environment_class"] in ["docker", "swerex_modal"]:
         env_config["image"] = image_name
     elif env_config["environment_class"] in ["singularity", "contree"]:
-        env_config["image"] = "docker://" + image_name
+        env_config["image"] = get_swebench_singularity_image_name(instance)
     if _is_rebench_instance(instance):
         repo = instance.get("repo") or ""
         if "/" in repo:
             env_config["cwd"] = f"/{repo.split('/', 1)[1]}"
+        env_config.setdefault("dataset_name", "rebench")
+    elif is_r2egym_instance(instance):
+        env_config["cwd"] = "/testbed"
+        env_config.setdefault("dataset_name", "r2egym")
 
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):
@@ -473,21 +503,50 @@ def filter_instances(
 def load_swebench_instances(subset: str, split: str) -> list[dict]:
     dataset_path = DATASET_MAPPING.get(subset, subset)
     logger.info(f"Loading dataset {dataset_path}, split {split}...")
-    return list(load_dataset(dataset_path, split=split))
+    return [_normalize_dataset_row(dataset_path, row) for row in load_dataset(dataset_path, split=split)]
+
+
+def load_swebench_instances_slice(subset: str, split: str, offset: int, limit: int) -> list[dict]:
+    if offset < 0 or limit < 1:
+        raise ValueError("offset must be non-negative and limit must be positive")
+    dataset_path = DATASET_MAPPING.get(subset, subset)
+    logger.info(f"Loading {limit} instance(s) from {dataset_path}, split {split}, offset {offset}...")
+    rows = load_dataset(dataset_path, split=split, streaming=True).skip(offset).take(limit)
+    return [_normalize_dataset_row(dataset_path, row) for row in rows]
 
 
 def load_swebench_instances_by_id(subset: str, split: str, instance_ids: list[str]) -> list[dict]:
+    if not instance_ids:
+        return []
     dataset_path = DATASET_MAPPING.get(subset, subset)
     logger.info(f"Loading {len(instance_ids)} instance(s) from {dataset_path}, split {split}...")
     wanted = set(instance_ids)
-    dataset = load_dataset("nebius/SWE-rebench-V2", split=split)
-    ids = dataset["instance_id"]
-    indices = [i for i, instance_id in enumerate(ids) if instance_id in wanted]
-    subset = dataset.select(indices)
-    found = {x["instance_id"]: dict(x) for x in subset}
-    if len(found) != len(instance_ids):
-        raise RuntimeError(f"Instances not found in {subset}/{split}: {', '.join(instance_ids - found.keys())}")
+    found: dict[str, dict] = {}
+    for row in load_dataset(dataset_path, split=split, streaming=True):
+        instance_id = _row_instance_id(dataset_path, row)
+        if instance_id in wanted and instance_id not in found:
+            found[instance_id] = _normalize_dataset_row(dataset_path, row)
+            if len(found) == len(wanted):
+                break
+    missing = wanted - set(found)
+    if missing:
+        raise RuntimeError(f"Instances not found in {subset}/{split}: {', '.join(sorted(missing))}")
     return [found[instance_id] for instance_id in instance_ids]
+
+
+def _normalize_dataset_row(dataset_path: str, row: dict) -> dict:
+    instance = dict(row)
+    if dataset_path.startswith("R2E-Gym/"):
+        return convert_r2egym_instance(instance)
+    return instance
+
+
+def _row_instance_id(dataset_path: str, row: dict) -> str:
+    if row.get("instance_id"):
+        return str(row["instance_id"])
+    if dataset_path.startswith("R2E-Gym/"):
+        return r2egym_instance_id(dict(row))
+    raise RuntimeError(f"Dataset {dataset_path} row does not have an instance_id")
 
 
 def build_swebench_config(

@@ -23,8 +23,8 @@ for path in (REPO_ROOT / "agent", REPO_ROOT / "slime"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from swe_agent.run.benchmarks.swebench import load_swebench_instances
 from swe_agent.run.benchmarks.swebench import get_swebench_docker_image_name
+from swe_agent.run.benchmarks.swebench import load_swebench_instances_by_id, load_swebench_instances_slice
 from swe_agent.run.run_swe_agent import infer_litellm_api_env
 from train_agent.collect_sft_rollout import (
     DEFAULT_TEACHER_MODEL,
@@ -54,14 +54,9 @@ def select_rebench_instances(
     offset: int,
     limit: int,
 ) -> list[dict[str, Any]]:
-    instances = load_swebench_instances(subset, split)
     if instance_ids:
-        instances_by_id = {str(instance["instance_id"]): instance for instance in instances}
-        missing = [instance_id for instance_id in instance_ids if instance_id not in instances_by_id]
-        if missing:
-            raise RuntimeError(f"Could not find instance ids in {subset}/{split}: {missing}")
-        return [instances_by_id[instance_id] for instance_id in instance_ids]
-    selected = instances[offset : offset + limit]
+        return load_swebench_instances_by_id(subset, split, instance_ids)
+    selected = load_swebench_instances_slice(subset, split, offset, limit)
     if len(selected) < limit:
         raise RuntimeError(f"Only found {len(selected)} instances for {subset}/{split} at offset={offset}, limit={limit}.")
     return selected
