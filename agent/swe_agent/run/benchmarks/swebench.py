@@ -31,10 +31,18 @@ from swe_agent.environments.docker import docker_available
 from swe_agent.environments import get_environment
 from swe_agent.environments.singularity import resolve_singularity_image, singularity_available
 from swe_agent.models import get_model
+from swe_agent.run.benchmarks.deepswe_eval import (
+    convert_deepswe_instance,
+    is_deepswe_instance,
+)
 from swe_agent.run.benchmarks.r2egym_eval import (
     convert_r2egym_instance,
     is_r2egym_instance,
     r2egym_instance_id,
+)
+from swe_agent.run.benchmarks.swebench_pro_eval import (
+    convert_swebench_pro_instance,
+    is_swebench_pro_instance,
 )
 from swe_agent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
 from swe_agent.utils.log import add_file_handler, logger
@@ -76,6 +84,8 @@ DATASET_MAPPING = {
     "rebench": "nebius/SWE-rebench",
     "rebench_v2": "nebius/SWE-rebench-V2",
     "r2egym": "R2E-Gym/R2E-Gym-Subset",
+    "swebench_pro": "ScaleAI/SWE-bench_Pro",
+    "deepswe": "datacurve/deep-swe",
 }
 
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
@@ -141,6 +151,8 @@ def resolve_swebench_image(instance: dict) -> tuple[str, str | None]:
 
 def _resolve_generated_swebench_image(instance: dict) -> tuple[str, str | None]:
     official_spec = make_test_spec(instance, namespace=OFFICIAL_IMAGE_NAMESPACE)
+    if not docker_available():
+        return official_spec.instance_image_key, OFFICIAL_IMAGE_NAMESPACE
     if _registry_image_exists(official_spec.instance_image_key):
         return official_spec.instance_image_key, OFFICIAL_IMAGE_NAMESPACE
 
@@ -384,6 +396,8 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
     elif is_r2egym_instance(instance):
         env_config["cwd"] = "/testbed"
         env_config.setdefault("dataset_name", "r2egym")
+    elif is_swebench_pro_instance(instance) or is_deepswe_instance(instance):
+        env_config["cwd"] = instance.get("swebench_workdir", "/app")
 
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):
@@ -538,6 +552,10 @@ def _normalize_dataset_row(dataset_path: str, row: dict) -> dict:
     instance = dict(row)
     if dataset_path.startswith("R2E-Gym/"):
         return convert_r2egym_instance(instance)
+    if dataset_path in {"ScaleAI/SWE-bench_Pro"}:
+        return convert_swebench_pro_instance(instance)
+    if dataset_path in {"datacurve/deep-swe"}:
+        return convert_deepswe_instance(instance)
     return instance
 
 

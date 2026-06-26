@@ -8,12 +8,11 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from swe_agent.environments.docker import docker_available
 from swe_agent.environments.singularity import (
     SingularityEnvironment,
     resolve_singularity_image,
-    singularity_available,
 )
+from swe_agent.run.benchmarks.container_runtime import select_container_backend
 
 
 R2EGYM_DATASET_NAMES = {
@@ -179,11 +178,9 @@ def convert_r2egym_instance(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _make_runtime(instance: dict[str, Any], timeout: int):
-    if docker_available():
+    if select_container_backend() == "docker":
         return DockerRuntime(ds=instance, command="/bin/bash")
-    if singularity_available():
-        return R2ESingularityRuntime(instance, timeout=timeout)
-    raise RuntimeError("Neither Docker nor Singularity is available for R2E-Gym evaluation.")
+    return R2ESingularityRuntime(instance, timeout=timeout)
 
 
 def _evaluate_with_runtime(runtime, instance: dict[str, Any], patch_text: str, timeout: int) -> dict[str, Any]:

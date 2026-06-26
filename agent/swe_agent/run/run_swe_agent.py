@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import contextlib
 import hashlib
@@ -28,6 +29,12 @@ from swebench.harness.docker_build import build_instance_image
 
 os.environ.setdefault("LITELLM_LOG", "ERROR")
 
+from swe_agent.run.benchmarks.container_runtime import select_container_backend
+from swe_agent.run.benchmarks.deepswe_eval import (
+    evaluate_deepswe_instances,
+    is_deepswe_dataset_name,
+    is_deepswe_instance,
+)
 from swe_agent.run.benchmarks.rebench_eval import (
     evaluate_rebench_instance as evaluate_rebench_prediction,
     is_rebench_dataset_name,
@@ -46,6 +53,12 @@ from swe_agent.run.benchmarks.swebench import (
     load_swebench_instances_slice,
     run_swebench_instances,
 )
+from swe_agent.run.benchmarks.swebench_pro_eval import (
+    evaluate_swebench_pro_instances,
+    is_swebench_pro_dataset_name,
+    is_swebench_pro_instance,
+)
+from swe_agent.run.benchmarks.swebench_singularity_eval import evaluate_swebench_instances_singularity
 
 
 def find_repo_root(start: Path) -> Path:
@@ -477,13 +490,15 @@ def make_evaluation_payload(
         raise ValueError(f"Unsupported RLER_REWARD_SCHEME={scheme!r}; choose from {sorted(SUPPORTED_REWARD_SCHEMES)}")
 
     passed_set = set(passed)
-    f2p = {str(t) for t in (fail_to_pass_expected or []) if str(t)}
-    p2p = {str(t) for t in (pass_to_pass_expected or []) if str(t)}
+    f2p = {str(t) for t in _test_sequence(fail_to_pass_expected) if str(t)}
+    p2p = {str(t) for t in _test_sequence(pass_to_pass_expected) if str(t)}
 
     if status == "empty":
         reward = EMPTY_REWARD
     elif status == "error":
         reward = ERROR_REWARD
+    elif scheme in {"joint", "f2p_only"} and not (f2p or p2p):
+        reward = 1.0 if status == "resolved" else 0.0
     elif scheme == "soft":
         total = len(passed_set | set(failed))
         reward = len(passed_set) / total if total else (1.0 if status == "resolved" else 0.0)
@@ -506,6 +521,24 @@ def make_evaluation_payload(
         "p2p_total": len(p2p),
         "metainfo": {"output": str(output)} if output else {},
     }
+
+
+def _test_sequence(value: Sequence[str] | str | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(stripped)
+                if isinstance(parsed, (list, tuple, set)):
+                    return [str(item) for item in parsed if str(item)]
+            except Exception:
+                pass
+        return [stripped]
+    return [str(item) for item in value if str(item)]
 
 
 def write_failure_artifacts(*, instance_id: str, run_dir: Path, error: Exception | str, log_path: Path | None = None) -> None:
@@ -565,6 +598,8 @@ def run_harness_evaluation(
         }
     rebench = is_rebench_dataset_name(dataset_name)
     r2egym = is_r2egym_dataset_name(dataset_name)
+    swebench_pro = is_swebench_pro_dataset_name(dataset_name)
+    deepswe = is_deepswe_dataset_name(dataset_name)
 
     def evaluate(run_dir: Path) -> tuple[Path, dict[str, Any]]:
         instance_id = run_dir.parent.name
@@ -583,6 +618,24 @@ def run_harness_evaluation(
                 work_dir=run_dir.resolve(),
             )[str(run_dir)]
             return run_dir, _r2egym_result_payload(result)
+        if swebench_pro or is_swebench_pro_instance(instance):
+            result = evaluate_swebench_pro_instances(
+                instance=instance,
+                patches_by_key={str(run_dir): patch},
+                max_workers=1,
+                timeout=timeout,
+                work_dir=run_dir.resolve(),
+            )[str(run_dir)]
+            return run_dir, _benchmark_result_payload(result)
+        if deepswe or is_deepswe_instance(instance):
+            result = evaluate_deepswe_instances(
+                instance=instance,
+                patches_by_key={str(run_dir): patch},
+                max_workers=1,
+                timeout=timeout,
+                work_dir=run_dir.resolve(),
+            )[str(run_dir)]
+            return run_dir, _benchmark_result_payload(result)
         if not patch:
             return run_dir, make_evaluation_payload("empty")
         if rebench:
@@ -638,7 +691,23 @@ def _r2egym_result_payload(result: dict[str, Any]) -> dict[str, Any]:
         pass_to_pass_expected=result.get("pass_to_pass_expected", []),
         fail_to_pass_expected=result.get("fail_to_pass_expected", []),
     )
-    payload["reward"] = float(result.get("reward", 1.0 if resolved else 0.0))
+    if "reward" in result:
+        payload.setdefault("metainfo", {})["benchmark_reward"] = float(result["reward"])
+    return payload
+
+
+def _benchmark_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+    resolved = bool(result.get("resolved"))
+    payload = make_evaluation_payload(
+        status="resolved" if resolved else "unresolved",
+        passed_tests=result.get("passed_actual", []),
+        failed_tests=result.get("failed_actual", []),
+        output=result.get("evaluation_output") or "",
+        pass_to_pass_expected=result.get("pass_to_pass_expected", []),
+        fail_to_pass_expected=result.get("fail_to_pass_expected", []),
+    )
+    if "reward" in result:
+        payload.setdefault("metainfo", {})["benchmark_reward"] = float(result["reward"])
     return payload
 
 
@@ -728,6 +797,32 @@ def evaluate_swebench_instance_patches(
                 evaluations[key] = make_evaluation_payload("error", error=exc)
         return evaluations
 
+    if is_swebench_pro_instance(instance):
+        try:
+            results = evaluate_swebench_pro_instances(
+                instance=instance,
+                patches_by_key=patches_by_key,
+                max_workers=max_workers,
+                timeout=600,
+                work_dir=eval_work_dir,
+            )
+            return {key: _benchmark_result_payload(result) for key, result in results.items()}
+        except Exception as exc:
+            return {key: make_evaluation_payload("error", error=exc) for key in patches_by_key}
+
+    if is_deepswe_instance(instance):
+        try:
+            results = evaluate_deepswe_instances(
+                instance=instance,
+                patches_by_key=patches_by_key,
+                max_workers=max_workers,
+                timeout=600,
+                work_dir=eval_work_dir,
+            )
+            return {key: _benchmark_result_payload(result) for key, result in results.items()}
+        except Exception as exc:
+            return {key: make_evaluation_payload("error", error=exc) for key in patches_by_key}
+
     unique_patches: dict[str, dict[str, Any]] = {}
     evaluations = {
         key: make_evaluation_payload("empty")
@@ -740,6 +835,39 @@ def evaluate_swebench_instance_patches(
             patch_hash = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
             unique_patches.setdefault(patch_hash, {"patch": patch_text, "keys": []})["keys"].append(key)
     if not unique_patches:
+        return evaluations
+
+    if select_container_backend() == "singularity":
+        try:
+            raw_results = evaluate_swebench_instances_singularity(
+                instance=instance,
+                patches_by_key={
+                    key: patch
+                    for key, patch in patches_by_key.items()
+                    if (patch or "").strip()
+                },
+                model_name=model_name,
+                max_workers=max_workers,
+                namespace=namespace,
+                work_dir=eval_work_dir,
+                timeout=600,
+            )
+        except Exception as exc:
+            for key, patch in patches_by_key.items():
+                if (patch or "").strip():
+                    evaluations[key] = make_evaluation_payload("error", error=exc)
+            return evaluations
+        for key, result in raw_results.items():
+            try:
+                evaluations[key] = _swebench_report_payload(
+                    result["report"],
+                    instance["instance_id"],
+                    result.get("output", ""),
+                    fail_to_pass_expected=instance.get("FAIL_TO_PASS", []) or [],
+                    pass_to_pass_expected=instance.get("PASS_TO_PASS", []) or [],
+                )
+            except Exception as exc:
+                evaluations[key] = make_evaluation_payload("error", output=result.get("output", ""), error=exc)
         return evaluations
 
     previous_eval_root = swebench_run_evaluation.RUN_EVALUATION_LOG_DIR

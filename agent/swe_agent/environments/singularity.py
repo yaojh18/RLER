@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -44,27 +45,42 @@ def resolve_singularity_image(image_name: str, instance: dict[str, Any] | None =
         return image_name
 
     sif_dirs = os.getenv("RLER_SIF_DIR") or os.getenv("SWE_AGENT_SIF_DIR") or os.getenv("SIF_DIR")
+    if not sif_dirs:
+        sif_dirs = str(Path(__file__).resolve().parents[4] / "singularity_images")
     if sif_dirs:
         instance_id = str(instance.get("instance_id") or "")
         image_tag = image_name.rsplit("/", 1)[-1].replace(":", "_")
-        candidates = [f"r2egym_{image_tag}.sif"]
+        image_stub = _image_name_to_sif_stub(image_name)
+        candidates = [f"{image_stub}.sif", f"r2egym_{image_tag}.sif"]
+        if image_name.startswith("public.ecr.aws/"):
+            candidates.append(f"{image_stub}-v1.1.sif")
+        if dockerhub_tag := instance.get("dockerhub_tag"):
+            candidates.append(f"jefzda_sweap-images_{dockerhub_tag}.sif")
         if instance_id:
             candidates.extend(
                 [
                     f"r2egym_{instance_id}.sif",
                     f"swebench_sweb.eval.x86_64.{instance_id.replace('__', '_1776_')}.sif",
+                    f"swebench_sweb.eval.x86_64.{instance_id.replace('__', '_1776_')}_latest.sif",
                     f"swegym_sweb.eval.x86_64.{instance_id.replace('__', '_s_')}.sif",
                 ]
             )
         for sif_dir in sif_dirs.split(os.pathsep):
+            root = Path(sif_dir)
             for candidate in candidates:
-                path = Path(sif_dir) / candidate
+                path = root / candidate
                 if path.exists():
                     return str(path)
+                matches = list(root.glob(f"*/{candidate}")) if root.exists() else []
+                if matches:
+                    return str(matches[0])
 
-    if image_name.startswith(("docker://", "library://", "oras://")):
-        return image_name
-    return "docker://" + image_name
+    raise FileNotFoundError(f"Could not resolve local SIF for image {image_name!r} under {sif_dirs}")
+
+
+def _image_name_to_sif_stub(image_name: str) -> str:
+    image_name = image_name.removeprefix("docker://")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", image_name).strip("_")
 
 
 class SingularityEnvironmentConfig(BaseModel):
