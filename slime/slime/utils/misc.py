@@ -1,9 +1,37 @@
 import importlib
 import subprocess
+from collections import defaultdict
+from collections.abc import Callable, Iterable
+from typing import Any
 
-import ray
+import torch
 
 from slime.utils.http_utils import is_port_available
+
+
+def decode_int32_meta_array(meta_info: dict[str, Any], keys: str | Iterable[str]) -> torch.Tensor | None:
+    if isinstance(keys, str):
+        keys = (keys,)
+    for key in keys:
+        if key in meta_info:
+            value = meta_info[key]
+            break
+    else:
+        return None
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        import pybase64
+
+        value = pybase64.b64decode(value.encode("ascii"))
+    if isinstance(value, bytes | bytearray | memoryview):
+        return torch.frombuffer(bytearray(value), dtype=torch.int32)
+    if torch.is_tensor(value):
+        return value.detach().to(device="cpu", dtype=torch.int32).reshape(-1)
+    if hasattr(value, "flags") and not value.flags.writeable:
+        value = value.copy()
+    return torch.as_tensor(value, dtype=torch.int32).reshape(-1)
 
 
 def load_function(path):
@@ -56,6 +84,10 @@ def exec_command(cmd: str, capture_output: bool = False) -> str | None:
 
 
 def get_current_node_ip():
+    # Lazy import so CPU-only code paths (rm_hub scoring, plugin contracts,
+    # etc.) can use other helpers in this module without requiring ray.
+    import ray
+
     address = ray._private.services.get_node_ip_address()
     # strip ipv6 address
     address = address.strip("[]")
@@ -101,13 +133,6 @@ class Box:
     @property
     def inner(self):
         return self._inner
-
-
-from collections import defaultdict
-from collections.abc import Callable, Iterable
-from typing import Any
-
-import torch
 
 
 # details: https://stackoverflow.com/questions/773/how-do-i-use-itertools-groupby

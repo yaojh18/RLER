@@ -26,9 +26,6 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
         "self_attention.linear_qkv.layer_norm_weight": [
             "model.language_model.layers.{layer_number}.input_layernorm.weight"
         ],
-        "self_attention.linear_qgkv.layer_norm_weight": [
-            "model.language_model.layers.{layer_number}.input_layernorm.weight"
-        ],
         "self_attention.q_layernorm.weight": ["model.language_model.layers.{layer_number}.self_attn.q_norm.weight"],
         "self_attention.k_layernorm.weight": ["model.language_model.layers.{layer_number}.self_attn.k_norm.weight"],
         "self_attention.linear_qkv.weight": [
@@ -36,17 +33,7 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
             "model.language_model.layers.{layer_number}.self_attn.k_proj.weight",
             "model.language_model.layers.{layer_number}.self_attn.v_proj.weight",
         ],
-        "self_attention.linear_qgkv.weight": [
-            "model.language_model.layers.{layer_number}.self_attn.q_proj.weight",
-            "model.language_model.layers.{layer_number}.self_attn.k_proj.weight",
-            "model.language_model.layers.{layer_number}.self_attn.v_proj.weight",
-        ],
         "self_attention.linear_qkv.bias": [
-            "model.language_model.layers.{layer_number}.self_attn.q_proj.bias",
-            "model.language_model.layers.{layer_number}.self_attn.k_proj.bias",
-            "model.language_model.layers.{layer_number}.self_attn.v_proj.bias",
-        ],
-        "self_attention.linear_qgkv.bias": [
             "model.language_model.layers.{layer_number}.self_attn.q_proj.bias",
             "model.language_model.layers.{layer_number}.self_attn.k_proj.bias",
             "model.language_model.layers.{layer_number}.self_attn.v_proj.bias",
@@ -129,6 +116,15 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
         if hasattr(self.hf_config, "text_config"):
             return self.hf_config.text_config
         return self.hf_config
+
+    def _adjust_mapping_for_shared_weights(self):
+        text_config = self._get_text_config()
+        tie_word_embeddings = getattr(text_config, "tie_word_embeddings", False) or getattr(
+            self.hf_config, "tie_word_embeddings", False
+        )
+        if tie_word_embeddings:
+            self._DIRECT_MAPPING = dict(self._DIRECT_MAPPING)
+            self._DIRECT_MAPPING["output_layer.weight"] = "model.language_model.embed_tokens.weight"
 
     def _supports_transformer_config_kwarg(self, kwarg_name: str) -> bool:
         """Check whether the current TransformerConfig accepts a given kwarg."""
@@ -253,10 +249,7 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
     ) -> tuple[list[str], list[torch.Tensor]]:
-        if (
-            ("self_attention.linear_qkv." in mcore_weights_name or "self_attention.linear_qgkv." in mcore_weights_name)
-            and "layer_norm" not in mcore_weights_name
-        ):
+        if "self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name:
             # merge qkv
             assert len(hf_weights) == 3
             text_config = self._get_text_config()
@@ -334,11 +327,9 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
             # Qwen3.5 specific
             moe_router_pre_softmax=False,
             qk_layernorm=True,
+            attention_output_gate=True,
             **mtp_args,
         )
-
-        if self._supports_transformer_config_kwarg("attention_output_gate"):
-            base_kwargs["attention_output_gate"] = True
 
         if self._supports_transformer_config_kwarg("use_gated_attention"):
             base_kwargs["use_gated_attention"] = True

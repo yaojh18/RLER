@@ -1,0 +1,7 @@
+{
+  "astropy__astropy-12907": {
+    "model_name_or_path": "nvidia/nvidia/Nemotron-3-Nano-30B-A3B",
+    "instance_id": "astropy__astropy-12907",
+    "model_patch": ""
+  }
+}

@@ -97,6 +97,9 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         split = task["split"]
         model_name = task["model_name"]
         policy_base_url = task["policy_base_url"]
+        # Per-fork-group endpoint pool. Fallback to single-URL list if the
+        # task dispatcher didn't supply one (old launcher / external caller).
+        policy_base_urls = task.get("policy_base_urls") or [policy_base_url]
         rubric_base_url = task["rubric_base_url"]
         api_key = task["api_key"]
         output_root = Path(task["output_root"])
@@ -156,12 +159,18 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                                           .get("environment_class", "docker"),
         )
 
+        reward_kind = task.get("reward_kind", "soft")
+        if reward_kind not in {"soft", "delta"}:
+            raise ValueError(f"unsupported lanes reward_kind={reward_kind!r}")
         cfg = ParallelSearchConfig(
             m=task["m"],
-            max_mid_cps=task["max_mid_cps"],
-            steps_per_round=task["steps_per_round"],
+            # Post chinsengi rubric-bank rebase the field names changed:
+            # max_mid_cps -> max_rounds, steps_per_round -> k, seed removed.
+            # Task dict still uses the old keys (env-set in slurm launcher)
+            # so remap here instead of churning every launcher.
+            max_rounds=task["max_mid_cps"],
+            k=task["steps_per_round"],
             step_limit=task["step_limit"],
-            seed=task.get("seed"),
             gt_eval_workers=task.get("gt_eval_workers", 8),
             lane_b_pool_size=task.get("lane_b_pool_size") or (task["m"] * task["max_mid_cps"]),
             keep_images=False,
@@ -171,6 +180,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             lane_b_top_p=task.get("lane_b_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
             disable_rubric=task.get("disable_rubric", False),
+            reward_kind=reward_kind,
         )
         run_dir = (
             output_root / instance_id
@@ -191,6 +201,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             policy_base_url=policy_base_url,
             rubric_base_url=rubric_base_url,
             api_key=api_key,
+            policy_base_urls=policy_base_urls,
         )
         record = asyncio.run(runner.run())
         # steps_per_round is read from record.config inside the converter;
@@ -269,6 +280,15 @@ _NODE_WORKERS: list[Any] = []          # list[ray.actor.ActorHandle]
 _NODE_WORKER_IPS: list[str] = []
 _PENDING: dict[Any, dict[str, Any]] = {}   # ObjectRef -> task dict
 _DISPATCH_COUNTER = 0
+
+# Rolling estimate of groups produced per completed instance. Updated in
+# _harvest_ready as bundles return; used by _submit_until_full to decide
+# whether the in-flight set already covers the over-sampling group target.
+# Initialized optimistically (every instance maxes out at max_mid_cps) so
+# the first dispatch round under-fills rather than over-fills; refines fast.
+_OBSERVED_GROUPS_TOTAL = 0
+_OBSERVED_INSTANCES = 0
+_DEFAULT_EST_GROUPS = 3.0  # fallback before any bundle has been observed
 
 
 @ray.remote(num_cpus=2)
@@ -415,6 +435,11 @@ def _lanes_values_from_env() -> dict[str, Any]:
         # GT-only training: skip rubric/judge in trajectory_search_parallel
         # and use branch.gt_score as the reward in the bundler.
         "disable_rubric": _bool("SWE_AGENT_LANES_DISABLE_RUBRIC", False),
+        # GT reward scoring formula (mirror of naive_search.reward_kind):
+        # 'soft' = raw_reward, 'delta' = max(0, raw - base_score) where
+        # base_score = p2p_total / (p2p_total + f2p_total). Applied inside
+        # ParallelSearchRunner._evaluate_gt.
+        "reward_kind": (os.environ.get("SWE_AGENT_LANES_REWARD_KIND") or "soft").lower(),
     }
 
 
@@ -454,10 +479,35 @@ def _route_least_loaded(ports: list[int], host: str) -> str:
         return url
 
 
+def _route_least_loaded_n(ports: list[int], host: str, n: int) -> list[str]:
+    """Pick n endpoints by least-loaded with pre-increment. Each pick
+    immediately bumps that endpoint's counter so subsequent picks in the
+    same call see the updated load. Returns a list of n URLs (with
+    repetition when n > len(ports)). Caller MUST call _release_endpoints()
+    with this exact list when the instance completes."""
+    candidates = [f"{host.rstrip('/')}:{p}" for p in ports]
+    picks: list[str] = []
+    with _ENDPOINT_LOAD_LOCK:
+        for c in candidates:
+            _ENDPOINT_LOAD.setdefault(c, 0)
+        for _ in range(max(1, n)):
+            url = min(candidates, key=lambda c: _ENDPOINT_LOAD[c])
+            _ENDPOINT_LOAD[url] += 1
+            picks.append(url)
+    return picks
+
+
 def _release_endpoint(url: str) -> None:
     with _ENDPOINT_LOAD_LOCK:
         if url in _ENDPOINT_LOAD:
             _ENDPOINT_LOAD[url] = max(0, _ENDPOINT_LOAD[url] - 1)
+
+
+def _release_endpoints(urls: list[str]) -> None:
+    with _ENDPOINT_LOAD_LOCK:
+        for url in urls:
+            if url in _ENDPOINT_LOAD:
+                _ENDPOINT_LOAD[url] = max(0, _ENDPOINT_LOAD[url] - 1)
 
 
 def _submit_until_full(
@@ -468,7 +518,20 @@ def _submit_until_full(
     output_root: Path,
     model_name: str,
     max_pending: int,
+    over_sampling_groups: int,
+    est_groups_per_instance: float,
 ) -> int:
+    """Dispatch instance tasks subject to two caps:
+      - max_pending: hard concurrency cap on in-flight Ray Futures
+      - over_sampling_groups: stop dispatching once
+        (buffer + pending * est_groups_per_instance) reaches this many groups
+
+    The second cap is what makes lanes a fair comparison to naive: each
+    instance yields ~max_mid_cps groups, so to land ROLLOUT_BATCH_SIZE
+    trainable groups in the buffer we only need ROLLOUT_BATCH_SIZE /
+    groups_per_instance live instances, not OVER_SAMPLING_BATCH_SIZE of
+    them. Dispatching more is wasted compute and stale-drop fodder.
+    """
     global _TASK_INDEX, _DISPATCH_COUNTER
     submitted = 0
     lanes_values = _lanes_values_from_env()
@@ -491,8 +554,19 @@ def _submit_until_full(
         rubric_ports = list(policy_ports)
 
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
+    # Per-instance URL count: pre-pick one URL per *potential* fork group so
+    # the runner can spread group-level branches across distinct sglang
+    # engines. lanes_values["max_mid_cps"] is the runner-side cap.
+    n_urls_per_instance = max(1, int(lanes_values.get("max_mid_cps") or 1))
 
-    while len(_PENDING) < max_pending:
+    while True:
+        if len(_PENDING) >= max_pending:
+            break
+        # Stop dispatching once we have (or expect to have) enough groups in
+        # buffer + in-flight to fill min_ready_groups after dynamic filter.
+        est_pending_groups = len(_PENDING) * est_groups_per_instance
+        if len(_BUFFER) + est_pending_groups >= over_sampling_groups:
+            break
         prompt_groups = data_buffer.get_samples(1)
         if not prompt_groups:
             break
@@ -502,16 +576,21 @@ def _submit_until_full(
         # first duplicate. n_samples_per_prompt MUST equal SWE_AGENT_LANES_M.
         metadata = prompt_group[0].metadata
         instance_id = metadata["instance_id"]
-        # LEAST-LOADED routing — pin THIS instance's policy AND rubric
-        # to the same lightest-loaded endpoint. Policy and rubric pin
-        # together so radix prefix cache stays warm within the instance.
-        # _release_endpoint is called when the task's bundle is reaped
-        # in _harvest_ready below.
-        policy_base_url = _route_least_loaded(policy_ports, api_host)
+        # Per-fork-group endpoint pool. _route_least_loaded_n picks N URLs
+        # by least-loaded with pre-increment, so an instance whose runner
+        # eventually spawns N fork groups gets N distinct (or repeated, when
+        # ports < N) endpoints. The runner round-robins groups across this
+        # pool. All picks are released together in _harvest_ready.
+        policy_base_urls = _route_least_loaded_n(
+            policy_ports, api_host, n=n_urls_per_instance,
+        )
+        policy_base_url = policy_base_urls[0]
         if rubric_ports == policy_ports:
             rubric_base_url = policy_base_url
+            rubric_picks: list[str] = []
         else:
             rubric_base_url = _route_least_loaded(rubric_ports, api_host)
+            rubric_picks = [rubric_base_url]
 
         task = {
             "index": _TASK_INDEX,
@@ -524,16 +603,13 @@ def _submit_until_full(
             "rubric_model_name": os.environ.get("SWE_AGENT_LANES_RUBRIC_MODEL") or model_name,
             "judge_model_name": os.environ.get("SWE_AGENT_LANES_JUDGE_MODEL") or model_name,
             "policy_base_url": policy_base_url,
+            "policy_base_urls": policy_base_urls,
             "rubric_base_url": rubric_base_url,
             "api_key": api_key,
             **lanes_values,
         }
-        # Stash for release on completion.
-        task["_pinned_endpoints"] = (
-            [policy_base_url]
-            if rubric_base_url == policy_base_url
-            else [policy_base_url, rubric_base_url]
-        )
+        # Stash for release on completion (every picked URL, even repeats).
+        task["_pinned_endpoints"] = list(policy_base_urls) + rubric_picks
         _TASK_INDEX += 1
         worker = _NODE_WORKERS[_DISPATCH_COUNTER % len(_NODE_WORKERS)]
         _DISPATCH_COUNTER += 1
@@ -609,6 +685,12 @@ def _harvest_ready(
         groups = (
             bundle.policy_groups if target == "policy" else bundle.rubric_groups
         )
+        # Refine the rolling groups-per-instance estimate from every
+        # successfully harvested bundle (even stale-dropped ones — the count
+        # is structurally meaningful regardless of training use).
+        global _OBSERVED_GROUPS_TOTAL, _OBSERVED_INSTANCES
+        _OBSERVED_GROUPS_TOTAL += len(groups)
+        _OBSERVED_INSTANCES += 1
         if task["rollout_id"] < current_rollout_id - 1:
             _STALE_DROPPED_GROUPS += len(groups)
             del result, bundle, groups, ref
@@ -716,6 +798,16 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     min_ready_groups = max(1, int(
         os.environ.get("SWE_AGENT_LANES_MIN_READY_GROUPS", str(args.rollout_batch_size))
     ))
+    # Group-units over-sampling target. Defaults to 2x min_ready_groups so
+    # the dynamic-filter pass-rate gets some headroom. Setting this is what
+    # makes lanes a fair compute comparison to naive: dispatch only enough
+    # instances to land `over_sampling_groups` GROUPS in the buffer, not
+    # OVER_SAMPLING_BATCH_SIZE instances (which would over-collect by ~3x
+    # since each instance yields ~3 fork groups). max_pending still bounds
+    # concurrency.
+    over_sampling_groups = max(min_ready_groups, int(
+        os.environ.get("SWE_AGENT_LANES_OVER_SAMPLING_GROUPS", str(min_ready_groups * 2))
+    ))
     timeout = float(os.environ.get("SWE_AGENT_LANES_WAIT_TIMEOUT", "10800"))
 
     if not _NODE_WORKERS:
@@ -738,13 +830,22 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         args=args, target=target, tokenizer=tokenizer,
         current_rollout_id=rollout_id, block=False,
     )
+    def _est_groups() -> float:
+        if _OBSERVED_INSTANCES <= 0:
+            return _DEFAULT_EST_GROUPS
+        return max(1.0, _OBSERVED_GROUPS_TOTAL / _OBSERVED_INSTANCES)
+
     submitted = _submit_until_full(
         args=args, data_buffer=data_buffer, rollout_id=rollout_id,
         output_root=output_root, model_name=model_name, max_pending=max_pending,
+        over_sampling_groups=over_sampling_groups,
+        est_groups_per_instance=_est_groups(),
     )
     logger.info(
-        "[lanes-async] post-init submitted=%d buffer=%d pending=%d",
+        "[lanes-async] post-init submitted=%d buffer=%d pending=%d "
+        "over_sampling_groups=%d est_groups_per_instance=%.2f",
         submitted, len(_BUFFER), len(_PENDING),
+        over_sampling_groups, _est_groups(),
     )
 
     wait_started = time.perf_counter()
@@ -762,6 +863,8 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         submitted += _submit_until_full(
             args=args, data_buffer=data_buffer, rollout_id=rollout_id,
             output_root=output_root, model_name=model_name, max_pending=max_pending,
+            over_sampling_groups=over_sampling_groups,
+            est_groups_per_instance=_est_groups(),
         )
         if time.perf_counter() - last_pulse > 30:
             last_pulse = time.perf_counter()
@@ -794,6 +897,8 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     _submit_until_full(
         args=args, data_buffer=data_buffer, rollout_id=rollout_id,
         output_root=output_root, model_name=model_name, max_pending=max_pending,
+        over_sampling_groups=over_sampling_groups,
+        est_groups_per_instance=_est_groups(),
     )
     samples = [sample for group in selected_groups for sample in group.samples]
     for group_index, group in enumerate(selected_groups):

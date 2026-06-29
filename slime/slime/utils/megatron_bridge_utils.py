@@ -1,4 +1,3 @@
-import logging
 from contextlib import contextmanager
 
 try:
@@ -7,33 +6,36 @@ except ImportError:
     unwrap_model = None
 
 
-logger = logging.getLogger(__name__)
+def patch_hf_config_for_megatron_bridge(hf_config):
+    configs = []
+    seen_config_ids = set()
+
+    def add_config(config):
+        if config is None or id(config) in seen_config_ids:
+            return
+        seen_config_ids.add(id(config))
+        configs.append(config)
+
+    add_config(hf_config)
+    add_config(getattr(hf_config, "config", None))
+
+    for config in list(configs):
+        add_config(getattr(config, "text_config", None))
+
+    for config in configs:
+        rope_params = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None)
+        if isinstance(rope_params, dict) and "rope_theta" in rope_params and not hasattr(config, "rope_theta"):
+            config.rope_theta = rope_params["rope_theta"]
+
+    return hf_config
 
 
-def get_auto_bridge():
-    try:
-        from megatron.bridge import AutoBridge
-    except ModuleNotFoundError as exc:
-        if exc.name != "megatron.bridge":
-            raise
-        from mbridge import AutoBridge
+def patch_auto_bridge_hf_config(bridge):
+    hf_pretrained = getattr(bridge, "hf_pretrained", None)
+    if hf_pretrained is not None:
+        patch_hf_config_for_megatron_bridge(hf_pretrained)
 
-        logger.warning("megatron.bridge is unavailable; falling back to mbridge.AutoBridge")
-        return AutoBridge
-
-    try:
-        import slime_plugins.megatron_bridge  # noqa: F401
-    except ModuleNotFoundError as exc:
-        logger.warning("Skipping slime custom megatron bridge registration: %s", exc)
-
-    return AutoBridge
-
-
-def load_auto_bridge_from_hf(path, **kwargs):
-    auto_bridge = get_auto_bridge()
-    if hasattr(auto_bridge, "from_hf_pretrained"):
-        return auto_bridge.from_hf_pretrained(path, **kwargs)
-    return auto_bridge.from_pretrained(path, **kwargs)
+    return bridge
 
 
 @contextmanager

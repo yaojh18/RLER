@@ -49,6 +49,7 @@ def _parse_lanes_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
                         "intra-group diversity. Default 1.0.")
     p.add_argument("--lanes-lane-b-top-p", type=float, default=0.95)
     p.add_argument("--lanes-fallback-patch-penalty", type=float, default=0.5)
+    p.add_argument("--lanes-reward-kind", choices=("soft", "delta"), default="soft")
     p.add_argument("--lanes-rubric-model", default="")
     p.add_argument("--lanes-judge-model", default="")
     p.add_argument("--lanes-disable-rubric", action="store_true",
@@ -94,6 +95,7 @@ def _export_lanes_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_LANES_LANE_B_TEMPERATURE"] = str(ns.lanes_lane_b_temperature)
     os.environ["SWE_AGENT_LANES_LANE_B_TOP_P"] = str(ns.lanes_lane_b_top_p)
     os.environ["SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY"] = str(ns.lanes_fallback_patch_penalty)
+    os.environ["SWE_AGENT_LANES_REWARD_KIND"] = ns.lanes_reward_kind
     if ns.lanes_rubric_model:
         os.environ["SWE_AGENT_LANES_RUBRIC_MODEL"] = ns.lanes_rubric_model
     if ns.lanes_judge_model:

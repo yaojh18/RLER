@@ -1,10 +1,10 @@
 import os
+import tempfile
 
 import slime.utils.external_utils.command_utils as U
 
 
 ENABLE_EVAL = bool(int(os.environ.get("SLIME_TEST_ENABLE_EVAL", "1")))
-TIGHT_HOST_MEMORY = bool(int(os.environ.get("SLIME_TEST_TIGHT_HOST_MEMORY", "1")))
 
 MODEL_NAME = "Qwen3-4B"
 MODEL_TYPE = "qwen3-4B"
@@ -21,6 +21,22 @@ def prepare():
 
 
 def execute():
+    megatron_config = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    megatron_config.write(
+        """
+megatron:
+  - name: default
+    role: critic
+    overrides:
+      lr: 1e-5
+  - name: default
+    role: actor
+    overrides:
+      lr: 1e-6
+"""
+    )
+    megatron_config.close()
+
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 
     rollout_args = (
@@ -30,12 +46,12 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 3 "
-        "--rollout-batch-size 8 "
-        "--n-samples-per-prompt 8 "
+        "--num-rollout 2 "
+        "--rollout-batch-size 4 "
+        "--n-samples-per-prompt 4 "
         "--rollout-max-response-len 8192 "
         "--rollout-temperature 0.8 "
-        "--global-batch-size 32 "
+        "--global-batch-size 16 "
         "--balance-data "
     )
 
@@ -56,20 +72,19 @@ def execute():
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
         "--use-dynamic-batch-size "
-        f"--max-tokens-per-gpu {2048 if TIGHT_HOST_MEMORY else 16384} "
+        "--max-tokens-per-gpu 16384 "
     )
 
     ppo_args = (
         "--advantage-estimator ppo "
-        f"{'' if TIGHT_HOST_MEMORY else '--use-kl-loss '}"
+        "--use-kl-loss "
         "--kl-loss-coef 0.00 "
         "--kl-loss-type k1 "
         "--kl-coef 0.00 "
         "--entropy-coef 0.00 "
         "--eps-clip 4e-4 "
-        "--critic-train-only "
+        "--num-critic-only-steps 2 "
         "--normalize-advantages "
-        "--critic-lr 1e-5 "
     )
 
     optimizer_args = (
@@ -83,8 +98,9 @@ def execute():
 
     sglang_args = (
         "--rollout-num-gpus-per-engine 2 "
-        "--rollout-num-gpus 4 "
+        "--rollout-num-gpus 8 "
         "--sglang-mem-fraction-static 0.8 "
+        "--sglang-cuda-graph-max-bs 16 "
         "--sglang-max-running-requests 512 "
         "--sglang-enable-metrics "
     )
@@ -100,13 +116,13 @@ def execute():
         "--attention-softmax-in-fp32 "
         # need to comment this when using model with MLA
         "--attention-backend flash "
-        "--actor-num-nodes 0 "
-        "--actor-num-gpus-per-node 0 "
-        "--critic-num-nodes 1 "
-        "--critic-num-gpus-per-node 4 "
+        "--actor-num-nodes 1 "
+        "--actor-num-gpus-per-node 8 "
+        "--colocate "
     )
 
     train_args = (
+        f"--megatron-config-path {megatron_config.name} "
         f"{ckpt_args} "
         f"{rollout_args} "
         f"{optimizer_args} "

@@ -128,10 +128,16 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
 
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
+    from megatron.bridge import AutoBridge
+
+    import slime_plugins.megatron_bridge  # noqa: F401
+
     logger.info(f"Load checkpoint from HuggingFace model into Megatron (path={load_path})")
 
     with megatron_bridge_utils.patch_megatron_model(ddp_model):
-        bridge = megatron_bridge_utils.load_auto_bridge_from_hf(load_path, trust_remote_code=True)
+        bridge = megatron_bridge_utils.patch_auto_bridge_hf_config(
+            AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True)
+        )
         bridge.load_hf_weights(ddp_model)
 
     # Copied from Megatron-core :: load_checkpoint (with simplifications)

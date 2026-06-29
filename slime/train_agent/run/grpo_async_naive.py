@@ -44,6 +44,7 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--naive-no-action-patch-penalty", type=float, default=0.0,
                    help="Multiplier applied when rollout emitted zero env actions. "
                         "0.0 = hard zero reward (default), 1.0 = no penalty.")
+    p.add_argument("--naive-reward-kind", choices=("soft", "delta"), default="delta")
     return p.parse_known_args(argv)
 
 
@@ -74,6 +75,7 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_NAIVE_POLICY_TOP_P"] = str(ns.naive_policy_top_p)
     os.environ["SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY"] = str(ns.naive_fallback_patch_penalty)
     os.environ["SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY"] = str(ns.naive_no_action_patch_penalty)
+    os.environ["SWE_AGENT_NAIVE_REWARD_KIND"] = ns.naive_reward_kind
 
 
 def main(argv: list[str] | None = None) -> int:

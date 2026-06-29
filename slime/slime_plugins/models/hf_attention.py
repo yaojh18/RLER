@@ -74,14 +74,8 @@ class HuggingfaceAttention(MegatronModule, ABC):
         layer_number: int,
         cp_comm_type: str = "p2p",
         pg_collection=None,
-        submodules=None,
-        attn_mask_type=None,
-        attention_type: str | None = None,
-        model_comm_pgs=None,
-        **kwargs,
     ):
         super().__init__(config=config)
-        del pg_collection, submodules, attn_mask_type, attention_type, model_comm_pgs, kwargs
         self.args = args
         self.config = config
         # Note that megatron layer_number starts at 1

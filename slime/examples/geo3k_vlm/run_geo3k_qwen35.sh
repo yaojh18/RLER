@@ -44,7 +44,7 @@ pkill -9 redis
 
 set -ex
 
-export PYTHONBUFFERED=16
+export PYTHONUNBUFFERED=1
 
 # Detect NVLink
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
@@ -167,8 +167,6 @@ BACKEND_ARGS=(
    --attention-softmax-in-fp32
    --attention-backend flash
 
-   # Packing is not supported for GDN currently
-   --qkv-format bshd
    --micro-batch-size 1
 )
 

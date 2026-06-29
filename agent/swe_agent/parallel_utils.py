@@ -29,6 +29,44 @@ MAX_RUBRICS = 6
 MAX_RUBRIC_GENERATION_ROUNDS = 10
 
 
+@dataclass
+class TurnTokenInfo:
+    turn_index: int
+    role: str
+    prompt_tokens: int
+    completion_tokens: int
+    output_token_ids: list[int]
+    output_logprobs: list[float]
+
+
+_RAW_ONLY_KEYS = ("prompt_token_ids", "token_ids", "logprobs", "extra", "usage", "content_no_thinking")
+
+
+def _strip_token_fields(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: value for key, value in message.items() if key not in _RAW_ONLY_KEYS} for message in messages]
+
+
+def _stamp_steps(
+    messages: list[dict[str, Any]], *, start_step: int
+) -> tuple[list[dict[str, Any]], int]:
+    stamped: list[dict[str, Any]] = []
+    step = start_step
+    for message in messages:
+        item = dict(message)
+        if item.get("role") == "assistant":
+            step += 1
+        item["step"] = step
+        stamped.append(item)
+    return stamped, step
+
+
+def _ensure_litellm_prefix(model_name: str) -> str:
+    for prefix in ("openai/", "azure/", "anthropic/", "huggingface/", "hosted_vllm/"):
+        if model_name.startswith(prefix):
+            return model_name
+    return "openai/" + model_name
+
+
 def _evaluation_error_payload(error: Any) -> dict[str, Any]:
     return {
         "status": "error",

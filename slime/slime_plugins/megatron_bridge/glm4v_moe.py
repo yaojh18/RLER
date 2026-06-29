@@ -21,7 +21,7 @@ import torch
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping, QKVMapping, ReplicatedMapping
-from megatron.bridge.models.qwen.qwen_provider import Qwen3MoEModelProvider
+from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
@@ -33,10 +33,10 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# THD ↔ BSHD helpers (cf. Qwen3VL bridge)
+# THD ↔ batch-sequence helpers (cf. Qwen3VL bridge)
 # ---------------------------------------------------------------------------
-def _thd_to_bshd(packed: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-    """Unpack THD-format [1, T, ...] to BSHD [bs, max_seq, ...] using cu_seqlens."""
+def _thd_to_batch_seq(packed: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Unpack THD-format [1, T, ...] to [bs, max_seq, ...] using cu_seqlens."""
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seq = seqlens.max().item()
     bs = len(cu_seqlens) - 1
@@ -46,8 +46,8 @@ def _thd_to_bshd(packed: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor
     return out
 
 
-def _bshd_to_thd(unpacked: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
-    """Pack BSHD [bs, max_seq, ...] back to THD [1, T, ...]."""
+def _batch_seq_to_thd(unpacked: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Pack [bs, max_seq, ...] back to THD [1, T, ...]."""
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
     total = cu_seqlens[-1].item()
     out = unpacked.new_zeros(1, total, *unpacked.shape[2:])
@@ -275,7 +275,7 @@ class Glm4vMoeVLModel(MegatronModule):
 
     def _compute_mrope_position_ids(
         self,
-        input_ids_bshd: torch.Tensor,
+        input_ids_batch_seq: torch.Tensor,
         image_grid_thw: torch.Tensor | None,
     ) -> torch.Tensor:
         """Compute 3D M-RoPE position IDs from input_ids in [bs, seq] format.
@@ -283,8 +283,8 @@ class Glm4vMoeVLModel(MegatronModule):
         Image regions are detected by looking for consecutive runs of
         ``image_token_id`` in each sequence — no ``mm_token_type_ids`` needed.
         """
-        bs, seq_len = input_ids_bshd.shape
-        device = input_ids_bshd.device
+        bs, seq_len = input_ids_batch_seq.shape
+        device = input_ids_batch_seq.device
         spatial_merge_size = self.spatial_merge_size
 
         position_ids = torch.zeros(3, bs, seq_len, dtype=torch.long, device=device)
@@ -300,7 +300,7 @@ class Glm4vMoeVLModel(MegatronModule):
         grid_iter = iter(image_grid_thw)
 
         for b in range(bs):
-            ids = input_ids_bshd[b]
+            ids = input_ids_batch_seq[b]
             is_image = ids == self.image_token_id
 
             # Find contiguous groups: text (0) vs image (1)
@@ -430,9 +430,9 @@ class Glm4vMoeVLModel(MegatronModule):
                             full_input_ids = _gather_input_ids_from_cp(input_ids, cu_seqlens)
                     else:
                         full_input_ids = input_ids
-                    input_ids_bshd = _thd_to_bshd(full_input_ids, cu_seqlens)
-                    pos_bshd = self._compute_mrope_position_ids(input_ids_bshd, image_grid_thw)
-                    pos_packed = _bshd_to_thd(pos_bshd.permute(1, 2, 0), cu_seqlens)
+                    input_ids_batch_seq = _thd_to_batch_seq(full_input_ids, cu_seqlens)
+                    pos_batch_seq = self._compute_mrope_position_ids(input_ids_batch_seq, image_grid_thw)
+                    pos_packed = _batch_seq_to_thd(pos_batch_seq.permute(1, 2, 0), cu_seqlens)
                     position_ids = pos_packed.permute(2, 0, 1).contiguous()  # [3, 1, T_global]
                 else:
                     position_ids = self._compute_mrope_position_ids(input_ids, image_grid_thw)
@@ -475,10 +475,10 @@ class Glm4vMoeVLModel(MegatronModule):
 # Model Provider (dataclass that doubles as TransformerConfig)
 # ---------------------------------------------------------------------------
 @dataclass
-class Glm4vMoeVLModelProvider(Qwen3MoEModelProvider):
+class Glm4vMoeVLModelProvider(GPTModelProvider):
     """Provider that creates Glm4vMoeVLModel.
 
-    Inherits from Qwen3MoEModelProvider to reuse MoE + TransformerConfig infra.
+    Inherits from GPTModelProvider to reuse MoE + TransformerConfig infra.
     Defined at module level (not inside a function) so that the class is
     picklable -- megatron-bridge broadcasts config objects across PP ranks
     via ``torch.distributed.broadcast_object_list`` which requires pickling.
@@ -579,7 +579,11 @@ class Glm4vMoeBridge(MegatronModelBridge):
             kv_channels=getattr(text_config, "head_dim", 128),
             init_method_std=text_config.initializer_range,
             layernorm_epsilon=text_config.rms_norm_eps,
+            normalization="RMSNorm",
             gated_linear_unit=True,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            autocast_dtype=model_dtype,
             make_vocab_size_divisible_by=self.make_vocab_size_divisible_by(text_config.vocab_size),
             rotary_base=rotary_base,
             rotary_percent=partial_rotary_factor,
@@ -596,6 +600,8 @@ class Glm4vMoeBridge(MegatronModelBridge):
             moe_shared_expert_intermediate_size=shared_expert_intermediate,
             moe_layer_freq=moe_layer_freq_list,
             moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_permute_fusion=True,
             moe_router_load_balancing_type="seq_aux_loss",
             moe_aux_loss_coeff=0,
             moe_router_score_function="sigmoid",

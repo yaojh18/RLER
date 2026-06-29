@@ -29,7 +29,7 @@ Initialize the Qwen3-4B-Instruct-2507 model needed for tool use:
 
 ```bash
 # hf checkpoint
-huggingface-cli download Qwen/Qwen3-4B-Instruct-2507 --local-dir /root/Qwen3-4B-Instruct-2507
+hf download Qwen/Qwen3-4B-Instruct-2507 --local-dir /root/Qwen3-4B-Instruct-2507
 
 # mcore checkpoint
 cd /root/slime
@@ -47,7 +47,7 @@ You need to configure your litellm API in `generate_with_tau.py` for user simula
 ```python
 TAU_CONFIGS = {
     "env": "retail",  # Select between ["retail", "airline"]
-    "agent": "tool-calling",  # Select between ["tool-calling", "act", "react", "few-shot"], only tool-calling implemented for now
+    "agent_strategy": "tool-calling",  # Select between ["tool-calling", "act", "react", "few-shot"], only tool-calling implemented for now
     "user_model": "gemini-2.0-flash-lite",  # Cheap Model for user simulator
     "user_model_provider": "gemini",
     "task_split": "train",  # Select between ["train", "test", "dev"] for retail, ["test"] for airline

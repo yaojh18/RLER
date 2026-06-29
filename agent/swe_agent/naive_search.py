@@ -8,7 +8,7 @@ harness, and contributes one ExportSample to a single ExportGroup.
 This module is intentionally parallel to (not coupled with)
 ``trajectory_search_parallel``: it imports a few stateless helpers from
 ``trajectory_search`` / ``parallel_utils`` (for terminal patch extraction,
-GT eval, workspace meta, step-card serialization, token-info extraction)
+GT eval, step-card serialization, token-info extraction)
 but does NOT import the lanes runner. Editing the lanes runner does not
 affect this file and vice-versa.
 
@@ -28,7 +28,6 @@ import contextvars
 import copy
 import json
 import logging
-import subprocess
 import time
 import traceback
 import uuid
@@ -43,12 +42,14 @@ from swe_agent.backend import SWEAgentRolloutBackend
 from swe_agent.parallel_utils import (
     TurnTokenInfo,
     _ensure_litellm_prefix,
-    _stamp_steps,
-    _strip_token_fields,
+    extract_terminal_patch_from_session,
 )
-from swe_agent.prompt import EMPTY_WORKSPACE_META
-from swe_agent.run.run_swe_agent import evaluate_swebench_instance_patches
-from swe_agent.trajectory_search import _build_step_cards, _collect_workspace_meta
+from swe_agent.run.run_swe_agent import (
+    build_messages,
+    evaluate_swebench_instance_patches,
+    make_evaluation_payload,
+)
+from swe_agent.trajectory_search import _build_step_cards
 
 
 logger = logging.getLogger("swe_agent.naive_search")
@@ -99,12 +100,8 @@ class NaiveRollout:
 
     rollout_index: int  # 0..m-1
     node_id: str
-    snapshot_after: dict[str, Any] | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
     step_cards: list[dict[str, Any]] = field(default_factory=list)
-    workspace_meta: dict[str, Any] = field(
-        default_factory=lambda: copy.deepcopy(EMPTY_WORKSPACE_META)
-    )
     turns: list[TurnTokenInfo] = field(default_factory=list)
     total_tokens: dict[str, int] = field(default_factory=dict)
     status: str = ""
@@ -116,6 +113,7 @@ class NaiveRollout:
     error: str | None = None
     gt_score: float | None = None
     gt_payload: dict[str, Any] | None = None
+    evaluation_payload: dict[str, Any] | None = None
     started_at: float = 0.0
     finished_at: float = 0.0
 
@@ -182,14 +180,13 @@ class NaiveSearchRunner:
 
         self.task = instance["problem_statement"]
         self.task_id = instance["instance_id"]
-        self.run_id = f"{self.task_id}-{time.strftime('%Y%m%d-%H%M%S')}"
+        self.run_timestamp = time.strftime("%Y%m%d-%H%M%S")
         self.base_image = str(self.backend.environment_config.get("image", ""))
         self.docker_executable = str(
             self.backend.environment_config.get("executable", "docker")
         )
 
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "rollouts").mkdir(parents=True, exist_ok=True)
         self._live_sessions: list[Any] = []
 
     # -- session plumbing ----------------------------------------------------
@@ -283,25 +280,6 @@ class NaiveSearchRunner:
             )
         return result
 
-    def _extract_terminal_patch(
-        self, result: dict[str, Any], session: Any
-    ) -> tuple[str, bool]:
-        def _normalize(p: str) -> str:
-            p = p.rstrip()
-            return p + "\n" if p else ""
-
-        patch = _normalize(result.get("submission") or "")
-        if patch:
-            return patch, False
-        try:
-            diff = session.agent.env.execute(
-                {"command": "git add -N . >/dev/null 2>&1; git diff"},
-                timeout=30,
-            )
-            return _normalize(diff.get("output") or ""), True
-        except Exception:
-            return "", True
-
     def _cleanup_session(self, session: Any) -> None:
         if session is None:
             return
@@ -326,6 +304,13 @@ class NaiveSearchRunner:
             self._cleanup_session(session)
         self._live_sessions = []
 
+    def _rollout_run_dir(self, rollout_index: int) -> Path:
+        return (
+            self.run_dir
+            / self.task_id
+            / f"{self.run_timestamp}-r{rollout_index:02d}"
+        )
+
     # -- one rollout end-to-end ---------------------------------------------
 
     def _run_one_rollout(self, rollout_index: int) -> NaiveRollout:
@@ -340,24 +325,18 @@ class NaiveSearchRunner:
         session = None
         try:
             session = self._make_session(rollout_index)
-            # Snapshot the empty session so we know how many sys+user
-            # messages exist before any assistant turn runs. Used as the
-            # parent_message_count when slicing assistant turns.
+            # Snapshot the empty session so later token/event extraction only
+            # reads data produced by this rollout.
             try:
                 snap0 = session.snapshot().model_dump(mode="json")
-                base_msg_count = len(
-                    snap0.get("agent", {}).get("state", {}).get("messages", [])
-                )
                 base_turn_count = len(snap0.get("metadata", {}).get("model_turns", []))
                 base_event_count = len(snap0.get("metadata", {}).get("events", []))
             except Exception:
-                base_msg_count = 0
                 base_turn_count = 0
                 base_event_count = 0
 
             result = self._step_session(session, max_steps=self.config.step_limit)
             snapshot_after = session.snapshot().model_dump(mode="json")
-            workspace_meta = _collect_workspace_meta(session.agent.env)
             # The training sample wants the FULL chat (sys+user+all asst+tool)
             # so we keep messages from index 0 — the lane-to-grpo path will
             # treat the sys+user prefix as the masked-out parent.
@@ -367,14 +346,12 @@ class NaiveSearchRunner:
             segment_events = copy.deepcopy(
                 snapshot_after.get("metadata", {}).get("events", [])[base_event_count:]
             )
-            rollout.snapshot_after = snapshot_after
             rollout.messages = all_messages
             rollout.step_cards = _build_step_cards(segment_events, 0)
             rollout.n_action_steps = sum(
                 1 for c in rollout.step_cards if c.get("commands")
             )
             rollout.terminal_no_action_emitted = (rollout.n_action_steps == 0)
-            rollout.workspace_meta = workspace_meta
             rollout.turns = self._extract_turn_token_info(snapshot_after, base_turn_count)
             rollout.total_tokens = {
                 "prompt": sum(t.prompt_tokens for t in rollout.turns),
@@ -383,9 +360,8 @@ class NaiveSearchRunner:
             rollout.status = result.get("status", "")
             rollout.terminated_early = result.get("exit_status") == "Submitted"
             rollout.terminal_patch, rollout.terminal_patch_from_fallback = (
-                self._extract_terminal_patch(result, session)
+                extract_terminal_patch_from_session(result, session)
             )
-            rollout._base_msg_count = base_msg_count  # type: ignore[attr-defined]
             logger.info(
                 "[%s] naive r=%d done dt=%.1fs steps=%d submitted=%s status=%s "
                 "patch_len=%d tokens_p=%d tokens_c=%d",
@@ -419,24 +395,35 @@ class NaiveSearchRunner:
         patch = (raw + "\n") if raw else ""
         if not patch:
             rollout.gt_score = 0.0
-            rollout.gt_payload = {"reward": 0.0, "note": "empty_patch"}
+            rollout.evaluation_payload = make_evaluation_payload("empty")
+            rollout.gt_payload = {
+                **rollout.evaluation_payload,
+                "raw_reward": 0.0,
+                "base_score": 0.0,
+                "delta_reward": 0.0,
+                "reward_kind": (self.config.reward_kind or "delta").lower(),
+                "note": "empty_patch",
+            }
             logger.info(
                 "[%s] gt_done node=%s dt=0.0s reward=0.0 note=empty_patch",
                 self.task_id, rollout.node_id,
             )
             return
         try:
+            rollout_run_dir = self._rollout_run_dir(rollout.rollout_index)
+            eval_key = str(rollout_run_dir)
             payload = evaluate_swebench_instance_patches(
                 instance=self.instance,
-                patches_by_key={rollout.node_id: patch},
+                patches_by_key={eval_key: patch},
                 model_name=self.policy_model_name,
                 max_workers=1,
                 namespace=self.harness_namespace,
-                work_dir=self.run_dir / "rollouts",
+                work_dir=rollout_run_dir,
             )
-            rollout_payload = (
-                payload.get(rollout.node_id, {}) if isinstance(payload, dict) else {}
-            )
+            if not isinstance(payload, dict) or eval_key not in payload:
+                raise RuntimeError(f"missing evaluation payload for {eval_key}")
+            rollout_payload = payload[eval_key]
+            rollout.evaluation_payload = copy.deepcopy(rollout_payload)
             raw_reward = float(rollout_payload.get("reward", 0.0))
             # base_score = soft score on the unmodified repo: all p2p pass,
             # all f2p fail -> p2p_total / (p2p_total + f2p_total). Subtracting
@@ -480,7 +467,8 @@ class NaiveSearchRunner:
                 rollout.gt_score if rollout.gt_score is not None else -1.0,
             )
         except Exception as exc:
-            rollout.gt_payload = {"error": f"{type(exc).__name__}: {exc}"}
+            rollout.evaluation_payload = make_evaluation_payload("error", error=exc)
+            rollout.gt_payload = copy.deepcopy(rollout.evaluation_payload)
             rollout.gt_score = None
             logger.warning(
                 "[%s] gt_FAILED node=%s dt=%.1fs %s",
@@ -495,9 +483,6 @@ class NaiveSearchRunner:
             run_dir=str(self.run_dir),
             task_id=self.task_id,
             config=asdict(self.config),
-        )
-        (self.run_dir / "config.json").write_text(
-            json.dumps(asdict(self.config), indent=2)
         )
         started = time.perf_counter()
         cfg = self.config
@@ -539,6 +524,9 @@ class NaiveSearchRunner:
                         error=f"executor: {type(item).__name__}: {item}",
                         status="error",
                     )
+                    err_rollout.evaluation_payload = make_evaluation_payload(
+                        "error", error=err_rollout.error,
+                    )
                     rollouts.append(err_rollout)
                 else:
                     rollouts.append(item)
@@ -550,6 +538,10 @@ class NaiveSearchRunner:
                 if r.error is not None:
                     r.gt_score = 0.0
                     r.gt_payload = {"reward": 0.0, "note": "rollout_error"}
+                    if r.evaluation_payload is None:
+                        r.evaluation_payload = make_evaluation_payload(
+                            "error", error=r.error,
+                        )
                     continue
                 ctx = contextvars.copy_context()
                 gt_futures.append(
@@ -580,69 +572,49 @@ class NaiveSearchRunner:
     # -- persistence ---------------------------------------------------------
 
     def _dump_record(self, record: NaiveRecord) -> None:
-        """Persist per-rollout artifacts + a top-level instance_record.json."""
+        """Persist each rollout in the same file shape as run_swe_agent."""
         for r in record.rollouts:
-            rdir = self.run_dir / "rollouts" / f"rollout_{r.rollout_index:02d}"
+            rdir = self._rollout_run_dir(r.rollout_index)
             rdir.mkdir(parents=True, exist_ok=True)
-            stamped, _ = _stamp_steps(r.messages, start_step=0)
             (rdir / "messages.json").write_text(
-                json.dumps(_strip_token_fields(stamped), indent=2, default=str)
-            )
-            (rdir / "messages_raw.json").write_text(
-                json.dumps(stamped, indent=2, default=str)
-            )
-            (rdir / "terminal_patch.txt").write_text(r.terminal_patch or "")
-            (rdir / "gt.json").write_text(
                 json.dumps(
-                    {"gt_score": r.gt_score, "gt_payload": r.gt_payload},
+                    build_messages(
+                        r.messages,
+                        model_name=self.policy_model_name,
+                        trajectory_format="mini-swe-agent-1.1",
+                    ),
                     indent=2,
                     default=str,
-                )
+                ),
+                encoding="utf-8",
             )
-            (rdir / "summary.json").write_text(
+            (rdir / "model_patch.json").write_text(
                 json.dumps(
                     {
-                        "node_id": r.node_id,
-                        "status": r.status,
-                        "terminated_early": r.terminated_early,
-                        "terminal_patch_from_fallback": r.terminal_patch_from_fallback,
-                        "terminal_no_action_emitted": r.terminal_no_action_emitted,
-                        "n_action_steps": r.n_action_steps,
-                        "terminal_patch_chars": len(r.terminal_patch or ""),
-                        "error": r.error,
-                        "n_messages": len(r.messages),
-                        "n_step_cards": len(r.step_cards),
-                        "total_tokens": r.total_tokens,
-                        "started_at": r.started_at,
-                        "finished_at": r.finished_at,
+                        self.task_id: {
+                            "model_name_or_path": self.policy_model_name,
+                            "instance_id": self.task_id,
+                            "model_patch": r.terminal_patch or "",
+                        }
                     },
                     indent=2,
                     default=str,
-                )
+                ),
+                encoding="utf-8",
             )
-        (self.run_dir / "instance_record.json").write_text(
-            json.dumps(
-                {
-                    "instance_id": record.instance_id,
-                    "run_dir": record.run_dir,
-                    "config": record.config,
-                    "completed": record.completed,
-                    "error": record.error,
-                    "seconds": record.seconds,
-                    "n_rollouts": len(record.rollouts),
-                    "rollouts": [
-                        {
-                            "rollout_index": r.rollout_index,
-                            "node_id": r.node_id,
-                            "status": r.status,
-                            "gt_score": r.gt_score,
-                            "n_step_cards": len(r.step_cards),
-                            "terminated_early": r.terminated_early,
-                        }
-                        for r in record.rollouts
-                    ],
-                },
-                indent=2,
-                default=str,
+            evaluation_payload = r.evaluation_payload
+            if evaluation_payload is None:
+                if r.error:
+                    evaluation_payload = make_evaluation_payload("error", error=r.error)
+                elif not (r.terminal_patch or "").strip():
+                    evaluation_payload = make_evaluation_payload("empty")
+                else:
+                    raise RuntimeError(f"missing evaluation payload for rollout {r.node_id}")
+            (rdir / "evaluation.json").write_text(
+                json.dumps(
+                    evaluation_payload,
+                    indent=2,
+                    default=str,
+                ),
+                encoding="utf-8",
             )
-        )

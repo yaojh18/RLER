@@ -14,9 +14,9 @@ py_version = 310  # python 3.10 as a target version
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 default_section = "THIRDPARTY"
 extend_skip = ["setup.py", "docs/source/conf.py"]
-known_first_party = ["slime", "slime_plugins", "train_agent"]
+known_first_party = ["slime", "slime_plugins"]
 known_third_party = ["megatron", "wandb", "ray", "transformers"]
-src_paths = ["slime", "slime_plugins", "train_agent"]
+src_paths = ["slime", "slime_plugins"]
 
 
 [tool.black]
@@ -24,6 +24,8 @@ line_length = 119
 
 [tool.ruff]
 line-length = 320  # TODO
+
+[tool.ruff.lint]
 select = [
     "E",      # Pycodestyle Errors (Structural/Fundamental Errors like bad indentation)
     "F",      # Pyflakes (Core Errors: Unused imports, undefined names)

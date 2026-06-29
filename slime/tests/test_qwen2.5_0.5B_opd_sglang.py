@@ -5,8 +5,6 @@ import urllib.request
 
 import slime.utils.external_utils.command_utils as U
 
-TIGHT_DEVICE_MEMORY = U.get_bool_env_var("SLIME_TEST_TIGHT_DEVICE_MEMORY", "1")
-
 MODEL_NAME = "Qwen2.5-0.5B-Instruct"
 MODEL_TYPE = "qwen2.5-0.5B"
 NUM_GPUS = 8
@@ -18,7 +16,7 @@ TEACHER_PORT = 13141
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
 
 
@@ -100,11 +98,11 @@ def execute():
             "--rollout-shuffle "
             "--rm-type math "
             "--num-rollout 2 "
-            "--rollout-batch-size 8 "
+            "--rollout-batch-size 4 "
             "--n-samples-per-prompt 4 "
             "--rollout-max-response-len 1024 "
             "--rollout-temperature 0.8 "
-            "--global-batch-size 32 "
+            "--global-batch-size 16 "
         )
 
         eval_args = (
@@ -156,8 +154,8 @@ def execute():
 
         sglang_args = (
             "--rollout-num-gpus-per-engine 1 "
-            f"--sglang-mem-fraction-static {0.6 if TIGHT_DEVICE_MEMORY else 0.7} "
-            "--sglang-cuda-graph-max-bs 32 "
+            "--sglang-mem-fraction-static 0.7 "
+            "--sglang-cuda-graph-max-bs 16 "
             "--sglang-enable-metrics "
         )
 

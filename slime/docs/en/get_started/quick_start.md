@@ -39,7 +39,7 @@ docker run --rm --gpus all --ipc=host --shm-size=16g \
 
 ### Install slime
 
-slime is already installed in the docker image. To update to the latest verison, please execute the following command:
+slime is already installed in the docker image. To update to the latest version, please execute the following command:
 
 ```bash
 # Path can be adjusted according to actual situation
@@ -71,7 +71,7 @@ hf download --repo-type dataset zhuzilin/aime-2024 \
 
 When using Megatron as the training backend, you need to first convert Hugging Face format model weights to Megatron `torch_dist` format.
 
-First, load the configuration file of the target model. The `slime/scripts/models` directory contains configuration files for supported models. You need to `source` the corresponding model script to load the configuration parameters into the current environment. Here we use GLM4-9B model as an example, and it's similar for Qwen3-4B, GLM-4.7-Flash, Qwen3-30B-A3B, etc.
+First, load the configuration file of the target model. The `slime/scripts/models` directory contains configuration files for supported models. You need to `source` the corresponding model script to load the configuration parameters into the current environment. Here we use GLM4-9B model as an example, and it's similar for Qwen3-4B, Qwen3.5, Qwen3.6, GLM-4.7-Flash, Qwen3-30B-A3B, etc.
 
 ```bash
 cd /root/slime
@@ -306,7 +306,7 @@ SGLANG_ARGS=(
 
 ### Colocated Actor and Rollout
 
-Under the default configuration, training (Actor) and inference (Rollout) resources are specified separately. Ray allocates `actor_num_nodes * actor_num_gpus_per_node` GPUs to the training part and `rollout_num_gpus` GPUs to inference, that is, training and inference are separated.
+Under the default configuration, training (Actor) and inference (Rollout) resources are specified separately. Ray allocates `actor_num_nodes * actor_num_gpus_per_node` GPUs to the training part and `rollout_num_gpus` GPUs to inference, that is, training and inference are separated. When `--rollout-num-gpus` is explicitly set to `0`, slime still parses SGLang arguments and launches the router, but does not launch local SGLang servers.
 
 **Standard (Disaggregated) Configuration**:
 ```bash
@@ -320,7 +320,7 @@ ray job submit ... \
 In the above configuration, Actor uses 4 cards, and Rollout also uses 4 cards, running in parallel.
 
 **Training-Inference Integration (Colocated) Configuration**:
-To deploy training and inference on the same group of GPUs, please add the `--colocate` parameter. After enabling, `--rollout-num-gpus` will be ignored to make the number of cards for training and inference equal.
+To deploy training and inference on the same group of GPUs, please add the `--colocate` parameter. By default, this makes the number of cards for training and inference equal. You can explicitly set a different positive `--rollout-num-gpus`, for example to use more rollout GPUs than actor GPUs; the extra GPUs are used as rollout-only resources. If `--rollout-num-gpus 0` is set explicitly, slime launches only the router and no local SGLang servers.
 
 ```bash
 ray job submit ... \
@@ -407,6 +407,12 @@ And replace `--hf-checkpoint` with:
 ```
 
 This will trigger fp8 inference. Currently, we will directly cast bf16 weights to fp8, and we will gradually add quantization schemes with less impact on accuracy in the future.
+
+For long-context rollout, you can also enable FP8 KV cache in SGLang to increase effective KV cache capacity:
+
+```bash
+--sglang-kv-cache-dtype fp8_e4m3
+```
 
 ⚠️ The training megatron checkpoint still needs to be the one converted from bf16 huggingface at the beginning.
 
@@ -581,6 +587,7 @@ export NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME=$(ip -o -4 addr show | awk '$4 ~ /^10\.
 slime has been deeply optimized for distributed training of large-scale Mixture of Experts (MoE) models. We provide some end-to-end training cases for reference:
 
 - [Example: 8xH100 Training GLM-4.7-Flash](../examples/glm4.7-30B-A3B.md)
+- [Example: 32xH100 Training GLM-5.2](../examples/glm5.2-744B-A40B.md)
 - [Example: 64xH100 Training GLM-4.7](../examples/glm4.7-355B-A32B.md)
 - [Example: 128xH100 Training DeepSeek-R1](../examples/deepseek-r1.md)
-- The scripts such as `scripts/run_qwen3_30b_a3b.py`, `scripts/run_glm45_355b_a32b.py` also support multi-node training, though there are little documentations about it currently.
+- Scripts such as `scripts/run_qwen3_30b_a3b.py` and `scripts/run_glm45_355b_a32b.py` also support multi-node training. Their documentation is still being expanded.

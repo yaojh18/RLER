@@ -13,7 +13,7 @@ pkill -9 python
 set -ex
 
 # will prevent ray from buffering stdout/stderr
-export PYTHONBUFFERED=16
+export PYTHONUNBUFFERED=1
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
@@ -177,6 +177,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "MASTER_ADDR": "${MASTER_ADDR}",
     "PYTHONPATH": "/root/Megatron-LM/",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "NVSHMEM_DISABLE_NCCL": "1",
     "NCCL_NVLS_ENABLE": "${HAS_NVLINK}"
   }
 }

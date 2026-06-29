@@ -316,7 +316,7 @@ if [ "$NODE" = "$HEAD_NODE" ]; then
       --context-parallel-size $CONTEXT_PARALLEL_SIZE \
       --tensor-model-parallel-size $TENSOR_MODEL_PARALLEL_SIZE \
       --max-tokens-per-gpu $MAX_TOKENS_PER_GPU \
-      --sglang-context-length $SGLANG_CONTEXT_LENGTH \
+      --rollout-max-context-len $SGLANG_CONTEXT_LENGTH \
       --ray-external \
       --lanes-instance-workers $LANES_INSTANCE_WORKERS \
       --lanes-m $LANES_M \

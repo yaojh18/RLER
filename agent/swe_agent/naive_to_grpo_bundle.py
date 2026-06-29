@@ -10,9 +10,9 @@ siblings in the group (encoded implicitly via the same loss-mask scheme).
 The token-level prefix invariant + per-turn loss-mask placement is COPIED
 verbatim from lane_to_grpo_bundle._build_branch_sample. The only logical
 difference is that we don't pull "parent_messages" from a MidCp snapshot
-— there is no MidCp. We slice messages[base_msg_count:] off the rollout
-to identify the assistant turns; sys+user messages stay in the prompt
-field but are not loss-trainable (mask=0 on those positions).
+— there is no MidCp. We split at the first assistant message; sys+user
+messages stay in the prompt field but are not loss-trainable (mask=0 on
+those positions).
 """
 
 from __future__ import annotations

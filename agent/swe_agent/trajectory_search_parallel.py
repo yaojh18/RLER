@@ -4,13 +4,13 @@ Flat Lane A / Lane B / Lane C scheme, three concurrent lanes per instance:
 
 * Lane A (spine, NOT trained)
     A single agent runs the problem linearly to terminal/submit. Never blocks.
-    Every `k` assistant turns: `docker commit` the container,
+    Every `k` assistant turns: checkpoint the container filesystem,
     emit a MidCp = {idx, image_tag, snapshot, asst_step}. Purely a fork-point
     provider — its trajectory is NOT included in any training group.
 
 * Lane B (M policy forks + one deterministic parent baseline per mid_cp)
-    For each mid_cp Lane A emits, fork M policy agents from that docker
-    snapshot plus one judge-parameter parent baseline branch used only for
+    For each mid_cp Lane A emits, fork M policy agents from that checkpoint
+    plus one judge-parameter parent baseline branch used only for
     parent-child rubric labels. Each policy branch runs independently to
     termination/limit and may switch generation parameters after the first
     budget window. The baseline branch is not exported as a policy sample.
@@ -36,7 +36,9 @@ import contextvars
 import copy
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 import traceback
 import uuid
@@ -53,15 +55,14 @@ from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
 # judge, and persistent-state implementations so the parallel path stays
 # aligned with the non-parallel search semantics.
 from swe_agent.parallel_utils import (
+    TurnTokenInfo,
     _rubric_turn_rewards,
-    _build_rubric_prompt,
     _ensure_litellm_prefix,
     _stamp_steps,
     _atomic_write_json,
     extract_terminal_patch_from_session,
     progress_reward,
     gap_corr,
-    TurnTokenInfo,
 )
 from swe_agent.prompt import (
     EMPTY_PERSISTENT_STATE,
@@ -202,6 +203,8 @@ class ParallelSearchConfig:
 
     keep_images: bool = False
     return_logprobs: bool = True
+    reward_kind: str = "soft"
+    disable_rubric: bool = False
     # Same recipe as v0: multiplicative penalty when the agent never invoked
     # the formal submit command and we fell back to `git diff` of the
     # working copy.
@@ -226,14 +229,17 @@ class ParallelSearchConfig:
             raise ValueError("trajectory_search_parallel requires lane_a_pool_size > 0.")
         if self.lane_b_pool_size is not None and self.lane_b_pool_size <= 0:
             raise ValueError("trajectory_search_parallel requires lane_b_pool_size > 0 when set.")
+        if self.reward_kind not in {"soft", "delta"}:
+            raise ValueError("trajectory_search_parallel reward_kind must be 'soft' or 'delta'.")
 
 
 @dataclass
 class MidCp:
     """Snapshot Lane A emits every `k` assistant turns.
 
-    Used as the fork point for `m` Lane B branches. The docker image_tag
-    captures the container filesystem state; the snapshot dict is runtime-only
+    Used as the fork point for `m` Lane B branches. The image_tag field stores
+    either a Docker image tag or a Singularity sandbox path that captures the
+    container filesystem state; the snapshot dict is runtime-only
     resume state for Lane B and intentionally omits parent events/model_turns.
     """
 
@@ -299,11 +305,9 @@ class ForkGroup:
     mid_cp: MidCp
     branches: list[LaneBBranch] = field(default_factory=list)
     parent_branch: LaneBBranch | None = None
-    rubric_prompt: str = ""
     rubric_model_response: dict[str, Any] = field(default_factory=dict)
     rubric_samples: list[dict[str, Any]] = field(default_factory=list)
     judge_response: dict[str, Any] = field(default_factory=dict)
-    pc_rubric_prompt: str = ""
     pc_rubric_model_response: dict[str, Any] = field(default_factory=dict)
     pc_rubric_samples: list[dict[str, Any]] = field(default_factory=list)
     pc_judge_response: dict[str, Any] = field(default_factory=dict)
@@ -760,6 +764,7 @@ class TrajectorySearchParallelRunner:
         policy_base_url: str,
         rubric_base_url: str,
         api_key: str = "EMPTY",
+        policy_base_urls: list[str] | None = None,
         score_banks: dict[str, ScoreRubricBank] | None = None,
         experience_banks: dict[str, ExperienceRubricBank] | None = None,
     ) -> None:
@@ -772,8 +777,12 @@ class TrajectorySearchParallelRunner:
         self.config = config
         self.harness_namespace = harness_namespace
         self.policy_base_url = policy_base_url.rstrip("/")
+        self.policy_base_urls = [
+            url.rstrip("/") for url in (policy_base_urls or [self.policy_base_url])
+        ]
         self.rubric_base_url = rubric_base_url.rstrip("/")
         self.api_key = api_key
+        self.skip_lane_c = bool(config.disable_rubric)
 
         self.task = instance["problem_statement"]
         self.task_id = instance["instance_id"]
@@ -788,6 +797,7 @@ class TrajectorySearchParallelRunner:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "groups").mkdir(parents=True, exist_ok=True)
         self._created_image_tags: list[str] = []
+        self._created_sandbox_dirs: list[Path] = []
         self._live_sessions: list[Any] = []
         provided_score_banks = score_banks if score_banks is not None else {}
         provided_experience_banks = experience_banks if experience_banks is not None else {}
@@ -1029,7 +1039,7 @@ class TrajectorySearchParallelRunner:
             except Exception:
                 mk = {}
             max_new_tokens = int(mk.get("max_tokens") or mk.get("max_completion_tokens") or 4096)
-            # 80960 = current --sglang-context-length in grpo.sh
+            # 80960 = current --rollout-max-context-len in grpo.sh
             sglang_ctx = int(os.environ.get("SWE_AGENT_LANES_SGLANG_CTX", "80960"))
             need = len(input_ids) + max_new_tokens
             return need > sglang_ctx
@@ -1040,9 +1050,33 @@ class TrajectorySearchParallelRunner:
             )
             return False
 
-    def _commit_container(self, session: Any, tag_kind: str) -> str | None:
-        """`docker commit` the session's container to a fresh image tag.
-        Returns the new image tag, or None if the container is gone."""
+    def _copy_singularity_sandbox(self, source: Path, tag_kind: str) -> Path:
+        if not source.exists():
+            raise FileNotFoundError(f"Singularity sandbox does not exist: {source}")
+        safe_task_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in self.task_id)[:80]
+        dst = Path(tempfile.gettempdir()) / f"swe-agent-{safe_task_id}-{tag_kind}-{uuid.uuid4().hex[:6]}"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.mkdir(parents=True, exist_ok=False)
+        try:
+            subprocess.run(
+                ["cp", "-a", "--reflink=auto", f"{source}/.", str(dst)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise
+        self._created_sandbox_dirs.append(dst)
+        return dst
+
+    def _checkpoint_environment(self, session: Any, tag_kind: str) -> str | None:
+        """Checkpoint the session filesystem for future Lane B forks."""
+        env = session.agent.env
+        sandbox_dir = getattr(env, "sandbox_dir", None)
+        if sandbox_dir is not None:
+            return str(self._copy_singularity_sandbox(Path(sandbox_dir), tag_kind))
+
         container_id = getattr(session.agent.env, "container_id", None) or getattr(
             session.agent.env, "_container_id", None
         )
@@ -1085,6 +1119,14 @@ class TrajectorySearchParallelRunner:
         except Exception as exc:
             logger.warning("Failed to delete image %s: %s", image_tag, exc)
 
+    def _delete_checkpoint(self, checkpoint_ref: str) -> None:
+        path = Path(checkpoint_ref)
+        if path.is_absolute():
+            if not self.config.keep_images:
+                shutil.rmtree(path, ignore_errors=True)
+            return
+        self._delete_image(checkpoint_ref)
+
     def _cleanup_all(self) -> None:
         for session in self._live_sessions:
             try:
@@ -1101,6 +1143,10 @@ class TrajectorySearchParallelRunner:
         for tag in list(self._created_image_tags):
             self._delete_image(tag)
         self._created_image_tags = []
+        for sandbox_dir in list(self._created_sandbox_dirs):
+            if not self.config.keep_images:
+                shutil.rmtree(sandbox_dir, ignore_errors=True)
+        self._created_sandbox_dirs = []
 
     # -- Lane B: per-mid_cp forks --------------------------------------------
 
@@ -1136,16 +1182,7 @@ class TrajectorySearchParallelRunner:
         temperature: float,
         top_p: float,
     ) -> Any:
-        """Fork a single Lane B branch from a MidCp. Returns the resumed
-        session pinned to a fresh docker container (instantiated from
-        mid_cp.image_tag) with Lane B sampling temperature.
-
-        Mirrors v0's _fork_branch container-isolation contract:
-        reuse_container_id=None + container_id=None + owns_container=False
-        force DockerEnvironment.__init__ down the _start_container path
-        so each Lane B gets its own container. Without this, all siblings
-        would share Lane A's container and the first cleanup()
-        would kill the rest."""
+        """Fork a single Lane B branch from a MidCp."""
         session_id = f"{node_id}-session"
         resumed = {
             "session_id": session_id,
@@ -1161,19 +1198,31 @@ class TrajectorySearchParallelRunner:
         if mid_cp.snapshot.get("memory") is not None:
             resumed["memory"] = mid_cp.snapshot["memory"]
         resumed["spec"]["session_id"] = session_id
+        lane_b_base_url = self.policy_base_urls[mid_cp.idx % len(self.policy_base_urls)]
         self._override_model_kwargs(
             resumed,
-            self.policy_base_url,
+            lane_b_base_url,
             temperature=temperature,
             top_p=top_p,
         )
         env_section = resumed["environment"]
         env_config = env_section["config"]
         env_state = env_section["state"]
-        env_config["image"] = mid_cp.image_tag
-        env_config["reuse_container_id"] = None
-        env_state["container_id"] = None
-        env_state["owns_container"] = False
+        env_type = str(env_section.get("type_path", "")).lower()
+        if "singularity" in env_type:
+            branch_sandbox = self._copy_singularity_sandbox(
+                Path(mid_cp.image_tag),
+                f"lane-b-g{mid_cp.idx:03d}-{branch_index:02d}",
+            )
+            env_config["image"] = self.base_image
+            env_config["reuse_sandbox_dir"] = str(branch_sandbox)
+            env_state["sandbox_dir"] = str(branch_sandbox)
+            env_state["owns_sandbox"] = True
+        else:
+            env_config["image"] = mid_cp.image_tag
+            env_config["reuse_container_id"] = None
+            env_state["container_id"] = None
+            env_state["owns_container"] = False
         session = self.backend.resume_session(RolloutSnapshot(**resumed))
         self._live_sessions.append(session)
         return session
@@ -1369,18 +1418,34 @@ class TrajectorySearchParallelRunner:
                 payload.get(branch.node_id, {}) if isinstance(payload, dict) else {}
             )
             raw_reward = float(branch_payload.get("reward", 0.0))
+            f2p_total = int(branch_payload.get("f2p_total") or 0)
+            p2p_total = int(branch_payload.get("p2p_total") or 0)
+            denom = f2p_total + p2p_total
+            base_score = (p2p_total / denom) if denom > 0 else 0.0
+            delta_reward = max(0.0, raw_reward - base_score)
+            reward_kind = (self.config.reward_kind or "soft").lower()
+            scored_reward = raw_reward if reward_kind == "soft" else delta_reward
             penalty = float(self.config.fallback_patch_penalty)
             if branch.terminal_patch_from_fallback and penalty != 1.0:
-                branch.gt_score = raw_reward * penalty
+                branch.gt_score = scored_reward * penalty
                 branch.gt_payload = {
                     **branch_payload,
                     "raw_reward": raw_reward,
+                    "base_score": base_score,
+                    "delta_reward": delta_reward,
+                    "reward_kind": reward_kind,
                     "fallback_penalty": penalty,
                     "note": "patch_from_git_diff_fallback",
                 }
             else:
-                branch.gt_payload = branch_payload
-                branch.gt_score = raw_reward
+                branch.gt_payload = {
+                    **branch_payload,
+                    "raw_reward": raw_reward,
+                    "base_score": base_score,
+                    "delta_reward": delta_reward,
+                    "reward_kind": reward_kind,
+                }
+                branch.gt_score = scored_reward
             logger.info(
                 "[%s] gt_done node=%s dt=%.1fs reward=%.3f",
                 self.task_id, branch.node_id, time.perf_counter() - t_gt,
@@ -1704,7 +1769,6 @@ class TrajectorySearchParallelRunner:
                 "rubric_list_prefix": "rubric",
                 "judge_prompt": SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
                 "include_variance_reward": True,
-                "prompt_attr": "rubric_prompt",
                 "samples_attr": "rubric_samples",
                 "judge_attr": "judge_response",
                 "model_response_attr": "rubric_model_response",
@@ -1716,7 +1780,6 @@ class TrajectorySearchParallelRunner:
                 "rubric_list_prefix": "pc-rubric",
                 "judge_prompt": PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
                 "include_variance_reward": False,
-                "prompt_attr": "pc_rubric_prompt",
                 "samples_attr": "pc_rubric_samples",
                 "judge_attr": "pc_judge_response",
                 "model_response_attr": "pc_rubric_model_response",
@@ -1731,19 +1794,6 @@ class TrajectorySearchParallelRunner:
             }
             for scope in self.rubric_scopes
         ]
-        for spec in scope_specs:
-            setattr(
-                group,
-                spec["prompt_attr"],
-                _build_rubric_prompt(
-                    system_prompt=self.system_prompt,
-                    user_prompt=self.user_prompt,
-                    previous_state=previous_state,
-                    latest_shared_segment=spec["latest_shared_segment"],
-                    continuations=continuations,
-                    generation_prompt=spec["generation_prompt"],
-                ),
-            )
         try:
             scope_results = await asyncio.gather(
                 *[
@@ -1939,7 +1989,7 @@ class TrajectorySearchParallelRunner:
 
         # Free the mid_cp image — all branches forked from it have terminated,
         # been GT-scored. Lane C only reads the saved snapshot.
-        self._delete_image(mid_cp.image_tag)
+        self._delete_checkpoint(mid_cp.image_tag)
         logger.info(
             "[%s] fork_group g=%d done dt=%.1fs gt_scores=%s lane_c_dt=%.1fs",
             self.task_id, mid_cp.idx, time.perf_counter() - t_group,
@@ -2060,7 +2110,7 @@ class TrajectorySearchParallelRunner:
             root_image_tag = await loop.run_in_executor(
                 lane_a_pool,
                 lambda s=session, c=ctx_root_commit: c.run(
-                    self._commit_container, s, "mid-root"
+                    self._checkpoint_environment, s, "mid-root"
                 ),
             )
         except Exception as exc:
@@ -2209,12 +2259,12 @@ class TrajectorySearchParallelRunner:
                     image_tag = await loop.run_in_executor(
                         lane_a_pool,
                         lambda s=session, tk=f"mid-{mid_cp_idx:03d}", c=contextvars.copy_context(): c.run(
-                            self._commit_container, s, tk
+                            self._checkpoint_environment, s, tk
                         ),
                     )
                     if image_tag is None:
                         logger.warning(
-                            "[%s] lane_a mid_cp idx=%d: docker commit returned None, "
+                            "[%s] lane_a mid_cp idx=%d: checkpoint returned None, "
                             "skipping fork-group emit",
                             self.task_id,
                             mid_cp_idx,

@@ -119,8 +119,20 @@ def convert_samples_to_train_data(args, samples):
         "raw_reward": raw_rewards,
         "truncated": [1 if sample.status == sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": [sample.index for sample in samples],
+        "rollout_ids": [],
         "loss_masks": [],
     }
+    rollout_ids = [sample.rollout_id for sample in samples]
+    existing_rollout_ids = set(rollout_id for rollout_id in rollout_ids if rollout_id is not None)
+    next_rollout_id = 0
+    for rollout_id in rollout_ids:
+        if rollout_id is None:
+            while next_rollout_id in existing_rollout_ids:
+                next_rollout_id += 1
+            rollout_id = next_rollout_id
+            existing_rollout_ids.add(rollout_id)
+        train_data["rollout_ids"].append(rollout_id)
+
     for idx, sample in enumerate(samples):
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
@@ -131,6 +143,13 @@ def convert_samples_to_train_data(args, samples):
             sample.loss_mask = [0] * sample.response_length
         train_data["loss_masks"].append(sample.loss_mask)
 
+    rollout_total_mask: dict[int, int] = {}
+    for rollout_id, loss_mask in zip(train_data["rollout_ids"], train_data["loss_masks"], strict=True):
+        rollout_total_mask[rollout_id] = rollout_total_mask.get(rollout_id, 0) + sum(loss_mask)
+    train_data["rollout_mask_sums"] = [
+        rollout_total_mask[rollout_id] for rollout_id in train_data["rollout_ids"]
+    ]
+
     if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
         train_data["raw_reward"] = [
             sample.metadata["raw_reward"] if sample.metadata and "raw_reward" in sample.metadata else sample.reward
@@ -140,6 +159,9 @@ def convert_samples_to_train_data(args, samples):
         train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
     if samples and samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+    if samples and samples[0].rollout_top_p_token_ids is not None:
+        train_data["rollout_top_p_token_ids"] = [sample.rollout_top_p_token_ids for sample in samples]
+        train_data["rollout_top_p_token_offsets"] = [sample.rollout_top_p_token_offsets for sample in samples]
     if samples and samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
     if args.loss_type == "custom_loss" or any(sample.train_metadata is not None for sample in samples):
@@ -155,16 +177,15 @@ def convert_samples_to_train_data(args, samples):
 
 
 def compute_rubric_loss(args, batch, logits, sum_of_sample_mean):
-    alpha = float(getattr(args, "swe_rtt_alpha", 1.0))
-    beta = float(getattr(args, "swe_rtt_beta", 1.0))
+    alpha = 1.0
+    beta = 1.0
     metadata_list = batch.get("metadata")
     if metadata_list is None:
         raise RuntimeError("rubric custom loss requires per-sample metadata")
 
     token_advantages = []
-    max_seq_lens = batch.get("max_seq_lens")
-    for index, (loss_mask, metadata, total_length, response_length) in enumerate(
-        zip(batch["loss_masks"], metadata_list, batch["total_lengths"], batch["response_lengths"], strict=False)
+    for loss_mask, metadata, total_length, response_length in zip(
+        batch["loss_masks"], metadata_list, batch["total_lengths"], batch["response_lengths"], strict=False
     ):
         full_token_advantage = torch.zeros_like(loss_mask, dtype=torch.float32)
         turn_rewards = list((metadata).get("turn_rewards"))
@@ -186,14 +207,11 @@ def compute_rubric_loss(args, batch, logits, sum_of_sample_mean):
                     )
                 full_token_advantage = full_token_advantage + turn_mask_tensor * turn_value
             full_token_advantage = full_token_advantage * (loss_mask > 0)
-        max_seq_len = max_seq_lens[index] if max_seq_lens is not None else None
         token_advantages.append(
             slice_log_prob_with_cp(
                 full_token_advantage,
                 total_length,
                 response_length,
-                args.qkv_format,
-                max_seq_len,
             )
         )
 
@@ -230,12 +248,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--load-dir", type=Path, required=True)
     parser.add_argument("--save-dir", type=Path, required=True)
     parser.add_argument("--ref-load-dir", type=Path)
-    parser.add_argument("--config-path", type=Path, default=Path("/workspace/rler/slime/train_agent/configs/grpo.sh"))
+    parser.add_argument("--config-path", type=Path)
     parser.add_argument("--rler-root", type=Path, default=Path("/workspace/rler"),
                         help="Root dir of the RLER repo as seen by the runtime (used to build PYTHONPATH and cd into slime). "
                              "Override when not running in the original docker layout (e.g. inside pyxis with --container-mounts to a Lustre path).")
     parser.add_argument("--rollout-function-path", default="train_agent.collect_grpo_rollout.generate_rollout")
     parser.add_argument("--num-rollout", type=int)
+    parser.add_argument("--num-epoch", type=int)
     parser.add_argument("--rollout-batch-size", type=int, default=2)
     parser.add_argument("--over-sampling-batch-size", type=int,
                         help="If set, slime pulls this many prompts per rollout cycle "
@@ -259,9 +278,31 @@ def main(argv: list[str] | None = None) -> int:
                         "brought up externally, e.g. by SLURM srun).")
     parser.add_argument("--context-parallel-size", type=int)
     parser.add_argument("--tensor-model-parallel-size", type=int)
+    parser.add_argument("--pipeline-model-parallel-size", type=int)
+    parser.add_argument("--decoder-last-pipeline-num-layers", type=int,
+                        help="Pass to megatron when PP>1 with an unbalanced layer split "
+                             "(e.g. 64 layers across PP=2 with last stage holding 30).")
+    parser.add_argument("--rollout-num-gpus-per-engine", type=int,
+                        help="sglang TP per engine. Default 1 from grpo.sh; bump to 2+ "
+                             "when the model weights don't fit on a single 80GB GPU "
+                             "alongside KV cache (e.g. Qwen3.5-27B BF16 is 54GB).")
     parser.add_argument("--max-tokens-per-gpu", type=int)
     parser.add_argument("--log-probs-chunk-size", type=int)
-    parser.add_argument("--sglang-context-length", type=int)
+    parser.add_argument("--rollout-max-context-len", type=int)
+    parser.add_argument("--model-config-name", type=str, default="qwen3.5-9B",
+                        help="Basename (no .sh) of a preset under "
+                             "$RLER/slime/train_agent/configs/ to source for MODEL_ARGS. "
+                             "Default 'qwen3.5-9B' preserves 59762-era behavior.")
+    parser.add_argument("--optimizer-cpu-offload", action="store_true", default=False,
+                        help="Offload Adam optimizer state (master weights + m + v) to CPU. "
+                             "Slime ref 27B recipe — needed when TP*PP weight shard factor "
+                             "is too small to fit Adam state on 80GB H100.")
+    parser.add_argument("--overlap-cpu-optimizer-d2h-h2d", action="store_true", default=False,
+                        help="Overlap CPU<->GPU optimizer state transfer with compute. Pairs "
+                             "with --optimizer-cpu-offload.")
+    parser.add_argument("--use-precision-aware-optimizer", action="store_true", default=False,
+                        help="Keep master weights in BF16 + Adam states in FP32; reduces "
+                             "optimizer memory by ~25%. Pairs with --optimizer-cpu-offload.")
     parser.add_argument("--rollout-instance-workers", type=int, default=2)
     parser.add_argument("--ray-num-cpus", type=int, default=32)
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
@@ -294,6 +335,17 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=None,
         help="Forwarded to slime train_async.py. TIS upper clip C (default 2.0 inside slime).",
+    )
+    parser.add_argument(
+        "--use-rollout-logprobs",
+        action="store_true",
+        default=False,
+        help=(
+            "Forwarded to slime train_async.py. Use sampling-time rollout "
+            "log-probs as the PPO 'old' reference instead of running a "
+            "separate Megatron compute_log_prob pass. Mutually exclusive "
+            "with --use-tis (asserted in slime arguments.py)."
+        ),
     )
     parser.add_argument(
         "--dynamic-sampling-filter-path",
@@ -329,6 +381,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.config_path is None:
+        args.config_path = args.rler_root / "slime/train_agent/configs/grpo.sh"
 
     total_gpus = args.actor_num_gpus + args.rollout_num_gpus
     actor_num_nodes = args.actor_num_nodes or args.num_nodes
@@ -342,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     wandb_dir = args.wandb_dir or (args.save_dir / "wandb")
     global_batch_size = shlex.quote(str(args.global_batch_size or args.rollout_batch_size))
     num_rollout_args = shlex.join(["--num-rollout", str(args.num_rollout)]) if args.num_rollout is not None else ""
+    num_epoch_args = shlex.join(["--num-epoch", str(args.num_epoch)]) if args.num_epoch is not None else ""
     oversample_arg = (
         shlex.join(["--over-sampling-batch-size", str(args.over_sampling_batch_size)])
         if args.over_sampling_batch_size is not None else ""
@@ -356,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.tis_clip is not None:
         tis_arg_parts.extend(["--tis-clip", str(args.tis_clip)])
     tis_arg = shlex.join(tis_arg_parts) if tis_arg_parts else ""
+    rollout_logprobs_arg = "--use-rollout-logprobs" if args.use_rollout_logprobs else ""
     save_debug_arg = (
         shlex.join(["--save-debug-train-data", args.save_debug_train_data])
         if args.save_debug_train_data else ""
@@ -369,12 +425,48 @@ def main(argv: list[str] | None = None) -> int:
         override_lines.append(f"GRPO_PARALLEL_ARGS+=(--context-parallel-size {args.context_parallel_size})")
     if args.tensor_model_parallel_size is not None:
         override_lines.append(f"GRPO_PARALLEL_ARGS+=(--tensor-model-parallel-size {args.tensor_model_parallel_size})")
+    if args.pipeline_model_parallel_size is not None:
+        override_lines.append(f"GRPO_PARALLEL_ARGS+=(--pipeline-model-parallel-size {args.pipeline_model_parallel_size})")
+    if args.decoder_last_pipeline_num_layers is not None:
+        override_lines.append(
+            f"GRPO_PARALLEL_ARGS+=(--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers})"
+        )
+    if args.rollout_num_gpus_per_engine is not None:
+        override_lines.append(
+            f"GRPO_ROLLOUT_ARGS+=(--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine})"
+        )
+    if args.optimizer_cpu_offload:
+        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--optimizer-cpu-offload)")
+    if args.overlap_cpu_optimizer_d2h_h2d:
+        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--overlap-cpu-optimizer-d2h-h2d)")
+    if args.use_precision_aware_optimizer:
+        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--use-precision-aware-optimizer)")
     if args.max_tokens_per_gpu is not None:
         override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
     if args.log_probs_chunk_size is not None:
         override_lines.append(f"GRPO_COMMON_ARGS+=(--log-probs-chunk-size {args.log_probs_chunk_size})")
-    if args.sglang_context_length is not None:
-        override_lines.append(f"GRPO_SGLANG_ARGS+=(--sglang-context-length {args.sglang_context_length})")
+    if args.rollout_max_context_len is not None:
+        override_lines.append(f"GRPO_SGLANG_ARGS+=(--rollout-max-context-len {args.rollout_max_context_len})")
+    if args.num_epoch is not None and args.num_rollout is None:
+        override_lines.append(
+            """
+GRPO_COMMON_ARGS_STRIPPED=()
+GRPO_STRIP_NEXT=0
+for arg in "${GRPO_COMMON_ARGS[@]}"; do
+  if [ "$GRPO_STRIP_NEXT" = 1 ]; then
+    GRPO_STRIP_NEXT=0
+    continue
+  fi
+  if [ "$arg" = "--num-rollout" ]; then
+    GRPO_STRIP_NEXT=1
+    continue
+  fi
+  GRPO_COMMON_ARGS_STRIPPED+=("$arg")
+done
+GRPO_COMMON_ARGS=("${GRPO_COMMON_ARGS_STRIPPED[@]}")
+unset GRPO_COMMON_ARGS_STRIPPED GRPO_STRIP_NEXT
+""".strip()
+        )
     config_overrides = "\n".join(override_lines)
     wandb_args = ""
     if args.wandb_mode != "disabled":
@@ -440,11 +532,11 @@ export SWE_AGENT_GRPO_P={"" if args.search_p is None else args.search_p}
 export SWE_AGENT_GRPO_MAX_ROUNDS={"" if args.search_max_rounds is None else args.search_max_rounds}
 export SWE_AGENT_GRPO_STEP_LIMIT={"" if args.search_step_limit is None else args.search_step_limit}
 export SWE_AGENT_GRPO_INSTANCE_WORKERS={args.rollout_instance_workers}
-export SWE_AGENT_PYTHON="{rler_root}/agent/.venv/bin/python"
+export SWE_AGENT_PYTHON="${{SWE_AGENT_PYTHON:-{rler_root}/agent/.venv/bin/python}}"
 {ray_trap_line}
 {ray_stop_line}
 cd {rler_root}/slime
-source {rler_root}/slime/train_agent/configs/qwen3.5-9B.sh
+source {rler_root}/slime/train_agent/configs/{args.model_config_name}.sh
 source {shlex.quote(str(args.config_path))}
 {config_overrides}
 if [ {shlex.quote(args.target)} = "rubric" ]; then
@@ -483,6 +575,7 @@ python3 train_async.py \\
   "${{GRPO_COMMON_ARGS[@]}}" \\
   --rollout-function-path {shlex.quote(args.rollout_function_path)} \\
   {num_rollout_args} \\
+  {num_epoch_args} \\
   "${{GRPO_TARGET_ARGS[@]}}" \\
   "${{GRPO_PARALLEL_ARGS[@]}}" \\
   "${{GRPO_RECOMPUTE_ARGS[@]}}" \\
@@ -492,6 +585,7 @@ python3 train_async.py \\
   "${{GRPO_MISC_ARGS[@]}}" \\
   {dynamic_filter_arg} \\
   {tis_arg} \\
+  {rollout_logprobs_arg} \\
   {save_debug_arg} \\
   {save_debug_rollout_arg} \\
   {wandb_args}

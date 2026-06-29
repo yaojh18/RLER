@@ -146,6 +146,9 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                                           .get("environment_class", "docker"),
         )
 
+        reward_kind = task.get("reward_kind", "delta")
+        if reward_kind not in {"soft", "delta"}:
+            raise ValueError(f"unsupported naive reward_kind={reward_kind!r}")
         cfg = NaiveSearchConfig(
             m=task["m"],
             step_limit=task["step_limit"],
@@ -156,7 +159,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             policy_top_p=task.get("policy_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
             no_action_patch_penalty=task.get("no_action_patch_penalty", 0.0),
-            reward_kind=task.get("reward_kind", "delta"),
+            reward_kind=reward_kind,
         )
         run_dir = (
             output_root / instance_id
@@ -434,6 +437,12 @@ def _naive_values_from_env() -> dict[str, Any]:
     def _float(name, default):
         v = os.environ.get(name, "")
         return float(v) if v else default
+
+    def _bool(name, default):
+        v = os.environ.get(name, "")
+        if not v:
+            return default
+        return v.strip().lower() in ("1", "true", "yes", "on")
 
     return {
         "m": _int("SWE_AGENT_NAIVE_M", 8),
@@ -908,6 +917,79 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 if isinstance(x, (int, float)):
                     rollout_lps.append(float(x))
 
+    # Per-trajectory weight-version staleness, measured as
+    # (current actor wv at consumption) - (wv stamped on first assistant turn).
+    # The current actor wv is the TRUE source of truth: query SGLang's
+    # /get_weight_version (the same endpoint trainer hits via
+    # /update_weight_version after each broadcast) so the metric here matches
+    # what the in-flight kill watchdog sees.
+    #
+    # We can't use `rollout_id - min(turn_wv)` because rollout_id is the
+    # consumer's call counter (off-by-one from actor wv at startup, and may
+    # diverge under async pacing), and within-trajectory min vs first-turn
+    # are equivalent unless turns span weight broadcasts.
+    # /get_weight_version only exists on individual sglang engines, NOT on
+    # sglang_router (which only proxies inference). Pick any per-engine
+    # endpoint from args.sglang_model_engines; fall back to router (404
+    # expected) only if the engine list is empty.
+    current_actor_wv: int | None = None
+    try:
+        engines_map = getattr(args, "sglang_model_engines", None) or {}
+        engine_eps = list(engines_map.get(model_name, []))
+        if not engine_eps and len(engines_map) == 1:
+            engine_eps = list(next(iter(engines_map.values())))
+        if engine_eps:
+            host, port = engine_eps[0]
+        else:
+            host, port = (getattr(args, "sglang_model_routers", None) or {}).get(
+                model_name, (args.sglang_router_ip, args.sglang_router_port),
+            )
+        import requests as _rq
+        _r = _rq.get(f"http://{host}:{port}/get_weight_version", timeout=10)
+        _r.raise_for_status()
+        current_actor_wv = int(_r.json().get("weight_version"))
+    except Exception as _exc:
+        logger.warning(
+            "[naive-async] could not fetch current_actor_wv from sglang: %s", _exc,
+        )
+
+    first_turn_wvs: list[int] = []
+    eldest_lags: list[int] = []
+    intra_traj_spreads: list[int] = []
+    for s in samples:
+        if not s.metadata:
+            continue
+        wvs = s.metadata.get("turn_weight_versions") or []
+        if not wvs:
+            continue
+        try:
+            int_wvs = [int(v) for v in wvs]
+        except (TypeError, ValueError):
+            continue
+        if not int_wvs:
+            continue
+        first_wv = int_wvs[0]
+        first_turn_wvs.append(first_wv)
+        intra_traj_spreads.append(int_wvs[-1] - first_wv)
+        if current_actor_wv is not None:
+            eldest_lags.append(current_actor_wv - first_wv)
+    if eldest_lags:
+        avg_eldest_weight_lag = sum(eldest_lags) / len(eldest_lags)
+        min_eldest_weight_lag = min(eldest_lags)
+        max_eldest_weight_lag = max(eldest_lags)
+        eldest_lag_coverage = len(eldest_lags) / len(samples) if samples else 0.0
+    else:
+        avg_eldest_weight_lag = 0.0
+        min_eldest_weight_lag = 0
+        max_eldest_weight_lag = 0
+        eldest_lag_coverage = 0.0
+    if intra_traj_spreads:
+        avg_intra_traj_spread = sum(intra_traj_spreads) / len(intra_traj_spreads)
+        max_intra_traj_spread = max(intra_traj_spreads)
+    else:
+        avg_intra_traj_spread = 0.0
+        max_intra_traj_spread = 0
+
     # --- Patch + eval-based ratios over the post-filter training batch ---
     # Denominators:
     #   * patch/submit ratios use all real_samples
@@ -944,9 +1026,24 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     some_pass = 0
     p2p_pass_rates: list[float] = []
     turns_for_avg: list[int] = []
+    fe_rates: list[float] = []
+    fe_counts: list[int] = []
+    n_fe_gated = 0
+    n_fe_killed = 0
     for s in real_samples:
         if s.metadata and s.metadata.get("n_full_trace_steps") is not None:
             turns_for_avg.append(int(s.metadata.get("n_full_trace_steps") or 0))
+        if s.metadata and s.metadata.get("n_assistant_turns") is not None:
+            rate = float(s.metadata.get("format_error_rate") or 0.0)
+            count = int(s.metadata.get("n_format_errors") or 0)
+            fe_rates.append(rate)
+            fe_counts.append(count)
+            # A trajectory is "gated" if more than half its asst turns were
+            # format errors — same signal the runtime gate uses (default 0.5).
+            if rate > 0.5:
+                n_fe_gated += 1
+        if s.metadata and s.metadata.get("format_error_killed"):
+            n_fe_killed += 1
     for s in eval_samples:
         md = s.metadata
         f2p_passed = int(md.get("f2p_passed_count") or 0)
@@ -1072,5 +1169,37 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/ratio_some_pass": (some_pass / n_eval) if n_eval else 0.0,
             "swe_agent/avg_turns": _safe_mean([float(x) for x in turns_for_avg]),
             "swe_agent/avg_existing_utest_pass_rate": _safe_mean(p2p_pass_rates),
+            # --- format-error health (job 58062 mode-collapse signal) ---
+            "swe_agent/format_error_rate_mean": _safe_mean(fe_rates),
+            "swe_agent/format_error_count_mean": _safe_mean(
+                [float(x) for x in fe_counts]
+            ),
+            "swe_agent/ratio_fe_gated_trajectories": (
+                (n_fe_gated / n_real) if n_real else 0.0
+            ),
+            # Format-error circuit breaker fired on this rollout — runner
+            # aborted after N consecutive trailing format errors.
+            "swe_agent/n_format_error_killed": n_fe_killed,
+            "swe_agent/ratio_format_error_killed": (
+                (n_fe_killed / n_real) if n_real else 0.0
+            ),
+            # --- policy-drift age (current actor wv - first turn wv) ---
+            # avg/min/max_eldest_weight_lag are now (current_actor_wv - first_turn_wv)
+            # for each trajectory in the consumed batch. current_actor_wv is
+            # polled from sglang's /get_weight_version at the start of the
+            # post-batch metrics block; this is the same source the kill
+            # watchdog uses for in-flight aborts (see naive_search.py:_step_
+            # session_with_stale_check). intra_traj_spread is the within-
+            # trajectory delta (= last_turn_wv - first_turn_wv) — this is
+            # what the OLD wandb metric and OLD killer were measuring.
+            "swe_agent/current_actor_wv": (
+                int(current_actor_wv) if current_actor_wv is not None else -1
+            ),
+            "swe_agent/avg_eldest_weight_lag": avg_eldest_weight_lag,
+            "swe_agent/min_eldest_weight_lag": min_eldest_weight_lag,
+            "swe_agent/max_eldest_weight_lag": max_eldest_weight_lag,
+            "swe_agent/eldest_lag_coverage": eldest_lag_coverage,
+            "swe_agent/avg_intra_traj_spread": avg_intra_traj_spread,
+            "swe_agent/max_intra_traj_spread": max_intra_traj_spread,
         },
     )

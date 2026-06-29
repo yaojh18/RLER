@@ -216,6 +216,17 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls"""
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
 
+    # Retried samples (previously aborted / partial) arrive here with stale
+    # rollout state from the first attempt. Clear it so this generation starts
+    # clean; otherwise the concatenation below appends new tokens to old ones
+    # and downstream `slice_log_prob_with_cp` sees a length mismatch.
+    sample.rollout_log_probs = None
+    sample.rollout_top_p_token_ids = None
+    sample.rollout_top_p_token_offsets = None
+    sample.response = ""
+    sample.response_length = 0
+    sample.loss_mask = []
+
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
@@ -224,27 +235,43 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
 
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    sample.tokens = list(prompt_tokens_ids)
     response = ""
     response_token_ids = []
-    loss_masks = []
+    loss_masks = sample.loss_mask
     tool_call_count = 0  # Track actual tool call rounds
+
+    if args.rollout_max_context_len is not None:
+        max_context_length = args.rollout_max_context_len
+    else:
+        max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
 
     for turn in range(TOOL_CONFIGS["max_turns"]):
         # Check if total length exceeds max context length
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
-        if args.rollout_max_context_len is not None:
-            max_context_length = args.rollout_max_context_len
-        else:
-            max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
             break
+
+        # Clamp per-turn max_new_tokens to the remaining context budget so a
+        # single turn cannot push total_length past max_context_length. Without
+        # this, a turn can append up to rollout_max_response_len tokens on top
+        # of a total that was just barely under the cap, producing samples
+        # that exceed the training-side max_tokens_per_gpu * cp_size budget
+        # and crash the partition/batch code (asserts or OOMs on an oversized
+        # partition).
+        remaining_budget = max_context_length - total_length
+        per_turn_sampling_params = dict(sampling_params)
+        per_turn_sampling_params["max_new_tokens"] = min(
+            sampling_params.get("max_new_tokens", remaining_budget),
+            remaining_budget,
+        )
 
         # Use token IDs instead of text
         current_token_ids = prompt_tokens_ids + response_token_ids
         payload = {
             "input_ids": current_token_ids,
-            "sampling_params": sampling_params,
+            "sampling_params": per_turn_sampling_params,
             "return_logprob": True,  # Request log probabilities for training
         }
 
@@ -280,18 +307,26 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
             cur_response = state.tokenizer.decode(cur_response_token_ids)
             cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-            if sample.rollout_log_probs is None:
-                sample.rollout_log_probs = []
-            sample.rollout_log_probs += cur_log_probs
 
         else:
-            cur_response = output["text"]
-            cur_response = postprocess_responses(cur_response)
-            cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+            # sglang returned text but no output_token_logprobs — we cannot
+            # recover per-token logprobs for this turn, which would desync
+            # rollout_log_probs from response_token_ids and blow up
+            # `slice_log_prob_with_cp` downstream. Abort the sample so the
+            # fully_async rollout manager returns the whole group to the
+            # buffer for retry instead of poisoning the trainer.
+            sample.status = Sample.Status.ABORTED
+            return sample
 
         response += cur_response
         response_token_ids += cur_response_token_ids
-        loss_masks += [1] * len(cur_response_token_ids)
+        sample.append_response_tokens(
+            args,
+            tokens=cur_response_token_ids,
+            log_probs=cur_log_probs,
+            trainable=True,
+            meta_info=output["meta_info"],
+        )
 
         # Check length limit
         if output["meta_info"]["finish_reason"]["type"] == "length":
@@ -308,18 +343,36 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
-        response += next_obs
-        response_token_ids += obs_tokens_ids
-        loss_masks += [0] * len(obs_tokens_ids)
+        overflow = len(prompt_tokens_ids) + len(response_token_ids) + len(obs_tokens_ids) - max_context_length
+        truncated_by_observation = overflow > 0
+        if truncated_by_observation:
+            obs_tokens_ids = obs_tokens_ids[: max(0, len(obs_tokens_ids) - overflow)]
 
         # Add dummy log probs for observation tokens (they won't be used due to loss_mask=0)
         # Check if maximum tool call count reached
-        if sample.rollout_log_probs is not None:
-            sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)
+        response_token_ids += obs_tokens_ids
+        sample.append_response_tokens(args, tokens=obs_tokens_ids, trainable=False)
 
+        if sample.rollout_log_probs is not None:
             assert len(response_token_ids) == len(
                 sample.rollout_log_probs
             ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
+
+        # Tool output is appended verbatim and can push total_length past
+        # max_context_length (the per-turn generation was clamped to the
+        # remaining budget, but tool output is unconstrained). Trim tail
+        # tokens so the final sample fits the training budget exactly.
+        if truncated_by_observation:
+            # Resync the text field from the trimmed token list so
+            # reward_func's `sample.prompt + sample.response` matches what
+            # the model was actually trained on. decode(tokenize(text)) can
+            # be lossy on some tokenizers (whitespace / special-token
+            # collapse), but reward_func's regex is whitespace-robust and
+            # the trainer sees tokens, not text — so the drift is safe.
+            response = state.tokenizer.decode(response_token_ids)
+            sample.status = Sample.Status.TRUNCATED
+            break
+        response += next_obs
 
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
             break
@@ -339,13 +392,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.tool_call_count = tool_call_count
 
     # Set status
-    match output["meta_info"]["finish_reason"]["type"]:
-        case "length":
-            sample.status = Sample.Status.TRUNCATED
-        case "abort":
-            sample.status = Sample.Status.ABORTED
-        case "stop":
-            sample.status = Sample.Status.COMPLETED
+    if sample.status is Sample.Status.PENDING:
+        match output["meta_info"]["finish_reason"]["type"]:
+            case "length":
+                sample.status = Sample.Status.TRUNCATED
+            case "abort":
+                sample.status = Sample.Status.ABORTED
+            case "stop":
+                sample.status = Sample.Status.COMPLETED
 
     return sample
 

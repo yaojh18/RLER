@@ -19,11 +19,17 @@ GRPO_COMMON_ARGS=(
   --use-kl-loss
   --kl-loss-coef 0.01
   --kl-loss-type k3
-  --calculate-per-token-loss
   --log-probs-chunk-size 256
-  --use-dynamic-global-batch-size
   --micro-batch-size 1
 )
+# --calculate-per-token-loss is the default for backwards compat; per-token
+# weighting amplifies long failing-trajectory gradients in GRPO and was the
+# main contributor to the 58541 policy collapse. To use per-sample weighting
+# instead, the launcher can `export CALCULATE_PER_TOKEN_LOSS=0` before
+# invoking the slime driver.
+if [ "${CALCULATE_PER_TOKEN_LOSS:-1}" = "1" ]; then
+  GRPO_COMMON_ARGS+=(--calculate-per-token-loss)
+fi
 
 GRPO_ROLLOUT_ARGS=(
   --rollout-num-gpus-per-engine 1
@@ -36,8 +42,6 @@ GRPO_POLICY_ARGS=(
 GRPO_RUBRIC_ARGS=(
   --loss-type custom_loss
   --custom-loss-function-path train_agent.run.grpo.compute_rubric_loss
-  --swe-rtt-alpha 1.0
-  --swe-rtt-beta 1.0
 )
 
 GRPO_PARALLEL_ARGS=(
@@ -66,7 +70,7 @@ GRPO_OPTIMIZER_ARGS=(
 )
 
 GRPO_SGLANG_ARGS=(
-  --sglang-context-length 80960
+  --rollout-max-context-len 80960
   --sglang-reasoning-parser qwen3
   # Radix cache enabled — slime calls engine.flush_cache.remote() inside
   # update_weight_from_distributed.py on every policy weight update, so
