@@ -7,6 +7,7 @@ import random
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import ray
@@ -453,6 +454,18 @@ class RolloutManager:
 
         if rollout_init_handles:
             ray.get(rollout_init_handles)
+        self.args.sglang_model_engines = {}
+        for name, server in self.servers.items():
+            endpoints = []
+            for url in ray.get([engine.get_url.remote() for engine in server.engines]):
+                if url is None:
+                    continue
+                parsed = urlparse(url)
+                if parsed.hostname is None or parsed.port is None:
+                    raise RuntimeError(f"invalid SGLang engine URL for {name}: {url!r}")
+                endpoints.append((parsed.hostname, parsed.port))
+            self.args.sglang_model_engines[name] = endpoints
+        logger.info(f"SGLang model engine endpoints: {self.args.sglang_model_engines}")
 
         init_tracking(args, primary=False)
         self.rollout_engine_lock = Lock.options(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -12,6 +13,7 @@ from swebench.harness.grading import get_eval_report
 from swebench.harness.test_spec.test_spec import make_test_spec
 
 from swe_agent.environments.singularity import SingularityEnvironment, resolve_singularity_image
+from swe_agent.run.benchmarks.container_runtime import raise_for_container_error
 
 
 def evaluate_swebench_instances_singularity(
@@ -31,28 +33,29 @@ def evaluate_swebench_instances_singularity(
         unique_patches.setdefault(patch_hash, {"patch": patch_text, "keys": []})["keys"].append(key)
 
     test_spec = make_test_spec(instance, namespace=namespace or "swebench")
-    eval_root = work_dir / ".swebench-sif-eval"
-    eval_root.mkdir(parents=True, exist_ok=True)
-
-    evaluations: dict[str, dict[str, Any]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(unique_patches) or 1))) as executor:
-        future_map = {
-            executor.submit(
-                _evaluate_one,
-                instance,
-                test_spec,
-                entry["patch"],
-                model_name,
-                eval_root,
-                timeout,
-            ): entry["keys"]
-            for entry in unique_patches.values()
-        }
-        for future, keys in future_map.items():
-            result = future.result()
-            for key in keys:
-                evaluations[key] = result
-    return evaluations
+    with tempfile.TemporaryDirectory(prefix=".swebench-sif-eval-", dir=work_dir) as tmp_dir:
+        eval_root = Path(tmp_dir)
+        evaluations: dict[str, dict[str, Any]] = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(max_workers, len(unique_patches) or 1))
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    _evaluate_one,
+                    instance,
+                    test_spec,
+                    entry["patch"],
+                    model_name,
+                    eval_root,
+                    timeout,
+                ): entry["keys"]
+                for entry in unique_patches.values()
+            }
+            for future, keys in future_map.items():
+                result = future.result()
+                for key in keys:
+                    evaluations[key] = result
+        return evaluations
 
 
 def _evaluate_one(
@@ -93,6 +96,7 @@ bash {json.dumps(eval_container_path)}
             cwd="/testbed",
             timeout=timeout,
         )
+        raise_for_container_error(result)
     finally:
         env.cleanup()
 

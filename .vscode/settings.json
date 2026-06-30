@@ -1,0 +1,10 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/agent/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "terminal.integrated.env.linux": {
+    "XDG_CONFIG_HOME": "${workspaceFolder}/../tmp/xdg_config"
+  },
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/agent"
+  ]
+}

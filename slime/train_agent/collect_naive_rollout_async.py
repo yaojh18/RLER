@@ -12,16 +12,16 @@ SLURM script's tunables):
   SWE_AGENT_NAIVE_STEP_LIMIT         int    hard cap per rollout (default 120)
   SWE_AGENT_NAIVE_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
   SWE_AGENT_NAIVE_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
-  SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 4096)
+  SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 16384)
   SWE_AGENT_NAIVE_POLICY_TEMPERATURE float  sampling temp (default 1.0)
   SWE_AGENT_NAIVE_POLICY_TOP_P       float  default 0.95
   SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY float default 0.5
-  SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY float default 0.0  (hard zero by default)
+  SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY float default -0.1
   SWE_AGENT_NAIVE_OUTPUT_ROOT        str    where to write per-instance run dirs
   SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE  int    per-instance ThreadPoolExecutor cap (default = M)
   SWE_AGENT_NAIVE_SEED               int    seed for sampling (optional)
-  SWE_AGENT_NAIVE_REWARD_KIND        str    'soft' (raw_reward) or 'delta'
-                                            (max(0, raw - baseline)); default 'delta'
+  SWE_AGENT_NAIVE_REWARD_KIND        str    hard, soft, delta, joint, or f2p_only;
+                                            default delta
 Per-engine endpoints come from args.sglang_model_engines (populated at engine
 init in slime/ray/rollout.py). The legacy SWE_AGENT_NAIVE_POLICY_PORTS env
 var is no longer consulted.
@@ -48,7 +48,7 @@ from slime.rollout.filter_hub.base_types import call_dynamic_filter
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
-from train_agent.collect_grpo_rollout import _rollout_tokenizer, build_rollout_samples
+from train_agent.collect_grpo_rollout import build_rollout_samples
 from train_agent.serving.sglang_chat_service import start_slime_policy_route_warmup
 
 
@@ -127,7 +127,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                 "model_kwargs": {
                     "api_base": api_base,
                     "api_key": api_key,
-                    "max_tokens": task.get("completion_max_tokens", 4096),
+                    "max_tokens": task.get("completion_max_tokens", 16384),
                     "extra_body": (
                         {"chat_template_kwargs": {"enable_thinking": True}}
                         if "qwen" in model_name.lower() else {}
@@ -147,7 +147,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         )
 
         reward_kind = task.get("reward_kind", "delta")
-        if reward_kind not in {"soft", "delta"}:
+        if reward_kind not in {"hard", "soft", "delta", "joint", "f2p_only"}:
             raise ValueError(f"unsupported naive reward_kind={reward_kind!r}")
         cfg = NaiveSearchConfig(
             m=task["m"],
@@ -158,8 +158,10 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             policy_temperature=task.get("policy_temperature", 1.0),
             policy_top_p=task.get("policy_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
-            no_action_patch_penalty=task.get("no_action_patch_penalty", 0.0),
+            no_action_patch_penalty=task.get("no_action_patch_penalty", -0.1),
             reward_kind=reward_kind,
+            joint_alpha=task.get("joint_alpha", 1.0),
+            all_pass_reward=task.get("all_pass_reward", 2.0),
         )
         run_dir = (
             output_root / instance_id
@@ -234,37 +236,32 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class _BufferedGroup:
-    rollout_id: int
     samples: list[Sample]
 
 
 _BUFFER: list[_BufferedGroup] = []
 _TASK_INDEX = 0
 _WARMUP_DONE = False
-_STALE_DROPPED_GROUPS = 0
 _FAILED_INSTANCES = 0
-_DROPPED_OVERSIZED = 0
+_TRUNCATED_OVERSIZED = 0
 _FILTER_DROPPED_GROUPS = 0
 _FILTER_DROP_REASONS: dict[str, int] = {}
-# L3 circuit-breaker counters: count *attempted* on-policy bundles and how
-# many of them were dropped by naive_to_grpo_bundle for infra reasons
-# (too_many_dummies / insufficient_real_samples / no_rollouts). Stale-drops
-# and dynamic-filter-drops are deliberately excluded — those are normal
-# off-policy / model-based filtering, not infra failures.
+# Count attempted on-policy groups and groups rejected because at least one
+# sibling trajectory was invalid. Dynamic-filter drops are deliberately
+# excluded because they are model-based filtering, not infra failures.
 _INFRA_DROPPED_GROUPS = 0
 _INFRA_DROP_REASONS: dict[str, int] = {}
 _TOTAL_GROUPS_ATTEMPTED = 0
 # Cumulative totals at the close of the previous perf log line. Subtract from
 # current totals to expose per-step deltas in wandb alongside the cumulative
 # counters (no manual diff() needed in the dashboard).
-_PREV_STALE_DROPPED_GROUPS = 0
 _PREV_FILTER_DROPPED_GROUPS = 0
 _PREV_INFRA_DROPPED_GROUPS = 0
 _PREV_TOTAL_GROUPS_ATTEMPTED = 0
 # Per-endpoint in-flight trial count, used by _pick_least_loaded_endpoints
 # to route each new instance's M trials across the engines that are currently
 # least loaded. Bumped when an instance is dispatched, decremented when its
-# bundle returns (success, error, or stale-dropped). Key is (host, port) so
+# bundle returns (success or error). Key is (host, port) so
 # we route across multiple physical nodes, not just multiple ports on one
 # host. With the default sglang_router cache_aware policy this is the only
 # way to get per-trial fanout: trials hitting the router collapse onto one
@@ -450,12 +447,14 @@ def _naive_values_from_env() -> dict[str, Any]:
         "seed": _int("SWE_AGENT_NAIVE_SEED"),
         "gt_eval_workers": _int("SWE_AGENT_NAIVE_GT_EVAL_WORKERS", 8),
         "rollout_pool_size": _int("SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE"),
-        "completion_max_tokens": _int("SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS", 4096),
+        "completion_max_tokens": _int("SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS", 16384),
         "policy_temperature": _float("SWE_AGENT_NAIVE_POLICY_TEMPERATURE", 1.0),
         "policy_top_p": _float("SWE_AGENT_NAIVE_POLICY_TOP_P", 0.95),
         "fallback_patch_penalty": _float("SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY", 0.5),
-        "no_action_patch_penalty": _float("SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY", 0.0),
+        "no_action_patch_penalty": _float("SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY", -0.1),
         "reward_kind": (os.environ.get("SWE_AGENT_NAIVE_REWARD_KIND") or "delta").lower(),
+        "joint_alpha": _float("SWE_AGENT_NAIVE_JOINT_ALPHA", 1.0),
+        "all_pass_reward": _float("SWE_AGENT_NAIVE_ALL_PASS_REWARD", 2.0),
     }
 
 
@@ -506,6 +505,7 @@ def _submit_until_full(
     output_root: Path,
     model_name: str,
     max_pending: int,
+    target_groups: int,
 ) -> int:
     global _TASK_INDEX, _DISPATCH_COUNTER
     submitted = 0
@@ -539,7 +539,10 @@ def _submit_until_full(
 
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
 
-    while len(_PENDING) < max_pending:
+    while (
+        len(_PENDING) < max_pending
+        and len(_BUFFER) + len(_PENDING) < target_groups
+    ):
         prompt_groups = data_buffer.get_samples(1)
         if not prompt_groups:
             break
@@ -587,13 +590,11 @@ def _harvest_ready(
     *,
     args,
     target: str,
-    tokenizer,
-    current_rollout_id: int,
     block: bool,
 ) -> int:
     """Reap Ray Futures whose subprocess fully returned. For each completed
     bundle, expand its policy_groups into Samples and append to _BUFFER."""
-    global _FAILED_INSTANCES, _STALE_DROPPED_GROUPS, _DROPPED_OVERSIZED
+    global _FAILED_INSTANCES, _TRUNCATED_OVERSIZED
     global _FILTER_DROPPED_GROUPS, _FILTER_DROP_REASONS
     global _INFRA_DROPPED_GROUPS, _INFRA_DROP_REASONS, _TOTAL_GROUPS_ATTEMPTED
     dynamic_filter = (
@@ -651,41 +652,25 @@ def _harvest_ready(
         groups = (
             bundle.policy_groups if target == "policy" else bundle.rubric_groups
         )
-        if task["rollout_id"] < current_rollout_id - 1:
-            # Stale-drops are NOT counted as attempted — they're off-policy
-            # noise from a previous rollout_id, not a fresh on-policy attempt.
-            _STALE_DROPPED_GROUPS += len(groups)
-            del result, bundle, groups, ref
-            continue
-        # L3 attempted-group bookkeeping. Naive scheme produces exactly one
-        # ExportGroup per instance (see naive_to_grpo_bundle); when that
-        # group is dropped for infra reasons (too_many_dummies / etc.) the
-        # bundle still arrives but with empty policy_groups. Count BOTH
-        # cases as one attempted group so the drop rate is well-defined.
+        # Naive produces exactly one attempted ExportGroup per instance. An
+        # invalid sibling leaves policy_groups empty but records the reason.
         if target == "policy":
             _TOTAL_GROUPS_ATTEMPTED += 1
             drop_reason = (bundle.metadata or {}).get("group_dropped_reason")
             if drop_reason:
                 _INFRA_DROPPED_GROUPS += 1
-                # Normalize "too_many_dummies (n_dummy=3 >= 2)" -> "too_many_dummies"
                 key = str(drop_reason).split(" ", 1)[0]
                 _INFRA_DROP_REASONS[key] = _INFRA_DROP_REASONS.get(key, 0) + 1
         for group in groups:
-            samples, dropped_here = build_rollout_samples(
+            samples, truncated_here = build_rollout_samples(
                 groups=[group],
-                tokenizer=tokenizer,
-                loss_mask_type=getattr(args, "loss_mask_type", "qwen3_5"),
                 include_turn_rewards=False,
                 max_sample_tokens=max_sample_tokens,
             )
-            _DROPPED_OVERSIZED += dropped_here
-            policy_version = f"rollout-{task['rollout_id']}"
+            _TRUNCATED_OVERSIZED += truncated_here
             for sample in samples:
-                sample.weight_versions = [policy_version]
                 sample.metadata = {
                     **(sample.metadata or {}),
-                    "policy_version": policy_version,
-                    "source_rollout_id": task["rollout_id"],
                     "instance_id": task["instance_id"],
                 }
             if dynamic_filter is not None and samples:
@@ -696,18 +681,11 @@ def _harvest_ready(
                     _FILTER_DROP_REASONS[reason] = _FILTER_DROP_REASONS.get(reason, 0) + 1
                     continue
             _BUFFER.append(
-                _BufferedGroup(rollout_id=task["rollout_id"], samples=samples)
+                _BufferedGroup(samples=samples)
             )
             harvested += 1
         del result, bundle, groups, ref
     return harvested
-
-
-def _drop_stale_buffer(current_rollout_id: int) -> None:
-    global _STALE_DROPPED_GROUPS
-    kept = [g for g in _BUFFER if g.rollout_id >= current_rollout_id - 1]
-    _STALE_DROPPED_GROUPS += len(_BUFFER) - len(kept)
-    _BUFFER[:] = kept
 
 
 def _pop_groups(min_groups: int) -> list[_BufferedGroup]:
@@ -760,7 +738,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             logger.warning("[naive-async] warmup failed (continuing): %s", exc)
         _WARMUP_DONE = True
 
-    tokenizer = _rollout_tokenizer(args)
     instance_workers = max(1, int(os.environ.get("SWE_AGENT_NAIVE_INSTANCE_WORKERS", "8")))
     max_pending = max(1, int(
         os.environ.get("SWE_AGENT_NAIVE_MAX_PENDING", str(instance_workers))
@@ -769,6 +746,12 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         os.environ.get("SWE_AGENT_NAIVE_MIN_READY_GROUPS", str(args.rollout_batch_size))
     ))
     timeout = float(os.environ.get("SWE_AGENT_NAIVE_WAIT_TIMEOUT", "10800"))
+
+    if _PENDING or _BUFFER:
+        raise RuntimeError(
+            "Naive collector retained work across official generate() boundaries: "
+            f"pending={len(_PENDING)} buffer={len(_BUFFER)}"
+        )
 
     if not _NODE_WORKERS:
         skip = {
@@ -793,14 +776,10 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         len(_BUFFER), len(_PENDING),
     )
 
-    _drop_stale_buffer(rollout_id)
-    _harvest_ready(
-        args=args, target=target, tokenizer=tokenizer,
-        current_rollout_id=rollout_id, block=False,
-    )
     submitted = _submit_until_full(
         args=args, data_buffer=data_buffer, rollout_id=rollout_id,
         output_root=output_root, model_name=model_name, max_pending=max_pending,
+        target_groups=min_ready_groups,
     )
     logger.info(
         "[naive-async] post-init submitted=%d buffer=%d pending=%d",
@@ -816,12 +795,12 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 f"buffer={len(_BUFFER)} pending={len(_PENDING)}"
             )
         _harvest_ready(
-            args=args, target=target, tokenizer=tokenizer,
-            current_rollout_id=rollout_id, block=bool(_PENDING),
+            args=args, target=target, block=bool(_PENDING),
         )
         submitted += _submit_until_full(
             args=args, data_buffer=data_buffer, rollout_id=rollout_id,
             output_root=output_root, model_name=model_name, max_pending=max_pending,
+            target_groups=min_ready_groups,
         )
         if time.perf_counter() - last_pulse > 30:
             last_pulse = time.perf_counter()
@@ -851,10 +830,11 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             )
 
     selected_groups = _pop_groups(min_ready_groups)
-    _submit_until_full(
-        args=args, data_buffer=data_buffer, rollout_id=rollout_id,
-        output_root=output_root, model_name=model_name, max_pending=max_pending,
-    )
+    if _PENDING or _BUFFER:
+        raise RuntimeError(
+            "Naive collector finished a batch with hidden work: "
+            f"pending={len(_PENDING)} buffer={len(_BUFFER)}"
+        )
     samples = [sample for group in selected_groups for sample in group.samples]
     for group_index, group in enumerate(selected_groups):
         for sample in group.samples:
@@ -873,8 +853,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         int(s.metadata.get("n_full_trace_steps", 0) or 0)
         for s in samples if s.metadata
     ]
-    real_samples = [s for s in samples if not (s.metadata and s.metadata.get("is_dummy"))]
-    n_dummy = len(samples) - len(real_samples)
+    real_samples = samples
     gts = [
         float(s.metadata.get("raw_gt_score") or 0.0)
         for s in real_samples
@@ -917,85 +896,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 if isinstance(x, (int, float)):
                     rollout_lps.append(float(x))
 
-    # Per-trajectory weight-version staleness, measured as
-    # (current actor wv at consumption) - (wv stamped on first assistant turn).
-    # The current actor wv is the TRUE source of truth: query SGLang's
-    # /get_weight_version (the same endpoint trainer hits via
-    # /update_weight_version after each broadcast) so the metric here matches
-    # what the in-flight kill watchdog sees.
-    #
-    # We can't use `rollout_id - min(turn_wv)` because rollout_id is the
-    # consumer's call counter (off-by-one from actor wv at startup, and may
-    # diverge under async pacing), and within-trajectory min vs first-turn
-    # are equivalent unless turns span weight broadcasts.
-    # /get_weight_version only exists on individual sglang engines, NOT on
-    # sglang_router (which only proxies inference). Pick any per-engine
-    # endpoint from args.sglang_model_engines; fall back to router (404
-    # expected) only if the engine list is empty.
-    current_actor_wv: int | None = None
-    try:
-        engines_map = getattr(args, "sglang_model_engines", None) or {}
-        engine_eps = list(engines_map.get(model_name, []))
-        if not engine_eps and len(engines_map) == 1:
-            engine_eps = list(next(iter(engines_map.values())))
-        if engine_eps:
-            host, port = engine_eps[0]
-        else:
-            host, port = (getattr(args, "sglang_model_routers", None) or {}).get(
-                model_name, (args.sglang_router_ip, args.sglang_router_port),
-            )
-        import requests as _rq
-        _r = _rq.get(f"http://{host}:{port}/get_weight_version", timeout=10)
-        _r.raise_for_status()
-        current_actor_wv = int(_r.json().get("weight_version"))
-    except Exception as _exc:
-        logger.warning(
-            "[naive-async] could not fetch current_actor_wv from sglang: %s", _exc,
-        )
-
-    first_turn_wvs: list[int] = []
-    eldest_lags: list[int] = []
-    intra_traj_spreads: list[int] = []
-    for s in samples:
-        if not s.metadata:
-            continue
-        wvs = s.metadata.get("turn_weight_versions") or []
-        if not wvs:
-            continue
-        try:
-            int_wvs = [int(v) for v in wvs]
-        except (TypeError, ValueError):
-            continue
-        if not int_wvs:
-            continue
-        first_wv = int_wvs[0]
-        first_turn_wvs.append(first_wv)
-        intra_traj_spreads.append(int_wvs[-1] - first_wv)
-        if current_actor_wv is not None:
-            eldest_lags.append(current_actor_wv - first_wv)
-    if eldest_lags:
-        avg_eldest_weight_lag = sum(eldest_lags) / len(eldest_lags)
-        min_eldest_weight_lag = min(eldest_lags)
-        max_eldest_weight_lag = max(eldest_lags)
-        eldest_lag_coverage = len(eldest_lags) / len(samples) if samples else 0.0
-    else:
-        avg_eldest_weight_lag = 0.0
-        min_eldest_weight_lag = 0
-        max_eldest_weight_lag = 0
-        eldest_lag_coverage = 0.0
-    if intra_traj_spreads:
-        avg_intra_traj_spread = sum(intra_traj_spreads) / len(intra_traj_spreads)
-        max_intra_traj_spread = max(intra_traj_spreads)
-    else:
-        avg_intra_traj_spread = 0.0
-        max_intra_traj_spread = 0
-
     # --- Patch + eval-based ratios over the post-filter training batch ---
-    # Denominators:
-    #   * patch/submit ratios use all real_samples
-    #   * f2p/p2p-based ratios use only `eval_samples` (real samples whose
-    #     eval payload carries f2p/p2p counts — excludes empty patches and
-    #     harness errors), per user spec "Exclude no-eval samples entirely".
     n_real = len(real_samples)
     formal_submit = sum(
         1 for s in real_samples
@@ -1011,20 +912,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         1 for s in real_samples
         if s.metadata and int(s.metadata.get("terminal_patch_len") or 0) == 0
     )
-    eval_samples = [
-        s for s in real_samples
-        if s.metadata
-        and s.metadata.get("eval_status") in ("resolved", "unresolved")
-        and s.metadata.get("f2p_passed_count") is not None
-        and s.metadata.get("p2p_passed_count") is not None
-    ]
-    n_eval = len(eval_samples)
-    full_pass = 0
-    zero_new_pass = 0
-    zero_pass = 0
-    regression = 0
-    some_pass = 0
-    p2p_pass_rates: list[float] = []
     turns_for_avg: list[int] = []
     fe_rates: list[float] = []
     fe_counts: list[int] = []
@@ -1044,39 +931,11 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 n_fe_gated += 1
         if s.metadata and s.metadata.get("format_error_killed"):
             n_fe_killed += 1
-    for s in eval_samples:
-        md = s.metadata
-        f2p_passed = int(md.get("f2p_passed_count") or 0)
-        f2p_total = int(md.get("f2p_total") or 0)
-        p2p_passed = int(md.get("p2p_passed_count") or 0)
-        p2p_total = int(md.get("p2p_total") or 0)
-        # full_pass: all F2P + all P2P pass (and there was something to test)
-        if (f2p_total + p2p_total) > 0 \
-                and f2p_passed == f2p_total \
-                and p2p_passed == p2p_total:
-            full_pass += 1
-        # zero_new_pass: f2p_passed==0, no P2P regression
-        if f2p_total > 0 and f2p_passed == 0 and p2p_passed == p2p_total:
-            zero_new_pass += 1
-        # zero_pass: strict — both passed counts are 0
-        if f2p_passed == 0 and p2p_passed == 0:
-            zero_pass += 1
-        # regression: any P2P now fails (p2f > 0)
-        if p2p_total > 0 and p2p_passed < p2p_total:
-            regression += 1
-        # some_pass: partial F2P progress
-        if f2p_total > 0 and 0 < f2p_passed < f2p_total:
-            some_pass += 1
-        if p2p_total > 0:
-            p2p_pass_rates.append(p2p_passed / p2p_total)
-
-    global _PREV_STALE_DROPPED_GROUPS, _PREV_FILTER_DROPPED_GROUPS
+    global _PREV_FILTER_DROPPED_GROUPS
     global _PREV_INFRA_DROPPED_GROUPS, _PREV_TOTAL_GROUPS_ATTEMPTED
-    stale_dropped_step = _STALE_DROPPED_GROUPS - _PREV_STALE_DROPPED_GROUPS
     filter_dropped_step = _FILTER_DROPPED_GROUPS - _PREV_FILTER_DROPPED_GROUPS
     infra_dropped_step = _INFRA_DROPPED_GROUPS - _PREV_INFRA_DROPPED_GROUPS
     attempted_step = _TOTAL_GROUPS_ATTEMPTED - _PREV_TOTAL_GROUPS_ATTEMPTED
-    _PREV_STALE_DROPPED_GROUPS = _STALE_DROPPED_GROUPS
     _PREV_FILTER_DROPPED_GROUPS = _FILTER_DROPPED_GROUPS
     _PREV_INFRA_DROPPED_GROUPS = _INFRA_DROPPED_GROUPS
     _PREV_TOTAL_GROUPS_ATTEMPTED = _TOTAL_GROUPS_ATTEMPTED
@@ -1129,13 +988,11 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/buffer_groups": len(_BUFFER),
             "swe_agent/submitted_instances": submitted,
             "swe_agent/failed_instances_total": _FAILED_INSTANCES,
-            "swe_agent/stale_dropped_groups_total": _STALE_DROPPED_GROUPS,
-            "swe_agent/dropped_oversized_samples_total": _DROPPED_OVERSIZED,
+            "swe_agent/truncated_oversized_samples_total": _TRUNCATED_OVERSIZED,
             "swe_agent/filter_dropped_groups_total": _FILTER_DROPPED_GROUPS,
             "swe_agent/infra_dropped_groups_total": _INFRA_DROPPED_GROUPS,
             "swe_agent/total_groups_attempted_total": _TOTAL_GROUPS_ATTEMPTED,
             # --- per-step drop deltas (easier to chart than diff of totals) ---
-            "swe_agent/stale_dropped_groups": stale_dropped_step,
             "swe_agent/dynamic_filter_dropped_groups": filter_dropped_step,
             "swe_agent/dynamic_filter_drop_rate": filter_drop_rate_step,
             "swe_agent/infra_dropped_groups": infra_dropped_step,
@@ -1153,22 +1010,13 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/truncation_rate": (trunc_count / len(samples)) if samples else 0.0,
             "swe_agent/distinct_instances_in_batch": distinct_instances,
             "swe_agent/instance_pass_at_0.5": instance_pass,
-            "swe_agent/dummy_sample_count": n_dummy,
-            "swe_agent/dummy_sample_rate": (n_dummy / len(samples)) if samples else 0.0,
             "swe_agent/rollout_logprob_mean": _safe_mean(rollout_lps),
             "swe_agent/rollout_logprob_token_count": len(rollout_lps),
             # --- patch + eval ratios over post-filter batch ---
             "swe_agent/ratio_formal_submit": (formal_submit / n_real) if n_real else 0.0,
             "swe_agent/ratio_informal_submit": (informal_submit / n_real) if n_real else 0.0,
             "swe_agent/ratio_zero_patch": (zero_patch / n_real) if n_real else 0.0,
-            "swe_agent/eval_samples_in_batch": n_eval,
-            "swe_agent/ratio_full_pass": (full_pass / n_eval) if n_eval else 0.0,
-            "swe_agent/ratio_zero_new_pass": (zero_new_pass / n_eval) if n_eval else 0.0,
-            "swe_agent/ratio_zero_pass": (zero_pass / n_eval) if n_eval else 0.0,
-            "swe_agent/ratio_regression": (regression / n_eval) if n_eval else 0.0,
-            "swe_agent/ratio_some_pass": (some_pass / n_eval) if n_eval else 0.0,
             "swe_agent/avg_turns": _safe_mean([float(x) for x in turns_for_avg]),
-            "swe_agent/avg_existing_utest_pass_rate": _safe_mean(p2p_pass_rates),
             # --- format-error health (job 58062 mode-collapse signal) ---
             "swe_agent/format_error_rate_mean": _safe_mean(fe_rates),
             "swe_agent/format_error_count_mean": _safe_mean(
@@ -1183,23 +1031,5 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/ratio_format_error_killed": (
                 (n_fe_killed / n_real) if n_real else 0.0
             ),
-            # --- policy-drift age (current actor wv - first turn wv) ---
-            # avg/min/max_eldest_weight_lag are now (current_actor_wv - first_turn_wv)
-            # for each trajectory in the consumed batch. current_actor_wv is
-            # polled from sglang's /get_weight_version at the start of the
-            # post-batch metrics block; this is the same source the kill
-            # watchdog uses for in-flight aborts (see naive_search.py:_step_
-            # session_with_stale_check). intra_traj_spread is the within-
-            # trajectory delta (= last_turn_wv - first_turn_wv) — this is
-            # what the OLD wandb metric and OLD killer were measuring.
-            "swe_agent/current_actor_wv": (
-                int(current_actor_wv) if current_actor_wv is not None else -1
-            ),
-            "swe_agent/avg_eldest_weight_lag": avg_eldest_weight_lag,
-            "swe_agent/min_eldest_weight_lag": min_eldest_weight_lag,
-            "swe_agent/max_eldest_weight_lag": max_eldest_weight_lag,
-            "swe_agent/eldest_lag_coverage": eldest_lag_coverage,
-            "swe_agent/avg_intra_traj_spread": avg_intra_traj_spread,
-            "swe_agent/max_intra_traj_spread": max_intra_traj_spread,
         },
     )

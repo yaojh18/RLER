@@ -199,8 +199,10 @@ async def run_litellm_completion_async(
                 finish_reason="stop",
                 model_name=model_name,
                 cost=0.0,
-                raw_response={"validation_error": str(exc)},
-                metadata={"timestamp": time.time(), "content_no_thinking": raw_content},
+                metadata={
+                    "timestamp": time.time(),
+                    "validation_error": str(exc),
+                },
             )
         # ContextWindow / token-count overflow must NOT be silently swallowed: doing so
         # causes the agent loop to inject a format_error template and retry with a
@@ -254,11 +256,10 @@ async def run_litellm_completion_async(
         usage = response.usage.model_dump() if hasattr(response.usage, "model_dump") else dict(response.usage)
     return ChatCompletion(
         content=content,
-        finish_reason=choice.finish_reason or "stop",
+        finish_reason=choice.finish_reason,
         model_name=model_name,
         cost=0.0,
         usage=usage,
-        raw_response=response.model_dump() if hasattr(response, "model_dump") else {},
         metadata={"timestamp": time.time(), "content_no_thinking": content_no_thinking},
     )
 
@@ -290,8 +291,6 @@ async def run_generate_with_route_async(
       - input_token_ids      = echo of the input_ids we sent
       - usage                = {prompt_tokens, completion_tokens}
       - finish_reason        = inferred from sglang meta_info
-      - raw_response         = compact response metadata; token/logprob arrays
-                               live in the dedicated fields below
     """
     import aiohttp  # local import — only token-IO path needs aiohttp
     if sampling_params is None:
@@ -376,29 +375,15 @@ async def run_generate_with_route_async(
                 output_logprobs.append(float(entry["logprob"]))
             except (TypeError, ValueError):
                 pass
-    compact_raw_response = {
-        "endpoint": "generate",
-        "finish_reason": finish_info,
-        "usage": usage,
-        "input_token_count": len(input_ids),
-        "output_token_count": len(output_ids),
-        "output_logprob_count": len(output_logprobs),
-        "has_output_logprobs": bool(output_logprobs),
-        "meta_info_keys": sorted(meta.keys()),
-    }
     return ChatCompletion(
         content=content,
         finish_reason=finish_reason,
         model_name=route_name,
         cost=0.0,
         usage=usage,
-        raw_response=compact_raw_response,
         metadata={
             "timestamp": time.time(),
-            # Keep full decoded text in `content`; expose stripped text through
-            # `content_no_thinking` for JSON parsing and artifact consumers.
             "content_no_thinking": content_no_thinking,
-            "endpoint": "generate",
         },
         output_token_ids=output_ids,
         output_logprobs=output_logprobs,
@@ -445,19 +430,6 @@ def _normalize_messages_for_generate(messages: List[Dict[str, Any]]) -> List[Dic
             item["token_ids"] = list(message["token_ids"])
         normalized.append(item)
     return normalized
-
-
-def compact_completion_response(completion: Any) -> Dict[str, Any]:
-    raw = completion.raw_response if isinstance(completion.raw_response, dict) else {}
-    return {
-        "endpoint": completion.metadata.get("endpoint") or raw.get("endpoint"),
-        "finish_reason": completion.finish_reason,
-        "usage": dict(completion.usage) if completion.usage else {},
-        "input_token_count": len(completion.input_token_ids or []),
-        "output_token_count": len(completion.output_token_ids or []),
-        "output_logprob_count": len(completion.output_logprobs or []),
-        "has_output_logprobs": bool(completion.output_logprobs),
-    }
 
 
 def _completion_to_assistant_message(

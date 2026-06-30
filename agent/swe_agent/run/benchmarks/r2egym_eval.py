@@ -12,7 +12,7 @@ from swe_agent.environments.singularity import (
     SingularityEnvironment,
     resolve_singularity_image,
 )
-from swe_agent.run.benchmarks.container_runtime import select_container_backend
+from swe_agent.run.benchmarks.container_runtime import raise_for_container_error, select_container_backend
 
 
 R2EGYM_DATASET_NAMES = {
@@ -100,6 +100,7 @@ class R2ESingularityRuntime(DockerRuntime):
         del type
         command = f"timeout {int(timeout)} {code} {args}".strip()
         result = self.env.execute({"command": command}, cwd=workdir or self.repo_path, timeout=timeout + 5)
+        raise_for_container_error(result)
         output = str(result.get("output") or "")
         output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
         returncode = int(result.get("returncode", -1))
@@ -118,7 +119,8 @@ class R2ESingularityRuntime(DockerRuntime):
             f"mkdir -p {shlex.quote(str(Path(dest_path).parent))} && "
             f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(dest_path)}"
         )
-        self.env.execute({"command": command}, cwd="/", timeout=120)
+        result = self.env.execute({"command": command}, cwd="/", timeout=120)
+        raise_for_container_error(result)
 
     def reset(self) -> None:
         self.env.cleanup()

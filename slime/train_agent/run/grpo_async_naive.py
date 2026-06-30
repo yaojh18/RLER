@@ -33,7 +33,7 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--naive-output-root", default="")
     p.add_argument("--naive-m", type=int, default=8)
     p.add_argument("--naive-step-limit", type=int, default=120)
-    p.add_argument("--naive-completion-max-tokens", type=int, default=4096)
+    p.add_argument("--naive-completion-max-tokens", type=int, default=16384)
     p.add_argument("--naive-seed", type=int, default=0)
     p.add_argument("--naive-gt-eval-workers", type=int, default=8)
     p.add_argument("--naive-rollout-pool-size", type=int, default=0)
@@ -41,10 +41,14 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
                    help="Sampling temperature for the M independent rollouts.")
     p.add_argument("--naive-policy-top-p", type=float, default=0.95)
     p.add_argument("--naive-fallback-patch-penalty", type=float, default=0.5)
-    p.add_argument("--naive-no-action-patch-penalty", type=float, default=0.0,
-                   help="Multiplier applied when rollout emitted zero env actions. "
-                        "0.0 = hard zero reward (default), 1.0 = no penalty.")
-    p.add_argument("--naive-reward-kind", choices=("soft", "delta"), default="delta")
+    p.add_argument("--naive-no-action-patch-penalty", type=float, default=-0.1)
+    p.add_argument(
+        "--naive-reward-kind",
+        choices=("hard", "soft", "delta", "joint", "f2p_only"),
+        default="delta",
+    )
+    p.add_argument("--naive-joint-alpha", type=float, default=1.0)
+    p.add_argument("--naive-all-pass-reward", type=float, default=2.0)
     return p.parse_known_args(argv)
 
 
@@ -76,6 +80,8 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY"] = str(ns.naive_fallback_patch_penalty)
     os.environ["SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY"] = str(ns.naive_no_action_patch_penalty)
     os.environ["SWE_AGENT_NAIVE_REWARD_KIND"] = ns.naive_reward_kind
+    os.environ["SWE_AGENT_NAIVE_JOINT_ALPHA"] = str(ns.naive_joint_alpha)
+    os.environ["SWE_AGENT_NAIVE_ALL_PASS_REWARD"] = str(ns.naive_all_pass_reward)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -15,7 +15,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from datasets import load_dataset
+from datasets import DownloadConfig, load_dataset
 
 import docker
 import typer
@@ -96,6 +96,32 @@ _IMAGE_RESOLUTION_LOCK = threading.Lock()
 _IMAGE_RESOLUTION_CACHE: dict[str, tuple[str, str | None]] = {}
 OFFICIAL_IMAGE_NAMESPACE = "swebench"
 REBENCH_VENDOR_ROOT = Path(__file__).resolve().parent / "swe_rebench_v2"
+LOCAL_DATASETS_ROOT = Path(__file__).resolve().parents[5] / "datasets"
+LOCAL_DATASET_DIRS = {
+    "princeton-nlp/SWE-Bench_Verified": "swebench_verified",
+    "ScaleAI/SWE-bench_Pro": "swebench_pro",
+    "datacurve/deep-swe": "deepswe",
+    "R2E-Gym/R2E-Gym-Subset": "r2egym",
+}
+
+
+def _load_dataset(*args, **kwargs):
+    dataset_path = args[0] if args else kwargs.get("path")
+    local_name = LOCAL_DATASET_DIRS.get(str(dataset_path))
+    local_path = LOCAL_DATASETS_ROOT / local_name / "raw" if local_name else None
+    if os.getenv("RLER_HF_DATASET_LOCAL_ONLY", "0") != "0" and local_path and local_path.exists():
+        if args:
+            return load_dataset(str(local_path), *args[1:], **kwargs)
+        return load_dataset(**{**kwargs, "path": str(local_path)})
+    try:
+        return load_dataset(*args, **kwargs)
+    except Exception:
+        if local_path and local_path.exists():
+            if args:
+                return load_dataset(str(local_path), *args[1:], **kwargs)
+            return load_dataset(**{**kwargs, "path": str(local_path)})
+        local_kwargs = {**kwargs, "download_config": DownloadConfig(local_files_only=True)}
+        return load_dataset(*args, **local_kwargs)
 
 
 class ProgressTrackingAgent(DefaultAgent):
@@ -119,7 +145,10 @@ def get_swebench_docker_image_name(instance: dict) -> str:
 
 def get_swebench_singularity_image_name(instance: dict) -> str:
     """Get the Apptainer/Singularity image for a SWEBench-style instance."""
-    return resolve_singularity_image(get_swebench_docker_image_name(instance), instance)
+    try:
+        return resolve_singularity_image(str(instance.get("docker_image") or "local"), instance)
+    except FileNotFoundError:
+        return resolve_singularity_image(get_swebench_docker_image_name(instance), instance)
 
 
 def get_swebench_harness_namespace(instance: dict) -> str | None:
@@ -383,9 +412,8 @@ def _infer_harness_namespace(image_name: str, instance: dict) -> str | None:
 def get_sb_environment(config: dict, instance: dict) -> Environment:
     env_config = config.setdefault("environment", {})
     env_config["environment_class"] = select_container_environment_class(env_config.get("environment_class", "docker"))
-    image_name = get_swebench_docker_image_name(instance)
     if env_config["environment_class"] in ["docker", "swerex_modal"]:
-        env_config["image"] = image_name
+        env_config["image"] = get_swebench_docker_image_name(instance)
     elif env_config["environment_class"] in ["singularity", "contree"]:
         env_config["image"] = get_swebench_singularity_image_name(instance)
     if _is_rebench_instance(instance):
@@ -398,6 +426,8 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
         env_config.setdefault("dataset_name", "r2egym")
     elif is_swebench_pro_instance(instance) or is_deepswe_instance(instance):
         env_config["cwd"] = instance.get("swebench_workdir", "/app")
+    else:
+        env_config["cwd"] = env_config.get("cwd") or "/testbed"
 
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):
@@ -517,7 +547,7 @@ def filter_instances(
 def load_swebench_instances(subset: str, split: str) -> list[dict]:
     dataset_path = DATASET_MAPPING.get(subset, subset)
     logger.info(f"Loading dataset {dataset_path}, split {split}...")
-    return [_normalize_dataset_row(dataset_path, row) for row in load_dataset(dataset_path, split=split)]
+    return [_normalize_dataset_row(dataset_path, row) for row in _load_dataset(dataset_path, split=split)]
 
 
 def load_swebench_instances_slice(subset: str, split: str, offset: int, limit: int) -> list[dict]:
@@ -525,7 +555,7 @@ def load_swebench_instances_slice(subset: str, split: str, offset: int, limit: i
         raise ValueError("offset must be non-negative and limit must be positive")
     dataset_path = DATASET_MAPPING.get(subset, subset)
     logger.info(f"Loading {limit} instance(s) from {dataset_path}, split {split}, offset {offset}...")
-    rows = load_dataset(dataset_path, split=split, streaming=True).skip(offset).take(limit)
+    rows = _load_dataset(dataset_path, split=split, streaming=True).skip(offset).take(limit)
     return [_normalize_dataset_row(dataset_path, row) for row in rows]
 
 
@@ -536,7 +566,7 @@ def load_swebench_instances_by_id(subset: str, split: str, instance_ids: list[st
     logger.info(f"Loading {len(instance_ids)} instance(s) from {dataset_path}, split {split}...")
     wanted = set(instance_ids)
     found: dict[str, dict] = {}
-    for row in load_dataset(dataset_path, split=split, streaming=True):
+    for row in _load_dataset(dataset_path, split=split, streaming=True):
         instance_id = _row_instance_id(dataset_path, row)
         if instance_id in wanted and instance_id not in found:
             found[instance_id] = _normalize_dataset_row(dataset_path, row)

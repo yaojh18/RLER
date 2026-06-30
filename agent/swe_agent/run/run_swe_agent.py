@@ -21,6 +21,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence, TextIO
 from swebench.harness import run_evaluation as swebench_run_evaluation
@@ -73,22 +74,16 @@ AGENT_ROOT = REPO_ROOT / "agent"
 DEFAULT_SUBSET = "verified"
 DEFAULT_SPLIT = "test"
 DEFAULT_OUTPUT_ROOT = AGENT_ROOT / "outputs"
-DEFAULT_LOG_ROOT = AGENT_ROOT / "logs"
+DEFAULT_LOG_ROOT = Path(os.environ.get("RUN_SWE_AGENT_LOG_ROOT", AGENT_ROOT / "logs"))
 DEFAULT_SERVE_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_OPENAI_MODEL = "gemini/gemini-3-pro-preview"
 DEFAULT_MODEL_CLASS = "route_textbased"
 DEFAULT_MAX_MODEL_LEN = 128000
 DEFAULT_STEP_LIMIT = 160
-DEFAULT_COMPLETION_MAX_TOKENS = 4096
+DEFAULT_COMPLETION_MAX_TOKENS = 8096
 EMPTY_REWARD = 0.0
 ERROR_REWARD = 0.0
-# RLER_REWARD_SCHEME selects the GT reward formula used by make_evaluation_payload.
-#   "soft"     (default, legacy): len(passed) / len(passed ∪ failed_in_view) over all visible tests.
-#                                 No-op on 9 P2P + 1 F2P scores 0.9 — high baseline.
-#   "joint":    frac_F2P_passed × frac_P2P_passed. Lazy no-op = 0; perfect fix = 1.
-#               Penalises P2P regressions multiplicatively. Requires per-instance F2P/P2P sets.
-#   "f2p_only": len(passed_F2P) / len(F2P). Ignores P2P regressions; pure bug-fix progress.
-SUPPORTED_REWARD_SCHEMES = {"soft", "joint", "f2p_only"}
+SUPPORTED_REWARD_KINDS = {"hard", "soft", "delta", "joint", "f2p_only"}
 DEFAULT_VLLM_PORT = 30000
 DEFAULT_ENV_TIMEOUT = 300
 DEFAULT_PULL_TIMEOUT = 600
@@ -100,6 +95,30 @@ SLIME_API_BASE = os.environ.get("SEARCH_SWE_SLIME_API_BASE", "http://127.0.0.1:8
 SLIME_API_KEY = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
 DEFAULT_SGLANG_IMAGE = "slimerl/slime:qwen35-route-fixed-20260416-v1"
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+
+
+@dataclass(frozen=True)
+class EvaluationRewardConfig:
+    kind: str = "delta"
+    joint_alpha: float = 1.0
+    all_pass_reward: float = 2.0
+    fallback_patch_penalty: float = 1.0
+    no_action_patch_penalty: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.kind not in SUPPORTED_REWARD_KINDS:
+            raise ValueError(
+                f"Unsupported reward kind {self.kind!r}; choose from {sorted(SUPPORTED_REWARD_KINDS)}"
+            )
+
+
+def default_evaluation_reward_config() -> EvaluationRewardConfig:
+    kind = os.environ.get("RLER_REWARD_KIND", "delta")
+    return EvaluationRewardConfig(
+        kind=kind.strip().lower() or "delta",
+        joint_alpha=float(os.environ.get("RLER_JOINT_ALPHA", "1.0")),
+        all_pass_reward=float(os.environ.get("RLER_ALL_PASS_REWARD", "2.0")),
+    )
 
 
 class TeeStream:
@@ -394,11 +413,15 @@ def parse_trajectory_message(
             "content",
             "prompt_token_ids",
             "token_ids",
+            "tokens",
             "logprobs",
             "usage",
         ):
             if key in message:
                 parsed[key] = message[key]
+        finish_reason = extra.get("finish_reason") or message.get("finish_reason")
+        if finish_reason:
+            parsed["finish_reason"] = finish_reason
         if "content_no_thinking" in message:
             parsed["content_no_thinking"] = message["content_no_thinking"]
         elif "content" in parsed:
@@ -471,6 +494,8 @@ def make_evaluation_payload(
     error: Exception | str | None = None,
     pass_to_pass_expected: Sequence[str] | None = None,
     fail_to_pass_expected: Sequence[str] | None = None,
+    reward_config: EvaluationRewardConfig | None = None,
+    infrastructure_error: bool = False,
 ) -> dict[str, Any]:
     if status not in {"resolved", "unresolved", "empty", "error"}:
         raise ValueError(f"Unknown evaluation status: {status}")
@@ -485,41 +510,53 @@ def make_evaluation_payload(
         )
         output = "\n".join(part for part in [output, error_output] if part)
 
-    scheme = os.environ.get("RLER_REWARD_SCHEME", "soft").strip().lower() or "soft"
-    if scheme not in SUPPORTED_REWARD_SCHEMES:
-        raise ValueError(f"Unsupported RLER_REWARD_SCHEME={scheme!r}; choose from {sorted(SUPPORTED_REWARD_SCHEMES)}")
-
     passed_set = set(passed)
     f2p = {str(t) for t in _test_sequence(fail_to_pass_expected) if str(t)}
     p2p = {str(t) for t in _test_sequence(pass_to_pass_expected) if str(t)}
+    reward_config = reward_config or default_evaluation_reward_config()
+    f2p_passed = len(passed_set & f2p)
+    p2p_passed = len(passed_set & p2p)
+    p2p_failed = max(0, len(p2p) - p2p_passed)
+    total_expected = len(f2p) + len(p2p)
+    visible_total = len(passed_set | set(failed))
+    all_pass = status == "resolved"
 
     if status == "empty":
         reward = EMPTY_REWARD
     elif status == "error":
         reward = ERROR_REWARD
-    elif scheme in {"joint", "f2p_only"} and not (f2p or p2p):
-        reward = 1.0 if status == "resolved" else 0.0
-    elif scheme == "soft":
-        total = len(passed_set | set(failed))
-        reward = len(passed_set) / total if total else (1.0 if status == "resolved" else 0.0)
+    elif reward_config.kind == "hard":
+        reward = 1.0 if all_pass else 0.0
+    elif reward_config.kind == "soft":
+        reward = len(passed_set) / visible_total if visible_total else float(all_pass)
+    elif total_expected == 0:
+        reward = float(all_pass)
+    elif reward_config.kind == "delta":
+        reward = max(0.0, (f2p_passed - p2p_failed) / total_expected)
     else:
-        f2p_frac = len(passed_set & f2p) / len(f2p) if f2p else 1.0
-        p2p_frac = len(passed_set & p2p) / len(p2p) if p2p else 1.0
-        if scheme == "joint":
-            reward = f2p_frac * p2p_frac
-        else:  # f2p_only
-            reward = f2p_frac
+        f2p_pass_rate = f2p_passed / len(f2p) if f2p else 1.0
+        p2p_pass_rate = p2p_passed / len(p2p) if p2p else 1.0
+        reward = (
+            f2p_pass_rate - reward_config.joint_alpha * p2p_pass_rate
+            if reward_config.kind == "joint"
+            else f2p_pass_rate
+        )
+
+    if status != "error":
+        if all_pass:
+            reward *= reward_config.all_pass_reward
+        reward *= reward_config.fallback_patch_penalty
+        reward += reward_config.no_action_patch_penalty
 
     return {
         "status": status,
         "passed_tests": passed,
         "failed_tests": failed,
         "reward": float(reward),
-        "f2p_passed_count": len(passed_set & f2p),
-        "f2p_total": len(f2p),
-        "p2p_passed_count": len(passed_set & p2p),
-        "p2p_total": len(p2p),
-        "metainfo": {"output": str(output)} if output else {},
+        "metainfo": {
+            **({"output": str(output)} if output else {}),
+            "infrastructure_error": bool(infrastructure_error),
+        },
     }
 
 
@@ -552,7 +589,12 @@ def materialize_backend_run(*, model_name: str, instance_id: str, run_dir: Path,
     traj = json.loads(traj_path.read_text(encoding="utf-8")) if traj_path.exists() else {}
     _json_dump(
         run_dir / "messages.json",
-        build_messages(traj.get("messages", []), model_name=model_name, trajectory_format=traj.get("trajectory_format")),
+        build_messages(
+            traj.get("messages", []),
+            model_name=model_name,
+            trajectory_format=traj.get("trajectory_format"),
+            preserve_token_fields=True,
+        ),
     )
 
     prediction = {}
@@ -664,7 +706,16 @@ def run_harness_evaluation(
                 _json_dump(result_dir / "evaluation.json", payload)
 
 
-def _rebench_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+def _rebench_result_payload(
+    result: dict[str, Any], reward_config: EvaluationRewardConfig | None = None
+) -> dict[str, Any]:
+    if result.get("error"):
+        return make_evaluation_payload(
+            "error",
+            output=result.get("evaluation_output") or "",
+            error=str(result["error"]),
+            reward_config=reward_config,
+        )
     expected = {str(test) for test in result.get("passed_expected", []) if str(test)}
     passed_actual = {str(test) for test in result.get("passed_actual", []) if str(test)}
     failed_actual = {str(test) for test in result.get("failed_actual", []) if str(test)}
@@ -678,37 +729,52 @@ def _rebench_result_payload(result: dict[str, Any]) -> dict[str, Any]:
         output=result.get("evaluation_output") or "",
         pass_to_pass_expected=result.get("pass_to_pass_expected", []),
         fail_to_pass_expected=result.get("fail_to_pass_expected", []),
+        reward_config=reward_config,
     )
 
 
-def _r2egym_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+def _r2egym_result_payload(
+    result: dict[str, Any], reward_config: EvaluationRewardConfig | None = None
+) -> dict[str, Any]:
+    if result.get("error"):
+        return make_evaluation_payload(
+            "error",
+            output=result.get("evaluation_output") or "",
+            error=str(result["error"]),
+            reward_config=reward_config,
+        )
     resolved = bool(result.get("resolved"))
-    payload = make_evaluation_payload(
+    return make_evaluation_payload(
         status="resolved" if resolved else "unresolved",
         passed_tests=result.get("passed_actual", []),
         failed_tests=result.get("failed_actual", []),
         output=result.get("evaluation_output") or "",
         pass_to_pass_expected=result.get("pass_to_pass_expected", []),
         fail_to_pass_expected=result.get("fail_to_pass_expected", []),
+        reward_config=reward_config,
     )
-    if "reward" in result:
-        payload.setdefault("metainfo", {})["benchmark_reward"] = float(result["reward"])
-    return payload
 
 
-def _benchmark_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+def _benchmark_result_payload(
+    result: dict[str, Any], reward_config: EvaluationRewardConfig | None = None
+) -> dict[str, Any]:
+    if result.get("error"):
+        return make_evaluation_payload(
+            "error",
+            output=result.get("evaluation_output") or "",
+            error=str(result["error"]),
+            reward_config=reward_config,
+        )
     resolved = bool(result.get("resolved"))
-    payload = make_evaluation_payload(
+    return make_evaluation_payload(
         status="resolved" if resolved else "unresolved",
         passed_tests=result.get("passed_actual", []),
         failed_tests=result.get("failed_actual", []),
         output=result.get("evaluation_output") or "",
         pass_to_pass_expected=result.get("pass_to_pass_expected", []),
         fail_to_pass_expected=result.get("fail_to_pass_expected", []),
+        reward_config=reward_config,
     )
-    if "reward" in result:
-        payload.setdefault("metainfo", {})["benchmark_reward"] = float(result["reward"])
-    return payload
 
 
 def _swebench_report_payload(
@@ -718,6 +784,7 @@ def _swebench_report_payload(
     *,
     fail_to_pass_expected: Sequence[str] | None = None,
     pass_to_pass_expected: Sequence[str] | None = None,
+    reward_config: EvaluationRewardConfig | None = None,
 ) -> dict[str, Any]:
     instance_report = report.get(instance_id, {}) if isinstance(report, dict) else {}
     tests_status = instance_report.get("tests_status", {}) if isinstance(instance_report, dict) else {}
@@ -736,6 +803,7 @@ def _swebench_report_payload(
         output=output,
         fail_to_pass_expected=fail_to_pass_expected,
         pass_to_pass_expected=pass_to_pass_expected,
+        reward_config=reward_config,
     )
 
 
@@ -747,6 +815,7 @@ def evaluate_swebench_instance_patches(
     max_workers: int,
     namespace: str | None = None,
     work_dir: Path | None = None,
+    reward_config: EvaluationRewardConfig | None = None,
 ) -> dict[str, dict[str, Any]]:
     eval_work_dir = Path(work_dir or Path.cwd()).resolve()
     if is_rebench_instance(instance):
@@ -755,7 +824,7 @@ def evaluate_swebench_instance_patches(
         for key, patch in patches_by_key.items():
             patch_text = patch or ""
             if not patch_text.strip():
-                evaluations[key] = make_evaluation_payload("empty")
+                evaluations[key] = make_evaluation_payload("empty", reward_config=reward_config)
                 continue
             unique_patches.setdefault(patch_text, {"patch": patch_text, "keys": []})["keys"].append(key)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(unique_patches) or 1))) as executor:
@@ -771,9 +840,11 @@ def evaluate_swebench_instance_patches(
             }
             for future, keys in future_map.items():
                 try:
-                    payload = _rebench_result_payload(future.result())
+                    payload = _rebench_result_payload(future.result(), reward_config)
                 except Exception as exc:
-                    payload = make_evaluation_payload("error", error=exc)
+                    payload = make_evaluation_payload(
+                        "error", error=exc, reward_config=reward_config, infrastructure_error=True
+                    )
                 for key in keys:
                     evaluations[key] = payload
         return evaluations
@@ -789,12 +860,19 @@ def evaluate_swebench_instance_patches(
                 work_dir=eval_work_dir,
             )
         except Exception as exc:
-            return {key: make_evaluation_payload("error", error=exc) for key in patches_by_key}
+            return {
+                key: make_evaluation_payload(
+                    "error", error=exc, reward_config=reward_config, infrastructure_error=True
+                )
+                for key in patches_by_key
+            }
         for key, result in results.items():
             try:
-                evaluations[key] = _r2egym_result_payload(result)
+                evaluations[key] = _r2egym_result_payload(result, reward_config)
             except Exception as exc:
-                evaluations[key] = make_evaluation_payload("error", error=exc)
+                evaluations[key] = make_evaluation_payload(
+                    "error", error=exc, reward_config=reward_config, infrastructure_error=True
+                )
         return evaluations
 
     if is_swebench_pro_instance(instance):
@@ -806,9 +884,14 @@ def evaluate_swebench_instance_patches(
                 timeout=600,
                 work_dir=eval_work_dir,
             )
-            return {key: _benchmark_result_payload(result) for key, result in results.items()}
+            return {key: _benchmark_result_payload(result, reward_config) for key, result in results.items()}
         except Exception as exc:
-            return {key: make_evaluation_payload("error", error=exc) for key in patches_by_key}
+            return {
+                key: make_evaluation_payload(
+                    "error", error=exc, reward_config=reward_config, infrastructure_error=True
+                )
+                for key in patches_by_key
+            }
 
     if is_deepswe_instance(instance):
         try:
@@ -819,13 +902,18 @@ def evaluate_swebench_instance_patches(
                 timeout=600,
                 work_dir=eval_work_dir,
             )
-            return {key: _benchmark_result_payload(result) for key, result in results.items()}
+            return {key: _benchmark_result_payload(result, reward_config) for key, result in results.items()}
         except Exception as exc:
-            return {key: make_evaluation_payload("error", error=exc) for key in patches_by_key}
+            return {
+                key: make_evaluation_payload(
+                    "error", error=exc, reward_config=reward_config, infrastructure_error=True
+                )
+                for key in patches_by_key
+            }
 
     unique_patches: dict[str, dict[str, Any]] = {}
     evaluations = {
-        key: make_evaluation_payload("empty")
+        key: make_evaluation_payload("empty", reward_config=reward_config)
         for key, patch in patches_by_key.items()
         if not (patch or "").strip()
     }
@@ -855,7 +943,9 @@ def evaluate_swebench_instance_patches(
         except Exception as exc:
             for key, patch in patches_by_key.items():
                 if (patch or "").strip():
-                    evaluations[key] = make_evaluation_payload("error", error=exc)
+                    evaluations[key] = make_evaluation_payload(
+                        "error", error=exc, reward_config=reward_config, infrastructure_error=True
+                    )
             return evaluations
         for key, result in raw_results.items():
             try:
@@ -865,9 +955,16 @@ def evaluate_swebench_instance_patches(
                     result.get("output", ""),
                     fail_to_pass_expected=instance.get("FAIL_TO_PASS", []) or [],
                     pass_to_pass_expected=instance.get("PASS_TO_PASS", []) or [],
+                    reward_config=reward_config,
                 )
             except Exception as exc:
-                evaluations[key] = make_evaluation_payload("error", output=result.get("output", ""), error=exc)
+                evaluations[key] = make_evaluation_payload(
+                    "error",
+                    output=result.get("output", ""),
+                    error=exc,
+                    reward_config=reward_config,
+                    infrastructure_error=True,
+                )
         return evaluations
 
     previous_eval_root = swebench_run_evaluation.RUN_EVALUATION_LOG_DIR
@@ -912,11 +1009,19 @@ def evaluate_swebench_instance_patches(
                             output,
                             fail_to_pass_expected=instance.get("FAIL_TO_PASS", []) or [],
                             pass_to_pass_expected=instance.get("PASS_TO_PASS", []) or [],
+                            reward_config=reward_config,
                         )
                     except (json.JSONDecodeError, KeyError, TypeError) as exc:
-                        payload = make_evaluation_payload("error", output=output, error=exc)
+                        payload = make_evaluation_payload(
+                            "error", output=output, error=exc, reward_config=reward_config
+                        )
                 else:
-                    payload = make_evaluation_payload("error", output=output, error="Missing SWE-bench evaluation report")
+                    payload = make_evaluation_payload(
+                        "error",
+                        output=output,
+                        error="Missing SWE-bench evaluation report",
+                        reward_config=reward_config,
+                    )
                 evaluations.update({key: payload for key in keys})
         finally:
             swebench_run_evaluation.RUN_EVALUATION_LOG_DIR = previous_eval_root
@@ -1250,6 +1355,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subset", default=DEFAULT_SUBSET)
     parser.add_argument("--split", default=DEFAULT_SPLIT)
     parser.add_argument("--evaluation-only", default=None)
+    parser.add_argument("--timestamp", default=None, help="Override the run timestamp used in output/log directories.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--step-limit", type=int, default=DEFAULT_STEP_LIMIT)
@@ -1295,7 +1401,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     args._evaluation_only = args.evaluation_only
-    args._run_timestamp = args.evaluation_only or time.strftime("%Y%m%d-%H%M%S")
+    args._run_timestamp = args.evaluation_only or args.timestamp or time.strftime("%Y%m%d-%H%M%S")
     args._run_log_path = DEFAULT_LOG_ROOT / f"{args._run_timestamp}.log"
     if args.pass_n < 1:
         raise ValueError("--pass-n must be positive")

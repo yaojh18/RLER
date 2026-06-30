@@ -9,6 +9,7 @@ from typing import Any, Literal
 import litellm
 from pydantic import BaseModel
 
+from swe_agent.exceptions import FormatError
 from swe_agent.models import GLOBAL_MODEL_STATS
 from swe_agent.models.utils.actions_toolcall import (
     BASH_TOOL,
@@ -48,6 +49,36 @@ def _message_contents(message: Any) -> tuple[str, str]:
         if closing_index >= 0:
             return content, content[closing_index + len(closing_tag) :].lstrip("\r\n")
     return content, content
+
+
+def _build_assistant_message(
+    *,
+    content: str | None,
+    content_no_thinking: str | None,
+    usage: dict[str, Any] | None,
+    prompt_token_ids: list[int] | None,
+    token_ids: list[int] | None,
+    logprobs: list[float] | None,
+    cost: float,
+    timestamp: float,
+    finish_reason: str | None,
+) -> dict[str, Any]:
+    """Build the canonical assistant-message schema shared by all text backends."""
+    return {
+        "role": "assistant",
+        "content": content or "",
+        "content_no_thinking": content_no_thinking or "",
+        "usage": dict(usage or {}),
+        "prompt_token_ids": list(prompt_token_ids or []),
+        "token_ids": list(token_ids or []),
+        "logprobs": list(logprobs or []),
+        "extra": {
+            "actions": [],
+            "cost": cost,
+            "timestamp": timestamp,
+            "finish_reason": finish_reason or "stop",
+        },
+    }
 
 
 class LitellmModelConfig(BaseModel):
@@ -115,8 +146,28 @@ class LitellmModel:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
             raise e
 
-    def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
-        prepared = [{k: v for k, v in msg.items() if k not in {"extra", "content_no_thinking"}} for msg in messages]
+    def _prepare_messages_for_api(
+        self, messages: list[dict], *, preserve_token_fields: bool = False
+    ) -> list[dict]:
+        internal_fields = {"extra", "content_no_thinking", "usage", "tokens"}
+        if not preserve_token_fields:
+            internal_fields.update({"prompt_token_ids", "token_ids", "logprobs"})
+        prepared = []
+        for message in messages:
+            item = {key: value for key, value in message.items() if key not in internal_fields}
+            actions = (message.get("extra") or {}).get("actions") or []
+            tool_calls = [
+                {
+                    "id": action["tool_call_id"],
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": json.dumps({"command": action["command"]})},
+                }
+                for action in actions
+                if action.get("tool_call_id") and "command" in action
+            ]
+            if tool_calls and "tool_calls" not in item:
+                item["tool_calls"] = tool_calls
+            prepared.append(item)
         prepared = _reorder_anthropic_thinking_blocks(prepared)
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
@@ -126,16 +177,34 @@ class LitellmModel:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
-        message = response.choices[0].message.model_dump()
-        full_content, content_no_thinking = _message_contents(response.choices[0].message)
-        message["content"] = full_content
-        message["content_no_thinking"] = content_no_thinking
-        message["extra"] = {
-            "actions": self._parse_actions(response),
-            "response": response.model_dump(),
-            **cost_output,
-            "timestamp": time.time(),
-        }
+        choice = response.choices[0]
+        choice_message = choice.message
+        full_content, content_no_thinking = _message_contents(choice_message)
+        usage_obj = getattr(response, "usage", None)
+        usage = usage_obj.model_dump() if hasattr(usage_obj, "model_dump") else dict(usage_obj or {})
+        logprob_entries = getattr(getattr(choice, "logprobs", None), "content", None) or []
+        logprobs = []
+        for entry in logprob_entries:
+            value = entry.get("logprob") if isinstance(entry, dict) else getattr(entry, "logprob", None)
+            if value is not None:
+                logprobs.append(float(value))
+        message = _build_assistant_message(
+            content=full_content,
+            content_no_thinking=content_no_thinking,
+            usage=usage,
+            prompt_token_ids=getattr(response, "prompt_token_ids", None),
+            token_ids=getattr(response, "output_token_ids", None),
+            logprobs=logprobs,
+            cost=cost_output["cost"],
+            timestamp=time.time(),
+            finish_reason=choice.finish_reason,
+        )
+        try:
+            message["extra"]["actions"] = self._parse_actions(response)
+        except FormatError as exc:
+            message["extra"]["format_error"] = True
+            setattr(exc, "assistant_message", message)
+            raise
         return message
 
     def _calculate_cost(self, response) -> dict[str, float]:

@@ -230,5 +230,9 @@ agent/outputs
 agent/logs
 agent/search_outputs
 agent/aggregate_outputs
-.vscode
+.vscode/*
+!.vscode/settings.json
 .agents
+
+outputs/
+search_outputs/

@@ -86,7 +86,6 @@ class SGLangChatService:
             finish_reason=choice.finish_reason or "stop",
             model_name=model_name or self.default_model_name,
             usage=response.usage.model_dump() if getattr(response, "usage", None) is not None else {},
-            raw_response=response.model_dump(),
             metadata={
                 "requested_policy_version": policy_version,
                 "content_no_thinking": message.content or "",

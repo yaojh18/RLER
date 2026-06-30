@@ -1,3 +1,6 @@
+# Two-node launchers intentionally override these for validation. Before a
+# formal run, use: num_rollout=3000, actor_gpus=64, rollout_gpus=64,
+# TP/PP/CP=4/2/4, and rollout_num_gpus_per_engine=4.
 GRPO_COMMON_ARGS=(
   --save-interval 10
   --no-load-optim
@@ -10,26 +13,16 @@ GRPO_COMMON_ARGS=(
   --input-key input
   --metadata-key metadata
   --n-samples-per-prompt 8
-  --num-rollout 1
   --custom-convert-samples-to-train-data-path train_agent.run.grpo.convert_samples_to_train_data
   --loss-mask-type qwen3_5
-  --advantage-estimator grpo
-  --eps-clip 0.2
+  --advantage-estimator gspo
+  --disable-grpo-std-normalization
+  --eps-clip 3e-4
+  --eps-clip-high 4e-4
   --entropy-coef 0
-  --use-kl-loss
-  --kl-loss-coef 0.01
-  --kl-loss-type k3
   --log-probs-chunk-size 256
   --micro-batch-size 1
 )
-# --calculate-per-token-loss is the default for backwards compat; per-token
-# weighting amplifies long failing-trajectory gradients in GRPO and was the
-# main contributor to the 58541 policy collapse. To use per-sample weighting
-# instead, the launcher can `export CALCULATE_PER_TOKEN_LOSS=0` before
-# invoking the slime driver.
-if [ "${CALCULATE_PER_TOKEN_LOSS:-1}" = "1" ]; then
-  GRPO_COMMON_ARGS+=(--calculate-per-token-loss)
-fi
 
 GRPO_ROLLOUT_ARGS=(
   --rollout-num-gpus-per-engine 1
@@ -61,16 +54,22 @@ GRPO_RECOMPUTE_ARGS=(
 
 GRPO_OPTIMIZER_ARGS=(
   --optimizer adam
-  --lr 1e-6
+  --lr 3e-6
   --lr-decay-style constant
-  --min-lr 1e-6
   --weight-decay 0.1
   --adam-beta1 0.9
-  --adam-beta2 0.95
+  --adam-beta2 0.98
+  --optimizer-cpu-offload
+  --overlap-cpu-optimizer-d2h-h2d
+  --use-precision-aware-optimizer
 )
 
 GRPO_SGLANG_ARGS=(
-  --rollout-max-context-len 80960
+  --rollout-max-context-len 131072
+  --rollout-max-response-len 16384
+  --sglang-context-length 131072
+  --sglang-mem-fraction-static 0.85
+  --sglang-server-concurrency 128
   --sglang-reasoning-parser qwen3
   # Radix cache enabled — slime calls engine.flush_cache.remote() inside
   # update_weight_from_distributed.py on every policy weight update, so
@@ -82,14 +81,8 @@ GRPO_SGLANG_ARGS=(
 
 GRPO_MISC_ARGS=(
   --use-dynamic-batch-size
-  # Per-sample cap = max_tokens_per_gpu * cp_size. We need this >= sglang's
-  # context_length (80960) since the token-in/token-out path's full sequence
-  # = last_assistant.prompt_token_ids + last_assistant.token_ids, bounded by
-  # sglang's own input+output cap. 32768 (= 131072/sample) OOM'd on backward
-  # under CP=4 packing (commit 47d170e); 16384 (= 65536/sample) was safe but
-  # too small for healthy long rollouts. 22528 gives ~90k per-sample cap —
-  # comfortably above sglang's 80960 ceiling, well below the OOM zone.
-  --max-tokens-per-gpu 22528
+  --balance-data
+  --max-tokens-per-gpu 32768
   --attention-dropout 0.0
   --hidden-dropout 0.0
   --accumulate-allreduce-grads-in-fp32

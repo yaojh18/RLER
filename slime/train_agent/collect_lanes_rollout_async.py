@@ -16,15 +16,14 @@ the SLURM script's tunables):
   SWE_AGENT_LANES_STEP_LIMIT         int    hard cap per Lane B branch (default 120)
   SWE_AGENT_LANES_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
   SWE_AGENT_LANES_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
-  SWE_AGENT_LANES_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 4096)
+  SWE_AGENT_LANES_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 16384)
   SWE_AGENT_LANES_POLICY_TEMPERATURE float  Lane A sampling temp (default 1.0)
   SWE_AGENT_LANES_POLICY_TOP_P       float  default 0.95
   SWE_AGENT_LANES_LANE_B_TEMPERATURE float  Lane B sampling temp (default 1.0)
   SWE_AGENT_LANES_LANE_B_TOP_P       float  default 0.95
   SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY float default 0.5
   SWE_AGENT_LANES_OUTPUT_ROOT        str    where to write per-instance run dirs
-  SWE_AGENT_LANES_API_HOST           str    sglang policy host (default http://127.0.0.1)
-  SWE_AGENT_LANES_POLICY_PORTS       str    csv of ports (one per sglang engine)
+  SWE_AGENT_LANES_SKIP_NODE_IPS      str    csv of Ray node IPs/hostnames to skip
 """
 
 from __future__ import annotations
@@ -33,7 +32,6 @@ import asyncio
 import atexit
 import logging
 import os
-import random
 import threading
 import time
 import traceback
@@ -51,7 +49,7 @@ from slime.utils.types import Sample
 
 # Reuse v0's tokenizer cache + rollout-sample assembler — they're independent
 # of the search topology. build_rollout_samples consumes ExportGroup -> Sample.
-from train_agent.collect_grpo_rollout import _rollout_tokenizer, build_rollout_samples
+from train_agent.collect_grpo_rollout import build_rollout_samples
 from train_agent.serving.sglang_chat_service import start_slime_policy_route_warmup
 
 
@@ -140,7 +138,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                 "model_kwargs": {
                     "api_base": api_base,
                     "api_key": api_key,
-                    "max_tokens": task.get("completion_max_tokens", 4096),
+                    "max_tokens": task.get("completion_max_tokens", 16384),
                     "extra_body": (
                         {"chat_template_kwargs": {"enable_thinking": True}}
                         if "qwen" in model_name.lower() else {}
@@ -159,8 +157,8 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                                           .get("environment_class", "docker"),
         )
 
-        reward_kind = task.get("reward_kind", "soft")
-        if reward_kind not in {"soft", "delta"}:
+        reward_kind = task.get("reward_kind", "delta")
+        if reward_kind not in {"hard", "soft", "delta", "joint", "f2p_only"}:
             raise ValueError(f"unsupported lanes reward_kind={reward_kind!r}")
         cfg = ParallelSearchConfig(
             m=task["m"],
@@ -179,8 +177,11 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             lane_b_temperature=task.get("lane_b_temperature", 1.0),
             lane_b_top_p=task.get("lane_b_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
+            no_action_patch_penalty=task.get("no_action_patch_penalty", -0.1),
             disable_rubric=task.get("disable_rubric", False),
             reward_kind=reward_kind,
+            joint_alpha=task.get("joint_alpha", 1.0),
+            all_pass_reward=task.get("all_pass_reward", 2.0),
         )
         run_dir = (
             output_root / instance_id
@@ -263,16 +264,14 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class _BufferedGroup:
-    rollout_id: int
     samples: list[Sample]
 
 
 _BUFFER: list[_BufferedGroup] = []
 _TASK_INDEX = 0
 _WARMUP_DONE = False
-_STALE_DROPPED_GROUPS = 0
 _FAILED_INSTANCES = 0
-_DROPPED_OVERSIZED = 0
+_TRUNCATED_OVERSIZED = 0
 _FILTER_DROPPED_GROUPS = 0
 _FILTER_DROP_REASONS: dict[str, int] = {}
 
@@ -359,15 +358,32 @@ def _spawn_node_workers(per_node_concurrency: int) -> None:
     global _NODE_WORKERS, _NODE_WORKER_IPS
     if _NODE_WORKERS:
         return
-    nodes = [
-        n for n in ray.nodes()
-        if n.get("Alive") and float(n.get("Resources", {}).get("GPU", 0)) > 0
-    ]
+    skip = {
+        s.strip()
+        for s in os.environ.get("SWE_AGENT_LANES_SKIP_NODE_IPS", "").split(",")
+        if s.strip()
+    }
+    nodes = []
+    for n in ray.nodes():
+        if not n.get("Alive"):
+            continue
+        if float(n.get("Resources", {}).get("GPU", 0)) <= 0:
+            continue
+        node_ip = n.get("NodeManagerAddress") or ""
+        node_name = n.get("NodeName") or ""
+        if node_ip in skip or node_name in skip:
+            logger.info(
+                f"[lanes-async] SKIP node {node_name or node_ip} "
+                f"(matched SWE_AGENT_LANES_SKIP_NODE_IPS)"
+            )
+            continue
+        nodes.append(n)
     if not nodes:
         raise RuntimeError("No GPU-bearing Ray nodes found for Lanes worker spawn")
     actor_concurrency = per_node_concurrency + 4
     logger.info(
-        f"[lanes-async] spawning {len(nodes)} node workers, "
+        f"[lanes-async] spawning {len(nodes)} node workers "
+        f"(skipped={len(skip)}), "
         f"per-node concurrency={per_node_concurrency} "
         f"actor_concurrency={actor_concurrency}"
     )
@@ -426,39 +442,24 @@ def _lanes_values_from_env() -> dict[str, Any]:
         "seed": _int("SWE_AGENT_LANES_SEED"),
         "gt_eval_workers": _int("SWE_AGENT_LANES_GT_EVAL_WORKERS", 8),
         "lane_b_pool_size": _int("SWE_AGENT_LANES_LANE_B_POOL_SIZE"),
-        "completion_max_tokens": _int("SWE_AGENT_LANES_COMPLETION_MAX_TOKENS", 4096),
+        "completion_max_tokens": _int("SWE_AGENT_LANES_COMPLETION_MAX_TOKENS", 16384),
         "policy_temperature": _float("SWE_AGENT_LANES_POLICY_TEMPERATURE", 1.0),
         "policy_top_p": _float("SWE_AGENT_LANES_POLICY_TOP_P", 0.95),
         "lane_b_temperature": _float("SWE_AGENT_LANES_LANE_B_TEMPERATURE", 1.0),
         "lane_b_top_p": _float("SWE_AGENT_LANES_LANE_B_TOP_P", 0.95),
         "fallback_patch_penalty": _float("SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY", 0.5),
+        "no_action_patch_penalty": _float("SWE_AGENT_LANES_NO_ACTION_PATCH_PENALTY", -0.1),
         # GT-only training: skip rubric/judge in trajectory_search_parallel
         # and use branch.gt_score as the reward in the bundler.
         "disable_rubric": _bool("SWE_AGENT_LANES_DISABLE_RUBRIC", False),
-        # GT reward scoring formula (mirror of naive_search.reward_kind):
-        # 'soft' = raw_reward, 'delta' = max(0, raw - base_score) where
-        # base_score = p2p_total / (p2p_total + f2p_total). Applied inside
-        # ParallelSearchRunner._evaluate_gt.
-        "reward_kind": (os.environ.get("SWE_AGENT_LANES_REWARD_KIND") or "soft").lower(),
+        # Shared evaluator reward kind, identical to naive in GT-only mode.
+        "reward_kind": (os.environ.get("SWE_AGENT_LANES_REWARD_KIND") or "delta").lower(),
+        "joint_alpha": _float("SWE_AGENT_LANES_JOINT_ALPHA", 1.0),
+        "all_pass_reward": _float("SWE_AGENT_LANES_ALL_PASS_REWARD", 2.0),
     }
 
 
-def _hash_to_index(s: str, n: int) -> int:
-    import hashlib
-    h = hashlib.sha256(s.encode("utf-8")).hexdigest()
-    return int(h, 16) % n
-
-
-def _route_for_instance(instance_id: str, ports: list[int], host: str) -> str:
-    """LEGACY hash-based routing. Kept for back-compat but superseded
-    by _route_least_loaded — hash is uneven on small N (e.g. 4 servers,
-    30 instances → can dump 12/6/6/6 or worse).
-    """
-    p = ports[_hash_to_index(instance_id, len(ports))]
-    return f"{host.rstrip('/')}:{p}"
-
-
-# Per-port in-flight counters for least-loaded routing. Lock-protected
+# Per-endpoint in-flight counters for least-loaded routing. Lock-protected
 # because _submit_until_full runs on the rollout coordinator thread but
 # completion (which releases the counter) happens in _harvest_ready —
 # they may interleave with future async tweaks.
@@ -466,26 +467,32 @@ _ENDPOINT_LOAD: dict[str, int] = {}
 _ENDPOINT_LOAD_LOCK = threading.Lock()
 
 
-def _route_least_loaded(ports: list[int], host: str) -> str:
-    """Pick the endpoint with fewest in-flight instances. Increments the
-    counter — caller MUST call _release_endpoint() when the instance
-    completes (success OR failure)."""
-    candidates = [f"{host.rstrip('/')}:{p}" for p in ports]
-    with _ENDPOINT_LOAD_LOCK:
-        for c in candidates:
-            _ENDPOINT_LOAD.setdefault(c, 0)
-        url = min(candidates, key=lambda c: _ENDPOINT_LOAD[c])
-        _ENDPOINT_LOAD[url] += 1
-        return url
+def _urls_from_ports_env(name: str, host: str) -> list[str]:
+    ports = [int(p) for p in os.environ.get(name, "").split(",") if p]
+    return [f"{host.rstrip('/')}:{p}" for p in ports]
 
 
-def _route_least_loaded_n(ports: list[int], host: str, n: int) -> list[str]:
-    """Pick n endpoints by least-loaded with pre-increment. Each pick
-    immediately bumps that endpoint's counter so subsequent picks in the
-    same call see the updated load. Returns a list of n URLs (with
-    repetition when n > len(ports)). Caller MUST call _release_endpoints()
-    with this exact list when the instance completes."""
-    candidates = [f"{host.rstrip('/')}:{p}" for p in ports]
+def _policy_urls_for_model(args, model_name: str) -> list[str]:
+    api_host = os.environ.get("SWE_AGENT_LANES_API_HOST", "http://127.0.0.1")
+    explicit_urls = _urls_from_ports_env("SWE_AGENT_LANES_POLICY_PORTS", api_host)
+    if explicit_urls:
+        return explicit_urls
+
+    engines_map = getattr(args, "sglang_model_engines", None) or {}
+    endpoints = list(engines_map.get(model_name, []))
+    if not endpoints and len(engines_map) == 1:
+        endpoints = list(next(iter(engines_map.values())))
+    if not endpoints:
+        raise RuntimeError(
+            f"No per-engine SGLang endpoints found for model={model_name!r}; "
+            "lane async requires args.sglang_model_engines or explicit "
+            "SWE_AGENT_LANES_POLICY_PORTS."
+        )
+    return [f"http://{host}:{int(port)}" for host, port in endpoints]
+
+
+def _pick_least_loaded_urls(candidates: list[str], n: int) -> list[str]:
+    """Pick n endpoint URLs by least-loaded with pre-increment."""
     picks: list[str] = []
     with _ENDPOINT_LOAD_LOCK:
         for c in candidates:
@@ -530,29 +537,14 @@ def _submit_until_full(
     instance yields ~max_mid_cps groups, so to land ROLLOUT_BATCH_SIZE
     trainable groups in the buffer we only need ROLLOUT_BATCH_SIZE /
     groups_per_instance live instances, not OVER_SAMPLING_BATCH_SIZE of
-    them. Dispatching more is wasted compute and stale-drop fodder.
+    them. Dispatching more wastes rollout compute.
     """
     global _TASK_INDEX, _DISPATCH_COUNTER
     submitted = 0
     lanes_values = _lanes_values_from_env()
-
-    policy_ports = [
-        int(p) for p in os.environ.get("SWE_AGENT_LANES_POLICY_PORTS", "").split(",") if p
-    ]
-    rubric_ports = [
-        int(p) for p in os.environ.get("SWE_AGENT_LANES_RUBRIC_PORTS", "").split(",") if p
-    ]
-    if not policy_ports:
-        router_ip, router_port = (getattr(args, "sglang_model_routers", None) or {}).get(
-            model_name, (args.sglang_router_ip, args.sglang_router_port),
-        )
-        policy_ports = [router_port]
-        api_host = f"http://{router_ip}"
-    else:
-        api_host = os.environ.get("SWE_AGENT_LANES_API_HOST", "http://127.0.0.1")
-    if not rubric_ports:
-        rubric_ports = list(policy_ports)
-
+    policy_urls = _policy_urls_for_model(args, model_name)
+    api_host = os.environ.get("SWE_AGENT_LANES_API_HOST", "http://127.0.0.1")
+    explicit_rubric_urls = _urls_from_ports_env("SWE_AGENT_LANES_RUBRIC_PORTS", api_host)
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
     # Per-instance URL count: pre-pick one URL per *potential* fork group so
     # the runner can spread group-level branches across distinct sglang
@@ -562,8 +554,8 @@ def _submit_until_full(
     while True:
         if len(_PENDING) >= max_pending:
             break
-        # Stop dispatching once we have (or expect to have) enough groups in
-        # buffer + in-flight to fill min_ready_groups after dynamic filter.
+        # Stop dispatching once buffer + in-flight estimates cover the
+        # over-sampling target.
         est_pending_groups = len(_PENDING) * est_groups_per_instance
         if len(_BUFFER) + est_pending_groups >= over_sampling_groups:
             break
@@ -576,21 +568,19 @@ def _submit_until_full(
         # first duplicate. n_samples_per_prompt MUST equal SWE_AGENT_LANES_M.
         metadata = prompt_group[0].metadata
         instance_id = metadata["instance_id"]
-        # Per-fork-group endpoint pool. _route_least_loaded_n picks N URLs
-        # by least-loaded with pre-increment, so an instance whose runner
+        # Per-fork-group endpoint pool. Pick N URLs by least-loaded with
+        # pre-increment, so an instance whose runner
         # eventually spawns N fork groups gets N distinct (or repeated, when
         # ports < N) endpoints. The runner round-robins groups across this
         # pool. All picks are released together in _harvest_ready.
-        policy_base_urls = _route_least_loaded_n(
-            policy_ports, api_host, n=n_urls_per_instance,
-        )
+        policy_base_urls = _pick_least_loaded_urls(policy_urls, n=n_urls_per_instance)
         policy_base_url = policy_base_urls[0]
-        if rubric_ports == policy_ports:
-            rubric_base_url = policy_base_url
-            rubric_picks: list[str] = []
+        if explicit_rubric_urls:
+            rubric_picks = _pick_least_loaded_urls(explicit_rubric_urls, n=1)
+            rubric_base_url = rubric_picks[0]
         else:
-            rubric_base_url = _route_least_loaded(rubric_ports, api_host)
-            rubric_picks = [rubric_base_url]
+            rubric_base_url = policy_base_url
+            rubric_picks = []
 
         task = {
             "index": _TASK_INDEX,
@@ -623,13 +613,11 @@ def _harvest_ready(
     *,
     args,
     target: str,
-    tokenizer,
-    current_rollout_id: int,
     block: bool,
 ) -> int:
     """Reap Ray Futures whose subprocess fully returned. For each completed
     bundle, expand its policy_groups into Samples and append to _BUFFER."""
-    global _FAILED_INSTANCES, _STALE_DROPPED_GROUPS, _DROPPED_OVERSIZED
+    global _FAILED_INSTANCES, _TRUNCATED_OVERSIZED
     global _FILTER_DROPPED_GROUPS, _FILTER_DROP_REASONS
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path)
@@ -686,31 +674,20 @@ def _harvest_ready(
             bundle.policy_groups if target == "policy" else bundle.rubric_groups
         )
         # Refine the rolling groups-per-instance estimate from every
-        # successfully harvested bundle (even stale-dropped ones — the count
-        # is structurally meaningful regardless of training use).
+        # successfully harvested bundle.
         global _OBSERVED_GROUPS_TOTAL, _OBSERVED_INSTANCES
         _OBSERVED_GROUPS_TOTAL += len(groups)
         _OBSERVED_INSTANCES += 1
-        if task["rollout_id"] < current_rollout_id - 1:
-            _STALE_DROPPED_GROUPS += len(groups)
-            del result, bundle, groups, ref
-            continue
         for group in groups:
-            samples, dropped_here = build_rollout_samples(
+            samples, truncated_here = build_rollout_samples(
                 groups=[group],
-                tokenizer=tokenizer,
-                loss_mask_type=getattr(args, "loss_mask_type", "qwen3_5"),
                 include_turn_rewards=False,
                 max_sample_tokens=max_sample_tokens,
             )
-            _DROPPED_OVERSIZED += dropped_here
-            policy_version = f"rollout-{task['rollout_id']}"
+            _TRUNCATED_OVERSIZED += truncated_here
             for sample in samples:
-                sample.weight_versions = [policy_version]
                 sample.metadata = {
                     **(sample.metadata or {}),
-                    "policy_version": policy_version,
-                    "source_rollout_id": task["rollout_id"],
                     "instance_id": task["instance_id"],
                 }
             if dynamic_filter is not None and samples:
@@ -721,32 +698,16 @@ def _harvest_ready(
                     _FILTER_DROP_REASONS[reason] = _FILTER_DROP_REASONS.get(reason, 0) + 1
                     continue
             _BUFFER.append(
-                _BufferedGroup(rollout_id=task["rollout_id"], samples=samples)
+                _BufferedGroup(samples=samples)
             )
             harvested += 1
         del result, bundle, groups, ref
     return harvested
 
 
-def _drop_stale_buffer(current_rollout_id: int) -> None:
-    global _STALE_DROPPED_GROUPS
-    kept = [g for g in _BUFFER if g.rollout_id >= current_rollout_id - 1]
-    _STALE_DROPPED_GROUPS += len(_BUFFER) - len(kept)
-    _BUFFER[:] = kept
-
-
-def _pop_groups(min_groups: int) -> list[_BufferedGroup]:
-    # Shuffle the buffer before slicing to break completion-order bias.
-    # Without this, easy instances (which finish fast → land in buffer first)
-    # dominate the early training steps, and reward statistics drift down
-    # as harder instances trickle in. Stale-drop ensures the buffer only
-    # holds rollout_id in {current-1, current}, so shuffling across that
-    # boundary is harmless. Reproducibility is not needed at this layer.
-    # Set SWE_AGENT_LANES_NO_SHUFFLE=1 to disable (for A/B against v0 order).
-    if os.environ.get("SWE_AGENT_LANES_NO_SHUFFLE", "0") != "1":
-        random.shuffle(_BUFFER)
-    groups = _BUFFER[:min_groups]
-    del _BUFFER[:min_groups]
+def _pop_groups(group_count: int) -> list[_BufferedGroup]:
+    groups = _BUFFER[:group_count]
+    del _BUFFER[:group_count]
     return groups
 
 
@@ -790,57 +751,58 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             logger.warning("[lanes-async] warmup failed (continuing): %s", exc)
         _WARMUP_DONE = True
 
-    tokenizer = _rollout_tokenizer(args)
     instance_workers = max(1, int(os.environ.get("SWE_AGENT_LANES_INSTANCE_WORKERS", "8")))
     max_pending = max(1, int(
         os.environ.get("SWE_AGENT_LANES_MAX_PENDING", str(instance_workers))
     ))
-    min_ready_groups = max(1, int(
-        os.environ.get("SWE_AGENT_LANES_MIN_READY_GROUPS", str(args.rollout_batch_size))
-    ))
-    # Group-units over-sampling target. Defaults to 2x min_ready_groups so
-    # the dynamic-filter pass-rate gets some headroom. Setting this is what
-    # makes lanes a fair compute comparison to naive: dispatch only enough
-    # instances to land `over_sampling_groups` GROUPS in the buffer, not
-    # OVER_SAMPLING_BATCH_SIZE instances (which would over-collect by ~3x
-    # since each instance yields ~3 fork groups). max_pending still bounds
-    # concurrency.
-    over_sampling_groups = max(min_ready_groups, int(
-        os.environ.get("SWE_AGENT_LANES_OVER_SAMPLING_GROUPS", str(min_ready_groups * 2))
-    ))
+    target_groups = int(args.rollout_batch_size)
+    if target_groups <= 0:
+        raise ValueError(f"rollout_batch_size must be positive, got {target_groups}")
+    over_sampling_groups = int(args.over_sampling_batch_size)
     timeout = float(os.environ.get("SWE_AGENT_LANES_WAIT_TIMEOUT", "10800"))
 
+    if _PENDING:
+        raise RuntimeError(
+            "Lane collector retained in-flight work across official generate() "
+            f"boundaries: pending={len(_PENDING)}"
+        )
+
     if not _NODE_WORKERS:
+        skip = {
+            s.strip()
+            for s in os.environ.get("SWE_AGENT_LANES_SKIP_NODE_IPS", "").split(",")
+            if s.strip()
+        }
         n_nodes = max(1, len([
             n for n in ray.nodes()
-            if n.get("Alive") and float(n.get("Resources", {}).get("GPU", 0)) > 0
+            if n.get("Alive")
+            and float(n.get("Resources", {}).get("GPU", 0)) > 0
+            and (n.get("NodeManagerAddress") or "") not in skip
+            and (n.get("NodeName") or "") not in skip
         ]))
         per_node = max(1, (instance_workers + n_nodes - 1) // n_nodes)
         _spawn_node_workers(per_node_concurrency=per_node)
 
     logger.info(
         "[lanes-async] generate_rollout START rollout_id=%d target=%s "
-        "min_ready_groups=%d max_pending=%d buffer_at_entry=%d pending_at_entry=%d",
-        rollout_id, target, min_ready_groups, max_pending,
+        "target_groups=%d max_pending=%d buffer_at_entry=%d pending_at_entry=%d",
+        rollout_id, target, target_groups, max_pending,
         len(_BUFFER), len(_PENDING),
     )
 
-    _drop_stale_buffer(rollout_id)
-    _harvest_ready(
-        args=args, target=target, tokenizer=tokenizer,
-        current_rollout_id=rollout_id, block=False,
-    )
     def _est_groups() -> float:
         if _OBSERVED_INSTANCES <= 0:
             return _DEFAULT_EST_GROUPS
         return max(1.0, _OBSERVED_GROUPS_TOTAL / _OBSERVED_INSTANCES)
 
-    submitted = _submit_until_full(
-        args=args, data_buffer=data_buffer, rollout_id=rollout_id,
-        output_root=output_root, model_name=model_name, max_pending=max_pending,
-        over_sampling_groups=over_sampling_groups,
-        est_groups_per_instance=_est_groups(),
-    )
+    submitted = 0
+    if len(_BUFFER) < target_groups:
+        submitted = _submit_until_full(
+            args=args, data_buffer=data_buffer, rollout_id=rollout_id,
+            output_root=output_root, model_name=model_name, max_pending=max_pending,
+            over_sampling_groups=over_sampling_groups,
+            est_groups_per_instance=_est_groups(),
+        )
     logger.info(
         "[lanes-async] post-init submitted=%d buffer=%d pending=%d "
         "over_sampling_groups=%d est_groups_per_instance=%.2f",
@@ -850,22 +812,22 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
 
     wait_started = time.perf_counter()
     last_pulse = wait_started
-    while len(_BUFFER) < min_ready_groups:
+    while len(_BUFFER) < target_groups:
         if time.perf_counter() - wait_started > timeout:
             raise RuntimeError(
                 f"Lanes async timed out waiting for samples: "
                 f"buffer={len(_BUFFER)} pending={len(_PENDING)}"
             )
         _harvest_ready(
-            args=args, target=target, tokenizer=tokenizer,
-            current_rollout_id=rollout_id, block=bool(_PENDING),
+            args=args, target=target, block=bool(_PENDING),
         )
-        submitted += _submit_until_full(
-            args=args, data_buffer=data_buffer, rollout_id=rollout_id,
-            output_root=output_root, model_name=model_name, max_pending=max_pending,
-            over_sampling_groups=over_sampling_groups,
-            est_groups_per_instance=_est_groups(),
-        )
+        if len(_BUFFER) < target_groups:
+            submitted += _submit_until_full(
+                args=args, data_buffer=data_buffer, rollout_id=rollout_id,
+                output_root=output_root, model_name=model_name, max_pending=max_pending,
+                over_sampling_groups=over_sampling_groups,
+                est_groups_per_instance=_est_groups(),
+            )
         if time.perf_counter() - last_pulse > 30:
             last_pulse = time.perf_counter()
             mems = []
@@ -885,21 +847,22 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 "[lanes-async] WAITING rollout_id=%d elapsed=%.0fs "
                 "buffer=%d/%d pending=%d submitted_total=%d",
                 rollout_id, time.perf_counter() - wait_started,
-                len(_BUFFER), min_ready_groups, len(_PENDING), submitted,
+                len(_BUFFER), target_groups, len(_PENDING), submitted,
             )
             logger.info("[lanes-mem] %s", " | ".join(mems))
-        if not _PENDING and len(_BUFFER) < min_ready_groups:
+        if not _PENDING and len(_BUFFER) < target_groups:
             raise RuntimeError(
                 f"Lanes async produced no {target} samples and has no pending instance."
             )
 
-    selected_groups = _pop_groups(min_ready_groups)
-    _submit_until_full(
-        args=args, data_buffer=data_buffer, rollout_id=rollout_id,
-        output_root=output_root, model_name=model_name, max_pending=max_pending,
-        over_sampling_groups=over_sampling_groups,
-        est_groups_per_instance=_est_groups(),
-    )
+    while _PENDING:
+        _harvest_ready(
+            args=args,
+            target=target,
+            block=True,
+        )
+
+    selected_groups = _pop_groups(target_groups)
     samples = [sample for group in selected_groups for sample in group.samples]
     for group_index, group in enumerate(selected_groups):
         for sample in group.samples:
@@ -910,7 +873,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     # --- per-batch metrics aggregated from sample.metadata + sample fields ---
     # Stashed by lane_to_grpo_bundle._build_branch_sample:
     #   n_continuation_steps, n_parent_steps, n_full_trace_steps,
-    #   raw_gt_score, terminated_early, instance_id, is_dummy
+    #   raw_gt_score, terminated_early, and instance_id
     def _safe_mean(xs: list[float]) -> float:
         return float(sum(xs) / len(xs)) if xs else 0.0
     cont_steps = [
@@ -925,10 +888,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         int(s.metadata.get("n_parent_steps", 0) or 0)
         for s in samples if s.metadata
     ]
-    # Exclude dummy samples (loss_mask all-zero placeholders for empty branches)
-    # from reward/pass stats — they're not real model outputs.
-    real_samples = [s for s in samples if not (s.metadata and s.metadata.get("is_dummy"))]
-    n_dummy = len(samples) - len(real_samples)
+    real_samples = samples
     gts = [
         float(s.metadata.get("raw_gt_score") or 0.0)
         for s in real_samples
@@ -964,9 +924,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         _safe_mean([c // m for c in inst_group_count.values()])
         if inst_group_count else 0.0
     )
-    # Truncation rate: fraction of samples whose status reached the per-branch
-    # step_limit without submitting (slime sets Sample.Status.TRUNCATED in that
-    # case; we approximate from .status if available).
+    # Fraction of samples right-truncated to the per-sample token budget.
     try:
         from slime.utils.types import Sample as _SlimeSample
         trunc_count = sum(
@@ -1002,45 +960,10 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         1 for s in real_samples
         if s.metadata and int(s.metadata.get("terminal_patch_len") or 0) == 0
     )
-    eval_samples = [
-        s for s in real_samples
-        if s.metadata
-        and s.metadata.get("eval_status") in ("resolved", "unresolved")
-        and s.metadata.get("f2p_passed_count") is not None
-        and s.metadata.get("p2p_passed_count") is not None
-    ]
-    n_eval = len(eval_samples)
-    full_pass = 0
-    zero_new_pass = 0
-    zero_pass = 0
-    regression = 0
-    some_pass = 0
-    p2p_pass_rates: list[float] = []
     turns_for_avg: list[int] = []
     for s in real_samples:
         if s.metadata and s.metadata.get("n_full_trace_steps") is not None:
             turns_for_avg.append(int(s.metadata.get("n_full_trace_steps") or 0))
-    for s in eval_samples:
-        md = s.metadata
-        f2p_passed = int(md.get("f2p_passed_count") or 0)
-        f2p_total = int(md.get("f2p_total") or 0)
-        p2p_passed = int(md.get("p2p_passed_count") or 0)
-        p2p_total = int(md.get("p2p_total") or 0)
-        if (f2p_total + p2p_total) > 0 \
-                and f2p_passed == f2p_total \
-                and p2p_passed == p2p_total:
-            full_pass += 1
-        if f2p_total > 0 and f2p_passed == 0 and p2p_passed == p2p_total:
-            zero_new_pass += 1
-        if f2p_passed == 0 and p2p_passed == 0:
-            zero_pass += 1
-        if p2p_total > 0 and p2p_passed < p2p_total:
-            regression += 1
-        if f2p_total > 0 and 0 < f2p_passed < f2p_total:
-            some_pass += 1
-        if p2p_total > 0:
-            p2p_pass_rates.append(p2p_passed / p2p_total)
-
     return RolloutFnTrainOutput(
         samples=samples,
         metrics={
@@ -1051,8 +974,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/buffer_groups": len(_BUFFER),
             "swe_agent/submitted_instances": submitted,
             "swe_agent/failed_instances_total": _FAILED_INSTANCES,
-            "swe_agent/stale_dropped_groups_total": _STALE_DROPPED_GROUPS,
-            "swe_agent/dropped_oversized_samples_total": _DROPPED_OVERSIZED,
+            "swe_agent/truncated_oversized_samples_total": _TRUNCATED_OVERSIZED,
             "swe_agent/filter_dropped_groups_total": _FILTER_DROPPED_GROUPS,
             "swe_agent/wait_seconds": time.perf_counter() - wait_started,
             "swe_agent/seconds": time.perf_counter() - started,
@@ -1068,21 +990,12 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/distinct_instances_in_batch": distinct_instances,
             "swe_agent/instance_pass_at_0.5": instance_pass,
             "swe_agent/avg_groups_per_instance_in_batch": groups_per_inst,
-            "swe_agent/dummy_sample_count": n_dummy,
-            "swe_agent/dummy_sample_rate": (n_dummy / len(samples)) if samples else 0.0,
             "swe_agent/rollout_logprob_mean": _safe_mean(rollout_lps),
             "swe_agent/rollout_logprob_token_count": len(rollout_lps),
             # --- patch + eval ratios over post-filter batch ---
             "swe_agent/ratio_formal_submit": (formal_submit / n_real) if n_real else 0.0,
             "swe_agent/ratio_informal_submit": (informal_submit / n_real) if n_real else 0.0,
             "swe_agent/ratio_zero_patch": (zero_patch / n_real) if n_real else 0.0,
-            "swe_agent/eval_samples_in_batch": n_eval,
-            "swe_agent/ratio_full_pass": (full_pass / n_eval) if n_eval else 0.0,
-            "swe_agent/ratio_zero_new_pass": (zero_new_pass / n_eval) if n_eval else 0.0,
-            "swe_agent/ratio_zero_pass": (zero_pass / n_eval) if n_eval else 0.0,
-            "swe_agent/ratio_regression": (regression / n_eval) if n_eval else 0.0,
-            "swe_agent/ratio_some_pass": (some_pass / n_eval) if n_eval else 0.0,
             "swe_agent/avg_turns": _safe_mean([float(x) for x in turns_for_avg]),
-            "swe_agent/avg_existing_utest_pass_rate": _safe_mean(p2p_pass_rates),
         },
     )

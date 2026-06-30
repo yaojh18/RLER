@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from swerex.deployment.modal import ModalDeployment
 from swerex.runtime.abstract import Command as RexCommand
 
+from swe_agent.environments import _extract_submission
 from swe_agent.exceptions import Submitted
 from swe_agent.utils.serialize import recursive_merge
 
@@ -90,9 +91,8 @@ class SwerexModalEnvironment:
 
     def _check_finished(self, output: dict):
         """Raises Submitted if the output indicates task completion."""
-        lines = output.get("output", "").lstrip().splitlines(keepends=True)
-        if lines and lines[0].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" and output["returncode"] == 0:
-            submission = "".join(lines[1:])
+        submission = _extract_submission(output)
+        if submission is not None:
             raise Submitted(
                 {
                     "role": "exit",

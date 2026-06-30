@@ -14,6 +14,12 @@ from swe_agent.environments.singularity import (
 ContainerBackend = Literal["docker", "singularity"]
 
 
+def raise_for_container_error(result: dict[str, Any]) -> None:
+    """Raise only for host/runtime failures, not command exit failures."""
+    if exception_info := result.get("exception_info"):
+        raise RuntimeError(str(exception_info))
+
+
 def select_container_backend() -> ContainerBackend:
     if docker_available():
         return "docker"

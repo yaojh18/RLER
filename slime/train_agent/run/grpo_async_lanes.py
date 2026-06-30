@@ -29,14 +29,13 @@ def _parse_lanes_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--api-host", default="http://127.0.0.1")
     p.add_argument("--lanes-instance-workers", type=int, default=8)
     p.add_argument("--lanes-max-pending", type=int, default=0)
-    p.add_argument("--lanes-min-ready-groups", type=int, default=0)
     p.add_argument("--lanes-wait-timeout", type=int, default=10800)
     p.add_argument("--lanes-output-root", default="")
     p.add_argument("--lanes-m", type=int, default=8)
     p.add_argument("--lanes-max-mid-cps", type=int, default=6)
     p.add_argument("--lanes-steps-per-round", type=int, default=20)
     p.add_argument("--lanes-step-limit", type=int, default=120)
-    p.add_argument("--lanes-completion-max-tokens", type=int, default=4096)
+    p.add_argument("--lanes-completion-max-tokens", type=int, default=16384)
     p.add_argument("--lanes-seed", type=int, default=0)
     p.add_argument("--lanes-gt-eval-workers", type=int, default=8)
     p.add_argument("--lanes-lane-b-pool-size", type=int, default=0)
@@ -49,14 +48,20 @@ def _parse_lanes_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
                         "intra-group diversity. Default 1.0.")
     p.add_argument("--lanes-lane-b-top-p", type=float, default=0.95)
     p.add_argument("--lanes-fallback-patch-penalty", type=float, default=0.5)
-    p.add_argument("--lanes-reward-kind", choices=("soft", "delta"), default="soft")
+    p.add_argument("--lanes-no-action-patch-penalty", type=float, default=-0.1)
+    p.add_argument(
+        "--lanes-reward-kind",
+        choices=("hard", "soft", "delta", "joint", "f2p_only"),
+        default="delta",
+    )
+    p.add_argument("--lanes-joint-alpha", type=float, default=1.0)
+    p.add_argument("--lanes-all-pass-reward", type=float, default=2.0)
     p.add_argument("--lanes-rubric-model", default="")
     p.add_argument("--lanes-judge-model", default="")
     p.add_argument("--lanes-disable-rubric", action="store_true",
                    help="Skip Lane C (rubric+judge) entirely. Reward becomes "
-                        "branch.gt_score (per-branch GT after fallback "
-                        "penalty). Pairs with RLER_REWARD_SCHEME for the GT "
-                        "formula. Saves the rubric token spend per ForkGroup.")
+                        "the centrally computed branch.gt_score. Saves the "
+                        "rubric token spend per ForkGroup.")
     return p.parse_known_args(argv)
 
 
@@ -73,8 +78,6 @@ def _export_lanes_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_LANES_INSTANCE_WORKERS"] = str(ns.lanes_instance_workers)
     if ns.lanes_max_pending:
         os.environ["SWE_AGENT_LANES_MAX_PENDING"] = str(ns.lanes_max_pending)
-    if ns.lanes_min_ready_groups:
-        os.environ["SWE_AGENT_LANES_MIN_READY_GROUPS"] = str(ns.lanes_min_ready_groups)
     os.environ["SWE_AGENT_LANES_WAIT_TIMEOUT"] = str(ns.lanes_wait_timeout)
 
     os.environ["SWE_AGENT_LANES_M"] = str(ns.lanes_m)
@@ -95,7 +98,10 @@ def _export_lanes_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_LANES_LANE_B_TEMPERATURE"] = str(ns.lanes_lane_b_temperature)
     os.environ["SWE_AGENT_LANES_LANE_B_TOP_P"] = str(ns.lanes_lane_b_top_p)
     os.environ["SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY"] = str(ns.lanes_fallback_patch_penalty)
+    os.environ["SWE_AGENT_LANES_NO_ACTION_PATCH_PENALTY"] = str(ns.lanes_no_action_patch_penalty)
     os.environ["SWE_AGENT_LANES_REWARD_KIND"] = ns.lanes_reward_kind
+    os.environ["SWE_AGENT_LANES_JOINT_ALPHA"] = str(ns.lanes_joint_alpha)
+    os.environ["SWE_AGENT_LANES_ALL_PASS_REWARD"] = str(ns.lanes_all_pass_reward)
     if ns.lanes_rubric_model:
         os.environ["SWE_AGENT_LANES_RUBRIC_MODEL"] = ns.lanes_rubric_model
     if ns.lanes_judge_model:

@@ -3,13 +3,12 @@ from typing import Any
 
 from agent_rl import ChatSamplingParams, call_model_service
 
-from swe_agent.models import GLOBAL_MODEL_STATS
 from swe_agent.exceptions import FormatError
-from swe_agent.models.litellm_model import LitellmModel
+from swe_agent.models import GLOBAL_MODEL_STATS
+from swe_agent.models.litellm_model import LitellmModel, _build_assistant_message, logger
 from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel, LitellmTextbasedModelConfig
 from swe_agent.models.utils.actions_text import parse_regex_actions
 from swe_agent.models.utils.retry import retry
-from swe_agent.models.litellm_model import logger
 
 
 class ModelServiceTextbasedModelConfig(LitellmTextbasedModelConfig):
@@ -29,9 +28,13 @@ class ModelServiceTextbasedModel(LitellmTextbasedModel):
         sampling = ChatSamplingParams(
             temperature=kwargs.get("temperature", self.config.model_kwargs.get("temperature", 0.0)),
             top_p=kwargs.get("top_p", self.config.model_kwargs.get("top_p", 1.0)),
-            max_tokens=kwargs.get("max_tokens", self.config.model_kwargs.get("max_tokens", 1024)),
+            max_tokens=kwargs.get("max_tokens", self.config.model_kwargs.get("max_tokens", 8096)),
             stop=kwargs.get("stop"),
-            extra={k: v for k, v in (self.config.model_kwargs | kwargs).items() if k not in {"temperature", "top_p", "max_tokens", "stop"}},
+            extra={
+                key: value
+                for key, value in (self.config.model_kwargs | kwargs).items()
+                if key not in {"temperature", "top_p", "max_tokens", "stop"}
+            },
         )
         prepared_messages = self._prepare_messages_for_api(messages)
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
@@ -45,19 +48,18 @@ class ModelServiceTextbasedModel(LitellmTextbasedModel):
                 )
 
         content = completion.content or ""
-        assistant_message = {
-            "role": "assistant",
-            "content": content,
-            "content_no_thinking": completion.metadata.get("content_no_thinking", content),
-            "extra": {
-                "actions": [],
-                "response": completion.raw_response,
-                "cost": completion.cost,
-                "timestamp": time.time(),
-                "finish_reason": completion.finish_reason,
-                **completion.metadata,
-            },
-        }
+        assistant_message = _build_assistant_message(
+            content=content,
+            content_no_thinking=completion.metadata.get("content_no_thinking", content),
+            usage=completion.usage,
+            prompt_token_ids=completion.input_token_ids,
+            token_ids=completion.output_token_ids,
+            logprobs=completion.output_logprobs,
+            cost=completion.cost,
+            timestamp=completion.metadata.get("timestamp", time.time()),
+            finish_reason=completion.finish_reason,
+        )
+        GLOBAL_MODEL_STATS.add(completion.cost)
         try:
             assistant_message["extra"]["actions"] = parse_regex_actions(
                 content,
@@ -67,9 +69,7 @@ class ModelServiceTextbasedModel(LitellmTextbasedModel):
         except FormatError as exc:
             assistant_message["extra"]["format_error"] = True
             setattr(exc, "assistant_message", assistant_message)
-            GLOBAL_MODEL_STATS.add(completion.cost)
             raise
-        GLOBAL_MODEL_STATS.add(completion.cost)
         return assistant_message
 
     def get_state(self) -> dict[str, Any]:

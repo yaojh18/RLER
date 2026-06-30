@@ -597,7 +597,7 @@ class PatchEvalManager:
             evaluations[node_id] = {"reward": 0.0}
         for bundle in bundles:
             if bundle.node_id in evaluations:
-                bundle.judge_payload["ground_truth_reward"] = float(evaluations[bundle.node_id].get("reward", 0.0))
+                bundle.judge_payload["ground_truth_reward"] = float(evaluations[bundle.node_id]["reward"])
 
         eval_extra_writes = [
             (bundle.node_dir / "terminal_evalution.json", evaluations[bundle.node_id])
@@ -613,7 +613,7 @@ class PatchEvalManager:
             if node_id in evaluations:
                 terminal_evaluation_by_node_id[node_id] = evaluations[node_id]
         rubric_update_payloads: list[dict[str, Any]] = []
-        gt_by_node_id = {node_id: float(payload.get("reward", 0.0)) for node_id, payload in evaluations.items()}
+        gt_by_node_id = {node_id: float(payload["reward"]) for node_id, payload in evaluations.items()}
         for bundle in rubric_bundles or []:
             payload = bundle.rubric_payload
             avg_scores = payload["average_rubric_judged_scores"]

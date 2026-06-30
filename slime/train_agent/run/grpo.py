@@ -56,44 +56,27 @@ def convert_samples_to_train_data(args, samples):
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
     rewards = list(raw_rewards)
-    # is_dummy samples (infra-failure placeholders with token_ids=[0,0],
-    # loss_mask=[0,0], reward=0.0) MUST be excluded from group reward
-    # mean/std — otherwise they drag the baseline toward 0 and inflate
-    # std, biasing every other sample's advantage. They still occupy a
-    # slot in the group to keep group_size consistent for downstream
-    # bookkeeping; their loss_mask is zeroed below so they contribute
-    # no gradient.
-    is_dummy_flags: list[bool] = [
-        bool(sample.metadata and sample.metadata.get("is_dummy"))
-        for sample in samples
-    ]
     # Track samples in degenerate groups (singleton or all-same reward).
     # These carry no GRPO signal and would produce NaN in whitening:
     #   * n=1: PyTorch unbiased std of a single element is NaN
     #          → 0 / (NaN + 1e-6) = NaN, poisons training (51963 step 0)
     #   * std=0 (all-same): 0 / (0 + 1e-6) = 0, no NaN but zero signal
     # In both cases we zero the loss_mask so the sample contributes nothing
-    # to the policy update. Caused by oversized-drop reducing a group's
-    # surviving sample count below 2.
+    # to the policy update.
     samples_to_drop: set[int] = set()
     if (
         args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
     ):
         for indices in grouped_indices.values():
-            real_indices = [i for i in indices if not is_dummy_flags[i]]
-            dummy_indices = [i for i in indices if is_dummy_flags[i]]
-            n = len(real_indices)
-            if n < 2:
-                # Insufficient real samples for GRPO comparison.
-                # naive_record_to_bundle drops most of these upstream, but
-                # singleton survivors of partial-drop still land here.
+            if len(indices) < 2:
                 for idx in indices:
                     rewards[idx] = 0.0
                     samples_to_drop.add(idx)
                 continue
-            real_group_raw = [raw_rewards[i] for i in real_indices]
-            group_rewards = torch.tensor(real_group_raw, dtype=torch.float).view(1, -1)
+            group_rewards = torch.tensor(
+                [raw_rewards[i] for i in indices], dtype=torch.float
+            ).view(1, -1)
             # unbiased=False is the population std — finite even for tiny groups.
             std = group_rewards.std(dim=-1, keepdim=True, unbiased=False)
             if torch.isnan(std).any() or (std <= 1e-9).all():
@@ -105,12 +88,8 @@ def convert_samples_to_train_data(args, samples):
             centered = group_rewards - group_rewards.mean(dim=-1, keepdim=True)
             if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
                 centered = centered / (std + 1e-6)
-            for sample_index, reward in zip(real_indices, centered.flatten().tolist(), strict=False):
+            for sample_index, reward in zip(indices, centered.flatten().tolist(), strict=False):
                 rewards[sample_index] = reward
-            # Dummies: zero advantage + drop (loss_mask zeroed below).
-            for idx in dummy_indices:
-                rewards[idx] = 0.0
-                samples_to_drop.add(idx)
 
     train_data = {
         "tokens": [sample.tokens for sample in samples],

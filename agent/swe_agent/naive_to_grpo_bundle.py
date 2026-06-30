@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math as _math
 
-from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
+from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle, has_exact_rollout_tokens
 from swe_agent.naive_search import NaiveRecord, NaiveRollout
 
 
@@ -35,18 +35,11 @@ def _build_rollout_sample(
     assemble (last_asst.prompt_token_ids + last_asst.token_ids) as the
     full sequence and set mask=1 only on each assistant turn's tokens.
     """
-    from swe_agent.tokenization import (
-        compute_loss_mask_for_messages,
-        tokenize_messages_with_template,
-    )
-
-    if rollout.error is not None:
-        reward = 0.0
-    else:
-        gt = float(rollout.gt_score) if rollout.gt_score is not None else 0.0
-        reward = gt
-        if _math.isnan(reward):
-            reward = 0.0  # defense in depth — never let NaN reach slime
+    if rollout.error is not None or rollout.gt_score is None:
+        return None
+    reward = float(rollout.gt_score)
+    if not _math.isfinite(reward):
+        return None
 
     full_messages = list(rollout.messages or [])
     if not full_messages:
@@ -57,12 +50,10 @@ def _build_rollout_sample(
     response_length: int | None = None
     rollout_logprobs: list[float] | None = None
 
-    asst_with_tokens = [
-        m for m in full_messages
-        if (m.get("role") == "assistant")
-        and m.get("prompt_token_ids")
-        and m.get("token_ids")
-    ]
+    assistant_messages = [m for m in full_messages if m.get("role") == "assistant"]
+    if not assistant_messages or not all(map(has_exact_rollout_tokens, assistant_messages)):
+        return None
+    asst_with_tokens = assistant_messages
     if asst_with_tokens:
         last = asst_with_tokens[-1]
         last_prompt = list(last["prompt_token_ids"])
@@ -112,55 +103,14 @@ def _build_rollout_sample(
             end = min(start + len(out_tok), len(mask))
             for k in range(start, end):
                 mask[k] = 1
-            lp = asst.get("logprobs") or []
-            n_lp = min(end - start, len(lp))
-            for j in range(n_lp):
+            lp = asst["logprobs"]
+            for j in range(end - start):
                 local_pos = (start - parent_prefix_len) + j
                 if 0 <= local_pos < response_length:
                     dense_lp[local_pos] = float(lp[j])
         token_ids = full_token_ids
         loss_mask = mask
         rollout_logprobs = dense_lp
-    else:
-        # Fallback (eval / non-rollout): re-tokenize via chat template.
-        normalized = [
-            {
-                "role": m.get("role", "assistant") or "assistant",
-                "content": m.get("content", "") or "",
-            }
-            for m in full_messages
-        ]
-        # Identify the sys+user prefix length so we can zero its mask
-        # bits (only assistant continuations contribute to the loss).
-        prefix_msgs: list[dict[str, str]] = []
-        for m in normalized:
-            if m["role"] == "assistant":
-                break
-            prefix_msgs.append(m)
-        try:
-            prefix_ids = (
-                tokenize_messages_with_template(
-                    prefix_msgs, add_generation_prompt=False,
-                ) if prefix_msgs else []
-            )
-            full_ids, full_mask = compute_loss_mask_for_messages(normalized)
-            zero_through = min(len(prefix_ids), len(full_mask))
-            for k in range(zero_through):
-                full_mask[k] = 0
-            token_ids = full_ids
-            loss_mask = full_mask
-            response_length = max(0, len(full_ids) - len(prefix_ids))
-            if response_length == 0:
-                return None
-            # Fallback path has no sglang-stored logprobs; emit a zero
-            # vector so TIS-enabled training still gets a same-shape
-            # tensor (tis=exp(old-0) is clamped; loss_mask zeroes
-            # contribution at non-trainable positions).
-            rollout_logprobs = [0.0] * response_length
-        except Exception:
-            token_ids = None
-            loss_mask = None
-            response_length = None
 
     # Split prompt (sys+user) from turns (everything assistant onward) for
     # build_training_messages downstream. First assistant index = boundary.
@@ -177,7 +127,6 @@ def _build_rollout_sample(
         for m in full_messages[first_asst_idx:]
     ]
 
-    gt_payload = rollout.gt_payload or {}
     return ExportSample(
         sample_id=rollout.node_id,
         group_id=f"naive-{instance_id}",
@@ -193,25 +142,14 @@ def _build_rollout_sample(
             "total_tokens": rollout.total_tokens,
             "parent_token_count": (len(token_ids) - response_length)
             if token_ids is not None and response_length is not None else None,
-            "token_source": "sglang_stored"
-            if asst_with_tokens else "rechattemplate",
+            "token_source": "sglang_stored",
             # Per-sample step counts — same keys as lanes for shared metric
             # aggregation in the rollout-fn (sample_cont_steps_mean etc.).
             "n_continuation_steps": len(rollout.step_cards),
             "n_parent_steps": 0,
             "n_full_trace_steps": len(rollout.step_cards),
-            # Patch + eval payload fields surfaced for per-batch WandB ratios
-            # (ratio_zero_patch, ratio_full_pass, ratio_regression, ...).
+            # Patch field used by rollout metrics.
             "terminal_patch_len": len(rollout.terminal_patch or ""),
-            "terminal_patch_from_fallback": bool(rollout.terminal_patch_from_fallback),
-            "terminal_no_action_emitted": bool(rollout.terminal_no_action_emitted),
-            "n_action_steps": int(rollout.n_action_steps),
-            "eval_status": gt_payload.get("status"),
-            "eval_note": gt_payload.get("note"),
-            "f2p_passed_count": gt_payload.get("f2p_passed_count"),
-            "f2p_total": gt_payload.get("f2p_total"),
-            "p2p_passed_count": gt_payload.get("p2p_passed_count"),
-            "p2p_total": gt_payload.get("p2p_total"),
         },
         token_ids=token_ids,
         loss_mask=loss_mask,
@@ -220,98 +158,29 @@ def _build_rollout_sample(
     )
 
 
-def _dummy_sample_for_rollout(
-    *, instance_id: str, rollout: NaiveRollout
-) -> ExportSample:
-    """Placeholder sample for a rollout that produced no asst tokens.
-
-    Same pattern as lane_to_grpo_bundle._dummy_sample_for_branch — keeps
-    the group at full M=8 so the GRPO baseline (group mean/std) stays
-    well-defined when some siblings fail.
-    """
-    return ExportSample(
-        sample_id=f"dummy-{rollout.node_id}",
-        group_id=f"naive-{instance_id}",
-        prompt=[],
-        turns=[],
-        reward=0.0,
-        metadata={
-            "rollout_index": rollout.rollout_index,
-            "group_index": 0,
-            "terminated_early": False,
-            "raw_gt_score": 0.0,
-            "raw_rubric_score": None,
-            "total_tokens": {"prompt": 0, "completion": 0},
-            "parent_token_count": 1,
-            "token_source": "dummy_empty_rollout",
-            "n_continuation_steps": 0,
-            "n_parent_steps": 0,
-            "n_full_trace_steps": 0,
-            "is_dummy": True,
-            "rollout_error": rollout.error or "no_asst_token_ids",
-            "terminal_patch_len": 0,
-            "terminal_patch_from_fallback": False,
-            "terminal_no_action_emitted": True,
-            "n_action_steps": 0,
-            "eval_status": None,
-            "eval_note": None,
-            "f2p_passed_count": None,
-            "f2p_total": None,
-            "p2p_passed_count": None,
-            "p2p_total": None,
-        },
-        token_ids=[0, 0],
-        loss_mask=[0, 0],
-        response_length=1,
-        rollout_logprobs=[0.0],
-    )
-
-
-import os as _os
-
-
-def _max_dummy_per_group() -> int:
-    """Read NAIVE_MAX_DUMMY_PER_GROUP at call time (test/config friendly)."""
-    try:
-        return max(1, int(_os.getenv("NAIVE_MAX_DUMMY_PER_GROUP", "2")))
-    except ValueError:
-        return 2
-
-
 def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
     """Convert one NaiveRecord into a GRPOExportBundle.
 
     policy_groups: a single ExportGroup with M ExportSamples (one per
-    naive rollout). Empty/errored rollouts get a dummy 0-reward
-    placeholder. The group is dropped when n_dummy >= NAIVE_MAX_DUMMY_PER_GROUP
-    (default 2) — too many dummies signal an infra issue (cache miss,
-    docker daemon, etc.) and the group's baseline cannot be trusted.
-    A single transient dummy is tolerated; downstream advantage
-    normalization (slime/train_agent/run/grpo.py) excludes is_dummy
-    samples from the group mean/std so the baseline stays clean.
+    naive rollout). If any rollout is invalid, the whole GRPO group is
+    omitted because its sibling baseline is no longer trustworthy.
 
     rubric_groups: always empty (naive baseline has no rubric/judge).
     """
     samples: list[ExportSample] = []
-    n_real = 0
+    invalid_rollouts: list[str] = []
     for r in record.rollouts:
         s = _build_rollout_sample(instance_id=record.instance_id, rollout=r)
         if s is None:
-            s = _dummy_sample_for_rollout(instance_id=record.instance_id, rollout=r)
-        else:
-            n_real += 1
+            invalid_rollouts.append(r.node_id)
+            continue
         samples.append(s)
 
-    n_dummy = len(samples) - n_real
-    max_dummy = _max_dummy_per_group()
-    group_dropped_reason: str | None = None
-    if not samples:
-        group_dropped_reason = "no_rollouts"
-    elif n_real < 2:
-        # GRPO needs >=2 real samples for any group baseline.
-        group_dropped_reason = f"insufficient_real_samples (n_real={n_real})"
-    elif n_dummy >= max_dummy:
-        group_dropped_reason = f"too_many_dummies (n_dummy={n_dummy} >= {max_dummy})"
+    group_dropped_reason = (
+        f"invalid_rollouts ({len(invalid_rollouts)}/{len(record.rollouts)})"
+        if invalid_rollouts or not samples
+        else None
+    )
 
     policy_groups: list[ExportGroup] = []
     if group_dropped_reason is None:
@@ -322,8 +191,7 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
                 metadata={
                     "group_index": 0,
                     "n_rollouts": len(record.rollouts),
-                    "n_real": n_real,
-                    "n_dummy": n_dummy,
+                    "n_real": len(samples),
                 },
             )
         )
@@ -340,8 +208,8 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
             "seconds": record.seconds,
             "num_rollouts": len(record.rollouts),
             "scheme": "naive_v1",
-            "n_real": n_real,
-            "n_dummy": n_dummy,
+            "n_real": len(samples),
+            "invalid_rollouts": invalid_rollouts,
             "group_dropped_reason": group_dropped_reason,
         },
     )

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from swe_agent.run.benchmarks.container_runtime import make_bound_environment
+from swe_agent.run.benchmarks.container_runtime import make_bound_environment, raise_for_container_error
 
 
 DEEPSWE_DATASET_NAMES = {"datacurve/deep-swe"}
@@ -40,19 +41,18 @@ def evaluate_deepswe_instances(
 ) -> dict[str, dict[str, Any]]:
     del max_workers
     instance = convert_deepswe_instance(instance)
-    output_dir = work_dir / ".deepswe-eval"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".deepswe-eval-", dir=work_dir) as tmp_dir:
+        output_dir = Path(tmp_dir)
+        unique_patches: dict[str, list[str]] = {}
+        for key, patch in patches_by_key.items():
+            unique_patches.setdefault(patch or "", []).append(key)
 
-    unique_patches: dict[str, list[str]] = {}
-    for key, patch in patches_by_key.items():
-        unique_patches.setdefault(patch or "", []).append(key)
-
-    evaluations: dict[str, dict[str, Any]] = {}
-    for patch_text, keys in unique_patches.items():
-        result = _evaluate_one(instance, patch_text, output_dir, timeout)
-        for key in keys:
-            evaluations[key] = result
-    return evaluations
+        evaluations: dict[str, dict[str, Any]] = {}
+        for patch_text, keys in unique_patches.items():
+            result = _evaluate_one(instance, patch_text, output_dir, timeout)
+            for key in keys:
+                evaluations[key] = result
+        return evaluations
 
 
 def _evaluate_one(instance: dict[str, Any], patch_text: str, output_dir: Path, timeout: int) -> dict[str, Any]:
@@ -86,6 +86,7 @@ bash /workspace/verifier.sh
 """
     try:
         result = env.execute({"command": command}, cwd="/app", timeout=timeout)
+        raise_for_container_error(result)
     finally:
         if hasattr(env, "cleanup"):
             env.cleanup()

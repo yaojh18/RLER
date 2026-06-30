@@ -28,9 +28,38 @@ RAY_DEFAULT_ENV_VARS = {
     "RAY_USE_UVLOOP": "0",
 }
 
+RAY_INHERITED_ENV_PREFIXES = (
+    "APPTAINER_",
+    "HF_",
+    "LITELLM_",
+    "MSWEA_",
+    "OPENAI_",
+    "NVIDIA_",
+    "RLER_",
+    "SEARCH_SWE_",
+    "SINGULARITY_",
+    "SWE_AGENT_",
+)
+
+RAY_INHERITED_ENV_KEYS = {
+    "PYTHONPATH",
+    "TMPDIR",
+    "WANDB_API_KEY",
+    "WANDB_BASE_URL",
+    "WANDB_ENTITY",
+    "WANDB_MODE",
+    "WANDB_PROJECT",
+    "XDG_CONFIG_HOME",
+}
+
 
 def add_default_ray_env_vars(env_vars: dict[str, str] | None = None) -> dict[str, str]:
-    return RAY_DEFAULT_ENV_VARS | (env_vars or {})
+    merged = dict(RAY_DEFAULT_ENV_VARS)
+    for key, value in os.environ.items():
+        if key in RAY_INHERITED_ENV_KEYS or key.startswith(RAY_INHERITED_ENV_PREFIXES):
+            merged[key] = value
+    merged.update(env_vars or {})
+    return merged
 
 
 def ray_noset_visible_devices(env_vars=os.environ):

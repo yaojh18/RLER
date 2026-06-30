@@ -49,14 +49,12 @@ from typing import Any
 
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
 from swe_agent.backend import SWEAgentRolloutBackend
-from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
 
 # Reuse shared artifact/prompt helpers plus trajectory_search's rubric,
 # judge, and persistent-state implementations so the parallel path stays
 # aligned with the non-parallel search semantics.
 from swe_agent.parallel_utils import (
     TurnTokenInfo,
-    _rubric_turn_rewards,
     _ensure_litellm_prefix,
     _stamp_steps,
     _atomic_write_json,
@@ -74,7 +72,12 @@ from swe_agent.prompt import (
     SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
     SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
 )
-from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches
+from swe_agent.run.run_swe_agent import (
+    EvaluationRewardConfig,
+    build_messages,
+    evaluate_swebench_instance_patches,
+    make_evaluation_payload,
+)
 from swe_agent.rubric_bank import ExperienceRubricBank, ScoreRubricBank, build_terminal_update_evidence
 from swe_agent.trajectory_search import (
     _avg_scores_from_rubrics,
@@ -203,12 +206,15 @@ class ParallelSearchConfig:
 
     keep_images: bool = False
     return_logprobs: bool = True
-    reward_kind: str = "soft"
+    reward_kind: str = "delta"
+    joint_alpha: float = 1.0
+    all_pass_reward: float = 2.0
     disable_rubric: bool = False
     # Same recipe as v0: multiplicative penalty when the agent never invoked
     # the formal submit command and we fell back to `git diff` of the
     # working copy.
-    fallback_patch_penalty: float = 1.0
+    fallback_patch_penalty: float = 0.5
+    no_action_patch_penalty: float = -0.1
 
     def __post_init__(self) -> None:
         if self.p <= 0:
@@ -229,8 +235,8 @@ class ParallelSearchConfig:
             raise ValueError("trajectory_search_parallel requires lane_a_pool_size > 0.")
         if self.lane_b_pool_size is not None and self.lane_b_pool_size <= 0:
             raise ValueError("trajectory_search_parallel requires lane_b_pool_size > 0 when set.")
-        if self.reward_kind not in {"soft", "delta"}:
-            raise ValueError("trajectory_search_parallel reward_kind must be 'soft' or 'delta'.")
+        if self.reward_kind not in {"hard", "soft", "delta", "joint", "f2p_only"}:
+            raise ValueError(f"unsupported trajectory_search_parallel reward_kind={self.reward_kind!r}")
 
 
 @dataclass
@@ -355,384 +361,6 @@ class InstanceRecord:
     seconds: float = 0.0
 
 
-class LaneGRPOCollector:
-    DEFAULT_GT_WEIGHT = 0.0
-    DEFAULT_SIBLINGS_WEIGHT = 0.5
-    DEFAULT_PC_WEIGHT = 0.5
-
-    def __init__(
-        self,
-        *,
-        policy_gt_weight: float = DEFAULT_GT_WEIGHT,
-        policy_siblings_weight: float = DEFAULT_SIBLINGS_WEIGHT,
-        policy_pc_weight: float = DEFAULT_PC_WEIGHT,
-    ) -> None:
-        self.policy_gt_weight = float(policy_gt_weight)
-        self.policy_siblings_weight = float(policy_siblings_weight)
-        self.policy_pc_weight = float(policy_pc_weight)
-
-    @staticmethod
-    def _branch_overall_rubric_score(branch: LaneBBranch, samples: list[dict[str, Any]]) -> float | None:
-        scores: list[float] = []
-        for sample in samples:
-            avg_scores = sample["average_rubric_judged_scores"]
-            if branch.node_id in avg_scores:
-                scores.append(float(avg_scores[branch.node_id]))
-        if not scores:
-            return None
-        return float(sum(scores) / len(scores))
-
-    @staticmethod
-    def _export_message(message: dict[str, Any]) -> dict[str, Any]:
-        item = {
-            "role": message["role"],
-            "content": message["content"],
-        }
-        if "content_no_thinking" in message:
-            item["content_no_thinking"] = message["content_no_thinking"]
-        return item
-
-    def _branch_reward(self, *, branch: LaneBBranch, group: ForkGroup) -> float:
-        import math
-
-        if branch.error is not None:
-            return 0.0
-        gt = float(branch.gt_score) if branch.gt_score is not None else 0.0
-        siblings = self._branch_overall_rubric_score(branch, group.rubric_samples)
-        pc = self._branch_overall_rubric_score(branch, group.pc_rubric_samples)
-        weighted_sum = 0.0
-        weight_sum = 0.0
-        if self.policy_gt_weight > 0.0:
-            weighted_sum += self.policy_gt_weight * gt
-            weight_sum += self.policy_gt_weight
-        if siblings is not None and not math.isnan(siblings) and self.policy_siblings_weight > 0.0:
-            weighted_sum += self.policy_siblings_weight * siblings
-            weight_sum += self.policy_siblings_weight
-        if pc is not None and not math.isnan(pc) and self.policy_pc_weight > 0.0:
-            weighted_sum += self.policy_pc_weight * pc
-            weight_sum += self.policy_pc_weight
-        if weight_sum == 0.0:
-            return gt
-        reward = weighted_sum / weight_sum
-        if math.isnan(reward):
-            return 0.0
-        return float(reward)
-
-    def _build_branch_sample(self, *, instance_id: str, group: ForkGroup, branch: LaneBBranch) -> ExportSample | None:
-        from swe_agent.tokenization import compute_loss_mask_for_messages, tokenize_messages_with_template
-
-        branch_step_cards = _build_step_cards(branch.events, branch.parent_asst_step)
-        parent_messages = list(
-            group.mid_cp.snapshot["agent"]["state"]["messages"]
-        )
-        branch_messages = list(branch.messages)
-        if not branch_messages:
-            return None
-
-        branch_assistants_with_tokens = [
-            message for message in branch_messages
-            if message.get("role") == "assistant"
-            and message.get("prompt_token_ids")
-            and message.get("token_ids")
-        ]
-        token_ids: list[int]
-        loss_mask: list[int]
-        response_length: int
-        rollout_logprobs: list[float] | None
-        token_source: str
-
-        if branch_assistants_with_tokens:
-            last = branch_assistants_with_tokens[-1]
-            last_prompt = list(last["prompt_token_ids"])
-            last_out = list(last["token_ids"])
-            full_token_ids = last_prompt + last_out
-            parent_prefix_len = len(branch_assistants_with_tokens[0]["prompt_token_ids"])
-            response_length = max(0, len(full_token_ids) - parent_prefix_len)
-            if response_length == 0:
-                return None
-            mask = [0] * len(full_token_ids)
-            logprobs: list[float] = []
-            for assistant in branch_assistants_with_tokens:
-                assistant_prompt = list(assistant["prompt_token_ids"])
-                if len(assistant_prompt) > len(last_prompt):
-                    raise AssertionError(
-                        f"lane sample {branch.node_id}: assistant prompt len {len(assistant_prompt)} exceeds final prompt len {len(last_prompt)}"
-                    )
-                if last_prompt[: len(assistant_prompt)] != assistant_prompt:
-                    divergence = next(
-                        index for index in range(len(assistant_prompt))
-                        if last_prompt[index] != assistant_prompt[index]
-                    )
-                    raise AssertionError(
-                        f"lane sample {branch.node_id}: assistant prompt is not a prefix of final prompt; first_divergence_idx={divergence}"
-                    )
-                start = len(assistant_prompt)
-                end = min(start + len(assistant["token_ids"]), len(mask))
-                for index in range(start, end):
-                    mask[index] = 1
-                logprobs.extend(list(assistant.get("logprobs") or [])[: max(0, end - start)])
-            token_ids = full_token_ids
-            loss_mask = mask
-            rollout_logprobs = logprobs
-            token_source = "sglang_stored"
-        else:
-            parent_norm = [self._export_message(message) for message in parent_messages]
-            branch_norm = [self._export_message(message) for message in branch_messages]
-            parent_ids = (
-                tokenize_messages_with_template(
-                    parent_norm,
-                    add_generation_prompt=False,
-                    model_path=branch.policy_model_name,
-                )
-                if parent_norm else []
-            )
-            full_ids, full_mask = compute_loss_mask_for_messages(
-                parent_norm + branch_norm,
-                model_path=branch.policy_model_name,
-            )
-            for index in range(min(len(parent_ids), len(full_mask))):
-                full_mask[index] = 0
-            response_length = max(0, len(full_ids) - len(parent_ids))
-            if response_length == 0:
-                return None
-            token_ids = full_ids
-            loss_mask = full_mask
-            rollout_logprobs = None
-            token_source = "rechattemplate"
-
-        return ExportSample(
-            sample_id=branch.node_id,
-            group_id=f"policy-{instance_id}-g{group.group_index:03d}",
-            prompt=[self._export_message(message) for message in parent_messages],
-            turns=[self._export_message(message) for message in branch_messages],
-            reward=self._branch_reward(branch=branch, group=group),
-            metadata={
-                "branch_index": branch.branch_index,
-                "group_index": group.group_index,
-                "mid_cp_image_tag": group.mid_cp.image_tag,
-                "mid_cp_asst_step": group.mid_cp.asst_step,
-                "terminated_early": branch.terminated_early,
-                "raw_gt_score": branch.gt_score,
-                "raw_siblings_score": self._branch_overall_rubric_score(branch, group.rubric_samples),
-                "raw_pc_score": self._branch_overall_rubric_score(branch, group.pc_rubric_samples),
-                "total_tokens": branch.total_tokens,
-                "parent_token_count": len(token_ids) - response_length,
-                "token_source": token_source,
-                "n_continuation_steps": len(branch_step_cards),
-                "n_parent_steps": group.mid_cp.asst_step,
-                "n_full_trace_steps": group.mid_cp.asst_step + len(branch_step_cards),
-            },
-            token_ids=token_ids,
-            loss_mask=loss_mask,
-            response_length=response_length,
-            rollout_logprobs=rollout_logprobs,
-        )
-
-    @staticmethod
-    def _dummy_sample_for_branch(*, instance_id: str, group: ForkGroup, branch: LaneBBranch) -> ExportSample:
-        return ExportSample(
-            sample_id=f"dummy-{branch.node_id}",
-            group_id=f"policy-{instance_id}-g{group.group_index:03d}",
-            prompt=[],
-            turns=[],
-            reward=0.0,
-            metadata={
-                "branch_index": branch.branch_index,
-                "group_index": group.group_index,
-                "mid_cp_image_tag": group.mid_cp.image_tag,
-                "mid_cp_asst_step": group.mid_cp.asst_step,
-                "terminated_early": False,
-                "raw_gt_score": 0.0,
-                "raw_siblings_score": None,
-                "raw_pc_score": None,
-                "total_tokens": {"prompt": 0, "completion": 0},
-                "parent_token_count": 1,
-                "token_source": "dummy_empty_branch",
-                "n_continuation_steps": 0,
-                "n_parent_steps": group.mid_cp.asst_step,
-                "n_full_trace_steps": group.mid_cp.asst_step,
-                "is_dummy": True,
-                "branch_error": branch.error or "no_asst_token_ids",
-            },
-            token_ids=[0, 0],
-            loss_mask=[0, 0],
-            response_length=1,
-            rollout_logprobs=[0.0],
-        )
-
-    def fork_group_to_export_group(self, *, instance_id: str, group: ForkGroup) -> ExportGroup | None:
-        samples: list[ExportSample] = []
-        n_real = 0
-        for branch in group.branches:
-            sample = self._build_branch_sample(instance_id=instance_id, group=group, branch=branch)
-            if sample is None:
-                sample = self._dummy_sample_for_branch(instance_id=instance_id, group=group, branch=branch)
-            else:
-                n_real += 1
-            samples.append(sample)
-        if n_real == 0:
-            return None
-        return ExportGroup(
-            group_id=samples[0].group_id,
-            samples=samples,
-            metadata={
-                "group_index": group.group_index,
-                "mid_cp_idx": group.mid_cp.idx,
-                "mid_cp_image_tag": group.mid_cp.image_tag,
-                "mid_cp_asst_step": group.mid_cp.asst_step,
-                "n_branches": len(group.branches),
-                "n_real": n_real,
-                "n_dummy": len(samples) - n_real,
-            },
-        )
-
-    def instance_record_to_bundle(self, record: InstanceRecord) -> GRPOExportBundle:
-        policy_groups: list[ExportGroup] = []
-        for group in record.groups:
-            export_group = self.fork_group_to_export_group(instance_id=record.instance_id, group=group)
-            if export_group is not None:
-                policy_groups.append(export_group)
-        rubric_groups = self._rubric_groups_for_record(record)
-        return GRPOExportBundle(
-            instance_id=record.instance_id,
-            run_dir=record.run_dir,
-            policy_groups=policy_groups,
-            rubric_groups=rubric_groups,
-            metadata={
-                "config": record.config,
-                "policy_reward_weights": {
-                    "gt": self.policy_gt_weight,
-                    "siblings": self.policy_siblings_weight,
-                    "pc": self.policy_pc_weight,
-                },
-                "completed": record.completed,
-                "error": record.error,
-                "seconds": record.seconds,
-                "num_groups": len(record.groups),
-                "num_mid_cps": len(record.lane_a.mid_cps),
-                "scheme": "lane_v1",
-            },
-        )
-
-    def _rubric_groups_for_record(self, record: InstanceRecord) -> list[ExportGroup]:
-        groups: list[ExportGroup] = []
-        for group in record.groups:
-            groups.extend(
-                self._rubric_export_groups_for_scope(
-                    record=record,
-                    group=group,
-                    scope="siblings",
-                    samples=group.rubric_samples,
-                    update_messages=group.experience_bank_message,
-                )
-            )
-            groups.extend(
-                self._rubric_export_groups_for_scope(
-                    record=record,
-                    group=group,
-                    scope="pc",
-                    samples=group.pc_rubric_samples,
-                    update_messages=group.pc_experience_bank_message,
-                )
-            )
-        return groups
-
-    def _rubric_export_groups_for_scope(
-        self,
-        *,
-        record: InstanceRecord,
-        group: ForkGroup,
-        scope: str,
-        samples: list[dict[str, Any]],
-        update_messages: list[dict[str, Any]],
-    ) -> list[ExportGroup]:
-        turn_reward_alpha = 1.0 if scope == "siblings" else 0.0
-        export_groups: list[ExportGroup] = []
-        if samples:
-            retrieve_messages = next(
-                (sample["retrieve_messages"] for sample in samples if sample["retrieve_messages"]),
-                None,
-            )
-            if retrieve_messages:
-                group_id = f"rubric-{record.instance_id}-g{group.group_index:03d}-{scope}-retrieve"
-                reward = sum(float(sample["reward"]) for sample in samples) / len(samples)
-                export_groups.append(
-                    ExportGroup(
-                        group_id=group_id,
-                        samples=[
-                            ExportSample(
-                                sample_id=f"{scope}-retrieve-g{group.group_index:03d}",
-                                group_id=group_id,
-                                prompt=[self._export_message(retrieve_messages[0])],
-                                turns=[self._export_message(message) for message in retrieve_messages[1:]],
-                                reward=reward,
-                                metadata={
-                                    "instance_id": record.instance_id,
-                                    "scope": scope,
-                                    "stage": "retrieve",
-                                },
-                            )
-                        ],
-                    )
-                )
-            generation_group_id = f"rubric-{record.instance_id}-g{group.group_index:03d}-{scope}-generate"
-            generation_samples: list[ExportSample] = []
-            for sample in samples:
-                conversation = [self._export_message(message) for message in sample["messages"]]
-                if not conversation:
-                    continue
-                generation_samples.append(
-                    ExportSample(
-                        sample_id=f"{scope}-{sample['rubric_list_id']}",
-                        group_id=generation_group_id,
-                        prompt=conversation[:1],
-                        turns=conversation[1:],
-                        reward=float(sample["reward"]),
-                        metadata={
-                            "scope": scope,
-                            "stage": "generate",
-                            "instance_id": record.instance_id,
-                            "turn_rewards": _rubric_turn_rewards(
-                                payload=sample,
-                                conversation=conversation,
-                                alpha=turn_reward_alpha,
-                                gamma=1.0,
-                                theta=1.0,
-                            ),
-                        },
-                    )
-                )
-            if generation_samples:
-                export_groups.append(ExportGroup(group_id=generation_group_id, samples=generation_samples))
-
-        update_group_id = f"rubric-{record.instance_id}-g{group.group_index:03d}-{scope}-experience-update"
-        update_samples: list[ExportSample] = []
-        for index, item in enumerate(update_messages):
-            messages = item["messages"]
-            conversation = [self._export_message(message) for message in messages]
-            if not conversation:
-                continue
-            update_samples.append(
-                ExportSample(
-                    sample_id=f"{scope}-experience-update-g{group.group_index:03d}-{index:02d}",
-                    group_id=update_group_id,
-                    prompt=conversation[:1],
-                    turns=conversation[1:],
-                    reward=0.0,
-                    metadata={
-                        "scope": scope,
-                        "stage": "experience_update",
-                        "instance_id": record.instance_id,
-                        "deferred_reward_kind": f"{scope}_experience_update_batch_instance_group_average",
-                    },
-                )
-            )
-        if update_samples:
-            export_groups.append(ExportGroup(group_id=update_group_id, samples=update_samples))
-        return export_groups
-
-
-# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1392,17 +1020,36 @@ class TrajectorySearchParallelRunner:
         return branch
 
     def _evaluate_gt(self, branch: LaneBBranch) -> None:
-        """Score a Lane B branch's terminal patch via swebench harness.
-        Same recipe as v0's _evaluate_gt (with fallback-patch penalty)."""
+        """Score a Lane B branch with the shared evaluator reward definition."""
         t_gt = time.perf_counter()
         raw = (branch.terminal_patch or "").rstrip()
         patch = (raw + "\n") if raw else ""
+        n_action_steps = sum(
+            1
+            for card in _build_step_cards(branch.events, branch.parent_asst_step)
+            if card.get("commands")
+        )
+        reward_config = EvaluationRewardConfig(
+            kind=self.config.reward_kind,
+            joint_alpha=self.config.joint_alpha,
+            all_pass_reward=self.config.all_pass_reward,
+            fallback_patch_penalty=(
+                self.config.fallback_patch_penalty
+                if branch.terminal_patch_from_fallback
+                else 1.0
+            ),
+            no_action_patch_penalty=(
+                self.config.no_action_patch_penalty if n_action_steps == 0 else 0.0
+            ),
+        )
         if not patch:
-            branch.gt_score = 0.0
-            branch.gt_payload = {"reward": 0.0, "note": "empty_patch"}
+            branch.gt_payload = make_evaluation_payload(
+                "empty", reward_config=reward_config
+            )
+            branch.gt_score = float(branch.gt_payload["reward"])
             logger.info(
-                "[%s] gt_done node=%s dt=0.0s reward=0.0 note=empty_patch",
-                self.task_id, branch.node_id,
+                "[%s] gt_done node=%s dt=0.0s reward=%.3f note=empty_patch",
+                self.task_id, branch.node_id, branch.gt_score,
             )
             return
         try:
@@ -1413,46 +1060,25 @@ class TrajectorySearchParallelRunner:
                 max_workers=1,
                 namespace=self.harness_namespace,
                 work_dir=self.run_dir / "groups",
+                reward_config=reward_config,
             )
-            branch_payload = (
-                payload.get(branch.node_id, {}) if isinstance(payload, dict) else {}
-            )
-            raw_reward = float(branch_payload.get("reward", 0.0))
-            f2p_total = int(branch_payload.get("f2p_total") or 0)
-            p2p_total = int(branch_payload.get("p2p_total") or 0)
-            denom = f2p_total + p2p_total
-            base_score = (p2p_total / denom) if denom > 0 else 0.0
-            delta_reward = max(0.0, raw_reward - base_score)
-            reward_kind = (self.config.reward_kind or "soft").lower()
-            scored_reward = raw_reward if reward_kind == "soft" else delta_reward
-            penalty = float(self.config.fallback_patch_penalty)
-            if branch.terminal_patch_from_fallback and penalty != 1.0:
-                branch.gt_score = scored_reward * penalty
-                branch.gt_payload = {
-                    **branch_payload,
-                    "raw_reward": raw_reward,
-                    "base_score": base_score,
-                    "delta_reward": delta_reward,
-                    "reward_kind": reward_kind,
-                    "fallback_penalty": penalty,
-                    "note": "patch_from_git_diff_fallback",
-                }
+            if not isinstance(payload, dict) or branch.node_id not in payload:
+                raise RuntimeError(f"missing evaluation payload for {branch.node_id}")
+            branch_payload = payload[branch.node_id]
+            branch.gt_payload = copy.deepcopy(branch_payload)
+            if branch_payload.get("metainfo", {}).get("infrastructure_error"):
+                branch.gt_score = None
             else:
-                branch.gt_payload = {
-                    **branch_payload,
-                    "raw_reward": raw_reward,
-                    "base_score": base_score,
-                    "delta_reward": delta_reward,
-                    "reward_kind": reward_kind,
-                }
-                branch.gt_score = scored_reward
+                branch.gt_score = float(branch_payload["reward"])
             logger.info(
                 "[%s] gt_done node=%s dt=%.1fs reward=%.3f",
                 self.task_id, branch.node_id, time.perf_counter() - t_gt,
                 branch.gt_score if branch.gt_score is not None else -1.0,
             )
         except Exception as exc:
-            branch.gt_payload = {"error": f"{type(exc).__name__}: {exc}"}
+            branch.gt_payload = make_evaluation_payload(
+                "error", error=exc, reward_config=reward_config, infrastructure_error=True
+            )
             branch.gt_score = None
             logger.warning(
                 "[%s] gt_FAILED node=%s dt=%.1fs %s",
@@ -1885,7 +1511,8 @@ class TrajectorySearchParallelRunner:
             self.task_id, mid_cp.idx, cfg.m, mid_cp.image_tag, first_budget, total_budget,
         )
         branch_tasks: list[asyncio.Task] = []
-        for bi in range(cfg.m + 1):
+        branch_count = cfg.m if cfg.disable_rubric else cfg.m + 1
+        for bi in range(branch_count):
             ctx = contextvars.copy_context()
             is_parent_baseline = bi == cfg.m
             initial_temperature = (
@@ -1929,7 +1556,9 @@ class TrajectorySearchParallelRunner:
             try:
                 await future
             except BaseException as exc:
-                branch.gt_payload = {"error": f"{type(exc).__name__}: {exc}"}
+                branch.gt_payload = make_evaluation_payload(
+                    "error", error=exc, infrastructure_error=True
+                )
                 branch.gt_score = None
                 logger.warning(
                     "[%s] gt_task_FAILED node=%s %s",
@@ -1954,8 +1583,10 @@ class TrajectorySearchParallelRunner:
                     status="error",
                     is_parent_baseline=bi == cfg.m,
                 )
-                err_branch.gt_score = 0.0
-                err_branch.gt_payload = {"reward": 0.0, "note": "branch_error"}
+                err_branch.gt_score = None
+                err_branch.gt_payload = make_evaluation_payload(
+                    "error", error=err_branch.error
+                )
                 branch = err_branch
             else:
                 branch = item
@@ -2000,7 +1631,8 @@ class TrajectorySearchParallelRunner:
                 ],
                 "parent": (
                     round(group.parent_branch.gt_score, 3)
-                    if group.parent_branch.gt_score is not None else None
+                    if group.parent_branch is not None and group.parent_branch.gt_score is not None
+                    else None
                 ),
             },
             (group.lane_c_done_at - group.lane_c_started_at)
@@ -2760,7 +2392,8 @@ class TrajectorySearchParallelRunner:
         gdir = self._dump_group_scaffold(group)
         self._dump_rubric_samples(gdir / "sibling_rubrics", group.rubric_samples)
         self._dump_rubric_samples(gdir / "pc_rubrics", group.pc_rubric_samples)
-        self._dump_branch(group, group.parent_branch)
+        if group.parent_branch is not None:
+            self._dump_branch(group, group.parent_branch)
         for branch in group.branches:
             self._dump_branch(group, branch)
 
@@ -2838,7 +2471,7 @@ class TrajectorySearchParallelRunner:
                             "n_step_cards": len(_build_step_cards(g.parent_branch.events, g.parent_branch.parent_asst_step)),
                             "terminated_early": g.parent_branch.terminated_early,
                             "error": g.parent_branch.error,
-                        },
+                        } if g.parent_branch is not None else None,
                         "branches": [
                             {
                                 "branch_index": b.branch_index,

@@ -22,7 +22,6 @@ class ChatCompletion:
     model_name: Optional[str] = None
     cost: float = 0.0
     usage: Dict[str, Any] = field(default_factory=dict)
-    raw_response: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     # Token-level fields populated by sglang /generate path. When set,
     # downstream consumers (PDS, training-side sample builder) prefer

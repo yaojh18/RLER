@@ -15,11 +15,11 @@ import time
 from typing import Any
 
 from agent_rl.model_service import run_async
-from agent_rl.run_utils import compact_completion_response, run_generate_with_route_async
+from agent_rl.run_utils import run_generate_with_route_async
 
 from swe_agent.exceptions import FormatError, LimitsExceeded
 from swe_agent.models import GLOBAL_MODEL_STATS
-from swe_agent.models.litellm_model import LitellmModel, logger
+from swe_agent.models.litellm_model import LitellmModel, _build_assistant_message, logger
 from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel, LitellmTextbasedModelConfig
 from swe_agent.models.utils.actions_text import parse_regex_actions
 from swe_agent.models.utils.retry import retry
@@ -45,11 +45,11 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         self.policy_version = policy_version
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
-        prepared_messages = self._prepare_messages_for_api(messages)
+        prepared_messages = self._prepare_messages_for_api(messages, preserve_token_fields=True)
         query_kwargs = self.config.model_kwargs | kwargs
         temperature = query_kwargs.pop("temperature", 0.0)
         top_p = query_kwargs.pop("top_p", 1.0)
-        max_tokens = query_kwargs.pop("max_tokens", query_kwargs.pop("max_completion_tokens", 1024))
+        max_tokens = query_kwargs.pop("max_tokens", query_kwargs.pop("max_completion_tokens", 8096))
         stop = query_kwargs.pop("stop", None)
         api_base = query_kwargs.pop("api_base", None)
         api_key = query_kwargs.pop("api_key", "EMPTY")
@@ -93,7 +93,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         # the agent's run() loop catch it cleanly, append an exit message,
         # and break out — `_step_session` returns normally, `rollout.messages`
         # is populated with the partial trace, and the bundle builds a real
-        # sample with reward=0 instead of an empty dummy. Mirrors the existing
+        # partial sample instead of an invalid empty trajectory. Mirrors the existing
         # step_limit / cost_limit / wall_clock checks in agents/default.py:query.
         if len(input_ids) + int(max_tokens) > self.config.context_length:
             raise LimitsExceeded({
@@ -203,36 +203,17 @@ class RouteTextbasedModel(LitellmTextbasedModel):
                         ) from exc
                     raise
         content = completion.content or ""
-        assistant_message = {
-            "role": "assistant",
-            "content": completion.content,
-            "content_no_thinking": completion.metadata.get("content_no_thinking", content),
-            "usage": dict(completion.usage) if completion.usage else {},
-            # ---- Token-level fields (the source of truth for training) ----
-            # The trio (prompt_token_ids, token_ids, logprobs) records EXACTLY
-            # what flowed across the sglang boundary for this turn:
-            #   prompt_token_ids = the input_ids we sent (chat-template
-            #                      encoded full conversation prefix)
-            #   token_ids        = sglang's exact output_ids (no re-tok)
-            #   logprobs         = per-output-token chosen logprob, one entry
-            #                      per output token, in token order
-            # PDS sample build then uses LAST assistant's prompt_token_ids +
-            # token_ids as the full sequence for training, with no need to
-            # re-apply the chat template (avoids any encode/decode mismatch).
-            "prompt_token_ids": list(completion.input_token_ids),
-            "token_ids": list(completion.output_token_ids),
-            "logprobs": list(completion.output_logprobs),
-            "extra": {
-                "actions": [],
-                "response": compact_completion_response(completion),
-                "cost": completion.cost,
-                "timestamp": completion.metadata.get("timestamp", time.time()),
-                "finish_reason": completion.finish_reason,
-                "route_name": self.config.route_name,
-                "policy_version": self.policy_version,
-                "input_token_count": len(completion.input_token_ids),
-            },
-        }
+        assistant_message = _build_assistant_message(
+            content=content,
+            content_no_thinking=completion.metadata.get("content_no_thinking", content),
+            usage=completion.usage,
+            prompt_token_ids=completion.input_token_ids,
+            token_ids=completion.output_token_ids,
+            logprobs=completion.output_logprobs,
+            cost=completion.cost,
+            timestamp=completion.metadata.get("timestamp", time.time()),
+            finish_reason=completion.finish_reason,
+        )
         GLOBAL_MODEL_STATS.add(completion.cost)
         try:
             assistant_message["extra"]["actions"] = parse_regex_actions(

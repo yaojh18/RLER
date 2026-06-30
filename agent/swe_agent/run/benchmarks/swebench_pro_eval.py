@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Iterator
 
-from swe_agent.run.benchmarks.container_runtime import make_bound_environment, select_container_backend
+from swe_agent.run.benchmarks.container_runtime import (
+    make_bound_environment,
+    raise_for_container_error,
+    select_container_backend,
+)
 
 
 SWEBENCH_PRO_DATASET_NAMES = {"ScaleAI/SWE-bench_Pro"}
@@ -47,21 +53,37 @@ def evaluate_swebench_pro_instances(
     del max_workers
     instance = convert_swebench_pro_instance(instance)
     root = _official_repo_root()
-    official = _load_official_eval(root)
-    output_dir = work_dir / ".swebench-pro-eval"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    with _node_local_singularity_eval_lock(instance):
+        official = _load_official_eval(root)
+        with tempfile.TemporaryDirectory(prefix=".swebench-pro-eval-", dir=work_dir) as tmp_dir:
+            output_dir = Path(tmp_dir)
+            unique_patches: dict[str, list[str]] = {}
+            for key, patch in patches_by_key.items():
+                unique_patches.setdefault(patch or "", []).append(key)
 
-    unique_patches: dict[str, list[str]] = {}
-    for key, patch in patches_by_key.items():
-        unique_patches.setdefault(patch or "", []).append(key)
+            evaluations: dict[str, dict[str, Any]] = {}
+            for index, (patch_text, keys) in enumerate(unique_patches.items()):
+                prefix = f"rler_{index}_{hashlib.sha1(patch_text.encode('utf-8')).hexdigest()[:8]}"
+                result = _evaluate_one(official, root, instance, patch_text, output_dir, prefix, timeout)
+                for key in keys:
+                    evaluations[key] = result
+            return evaluations
 
-    evaluations: dict[str, dict[str, Any]] = {}
-    for index, (patch_text, keys) in enumerate(unique_patches.items()):
-        prefix = f"rler_{index}_{hashlib.sha1(patch_text.encode('utf-8')).hexdigest()[:8]}"
-        result = _evaluate_one(official, root, instance, patch_text, output_dir, prefix, timeout)
-        for key in keys:
-            evaluations[key] = result
-    return evaluations
+
+@contextlib.contextmanager
+def _node_local_singularity_eval_lock(instance: dict[str, Any]) -> Iterator[None]:
+    if select_container_backend() != "singularity":
+        yield
+        return
+    repo = str(instance.get("repo") or instance.get("dockerhub_tag") or "unknown")
+    repo_hash = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:12]
+    lock_path = Path("/tmp") / f"rler-swebench-pro-eval-{os.getuid()}-{repo_hash}.lock"
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def _evaluate_one(
@@ -127,6 +149,7 @@ def _eval_with_singularity(
     )
     try:
         result = env.execute({"command": "bash /workspace/entryscript.sh"}, cwd="/", timeout=timeout)
+        raise_for_container_error(result)
     finally:
         if hasattr(env, "cleanup"):
             env.cleanup()

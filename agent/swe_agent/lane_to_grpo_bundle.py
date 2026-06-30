@@ -19,20 +19,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
+from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle, has_exact_rollout_tokens
 from swe_agent.trajectory_search_parallel import (
     ForkGroup,
     InstanceRecord,
     LaneBBranch,
 )
-
-
-# Pure-rubric reward for policy update. The earlier blend (alpha*gt +
-# (1-alpha)*rubric) is gone — see commit message and docs/rubric_rl.md for
-# the rationale (GT-only and blended rewards both biased the policy toward
-# patch-format hacking; rubric-only forces the policy to satisfy the judge's
-# rubric criteria, which is the actual training signal we want to optimize).
-EMPTY_RUBRIC_REWARD = 0.0
+from swe_agent.trajectory_search import _build_step_cards
 
 
 def _branch_overall_rubric_score(
@@ -53,13 +46,6 @@ def _branch_overall_rubric_score(
     if not scores:
         return None
     return float(sum(scores) / len(scores))
-
-
-def _normalize_message(msg: dict) -> dict:
-    return {
-        "role": msg.get("role", "assistant") or "assistant",
-        "content": msg.get("content", "") or "",
-    }
 
 
 def _build_branch_sample(
@@ -84,9 +70,6 @@ def _build_branch_sample(
     a_i.prompt to be a true prefix of last.prompt — guaranteed by the
     custom chat template in swe_agent.tokenization (pure-splice renderer).
 
-    Fallback path: re-tokenize via the chat template when stored token
-    fields are absent (eval / non-rollout-traffic paths).
-
     steps_per_round (task 3): if set, truncate the trainable window to the
     first `steps_per_round` ASSISTANT TURNS past the shared parent. Tokens
     emitted after that cutoff are dropped entirely (token_ids ends at the
@@ -96,41 +79,33 @@ def _build_branch_sample(
     has no judged signal — and the GRPO advantage applied to those tokens
     is just noise from the group baseline.
     """
-    from swe_agent.tokenization import (
-        compute_loss_mask_for_messages,
-        tokenize_messages_with_template,
-    )
-
     # Reward = pure rubric (task 4). Earlier we blended alpha*gt +
     # (1-alpha)*rubric; that biased the policy toward whichever signal had
     # higher variance in a given group. With rubric-only, every group's
     # advantage is driven by the judge — which is the signal we actually
-    # want the policy to optimize. NaN-safe: if no rubric judged this
-    # branch (errored branch / Lane C failed / overflow), reward is 0
-    # so it sits at the baseline rather than poisoning the group with NaN.
+    # want the policy to optimize. A missing rubric or invalid branch makes
+    # the complete sibling group unusable.
     #
     # gt_only_reward (paired with ParallelSearchConfig.disable_rubric): use
-    # branch.gt_score (already has fallback_patch_penalty baked in) as the
-    # reward. Same scale as the naive baseline; each ForkGroup's M branches
+    # the centrally computed branch.gt_score as the reward. Same scale as
+    # the naive baseline; each ForkGroup's M branches
     # are GRPO-normalized against each other conditioned on the shared
     # MidCp state.
     import math as _math
-    if branch.error is not None:
-        reward = 0.0
+    if branch.error is not None or branch.gt_score is None:
+        return None
     elif gt_only_reward:
         gt = branch.gt_score
-        if gt is None or _math.isnan(float(gt)):
-            reward = 0.0
-        else:
-            reward = float(gt)
+        if gt is None or not _math.isfinite(float(gt)):
+            return None
+        reward = float(gt)
     else:
         rubric = _branch_overall_rubric_score(
             branch.branch_index, group.judge_response
         )
-        if rubric is None or _math.isnan(rubric):
-            reward = 0.0
-        else:
-            reward = float(rubric)
+        if rubric is None or not _math.isfinite(rubric):
+            return None
+        reward = float(rubric)
 
     # Parent messages = Lane A's spine messages up to mid_cp.
     # Pulled from the MidCp snapshot we stored at emit time.
@@ -147,12 +122,14 @@ def _build_branch_sample(
     response_length: int | None = None
     rollout_logprobs: list[float] | None = None
 
-    branch_assistants_with_tokens = [
-        m for m in branch_messages
-        if (m.get("role") == "assistant")
-        and m.get("prompt_token_ids")
-        and m.get("token_ids")
+    branch_assistant_messages = [
+        m for m in branch_messages if m.get("role") == "assistant"
     ]
+    if not branch_assistant_messages or not all(
+        map(has_exact_rollout_tokens, branch_assistant_messages)
+    ):
+        return None
+    branch_assistants_with_tokens = branch_assistant_messages
     # Cap trainable assistant turns to first steps_per_round (task 3).
     # Anything past that cap is dropped from token_ids entirely — we slice
     # `last` to the last in-window assistant turn, so full_token_ids =
@@ -205,58 +182,14 @@ def _build_branch_sample(
             end = min(start + len(out_tok), len(mask))
             for k in range(start, end):
                 mask[k] = 1
-            lp = asst.get("logprobs") or []
-            n_lp = min(end - start, len(lp))
-            for j in range(n_lp):
+            lp = asst["logprobs"]
+            for j in range(end - start):
                 local_pos = (start - parent_prefix_len) + j
                 if 0 <= local_pos < response_length:
                     dense_lp[local_pos] = float(lp[j])
         token_ids = full_token_ids
         loss_mask = mask
         rollout_logprobs = dense_lp
-    else:
-        # Fallback (eval / non-rollout): re-tokenize via chat template.
-        # Apply the same steps_per_round cap by trimming branch_messages
-        # to end after the steps_per_round-th assistant turn.
-        capped_branch_messages = branch_messages
-        if steps_per_round is not None and steps_per_round > 0:
-            asst_count = 0
-            cutoff_idx = len(branch_messages)
-            for idx, m in enumerate(branch_messages):
-                if m.get("role") == "assistant":
-                    asst_count += 1
-                    if asst_count >= steps_per_round:
-                        cutoff_idx = idx + 1
-                        break
-            capped_branch_messages = branch_messages[:cutoff_idx]
-        parent_norm = [_normalize_message(m) for m in parent_messages]
-        branch_norm = [_normalize_message(m) for m in capped_branch_messages]
-        try:
-            if parent_norm:
-                parent_ids = tokenize_messages_with_template(
-                    parent_norm, add_generation_prompt=False,
-                )
-            else:
-                parent_ids = []
-            full_norm = parent_norm + branch_norm
-            full_ids, full_mask = compute_loss_mask_for_messages(full_norm)
-            zero_through = min(len(parent_ids), len(full_mask))
-            for k in range(zero_through):
-                full_mask[k] = 0
-            token_ids = full_ids
-            loss_mask = full_mask
-            response_length = max(0, len(full_ids) - len(parent_ids))
-            if response_length == 0:
-                return None
-            # Fallback path has no sglang-stored logprobs; emit a zero
-            # vector so build_rollout_samples passes its length guard and
-            # TIS / rollout_logprob_mean stay shape-compatible. loss_mask
-            # zeros at these positions ensure no PG / IS contribution.
-            rollout_logprobs = [0.0] * response_length
-        except Exception:
-            token_ids = None
-            loss_mask = None
-            response_length = None
 
     # Reflect the steps_per_round cap in the emitted `turns` payload for
     # consistency with the token-level path. The cap is applied as a
@@ -278,7 +211,7 @@ def _build_branch_sample(
         capped_branch_messages_for_turns = branch_messages[:cutoff_idx]
         n_trainable_asst_turns = min(steps_per_round, n_trainable_asst_turns)
 
-    gt_payload = branch.gt_payload or {}
+    branch_step_cards = _build_step_cards(branch.events, branch.parent_asst_step)
     return ExportSample(
         sample_id=branch.node_id,
         group_id=f"policy-{instance_id}-g{group.group_index:03d}",
@@ -304,87 +237,21 @@ def _build_branch_sample(
             "total_tokens": branch.total_tokens,
             "parent_token_count": (len(token_ids) - response_length)
             if token_ids is not None and response_length is not None else None,
-            "token_source": "sglang_stored"
-            if branch_assistants_with_tokens else "rechattemplate",
+            "token_source": "sglang_stored",
             # Per-sample step counts — surfaced for wandb aggregation in
             # collect_lanes_rollout_async.generate_rollout's metrics dict.
-            "n_continuation_steps": len(branch.step_cards),
+            "n_continuation_steps": len(branch_step_cards),
             "n_trainable_asst_turns": n_trainable_asst_turns,
             "steps_per_round_cap": steps_per_round,
             "n_parent_steps": mid_cp.asst_step,
-            "n_full_trace_steps": mid_cp.asst_step + len(branch.step_cards),
-            # Patch + eval payload fields surfaced for per-batch WandB ratios
-            # (ratio_zero_patch, ratio_full_pass, ratio_regression, ...).
+            "n_full_trace_steps": mid_cp.asst_step + len(branch_step_cards),
+            # Patch field used by rollout metrics.
             "terminal_patch_len": len(branch.terminal_patch or ""),
-            "terminal_patch_from_fallback": bool(branch.terminal_patch_from_fallback),
-            "eval_status": gt_payload.get("status"),
-            "eval_note": gt_payload.get("note"),
-            "f2p_passed_count": gt_payload.get("f2p_passed_count"),
-            "f2p_total": gt_payload.get("f2p_total"),
-            "p2p_passed_count": gt_payload.get("p2p_passed_count"),
-            "p2p_total": gt_payload.get("p2p_total"),
         },
         token_ids=token_ids,
         loss_mask=loss_mask,
         response_length=response_length,
         rollout_logprobs=rollout_logprobs,
-    )
-
-
-def _dummy_sample_for_branch(
-    *, instance_id: str, group: ForkGroup, branch: LaneBBranch
-) -> ExportSample:
-    """Placeholder sample for a branch that produced no asst tokens (e.g.,
-    sglang context-length overflow on the FIRST call from a late mid_cp —
-    97% of empty branches in 51963 rollout_0 died this way).
-
-    The dummy carries reward=0.0 with a 2-token sequence whose loss_mask
-    is all-zero, so it contributes nothing to the policy gradient. But it
-    DOES participate in the GRPO baseline (group mean/std), preventing
-    the singleton-group NaN we saw in 51963 step 0 when 7 of 8 siblings
-    failed and only 1 real sample was left.
-
-    Mirrors v0's approach in pds_to_grpo_bundle (set reward=0.0 for
-    errored branches) but extends it to the response_length==0 case which
-    v0 also drops.
-    """
-    return ExportSample(
-        sample_id=f"dummy-{branch.node_id}",
-        group_id=f"policy-{instance_id}-g{group.group_index:03d}",
-        prompt=[],
-        turns=[],
-        reward=0.0,
-        metadata={
-            "branch_index": branch.branch_index,
-            "group_index": group.group_index,
-            "mid_cp_image_tag": group.mid_cp.image_tag,
-            "mid_cp_asst_step": group.mid_cp.asst_step,
-            "terminated_early": False,
-            "raw_gt_score": 0.0,
-            "raw_rubric_score": None,
-            "total_tokens": {"prompt": 0, "completion": 0},
-            "parent_token_count": 1,
-            "token_source": "dummy_empty_branch",
-            "n_continuation_steps": 0,
-            "n_parent_steps": group.mid_cp.asst_step,
-            "n_full_trace_steps": group.mid_cp.asst_step,
-            "is_dummy": True,
-            "branch_error": branch.error or "no_asst_token_ids",
-            "terminal_patch_len": 0,
-            "terminal_patch_from_fallback": False,
-            "eval_status": None,
-            "eval_note": None,
-            "f2p_passed_count": None,
-            "f2p_total": None,
-            "p2p_passed_count": None,
-            "p2p_total": None,
-        },
-        # 2 tokens (parent + response); loss_mask all-zero → no PG signal.
-        # Using small pad ids (0) keeps slime's _post_process happy.
-        token_ids=[0, 0],
-        loss_mask=[0, 0],
-        response_length=1,
-        rollout_logprobs=[0.0],
     )
 
 
@@ -401,19 +268,14 @@ def fork_group_to_export_group(
     — fires per-group as each group completes, without waiting for the
     instance to finish.
 
-    Always emits one sample per branch, even when a branch errored or
-    produced no asst tokens — empty branches get a dummy 0-reward
-    placeholder (see _dummy_sample_for_branch). This keeps groups at
-    full M=M=8, matches v0's GRPO baseline shape, and prevents the
-    singleton-NaN bug (51963 step 0). If ALL branches are empty, the
-    whole group has zero signal — caller drops it.
+    An invalid branch invalidates the complete sibling group so GRPO never
+    computes an advantage from a partial group.
 
     steps_per_round (task 3): cap each branch's trainable window to its
     first steps_per_round assistant turns past the shared parent. Tokens
     after the cap are dropped from token_ids entirely.
     """
     samples: list[ExportSample] = []
-    n_real = 0
     for branch in group.branches:
         s = _build_branch_sample(
             instance_id=instance_id, group=group, branch=branch,
@@ -421,14 +283,9 @@ def fork_group_to_export_group(
             gt_only_reward=gt_only_reward,
         )
         if s is None:
-            s = _dummy_sample_for_branch(
-                instance_id=instance_id, group=group, branch=branch,
-            )
-        else:
-            n_real += 1
+            return None
         samples.append(s)
-    if n_real == 0:
-        # Pure-dummy group → no learning signal at all. Drop.
+    if not samples:
         return None
     return ExportGroup(
         group_id=samples[0].group_id,
@@ -439,8 +296,7 @@ def fork_group_to_export_group(
             "mid_cp_image_tag": group.mid_cp.image_tag,
             "mid_cp_asst_step": group.mid_cp.asst_step,
             "n_branches": len(group.branches),
-            "n_real": n_real,
-            "n_dummy": len(samples) - n_real,
+            "n_real": len(samples),
         },
     )
 

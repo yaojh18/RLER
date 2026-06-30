@@ -15,6 +15,17 @@ _ENVIRONMENT_MAPPING = {
 }
 
 
+def _extract_submission(output: dict) -> str | None:
+    if output.get("returncode") != 0:
+        return None
+    lines = output.get("output", "").splitlines(keepends=True)
+    marker = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+    marker_index = next((index for index, line in enumerate(lines) if line.strip() == marker), None)
+    if marker_index is None:
+        return None
+    return "".join(lines[marker_index + 1 :])
+
+
 def get_environment_class(spec: str) -> type[Environment]:
     full_path = _ENVIRONMENT_MAPPING.get(spec, spec)
     if full_path == "swe_agent.environments.docker.DockerEnvironment":

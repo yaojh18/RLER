@@ -1,7 +1,24 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def has_exact_rollout_tokens(message: dict[str, Any]) -> bool:
+    prompt_token_ids = message.get("prompt_token_ids")
+    token_ids = message.get("token_ids")
+    logprobs = message.get("logprobs")
+    if not all(isinstance(values, list) and values for values in (prompt_token_ids, token_ids, logprobs)):
+        return False
+    if len(logprobs) != len(token_ids):
+        return False
+    try:
+        return all(isinstance(token, int) for token in prompt_token_ids + token_ids) and all(
+            math.isfinite(float(logprob)) for logprob in logprobs
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass
@@ -12,9 +29,8 @@ class ExportSample:
     turns: list[dict[str, Any]]
     reward: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    # ---- precomputed token-level fields (preferred for training) ----
-    # If set, slime's build_rollout_samples uses these directly and SKIPS
-    # text re-tokenization. They are the source of truth for PDS samples.
+    # ---- exact rollout token fields (required for training) ----
+    # Slime consumes these directly; text re-tokenization is not supported.
     #   token_ids       = full sequence (parent's shared prefix + this branch's
     #                     new messages, encoded with the same chat template
     #                     used by sglang)
@@ -28,10 +44,8 @@ class ExportSample:
     #                     len(parent_prefix)). slime takes
     #                     loss_mask[-response_length:] as the per-token
     #                     advantage mask.
-    #   rollout_logprobs= per-assistant-token logprobs from sglang during
-    #                     rollout (concatenated over the branch's new
-    #                     portion). Reserved for future TIS / off-policy
-    #                     correction; None when not available.
+    #   rollout_logprobs= dense response-aligned logprobs from sglang; masked
+    #                     non-assistant positions contain zero.
     token_ids: list[int] | None = None
     loss_mask: list[int] | None = None
     response_length: int | None = None

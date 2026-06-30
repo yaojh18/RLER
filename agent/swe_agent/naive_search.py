@@ -45,6 +45,7 @@ from swe_agent.parallel_utils import (
     extract_terminal_patch_from_session,
 )
 from swe_agent.run.run_swe_agent import (
+    EvaluationRewardConfig,
     build_messages,
     evaluate_swebench_instance_patches,
     make_evaluation_payload,
@@ -76,18 +77,12 @@ class NaiveSearchConfig:
 
     # Same fallback-patch penalty recipe as v0/lanes.
     fallback_patch_penalty: float = 0.5
-    # Stricter penalty applied when the rollout emitted ZERO environment
-    # actions (degenerate <think></think><|im_end|> collapse seen in 56724).
-    # 0.0 = hard zero reward, 1.0 = no penalty. Multiplied AFTER the regular
-    # fallback penalty above.
-    no_action_patch_penalty: float = 0.0
+    # Additive adjustment for trajectories that execute no environment action.
+    no_action_patch_penalty: float = -0.1
 
-    # Reward formula. 'soft' = raw passed_set / (passed ∪ failed) on the
-    # patched repo (always >= 0). 'delta' = max(0, raw - baseline), where
-    # baseline is the soft score of an empty patch (only p2p_total contributes
-    # to passed). 'delta' floors at 0 so a rollout that merely preserves
-    # baseline pass-rate earns no credit; only NEW pass-rate gets signal.
     reward_kind: str = "delta"
+    joint_alpha: float = 1.0
+    all_pass_reward: float = 2.0
 
 
 @dataclass
@@ -109,10 +104,8 @@ class NaiveRollout:
     terminal_patch: str = ""
     terminal_patch_from_fallback: bool = False
     n_action_steps: int = 0  # count of step_cards with at least one command
-    terminal_no_action_emitted: bool = False  # True iff zero env actions across rollout
     error: str | None = None
     gt_score: float | None = None
-    gt_payload: dict[str, Any] | None = None
     evaluation_payload: dict[str, Any] | None = None
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -351,7 +344,6 @@ class NaiveSearchRunner:
             rollout.n_action_steps = sum(
                 1 for c in rollout.step_cards if c.get("commands")
             )
-            rollout.terminal_no_action_emitted = (rollout.n_action_steps == 0)
             rollout.turns = self._extract_turn_token_info(snapshot_after, base_turn_count)
             rollout.total_tokens = {
                 "prompt": sum(t.prompt_tokens for t in rollout.turns),
@@ -386,27 +378,33 @@ class NaiveSearchRunner:
         return rollout
 
     def _evaluate_gt(self, rollout: NaiveRollout) -> None:
-        """Same recipe as TrajectorySearchParallelRunner._evaluate_gt: run the
-        swebench harness on the rollout's terminal patch, apply fallback
-        penalty when the patch came from `git diff` instead of formal submit.
-        """
+        """Evaluate one terminal patch with the shared reward definition."""
         t_gt = time.perf_counter()
         raw = (rollout.terminal_patch or "").rstrip()
         patch = (raw + "\n") if raw else ""
+        reward_config = EvaluationRewardConfig(
+            kind=self.config.reward_kind,
+            joint_alpha=self.config.joint_alpha,
+            all_pass_reward=self.config.all_pass_reward,
+            fallback_patch_penalty=(
+                self.config.fallback_patch_penalty
+                if rollout.terminal_patch_from_fallback
+                else 1.0
+            ),
+            no_action_patch_penalty=(
+                self.config.no_action_patch_penalty
+                if rollout.n_action_steps == 0
+                else 0.0
+            ),
+        )
         if not patch:
-            rollout.gt_score = 0.0
-            rollout.evaluation_payload = make_evaluation_payload("empty")
-            rollout.gt_payload = {
-                **rollout.evaluation_payload,
-                "raw_reward": 0.0,
-                "base_score": 0.0,
-                "delta_reward": 0.0,
-                "reward_kind": (self.config.reward_kind or "delta").lower(),
-                "note": "empty_patch",
-            }
+            rollout.evaluation_payload = make_evaluation_payload(
+                "empty", reward_config=reward_config
+            )
+            rollout.gt_score = float(rollout.evaluation_payload["reward"])
             logger.info(
-                "[%s] gt_done node=%s dt=0.0s reward=0.0 note=empty_patch",
-                self.task_id, rollout.node_id,
+                "[%s] gt_done node=%s dt=0.0s reward=%.3f note=empty_patch",
+                self.task_id, rollout.node_id, rollout.gt_score,
             )
             return
         try:
@@ -419,56 +417,25 @@ class NaiveSearchRunner:
                 max_workers=1,
                 namespace=self.harness_namespace,
                 work_dir=rollout_run_dir,
+                reward_config=reward_config,
             )
             if not isinstance(payload, dict) or eval_key not in payload:
                 raise RuntimeError(f"missing evaluation payload for {eval_key}")
             rollout_payload = payload[eval_key]
             rollout.evaluation_payload = copy.deepcopy(rollout_payload)
-            raw_reward = float(rollout_payload.get("reward", 0.0))
-            # base_score = soft score on the unmodified repo: all p2p pass,
-            # all f2p fail -> p2p_total / (p2p_total + f2p_total). Subtracting
-            # it floors at 0, so a rollout that merely preserves baseline
-            # earns no reward; only NEW pass rate gets signal.
-            f2p_total = int(rollout_payload.get("f2p_total") or 0)
-            p2p_total = int(rollout_payload.get("p2p_total") or 0)
-            denom = f2p_total + p2p_total
-            base_score = (p2p_total / denom) if denom > 0 else 0.0
-            delta_reward = max(0.0, raw_reward - base_score)
-            penalty = float(self.config.fallback_patch_penalty)
-            no_action_penalty = float(self.config.no_action_patch_penalty)
-            reward_kind = (self.config.reward_kind or "delta").lower()
-            if reward_kind == "soft":
-                scored_reward = raw_reward
+            if rollout_payload.get("metainfo", {}).get("infrastructure_error"):
+                rollout.gt_score = None
             else:
-                scored_reward = delta_reward
-            notes: list[str] = []
-            multipliers: dict[str, float] = {}
-            if rollout.terminal_patch_from_fallback and penalty != 1.0:
-                scored_reward = scored_reward * penalty
-                multipliers["fallback_penalty"] = penalty
-                notes.append("patch_from_git_diff_fallback")
-            if rollout.terminal_no_action_emitted and no_action_penalty != 1.0:
-                scored_reward = scored_reward * no_action_penalty
-                multipliers["no_action_penalty"] = no_action_penalty
-                notes.append("no_action_emitted")
-            rollout.gt_score = scored_reward
-            rollout.gt_payload = {
-                **rollout_payload,
-                "raw_reward": raw_reward,
-                "base_score": base_score,
-                "delta_reward": delta_reward,
-                "reward_kind": reward_kind,
-                **multipliers,
-                **({"note": "+".join(notes)} if notes else {}),
-            }
+                rollout.gt_score = float(rollout_payload["reward"])
             logger.info(
                 "[%s] gt_done node=%s dt=%.1fs reward=%.3f",
                 self.task_id, rollout.node_id, time.perf_counter() - t_gt,
                 rollout.gt_score if rollout.gt_score is not None else -1.0,
             )
         except Exception as exc:
-            rollout.evaluation_payload = make_evaluation_payload("error", error=exc)
-            rollout.gt_payload = copy.deepcopy(rollout.evaluation_payload)
+            rollout.evaluation_payload = make_evaluation_payload(
+                "error", error=exc, reward_config=reward_config, infrastructure_error=True
+            )
             rollout.gt_score = None
             logger.warning(
                 "[%s] gt_FAILED node=%s dt=%.1fs %s",
@@ -536,8 +503,7 @@ class NaiveSearchRunner:
             gt_futures: list[asyncio.Future] = []
             for r in rollouts:
                 if r.error is not None:
-                    r.gt_score = 0.0
-                    r.gt_payload = {"reward": 0.0, "note": "rollout_error"}
+                    r.gt_score = None
                     if r.evaluation_payload is None:
                         r.evaluation_payload = make_evaluation_payload(
                             "error", error=r.error,
@@ -604,12 +570,7 @@ class NaiveSearchRunner:
             )
             evaluation_payload = r.evaluation_payload
             if evaluation_payload is None:
-                if r.error:
-                    evaluation_payload = make_evaluation_payload("error", error=r.error)
-                elif not (r.terminal_patch or "").strip():
-                    evaluation_payload = make_evaluation_payload("empty")
-                else:
-                    raise RuntimeError(f"missing evaluation payload for rollout {r.node_id}")
+                raise RuntimeError(f"missing evaluation payload for rollout {r.node_id}")
             (rdir / "evaluation.json").write_text(
                 json.dumps(
                     evaluation_payload,
