@@ -3,21 +3,20 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import logging
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from agent_rl.run_utils import extract_json_from_response, route_completion_message
+from agent_rl.run_utils import extract_last_json_object, freeform_thought_model_kwargs, route_completion_message
 
 from swe_agent.models.litellm_model import LitellmModel
 from swe_agent.models.utils.retry import retry
 from swe_agent.prompt import (
     RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
-    RUBRIC_EXPERIENCE_RETRIEVAL_RESPONSE_FORMAT,
     RUBRIC_EXPERIENCE_UPDATE_PROMPT,
-    RUBRIC_EXPERIENCE_UPDATE_RESPONSE_FORMAT,
     _seed_experiences,
     _seed_rubrics,
 )
@@ -50,7 +49,7 @@ class RubricRecord:
     direction: Literal["positive", "negative"]
     description: str
     scale: dict[str, str]
-    weight: int
+    weight: float
     source_round: int
     reward: float | None = None
     metadata: dict[str, str] | None = None
@@ -276,7 +275,7 @@ def _convert_experience(payload: dict[str, Any], experience_id: str | None = Non
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
         return None
-    required_metadata_types = {
+    legacy_metadata_types = {
         "generated_rubrics": list,
         "gt_skeleton": str,
         "generated_rubric_accuracy": dict,
@@ -284,12 +283,20 @@ def _convert_experience(payload: dict[str, Any], experience_id: str | None = Non
         "analysis": str,
         "reference_golden_rubrics": list,
     }
-    if set(metadata) != set(required_metadata_types):
+    compact_metadata_types = {"reference_golden_rubrics": list}
+    if set(metadata) == set(legacy_metadata_types):
+        required_metadata_types = legacy_metadata_types
+    elif set(metadata) == set(compact_metadata_types):
+        # Offline PRM analysis emits deployable experiences without retaining
+        # privileged reward, score, or golden-patch diagnostics. Continue to
+        # accept the legacy update artifacts while allowing this compact form.
+        required_metadata_types = compact_metadata_types
+    else:
         return None
     for key, expected_type in required_metadata_types.items():
         if not isinstance(metadata.get(key), expected_type):
             return None
-    for rubric in metadata["generated_rubrics"]:
+    for rubric in metadata.get("generated_rubrics", []):
         if not isinstance(rubric, dict) or _convert_rubric_item("generated", rubric, 0) is None:
             return None
     for rubric in metadata["reference_golden_rubrics"]:
@@ -390,6 +397,7 @@ def _convert_action(
         validated_reference_golden_rubrics.append(
             {
                 "polarity": rubric.direction,
+                "weight": rubric.weight,
                 "title": rubric.title,
                 "description": rubric.description,
                 "metadata": copy.deepcopy(rubric.metadata or {}),
@@ -480,7 +488,11 @@ def _seed_experience_records(scope: str = "siblings") -> dict[str, RubricExperie
     }
 
 
-def _convert_rubric_item(task: str, item: dict[str, Any], round_index: int) -> RubricRecord | None:
+def _convert_rubric_item(
+    task: str,
+    item: dict[str, Any],
+    round_index: int,
+) -> RubricRecord | None:
     if not isinstance(item, dict):
         return None
     direction = item.get("polarity", None)
@@ -502,6 +514,14 @@ def _convert_rubric_item(task: str, item: dict[str, Any], round_index: int) -> R
     if not isinstance(metadata_raw, dict):
         return None
     metadata = {str(key): str(value) for key, value in metadata_raw.items()}
+    if "weight" not in item:
+        return None
+    try:
+        weight = float(item["weight"])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(weight) or weight <= 0.0:
+        return None
     rubric_id = hashlib.md5(
         json.dumps(
             {
@@ -511,6 +531,7 @@ def _convert_rubric_item(task: str, item: dict[str, Any], round_index: int) -> R
                 "description": description,
                 "metadata": metadata,
                 "scale": scale,
+                "weight": weight,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -522,7 +543,7 @@ def _convert_rubric_item(task: str, item: dict[str, Any], round_index: int) -> R
         direction=direction,
         description=description,
         scale=scale,
-        weight=1 if direction == "positive" else -1,
+        weight=weight,
         source_round=round_index,
         metadata=metadata,
     )
@@ -555,6 +576,7 @@ class ScoreRubricBank:
                 + json.dumps(
                     [{
                             "polarity": rubric.direction,
+                            "weight": rubric.weight,
                             "title": rubric.title,
                             "description": rubric.description,
                             "scale": rubric.scale,
@@ -734,27 +756,36 @@ class ExperienceRubricBank:
                         temperature=temperature,
                         top_p=top_p,
                         max_tokens=max_tokens,
-                        response_format=copy.deepcopy(RUBRIC_EXPERIENCE_RETRIEVAL_RESPONSE_FORMAT),
-                        model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
+                        model_kwargs=freeform_thought_model_kwargs(model_kwargs),
                     )
             response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
             messages.append(assistant_message)
-            parsed = extract_json_from_response(response or "")
-            if isinstance(parsed, dict) and isinstance(parsed.get("titles"), list):
+            parsed = extract_last_json_object(response)
+            if (
+                isinstance(parsed, dict)
+                and isinstance(parsed.get("titles"), list)
+                and all(isinstance(title, str) for title in parsed["titles"])
+            ):
                 requested_titles = [title for title in parsed["titles"][: self.retrieve_top_k] if title in self.experiences]
                 if len(requested_titles) == len(parsed["titles"][: self.retrieve_top_k]):
                     break
                 messages.append(
                     {
                         "role": "user",
-                        "content": "Some requested titles do not exist in the experience index. Return corrected JSON using only existing titles, or {\"titles\": []}.",
+                        "content": (
+                            "Some requested titles do not exist in the experience index. Follow the output format example "
+                            "above using only existing titles, or {\"titles\": []}."
+                        ),
                     }
                 )
                 continue
             messages.append(
                 {
                     "role": "user",
-                    "content": "Expected JSON exactly in the format {\"titles\": [\"existing experience title\"]}. Return corrected JSON only.",
+                    "content": (
+                        "Expected {\"titles\": [\"existing experience title\"]} in the final JSON. Follow the output "
+                        "format example above."
+                    ),
                 }
             )
         return [self.experiences[title] for title in requested_titles], messages
@@ -922,6 +953,7 @@ class ExperienceRubricBank:
             generated_rubrics = [
                 {
                     "polarity": rubric["direction"],
+                    "weight": rubric["weight"],
                     "title": rubric["title"],
                     "description": rubric["description"],
                     "metadata": copy.deepcopy(rubric["metadata"]),
@@ -1005,12 +1037,11 @@ class ExperienceRubricBank:
                             temperature=temperature,
                             top_p=top_p,
                             max_tokens=max_tokens,
-                            response_format=copy.deepcopy(RUBRIC_EXPERIENCE_UPDATE_RESPONSE_FORMAT),
-                            model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
+                            model_kwargs=freeform_thought_model_kwargs(model_kwargs),
                         )
                 response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
                 messages.append(assistant_message)
-                parsed = extract_json_from_response(response)
+                parsed = extract_last_json_object(response)
                 if parsed == {}:
                     if add_update_count == 0:
                         messages.append(
@@ -1018,7 +1049,7 @@ class ExperienceRubricBank:
                                 "role": "user",
                                 "content": (
                                     "Generate at least one add or update action with concrete observable rubric-generation guidance, "
-                                    "or retrieve an existing experience first if needed."
+                                    "or retrieve an existing experience first if needed. Follow the output format example above."
                                 ),
                             }
                         )
@@ -1036,7 +1067,7 @@ class ExperienceRubricBank:
                                 "metadata.reference_golden_rubrics must be top-level fields in the new flat format. "
                                 "Current valid experience titles are: "
                                 + json.dumps(valid_titles, ensure_ascii=False)
-                                + ". Generate a corrected single action or return {}."
+                                + ". Follow the output format example above with a corrected single action or {}."
                             ),
                         }
                     )
@@ -1053,7 +1084,8 @@ class ExperienceRubricBank:
                                 "## Retrieved Existing Experiences:\n"
                                 + json.dumps(retrieved)
                                 + "\n\nUse this retrieved context to decide the next add, update, delete, or retrieve action. "
-                                + "Return {} when no more bank changes are needed for this rubric generation attempt."
+                                + "Follow the output format example above, or return {} when no "
+                                + "more bank changes are needed for this rubric generation attempt."
                             ),
                         }
                     )
@@ -1076,7 +1108,8 @@ class ExperienceRubricBank:
                     {
                         "role": "user",
                         "content": (
-                            "Applied the action to the rubric experience bank successfully.\nGenerate the next action or return an empty object."
+                            "Applied the action to the rubric experience bank successfully.\nGenerate the next action or return "
+                            "an empty object. Follow the output format example above."
                         ),
                     }
                 )

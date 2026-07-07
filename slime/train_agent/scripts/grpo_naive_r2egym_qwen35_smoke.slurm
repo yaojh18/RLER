@@ -15,9 +15,8 @@
 
 set -euo pipefail
 
-# Reproducer for the successful naive R2E-Gym train smoke:
-#   job 13176098, Qwen3.5-9B, 2 H100 nodes, actor 8 GPUs, rollout 8 GPUs,
-#   TP=2, CP=4, 4 train epochs, 1 R2E-Gym instance.
+# Qwen3.5-9B, 2 H100 nodes, actor 8 GPUs, rollout 8 GPUs,
+# TP=2, CP=4, 4 rollouts, 1 R2E-Gym instance.
 
 ROOT=${ROOT:-/lustre/fsw/portfolios/nemotron/projects/nemotron_rl_rm/users/jiyao}
 WORKSPACE=/workspace
@@ -36,6 +35,8 @@ NODE_TABLE=$RUN_DIR/node_ip_table.txt
 INNER_HOST=$RUN_DIR_HOST/launch_inside_container.sh
 INNER=$RUN_DIR/launch_inside_container.sh
 RAY_PORT=${RAY_PORT:-6379}
+RUN_NODELIST=${RUN_NODELIST:-$SLURM_JOB_NODELIST}
+RUN_NUM_NODES=$(scontrol show hostnames "$RUN_NODELIST" | wc -l)
 
 HF_CHECKPOINT=${HF_CHECKPOINT:-$WORKSPACE/models/Qwen3.5-9B}
 LOAD_DIR=${LOAD_DIR:-$WORKSPACE/models/Qwen3.5-9B_torch_dist}
@@ -46,6 +47,7 @@ NAIVE_OUTPUT_ROOT=${NAIVE_OUTPUT_ROOT:-$RUN_DIR/naive_out}
 REQUIRED_SIF_HOST=$ROOT/singularity_images/r2egym/namanjain12_orange3_final_2d9617bd0cb1f0ba61771258410ab8fae8e7e24d.sif
 
 [ -n "${SLURM_JOB_ID:-}" ] || { echo "ERROR: run this script under sbatch/salloc"; exit 1; }
+[ "$RUN_NUM_NODES" -eq 2 ] || { echo "ERROR: naive smoke requires exactly 2 run nodes, got $RUN_NUM_NODES"; exit 1; }
 [ -f "$SLIME_IMAGE" ] || { echo "ERROR: missing slime image: $SLIME_IMAGE"; exit 1; }
 [ -f "$REQUIRED_SIF_HOST" ] || { echo "ERROR: missing R2E-Gym SIF: $REQUIRED_SIF_HOST"; exit 1; }
 [ -d "$ROOT/RLER" ] || { echo "ERROR: missing RLER checkout: $ROOT/RLER"; exit 1; }
@@ -63,7 +65,7 @@ while IFS= read -r node; do
   ip=$(getent ahostsv4 "$node" | awk '$1 ~ /^10[.]65[.]/ {print $1; exit}')
   [ -n "$ip" ] || { echo "ERROR: could not resolve 10.65.* IP for $node"; exit 1; }
   printf '%s %s %s\n' "$ip" "$node" "$ip" >> "$NODE_TABLE_HOST"
-done < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+done < <(scontrol show hostnames "$RUN_NODELIST")
 sort -V -o "$NODE_TABLE_HOST" "$NODE_TABLE_HOST"
 HEAD_IP=$(awk 'NR == 1 {print $3}' "$NODE_TABLE_HOST")
 HEAD_NODE=$(awk 'NR == 1 {print $2}' "$NODE_TABLE_HOST")
@@ -148,11 +150,11 @@ print(sum(1 for n in ray.nodes() if n.get("Alive")))
 ray.shutdown()
 PY
 )
-    echo "[$(date)] ray nodes=$nodes waiting=$SLURM_JOB_NUM_NODES"
-    [ "$nodes" -ge "$SLURM_JOB_NUM_NODES" ] && break
+    echo "[$(date)] ray nodes=$nodes waiting=$RUN_NUM_NODES"
+    [ "$nodes" -ge "$RUN_NUM_NODES" ] && break
     sleep 2
   done
-  [ "$nodes" -ge "$SLURM_JOB_NUM_NODES" ] || { echo "ERROR: Ray cluster did not reach $SLURM_JOB_NUM_NODES nodes"; exit 1; }
+  [ "$nodes" -ge "$RUN_NUM_NODES" ] || { echo "ERROR: Ray cluster did not reach $RUN_NUM_NODES nodes"; exit 1; }
 
   cd /workspace/RLER/slime
   set +e
@@ -169,7 +171,7 @@ PY
     --save-dir "$SAVE_DIR" \
     --search-output-root "$NAIVE_OUTPUT_ROOT" \
     --naive-output-root "$NAIVE_OUTPUT_ROOT" \
-    --num-nodes 2 \
+    --num-nodes "$RUN_NUM_NODES" \
     --num-gpus-per-node 8 \
     --actor-num-gpus 8 \
     --actor-num-nodes 1 \
@@ -189,7 +191,7 @@ PY
     --wandb-team "$WANDB_ENTITY" \
     --wandb-group "naive-r2egym-$SLURM_JOB_ID-smoke" \
     --naive-m 8 \
-    --naive-step-limit 2 \
+    --naive-step-limit 250 \
     --naive-instance-workers 1 \
     --naive-gt-eval-workers 8 \
     --naive-completion-max-tokens 16384 \
@@ -225,11 +227,11 @@ ray stop --force >/dev/null 2>&1 || true
 INNER
 chmod +x "$INNER_HOST"
 
-echo "[$(date)] job=$SLURM_JOB_ID nodes=$SLURM_JOB_NUM_NODES head=$HEAD_NODE head_ip=$HEAD_IP"
+echo "[$(date)] job=$SLURM_JOB_ID nodes=$RUN_NUM_NODES head=$HEAD_NODE head_ip=$HEAD_IP"
 cat "$NODE_TABLE_HOST"
 echo "[$(date)] run_dir=$RUN_DIR_HOST"
 
-export RUN_DIR PROMPT_DATA NODE_TABLE HEAD_IP HEAD_NODE RAY_PORT
+export RUN_DIR PROMPT_DATA NODE_TABLE HEAD_IP HEAD_NODE RAY_PORT RUN_NUM_NODES
 export HF_CHECKPOINT LOAD_DIR REF_LOAD_DIR SAVE_DIR NAIVE_OUTPUT_ROOT MODEL_NAME
 
 export ENROOT_CACHE_PATH=$ROOT/tmp/train_async_validation/enroot/cache
@@ -239,8 +241,10 @@ export ENROOT_TEMP_PATH=/tmp/jiyao_enroot_tmp_$SLURM_JOB_ID
 mkdir -p "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH" "$ENROOT_RUNTIME_PATH" "$ENROOT_TEMP_PATH"
 
 srun \
-  --nodes="$SLURM_JOB_NUM_NODES" \
-  --ntasks="$SLURM_JOB_NUM_NODES" \
+  --exclusive \
+  --nodelist="$RUN_NODELIST" \
+  --nodes="$RUN_NUM_NODES" \
+  --ntasks="$RUN_NUM_NODES" \
   --ntasks-per-node=1 \
   --container-image="$SLIME_IMAGE" \
   --no-container-mount-home \

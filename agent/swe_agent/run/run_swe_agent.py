@@ -22,8 +22,10 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Sequence, TextIO
+import yaml
 from swebench.harness import run_evaluation as swebench_run_evaluation
 from swebench.harness.constants import LOG_REPORT, LOG_TEST_OUTPUT
 from swebench.harness.docker_build import build_instance_image
@@ -60,6 +62,7 @@ from swe_agent.run.benchmarks.swebench_pro_eval import (
     is_swebench_pro_instance,
 )
 from swe_agent.run.benchmarks.swebench_singularity_eval import evaluate_swebench_instances_singularity
+from swe_agent.models.utils.actions_text import format_observation_messages
 
 
 def find_repo_root(start: Path) -> Path:
@@ -81,9 +84,9 @@ DEFAULT_MODEL_CLASS = "route_textbased"
 DEFAULT_MAX_MODEL_LEN = 128000
 DEFAULT_STEP_LIMIT = 160
 DEFAULT_COMPLETION_MAX_TOKENS = 8096
-EMPTY_REWARD = 0.0
-ERROR_REWARD = 0.0
-SUPPORTED_REWARD_KINDS = {"hard", "soft", "delta", "joint", "f2p_only"}
+EMPTY_REWARD = -0.2
+ERROR_REWARD = -0.5
+SUPPORTED_REWARD_KINDS = {"hard", "soft", "joint", "f2p_only"}
 DEFAULT_VLLM_PORT = 30000
 DEFAULT_ENV_TIMEOUT = 300
 DEFAULT_PULL_TIMEOUT = 600
@@ -97,9 +100,33 @@ DEFAULT_SGLANG_IMAGE = "slimerl/slime:qwen35-route-fixed-20260416-v1"
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
 
+@lru_cache(maxsize=1)
+def _swe_agent_observation_template() -> str:
+    config = yaml.safe_load(SWE_AGENT_TEXTBASED_CONFIG.read_text(encoding="utf-8"))
+    return str(config["model"]["observation_template"])
+
+
+def format_swe_agent_observation(
+    output: str,
+    *,
+    returncode: int | None = None,
+    exception_info: str | None = None,
+) -> str:
+    return format_observation_messages(
+        [
+            {
+                "output": output,
+                "returncode": returncode,
+                "exception_info": exception_info,
+            }
+        ],
+        observation_template=_swe_agent_observation_template(),
+    )[0]["content"]
+
+
 @dataclass(frozen=True)
 class EvaluationRewardConfig:
-    kind: str = "delta"
+    kind: str = "joint"
     joint_alpha: float = 1.0
     all_pass_reward: float = 2.0
     fallback_patch_penalty: float = 1.0
@@ -113,9 +140,9 @@ class EvaluationRewardConfig:
 
 
 def default_evaluation_reward_config() -> EvaluationRewardConfig:
-    kind = os.environ.get("RLER_REWARD_KIND", "delta")
+    kind = os.environ.get("RLER_REWARD_KIND", "joint")
     return EvaluationRewardConfig(
-        kind=kind.strip().lower() or "delta",
+        kind=kind.strip().lower() or "joint",
         joint_alpha=float(os.environ.get("RLER_JOINT_ALPHA", "1.0")),
         all_pass_reward=float(os.environ.get("RLER_ALL_PASS_REWARD", "2.0")),
     )
@@ -516,7 +543,6 @@ def make_evaluation_payload(
     reward_config = reward_config or default_evaluation_reward_config()
     f2p_passed = len(passed_set & f2p)
     p2p_passed = len(passed_set & p2p)
-    p2p_failed = max(0, len(p2p) - p2p_passed)
     total_expected = len(f2p) + len(p2p)
     visible_total = len(passed_set | set(failed))
     all_pass = status == "resolved"
@@ -531,18 +557,16 @@ def make_evaluation_payload(
         reward = len(passed_set) / visible_total if visible_total else float(all_pass)
     elif total_expected == 0:
         reward = float(all_pass)
-    elif reward_config.kind == "delta":
-        reward = max(0.0, (f2p_passed - p2p_failed) / total_expected)
     else:
         f2p_pass_rate = f2p_passed / len(f2p) if f2p else 1.0
         p2p_pass_rate = p2p_passed / len(p2p) if p2p else 1.0
         reward = (
-            f2p_pass_rate - reward_config.joint_alpha * p2p_pass_rate
+            f2p_pass_rate - reward_config.joint_alpha * (1.0 - p2p_pass_rate)
             if reward_config.kind == "joint"
             else f2p_pass_rate
         )
 
-    if status != "error":
+    if status in {"resolved", "unresolved"}:
         if all_pass:
             reward *= reward_config.all_pass_reward
         reward *= reward_config.fallback_patch_penalty
@@ -558,6 +582,33 @@ def make_evaluation_payload(
             "infrastructure_error": bool(infrastructure_error),
         },
     }
+
+
+def _evaluator_exception_payload(
+    error: Exception,
+    reward_config: EvaluationRewardConfig | None = None,
+    *,
+    output: str = "",
+) -> dict[str, Any]:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    timed_out = False
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if (
+            isinstance(current, (subprocess.TimeoutExpired, TimeoutError))
+            or "timed out after" in str(current).lower()
+        ):
+            timed_out = True
+            break
+        current = current.__cause__ or current.__context__
+    return make_evaluation_payload(
+        "error",
+        output=output,
+        error=error,
+        reward_config=reward_config,
+        infrastructure_error=not timed_out,
+    )
 
 
 def _test_sequence(value: Sequence[str] | str | None) -> list[str]:
@@ -688,6 +739,7 @@ def run_harness_evaluation(
             patches_by_key={str(run_dir): patch},
             model_name=model_name,
             max_workers=1,
+            timeout=timeout,
             namespace=None,
             work_dir=run_dir,
         )
@@ -701,7 +753,7 @@ def run_harness_evaluation(
                 try:
                     result_dir, payload = future.result()
                 except Exception as exc:
-                    result_dir, payload = run_dir, make_evaluation_payload("error", error=exc)
+                    result_dir, payload = run_dir, _evaluator_exception_payload(exc)
                     _append_error_to_log(log_path, exc)
                 _json_dump(result_dir / "evaluation.json", payload)
 
@@ -813,6 +865,7 @@ def evaluate_swebench_instance_patches(
     patches_by_key: dict[str, str],
     model_name: str,
     max_workers: int,
+    timeout: int = 600,
     namespace: str | None = None,
     work_dir: Path | None = None,
     reward_config: EvaluationRewardConfig | None = None,
@@ -833,7 +886,7 @@ def evaluate_swebench_instance_patches(
                     evaluate_rebench_prediction,
                     instance=instance,
                     patch_text=entry["patch"],
-                    timeout=600,
+                    timeout=timeout,
                     work_dir=eval_work_dir,
                 ): entry["keys"]
                 for entry in unique_patches.values()
@@ -842,9 +895,7 @@ def evaluate_swebench_instance_patches(
                 try:
                     payload = _rebench_result_payload(future.result(), reward_config)
                 except Exception as exc:
-                    payload = make_evaluation_payload(
-                        "error", error=exc, reward_config=reward_config, infrastructure_error=True
-                    )
+                    payload = _evaluator_exception_payload(exc, reward_config)
                 for key in keys:
                     evaluations[key] = payload
         return evaluations
@@ -856,23 +907,19 @@ def evaluate_swebench_instance_patches(
                 instance=instance,
                 patches_by_key=patches_by_key,
                 max_workers=max_workers,
-                timeout=600,
+                timeout=timeout,
                 work_dir=eval_work_dir,
             )
         except Exception as exc:
             return {
-                key: make_evaluation_payload(
-                    "error", error=exc, reward_config=reward_config, infrastructure_error=True
-                )
+                key: _evaluator_exception_payload(exc, reward_config)
                 for key in patches_by_key
             }
         for key, result in results.items():
             try:
                 evaluations[key] = _r2egym_result_payload(result, reward_config)
             except Exception as exc:
-                evaluations[key] = make_evaluation_payload(
-                    "error", error=exc, reward_config=reward_config, infrastructure_error=True
-                )
+                evaluations[key] = _evaluator_exception_payload(exc, reward_config)
         return evaluations
 
     if is_swebench_pro_instance(instance):
@@ -881,15 +928,13 @@ def evaluate_swebench_instance_patches(
                 instance=instance,
                 patches_by_key=patches_by_key,
                 max_workers=max_workers,
-                timeout=600,
+                timeout=timeout,
                 work_dir=eval_work_dir,
             )
             return {key: _benchmark_result_payload(result, reward_config) for key, result in results.items()}
         except Exception as exc:
             return {
-                key: make_evaluation_payload(
-                    "error", error=exc, reward_config=reward_config, infrastructure_error=True
-                )
+                key: _evaluator_exception_payload(exc, reward_config)
                 for key in patches_by_key
             }
 
@@ -899,15 +944,13 @@ def evaluate_swebench_instance_patches(
                 instance=instance,
                 patches_by_key=patches_by_key,
                 max_workers=max_workers,
-                timeout=600,
+                timeout=timeout,
                 work_dir=eval_work_dir,
             )
             return {key: _benchmark_result_payload(result, reward_config) for key, result in results.items()}
         except Exception as exc:
             return {
-                key: make_evaluation_payload(
-                    "error", error=exc, reward_config=reward_config, infrastructure_error=True
-                )
+                key: _evaluator_exception_payload(exc, reward_config)
                 for key in patches_by_key
             }
 
@@ -938,14 +981,12 @@ def evaluate_swebench_instance_patches(
                 max_workers=max_workers,
                 namespace=namespace,
                 work_dir=eval_work_dir,
-                timeout=600,
+                timeout=timeout,
             )
         except Exception as exc:
             for key, patch in patches_by_key.items():
                 if (patch or "").strip():
-                    evaluations[key] = make_evaluation_payload(
-                        "error", error=exc, reward_config=reward_config, infrastructure_error=True
-                    )
+                    evaluations[key] = _evaluator_exception_payload(exc, reward_config)
             return evaluations
         for key, result in raw_results.items():
             try:
@@ -958,12 +999,10 @@ def evaluate_swebench_instance_patches(
                     reward_config=reward_config,
                 )
             except Exception as exc:
-                evaluations[key] = make_evaluation_payload(
-                    "error",
+                evaluations[key] = _evaluator_exception_payload(
+                    exc,
+                    reward_config,
                     output=result.get("output", ""),
-                    error=exc,
-                    reward_config=reward_config,
-                    infrastructure_error=True,
                 )
         return evaluations
 
@@ -1238,7 +1277,7 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
             model_name=model_name,
             dataset_name=DATASET_MAPPING.get(args.subset, args.subset),
             log_path=args._run_log_path,
-            timeout=600,
+            timeout=args.eval_timeout,
             max_workers=args.workers,
             instances_by_id=by_id,
         )
@@ -1331,7 +1370,7 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
                 output_root=args.output_root,
                 config=config,
                 model_name=model_name,
-                eval_timeout=600,
+                eval_timeout=args.eval_timeout,
                 workers=args.workers,
                 pass_n=args.pass_n,
                 redo_existing=True,
@@ -1356,8 +1395,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split", default=DEFAULT_SPLIT)
     parser.add_argument("--evaluation-only", default=None)
     parser.add_argument("--timestamp", default=None, help="Override the run timestamp used in output/log directories.")
+    parser.add_argument("--run-log-path", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--eval-timeout", type=int, default=600)
     parser.add_argument("--step-limit", type=int, default=DEFAULT_STEP_LIMIT)
     parser.add_argument(
         "--wall-clock-limit-seconds",
@@ -1402,7 +1443,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     args._evaluation_only = args.evaluation_only
     args._run_timestamp = args.evaluation_only or args.timestamp or time.strftime("%Y%m%d-%H%M%S")
-    args._run_log_path = DEFAULT_LOG_ROOT / f"{args._run_timestamp}.log"
+    args._run_log_path = args.run_log_path or (DEFAULT_LOG_ROOT / f"{args._run_timestamp}.log")
     if args.pass_n < 1:
         raise ValueError("--pass-n must be positive")
     args._selected_instances = select_instances(args)

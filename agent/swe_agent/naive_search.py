@@ -80,7 +80,7 @@ class NaiveSearchConfig:
     # Additive adjustment for trajectories that execute no environment action.
     no_action_patch_penalty: float = -0.1
 
-    reward_kind: str = "delta"
+    reward_kind: str = "joint"
     joint_alpha: float = 1.0
     all_pass_reward: float = 2.0
 

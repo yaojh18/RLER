@@ -206,7 +206,7 @@ class ParallelSearchConfig:
 
     keep_images: bool = False
     return_logprobs: bool = True
-    reward_kind: str = "delta"
+    reward_kind: str = "joint"
     joint_alpha: float = 1.0
     all_pass_reward: float = 2.0
     disable_rubric: bool = False
@@ -235,7 +235,7 @@ class ParallelSearchConfig:
             raise ValueError("trajectory_search_parallel requires lane_a_pool_size > 0.")
         if self.lane_b_pool_size is not None and self.lane_b_pool_size <= 0:
             raise ValueError("trajectory_search_parallel requires lane_b_pool_size > 0 when set.")
-        if self.reward_kind not in {"hard", "soft", "delta", "joint", "f2p_only"}:
+        if self.reward_kind not in {"hard", "soft", "joint", "f2p_only"}:
             raise ValueError(f"unsupported trajectory_search_parallel reward_kind={self.reward_kind!r}")
 
 

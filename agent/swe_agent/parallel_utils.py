@@ -207,6 +207,8 @@ def compact_workspace_meta(workspace_meta: dict[str, Any], *, file_limit: int = 
 
 def rubric_score_record(rubric: Any, score_raw: int, judge_message: Any) -> dict[str, Any]:
     normalized = max(0.0, min(1.0, (float(score_raw) - 1.0) / 4.0))
+    importance = abs(float(rubric.weight))
+    directional_score = -normalized if rubric.direction == "negative" else normalized
     return {
         "rubric_id": rubric.rubric_id,
         "rubric": {
@@ -216,12 +218,12 @@ def rubric_score_record(rubric: Any, score_raw: int, judge_message: Any) -> dict
             "description": rubric.description,
             "metadata": copy.deepcopy(getattr(rubric, "metadata", {}) or {}),
             "scale": copy.deepcopy(rubric.scale),
-            "weight": rubric.weight,
+            "weight": importance,
             "source_round": rubric.source_round,
         },
         "score_raw": int(score_raw),
         "score_normalized": normalized,
-        "weighted_score": float(rubric.weight) * normalized,
+        "weighted_score": importance * directional_score,
         "judge_message": judge_message,
     }
 

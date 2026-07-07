@@ -19,6 +19,7 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
 - **Description**: Detailed, specific description of what makes a continuation excellent/problematic
 - **Scale**: A five-point scale from 1 to 5 with concrete anchors for this rubric. The scale must follow the rubric polarity: for a positive rubric, 1 is the weakest evidence and 5 is the strongest evidence; for a negative rubric, 1 is no/least evidence of the flaw and 5 is the most severe evidence of the flaw.
 - **Polarity**: Either `"positive"` or `"negative"`.
+- **Weight**: A positive number expressing this rubric's relative importance among all the rubrics generated. Use `1.0` as a neutral default and assign higher weights to impactful rubrics and lower weights to less impactful ones. Weight is always positive even for negative rubrics.
 - **Metadata**: A structured evidence payload for style-specific extra content. Use string fields such as `stage`, `oracle_test`, `code_review`, `privileged_reference_summary`, `judge_focus`, or `failure_mode`. Put complete test snippets, review reasoning, or reference-derived behavioral oracles here instead of overloading the title or scale.
 
 ## Categories
@@ -81,10 +82,15 @@ Represent this choice using the `polarity` field in the rubric object.
 3. Check if factors covered by existing rubrics
 4. Select the single criterion with the highest discriminative value
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "polarity": "<positive|negative>",
+    "weight": <positive number>,
     "description": "<detailed excellence/failure description>",
     "title": "<abstract label>",
     "metadata": {
@@ -99,10 +105,19 @@ Represent this choice using the `polarity` field in the rubric object.
     }
 }
 ```
+
+</format_example>
+
 If no new high-impact, non-redundant rubric should be added, output:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {}
 ```
+
+</format_example>
 
 ## Inputs
 1. **Question**: Original system and user prompt containing code problem statement
@@ -124,7 +139,9 @@ If no new high-impact, non-redundant rubric should be added, output:
 Generate only the most impactful, non-redundant rubrics revealing meaningful quality differences.
 """
 
-RUBRIC_GENERATION_CONTINUE_PROMPT = "Generate the next best rubric or return an empty object."
+RUBRIC_GENERATION_CONTINUE_PROMPT = (
+    "Generate the next best rubric or return an empty object. Follow the output format example above."
+)
 
 SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT = """
 You are an expert evaluator scoring one agent trajectory continuation given one rubric.
@@ -138,14 +155,20 @@ Evaluate the provided continuation trajectory using the provided criterion and t
 - Score the continuation trajectory itself, not the underlying task or bug in the abstract
 - Use only evidence visible in the continuation trajectory. Do not hallucinate or infer unstated facts
 - Use the previous persistent state and latest agent trajectory only when it is needed to interpret the continuation
-- Output only score in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response
+- Keep the structured answer limited to the score field. Do not restate the full question, criterion, persistent state, or trajectories inside the JSON block.
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
   "score": <a score on a scale of 1 to 5 indicating how appropriate the continuation is based on the scale of the given criterion>
 }
 ```
+
+</format_example>
 
 ## Inputs
 1. **Question**: Original system and user prompt containing code problem statement
@@ -154,7 +177,6 @@ Evaluate the provided continuation trajectory using the provided criterion and t
 4. **Continuation Trajectory**: A agent trajectory continued from the latest trajectory
 5. **Criterion**: The specific criterion to evaluate
 
-Return only the JSON object.
 """
 
 PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT = """
@@ -170,6 +192,7 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
 - **Description**: A specific relative progress evaluation criterion grounded in observable trajectory or patch evidence. It must name the relevant parent baseline and the child behavior that would count as progress, equivalence, or regression.
 - **Scale**: A five-point scale from 1 to 5 with concrete anchors for this rubric. The scale must follow the rubric polarity: for a positive rubric, 1 is the weakest evidence and 5 is the strongest evidence; for a negative rubric, 1 is no/least evidence of the flaw and 5 is the most severe evidence of the flaw.
 - **Polarity**: Either `"positive"` or `"negative"`.
+- **Weight**: A positive number expressing this rubric's relative importance among all the rubrics generated. Use `1.0` as a neutral default and assign higher weights to impactful rubrics and lower weights to less impactful ones. Weight is always positive even for negative rubrics.
 - **Metadata**: A structured evidence payload for style-specific extra content. Use string fields such as `stage`, `oracle_test`, `code_review`, `privileged_reference_summary`, `judge_focus`, or `failure_mode`. Put complete test snippets, review reasoning, or reference-derived behavioral oracles here instead of overloading the title or scale.
 
 ## Core Guidelines
@@ -216,10 +239,15 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
 - If a previous rubric or experience would turn a precise current distinction into a broad generic rubric, ignore it
 
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "polarity": "<positive|negative>",
+    "weight": <positive number>,
     "description": "<detailed parent-child progress criterion>",
     "title": "<abstract label>",
     "metadata": {
@@ -234,10 +262,19 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
     }
 }
 ```
+
+</format_example>
+
 If no new high-impact, non-redundant rubric should be added, output:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {}
 ```
+
+</format_example>
 
 ## Inputs
 1. **Question**: Original system and user prompt containing code problem statement
@@ -272,14 +309,20 @@ Evaluate the continuation against the parent trajectory using the provided crite
 - Use the parent trajectory, continuation trajectory, previous persistent state, and shared context only as evidence for the specified criterion.
 - If evidence is mixed or incomplete, choose the scale anchor best supported by the visible evidence rather than adding a new criterion.
 - Do not hallucinate hidden facts, unstated test results, or repository behavior not supported by the provided trajectories.
-- Output only score in the requried format. Do not restate the question, criterion, presistent state, or agent trajectories in the response.
+- Keep the structured answer limited to the score field. Do not restate the full question, criterion, persistent state, or trajectories inside the JSON block.
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
   "score": <integer from 1 to 5>
 }
 ```
+
+</format_example>
 
 ## Inputs
 1. **Question**: Original system and user prompt containing code problem statement
@@ -288,7 +331,6 @@ Evaluate the continuation against the parent trajectory using the provided crite
 4. **Continuation Trajectory**: A agent trajectory continued from the parent trajectory to compare
 5. **Criterion**: The specific parent-child progress criterion to evaluate
 
-Return only the JSON object.
 """
 
 PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT = """
@@ -328,12 +370,18 @@ Retrieve an experience only when it can help choose a parent-relative rubric for
 - Prefer an empty list over a broad, stale, or context-mismatched experience that could pull the generator away from the current parent-relative delta.
 - Do not output or invent internal IDs. Operate only on titles.
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
   "titles": ["..."]
 }
 ```
+
+</format_example>
 """
 
 PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT = """
@@ -401,8 +449,12 @@ Output is a retrieve/add/update/delete action on the experience bank with the fo
 - Base `metadata.analysis`, `context`, and `experience` only on the current update input and any retrieved existing experiences. Do not cite external reports, source files, or prior analyses unless they are explicitly present in the input.
 - In each response, return either one retrieve/add/update/delete action, or an empty dict representing the end of session. Do not return multiple actions.
 
-## Output Format
-Return only JSON in the following format:
+## Output Format Example
+For retrieve:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "action": "retrieve",
@@ -410,7 +462,13 @@ Return only JSON in the following format:
 }
 ```
 
+</format_example>
+
 For add:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "action": "add",
@@ -425,7 +483,13 @@ For add:
 }
 ```
 
+</format_example>
+
 For update:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "action": "update",
@@ -441,7 +505,13 @@ For update:
 }
 ```
 
+</format_example>
+
 For delete:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "action": "delete",
@@ -449,11 +519,14 @@ For delete:
 }
 ```
 
+</format_example>
+
 ## Reference Golden Rubrics Output Format
 ```json
 [
     {
         "polarity": "<positive|negative>",
+        "weight": <positive number>,
         "description": "<detailed excellence/failure description>",
         "title": "<abstract label>",
         "metadata": {
@@ -472,6 +545,8 @@ For delete:
     }
 ]
 ```
+
+The fenced JSON action block must be the final content in the response.
 """
 
 PERSISTENT_STATE_UPDATE_PROMPT = """
@@ -502,7 +577,11 @@ Return exactly these 8 top-level string fields:
 - If an earlier belief was revised, record that correction explicitly in the appropriate section.
 - Do not hallucinate. Prefer omission to speculation.
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
   "current_state": "",
@@ -516,13 +595,55 @@ Return exactly these 8 top-level string fields:
 }
 ```
 
+</format_example>
+
 ## Inputs
 1. **Question**: Original system and user prompt containing the coding task
 2. **Previous Persistent State**: Previous memory state
 3. **Evicted Older Trajectory**: Older trajectory segments that must now be compressed
 4. **Workspace Metadata**: Compact git-based metadata at the current step
 
-Return only the updated JSON object.
+"""
+
+STRUCTURED_SUMMARY_FORMAT_CORRECTION_PROMPT = """
+The previous response could not be parsed into the required summary fields. Return a corrected response following the output format example.
+
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
+```json
+{
+  "current_state": "",
+  "task_specification": "",
+  "files_and_functions": "",
+  "errors_and_corrections": "",
+  "codebase_and_system_documentation": "",
+  "learnings": "",
+  "key_results": "",
+  "worklog": ""
+}
+```
+
+</format_example>
+"""
+
+RUBRIC_JUDGE_FORMAT_CORRECTION_PROMPT = """
+The previous response could not be parsed into a valid score. Return a corrected response following the output format example.
+
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
+```json
+{
+  "score": <integer from 1 to 5>
+}
+```
+
+</format_example>
 """
 
 EMPTY_PERSISTENT_STATE = {
@@ -546,77 +667,6 @@ EMPTY_WORKSPACE_META = {
     "diff_stat": "",
     "current_patch_chars": 0,
     "workspace_fingerprint": None,
-}
-
-RUBRIC_SCALE_JSON_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {str(score): {"type": "string"} for score in range(1, 6)},
-    "required": [str(score) for score in range(1, 6)],
-}
-
-RUBRIC_ITEM_JSON_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "polarity": {"type": "string", "enum": ["positive", "negative"]},
-        "title": {"type": "string"},
-        "description": {"type": "string"},
-        "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
-        "scale": RUBRIC_SCALE_JSON_SCHEMA,
-    },
-    "required": ["polarity", "title", "description", "metadata", "scale"],
-}
-
-PERSISTENT_STATE_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "persistent_state_update",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {key: {"type": "string"} for key in EMPTY_PERSISTENT_STATE},
-            "required": list(EMPTY_PERSISTENT_STATE),
-        },
-    },
-}
-
-RUBRIC_GENERATION_RESPONSE_SCHEMA = copy.deepcopy(RUBRIC_ITEM_JSON_SCHEMA)
-RUBRIC_GENERATION_RESPONSE_SCHEMA.pop("required", None)
-
-REQUIRED_RUBRIC_GENERATION_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "adaptive_rubric_generation_required",
-        "strict": True,
-        "schema": RUBRIC_ITEM_JSON_SCHEMA,
-    },
-}
-
-RUBRIC_GENERATION_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "adaptive_rubric_generation",
-        "strict": True,
-        "schema": RUBRIC_GENERATION_RESPONSE_SCHEMA,
-    },
-}
-
-JUDGE_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "rubric_judge",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "score": {"type": "integer", "minimum": 1, "maximum": 5},
-            },
-            "required": ["score"],
-        },
-    },
 }
 
 RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT = """
@@ -654,12 +704,18 @@ Retrieve an experience including but not limited to the following types of lesso
 - Return an empty list when the index contains no experience with a concrete target match.
 - Do not output or invent internal IDs. Operate only on titles.
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
   "titles": ["..."]
 }
 ```
+
+</format_example>
 """
 
 RUBRIC_EXPERIENCE_UPDATE_PROMPT = """
@@ -725,8 +781,12 @@ Output is a retrieve/add/update/delete action on the experience bank with the fo
 - Base `metadata.analysis`, `context`, and `experience` only on the current update input and any retrieved existing experiences. Do not cite external reports, source files, or prior analyses unless they are explicitly present in the input.
 - In each response, return either one retrieve/add/update/delete action, or an empty dict representing the end of session. Do not return multiple actions.
 
-## Output Format
-Return only JSON in the following format:
+## Output Format Example
+For retrieve:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "action": "retrieve",
@@ -734,7 +794,13 @@ Return only JSON in the following format:
 }
 ```
 
+</format_example>
+
 For add:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "action": "add",
@@ -749,7 +815,13 @@ For add:
 }
 ```
 
+</format_example>
+
 For update:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "action": "update",
@@ -765,7 +837,13 @@ For update:
 }
 ```
 
+</format_example>
+
 For delete:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
     "action": "delete",
@@ -773,11 +851,14 @@ For delete:
 }
 ```
 
+</format_example>
+
 ## Reference Golden Rubrics Output Format
 ```json
 [
     {
         "polarity": "<positive|negative>",
+        "weight": <positive number>,
         "description": "<detailed excellence/failure description>",
         "title": "<abstract label>",
         "metadata": {
@@ -796,34 +877,14 @@ For delete:
     }
 ]
 ```
+
 """
-
-RUBRIC_EXPERIENCE_RETRIEVAL_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "rubric_experience_retrieval",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "titles": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
-            },
-            "required": ["titles"],
-        },
-    },
-}
-
-RUBRIC_EXPERIENCE_UPDATE_RESPONSE_FORMAT = {"type": "json_object"}
-
 
 def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
     if scope == "pc":
         parent_relative_semantic_progress = {
             "polarity": "positive",
+            "weight": 1.0,
             "title": "Parent-Relative Semantic Progress",
             "description": (
                 "Scores whether the continuation changes the real owner code to add task-relevant behavior that the parent lacked, rather than merely "
@@ -857,6 +918,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
         }
         parent_equivalence_preservation = {
             "polarity": "positive",
+            "weight": 1.0,
             "title": "Sitemap Index Patch Equivalence Preservation",
             "description": (
                 "Scores whether the continuation preserves the parent's sitemap-index parser behavior: flushing a buffered <loc> when a closing loc or "
@@ -885,6 +947,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
         }
         invalid_artifact_or_parent_work_loss = {
             "polarity": "negative",
+            "weight": 1.0,
             "title": "WTForms HTML5 Patch Artifact Integrity",
             "description": (
                 "Penalizes continuations that lose or fake the WTForms HTML5 migration patch when the parent already has useful source edits. The key "
@@ -913,6 +976,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
         }
         implementation_of_core_error_propagation = {
             "polarity": "positive",
+            "weight": 1.0,
             "title": "Implementation of Core Error Propagation",
             "description": (
                 "Scores whether the continuation successfully catches errors from the hooks and propagates them to the test reporter or result state, "
@@ -957,6 +1021,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                     "generated_rubrics": [
                         {
                             "polarity": "positive",
+                            "weight": 1.0,
                             "title": "Graceful Hook Error Event Emission",
                             "description": (
                                 "Scores whether the continuation implements the core semantic fix (missing from the empty parent) by catching hook errors "
@@ -979,6 +1044,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                         },
                         {
                             "polarity": "negative",
+                            "weight": 1.0,
                             "title": "Journey Execution Despite beforeAll Failure",
                             "description": (
                                 "Penalizes continuations that catch the `beforeAll` hook error but fail to prevent the subsequent execution of journeys."
@@ -1059,6 +1125,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                     "generated_rubrics": [
                         {
                             "polarity": "negative",
+                            "weight": 1.0,
                             "title": "Invalid Patch Artifact Submission",
                             "description": (
                                 "Penalizes continuations that fail to properly submit the final git patch, either by constructing a malformed submission "
@@ -1079,6 +1146,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                         },
                         {
                             "polarity": "negative",
+                            "weight": 1.0,
                             "title": "Submission Failure and Patch Loss",
                             "description": (
                                 "Penalizes continuations that attempt to submit but fail to emit a valid patch artifact, such as executing malformed "
@@ -1160,6 +1228,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
                     "generated_rubrics": [
                         {
                             "polarity": "negative",
+                            "weight": 1.0,
                             "title": "Invalid Artifact Or Parent Work Loss",
                             "description": (
                                 "Penalizes continuations that fail to successfully submit the complete set of modifications prepared in the parent "
@@ -1225,6 +1294,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
         ]
     selective_compatibility_boundary = {
             "polarity": "positive",
+            "weight": 1.0,
             "title": "Selective Compatibility Boundary",
             "description": (
                 "Scores whether the continuation identifies and preserves the task-specific boundary between behavior that should change "
@@ -1252,6 +1322,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
     }
     fabricated_workspace_patch = {
             "polarity": "negative",
+            "weight": 1.0,
             "title": "Fabricated Workspace Patch",
             "description": (
                 "Penalizes continuations that create or modify a synthetic project or dummy files and present that work as the solution, rather than grounding "
@@ -1279,6 +1350,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
     }
     post_modification_regression_testing = {
             "polarity": "positive",
+            "weight": 1.0,
             "title": "Post-Modification Regression Testing",
             "description": (
                 "The agent validates its codebase modifications by actively running the project's official, built-in test suite (e.g., `pytest`, `unittest`) "
@@ -1296,6 +1368,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
     }
     destructive_test_appeasement = {
             "polarity": "negative",
+            "weight": 1.0,
             "title": "Destructive Test Appeasement",
             "description": (
                 "Evaluates whether the agent erroneously reverts valid, requested source code modifications to appease outdated tests. A poor continuation treats all "
@@ -1314,6 +1387,7 @@ def _seed_experiences(scope: str = "siblings") -> list[dict[str, Any]]:
     }
     targeting_fabricated_code = {
             "polarity": "negative",
+            "weight": 1.0,
             "title": "Targeting Fabricated Code",
             "description": (
                 "The agent applies proposed fixes to a dummy project or synthetic files it created from scratch (often derived from the issue description's "
@@ -1532,6 +1606,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
         return [
             {
                     "polarity": "positive",
+                    "weight": 1.0,
                     "title": "Parent-Relative Semantic Progress",
                     "description": (
                         "Scores whether the continuation adds task-relevant behavior that the parent trajectory lacked in the real target workspace. "
@@ -1551,6 +1626,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
             },
             {
                     "polarity": "positive",
+                    "weight": 1.0,
                     "title": "Owner-Surface Integration Progress",
                     "description": (
                         "Scores whether the continuation places the fix on the code path or owner surface that the real system uses, and wires the related "
@@ -1571,6 +1647,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
             },
             {
                     "polarity": "positive",
+                    "weight": 1.0,
                     "title": "Correct Target Workspace Progress",
                     "description": (
                         "Scores whether the continuation improves over a confused or synthetic parent by finding the actual task workspace and making "
@@ -1590,6 +1667,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
             },
             {
                     "polarity": "negative",
+                    "weight": 1.0,
                     "title": "Invalid Artifact Or Parent Work Loss",
                     "description": (
                         "Penalizes continuations that regress from useful parent work by submitting an empty, fake, summary-only, wrong-target, or incomplete "
@@ -1609,6 +1687,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
             },
             {
                     "polarity": "negative",
+                    "weight": 1.0,
                     "title": "Unsafe Broad Edit Regression",
                     "description": (
                         "Penalizes continuations that use broad or poorly controlled edits which delete unrelated existing behavior, corrupt source structure, "
@@ -1630,6 +1709,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
     return [
         {
                 "polarity": "negative",
+                "weight": 1.0,
                 "title": "Target Workspace Bypass",
                 "description": (
                     "Penalizes continuations that bypass the provided task workspace and treat an external checkout, newly initialized repository, or synthetic "
@@ -1648,6 +1728,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
         },
         {
                 "polarity": "negative",
+                "weight": 1.0,
                 "title": "Unsupported Environment Assumption",
                 "description": (
                     "Penalizes continuations that choose tooling, file searches, tests, or patch targets from an unsupported assumption about the project "
@@ -1666,6 +1747,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
         },
         {
                 "polarity": "positive",
+                "weight": 1.0,
                 "title": "Targeted Behavior Validation",
                 "description": (
                     "Scores whether the continuation validates the decisive behavior through a focused check that reaches the relevant code path, instead of "
@@ -1684,6 +1766,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
         },
         {
                 "polarity": "positive",
+                "weight": 1.0,
                 "title": "Compatibility Boundary Preservation",
                 "description": (
                     "Scores whether the continuation identifies what behavior should change while preserving surrounding compatibility boundaries, instead "
@@ -1702,6 +1785,7 @@ def _seed_rubrics(scope: str = "siblings") -> list[dict[str, Any]]:
         },
         {
                 "polarity": "negative",
+                "weight": 1.0,
                 "title": "Unsafe Source Modification",
                 "description": (
                     "Penalizes continuations whose editing method or patch shape corrupts source structure, deletes unrelated behavior, or makes correctness "
@@ -1747,7 +1831,11 @@ Return exactly these 8 top-level string fields:
 - Keep each section under 400 words. Prefer compression over copying long logs verbatim.
 - Do not hallucinate hidden repository behavior, test results, or patch effects. Prefer omission to speculation.
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
   "current_state": "",
@@ -1761,12 +1849,13 @@ Return exactly these 8 top-level string fields:
 }
 ```
 
+</format_example>
+
 ## Inputs
 1. **Question**: Original system and user prompt containing the coding task
 2. **Trajectory Metadata**: Node id, stop status, patch length, fallback-patch flag, and model statistics
 3. **Full Agent Trajectory**: Step cards for the complete sampled trajectory
 
-Return only the updated JSON object.
 """
 
 AGGREGATE_RUBRIC_GENERATION_PROMPT = """
@@ -1780,6 +1869,7 @@ Generate the single most useful non-redundant criterion for ranking the provided
 - **Description**: A concrete criterion grounded in observable trajectory, patch, validation, or repository evidence.
 - **Scale**: A five-point scale from 1 to 5 with concrete anchors. For a positive rubric, 5 is strongest evidence of quality. For a negative rubric, 5 is most severe evidence of the flaw.
 - **Polarity**: Either `"positive"` or `"negative"`.
+- **Weight**: A positive number expressing this rubric's relative importance among all the rubrics generated. Use `1.0` as a neutral default and assign higher weights to impactful rubrics and lower weights to less impactful ones. Weight is always positive even for negative rubrics.
 - **Metadata**: Structured judging evidence such as `judge_focus`, `failure_mode`, `patch_semantics`, `validation_signal`, `target_files`, `oracle_test`, or `code_review`.
 
 ## Core Guidelines
@@ -1812,10 +1902,15 @@ Generate the single most useful non-redundant criterion for ranking the provided
 - Prefer a small set of strong, independent rubrics over many broad rubrics.
 - If a generated rubric would apply equally to every trajectory, return `{}`.
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
   "polarity": "<positive|negative>",
+  "weight": <positive number>,
   "description": "<detailed aggregate trajectory ranking criterion>",
   "title": "<abstract label>",
   "metadata": {
@@ -1830,16 +1925,24 @@ Generate the single most useful non-redundant criterion for ranking the provided
   }
 }
 ```
+
+</format_example>
+
 If no new high-impact, non-redundant rubric should be added, output:
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {}
 ```
+
+</format_example>
 
 ## Inputs
 1. **Question**: Original system and user prompt containing the coding task
 2. **Trajectory Summaries**: Multiple compressed summaries of complete sampled trajectories
 
-Return only the JSON object.
 """
 
 AGGREGATE_RUBRIC_JUDGE_PROMPT = """
@@ -1854,19 +1957,24 @@ Evaluate the provided complete trajectory summary using only the provided criter
 - Score the complete trajectory as a standalone attempt for the task.
 - Use only evidence visible in the summary and task context. Do not infer hidden test results, unstated repository behavior, or patch effects.
 - If evidence is mixed or incomplete, choose the scale anchor best supported by visible evidence.
-- Output only the score JSON. Do not restate the question, criterion, or trajectory.
+- Keep the structured answer limited to the score field. Do not restate the full question, criterion, or trajectory inside the JSON block.
 
-## Output Format
+## Output Format Example
+<format_example>
+
+THOUGHT: <your reasoning process>
+
 ```json
 {
   "score": <integer from 1 to 5>
 }
 ```
 
+</format_example>
+
 ## Inputs
 1. **Question**: Original system and user prompt containing the coding task
 2. **Complete Trajectory Summary**: The compressed view of one sampled trajectory
 3. **Criterion**: The evaluation rubric to apply
 
-Return only the JSON object.
 """

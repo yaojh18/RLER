@@ -13,7 +13,6 @@ from swe_agent.parallel_utils import NodeArtifactBundle
 from swe_agent.parallel_utils import PatchEvalManager
 from swe_agent.parallel_utils import RubricArtifactBundle
 from swe_agent.parallel_utils import progress_reward
-from swe_agent.prompt import JUDGE_RESPONSE_FORMAT
 from swe_agent.rubric_bank import ExperienceRubricBank
 from swe_agent.rubric_bank import RubricRecord
 from swe_agent.rubric_bank import ScoreRubricBank
@@ -56,7 +55,19 @@ def test_route_completion_message_requires_reasoning_for_structured_sglang(monke
             temperature=0.0,
             top_p=1.0,
             max_tokens=64,
-            response_format=JUDGE_RESPONSE_FORMAT,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "generic_test_schema",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"score": {"type": "integer"}},
+                        "required": ["score"],
+                    },
+                },
+            },
             model_kwargs={
                 "api_base": "http://127.0.0.1:8021/v1",
                 "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},

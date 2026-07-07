@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -17,7 +18,12 @@ from statistics import pvariance
 from typing import Any, Literal
 import numpy as np
 
-from agent_rl.run_utils import extract_json_from_response, route_completion_message
+from agent_rl.run_utils import (
+    extract_last_json_object,
+    extract_json_from_response,
+    freeform_thought_model_kwargs,
+    route_completion_message,
+)
 
 from agent_rl import RolloutSessionSpec, RolloutSnapshot
 from swe_agent.backend import SWEAgentRolloutBackend
@@ -54,6 +60,7 @@ MAX_OBSERVATION_CHARS = 512
 MIN_OBSERVATION_SECTION_CHARS = 128
 MAX_RUBRICS = 6
 MAX_RUBRIC_GENERATION_ROUNDS = 10
+MAX_FORMAT_CORRECTION_ROUNDS = 4
 JUDGE_ERROR_REWARD = -0.2
 
 
@@ -188,7 +195,10 @@ def _build_step_cards(segment_events: list[dict[str, Any]], step_start: int) -> 
                 card["assistant_message"] = _truncate_middle(assistant_message, MAX_OBSERVATION_CHARS)
             continue
         if event.get("kind") == "environment_action":
-            commands = [action.get("command", "") for action in (event.get("payload") or {}).get("actions", [])]
+            commands = [
+                _truncate_middle(action.get("command", ""), MAX_OBSERVATION_CHARS)
+                for action in (event.get("payload") or {}).get("actions", [])
+            ]
             card["commands"] = commands
             continue
         if event.get("kind") not in {"environment_result", "agent_interrupt"}:
@@ -200,6 +210,46 @@ def _build_step_cards(segment_events: list[dict[str, Any]], step_start: int) -> 
         card["observation"] = _truncate_structured_observation(observation or "")
         step_index += 1
     return [cards[index] for index in sorted(cards)]
+
+
+def _render_step_cards(step_cards: list[dict[str, Any]]) -> str:
+    if not step_cards:
+        return "None"
+    return "\n\n".join(
+        "\n".join(
+            [
+                f"### Step {card.get('step_index', index)}",
+                "Assistant:",
+                str(card.get("assistant_message") or ""),
+                "Observation:",
+                str(card.get("observation") or ""),
+            ]
+        )
+        for index, card in enumerate(step_cards)
+    )
+
+
+def _render_trajectory_segment(segment: dict[str, Any] | None) -> str:
+    if not segment:
+        return "None"
+    parts: list[str] = []
+    step_range = segment.get("segment_step_range")
+    if isinstance(step_range, list) and len(step_range) == 2:
+        parts.append(f"Segment step range: {step_range[0]}-{step_range[1]}")
+    parts.append(_render_step_cards(segment.get("step_cards") or []))
+    return "\n\n".join(parts)
+
+
+def _render_continuation_view(continuation: dict[str, Any]) -> str:
+    parts = [
+        "Summary:",
+        json.dumps(continuation.get("summary", {}), indent=2, ensure_ascii=False),
+        "Trajectory:",
+        _render_trajectory_segment(continuation.get("trajectory_continuation")),
+    ]
+    if continuation.get("note"):
+        parts.extend(["Note:", str(continuation["note"])])
+    return "\n".join(parts)
 
 
 def _collect_workspace_meta(environment: Any) -> dict[str, Any]:
@@ -322,48 +372,55 @@ async def _update_persistent_state(
             PERSISTENT_STATE_UPDATE_PROMPT.strip(),
             f"\n\n## Question:\n System Prompt:\n{system_prompt}\n User Prompt:\n{user_prompt}",
             f"## Previous Persistent State:\n{json.dumps(previous_state, indent=2, ensure_ascii=False)}",
-            f"## Evicted Older Trajectory:\n{json.dumps(evicted_step_cards, indent=2, ensure_ascii=False)}",
+            f"## Evicted Older Trajectory:\n{_render_step_cards(evicted_step_cards)}",
             f"## Workspace Metadata:\n{json.dumps(workspace_meta, indent=2, ensure_ascii=False)}",
         ]
     )
-    async for attempt in retry(
-        logger=logger,
-        abort_exceptions=LitellmModel.abort_exceptions,
-        model_name=model_name,
-        async_retry=True,
-    ):
-        with attempt:
-            messages = [{"role": "user", "content": prompt}]
-            assistant_message = await route_completion_message(
-                route_name="rubric_judge",
-                model_name=model_name,
-                messages=messages,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                response_format=copy.deepcopy(PERSISTENT_STATE_RESPONSE_FORMAT),
-                model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
-            )
-            parsed = extract_json_from_response(assistant_message.get("content_no_thinking"))
-            if not isinstance(parsed, dict):
-                raise ValueError("InvalidPersistentStateResponse")
-            state = copy.deepcopy(previous_state)
-            for key in state:
-                if isinstance(parsed.get(key), str):
-                    state[key] = parsed[key]
-            return {"state": state, "messages": copy.deepcopy(messages + [assistant_message])}
-    raise RuntimeError("Persistent state update retry loop exited without result")
+    messages = [{"role": "user", "content": prompt}]
+    for _ in range(MAX_FORMAT_CORRECTION_ROUNDS):
+        async for attempt in retry(
+            logger=logger,
+            abort_exceptions=LitellmModel.abort_exceptions,
+            model_name=model_name,
+            async_retry=True,
+        ):
+            with attempt:
+                assistant_message = await route_completion_message(
+                    route_name="rubric_judge",
+                    model_name=model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    model_kwargs=freeform_thought_model_kwargs(model_kwargs),
+                )
+        response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
+        messages.append(assistant_message)
+        parsed = _parse_persistent_state_response(response)
+        if parsed is not None:
+            return {"state": parsed, "messages": copy.deepcopy(messages)}
+        messages.append(
+            {
+                "role": "user",
+                "content": STRUCTURED_SUMMARY_FORMAT_CORRECTION_PROMPT.strip(),
+            }
+        )
+    raise ValueError("InvalidPersistentStateResponse")
 
 
 def _parse_judge_score(response: str) -> int | None:
-    parsed = extract_json_from_response(response)
-    if not isinstance(parsed, dict):
+    parsed = extract_last_json_object(response)
+    if not isinstance(parsed, dict) or "score" not in parsed:
         return None
-    try:
-        score = int(parsed.get("score"))
-    except (TypeError, ValueError):
+    score = parsed.get("score")
+    if isinstance(score, bool) or not isinstance(score, int):
         return None
     return score if 1 <= score <= 5 else None
+
+
+def _parse_persistent_state_response(response: str) -> dict[str, Any] | None:
+    parsed = extract_last_json_object(response)
+    return parsed if isinstance(parsed, dict) else None
 
 
 async def _generate_round_rubrics(
@@ -385,7 +442,7 @@ async def _generate_round_rubrics(
     rubric_list_prefix: str = "rubric",
     require_first_rubric: bool = False,
 ) -> RubricGenerationSample:
-    latest_shared_segment_text = json.dumps(latest_shared_segment, indent=2, ensure_ascii=False) if latest_shared_segment else "None"
+    latest_shared_segment_text = _render_trajectory_segment(latest_shared_segment)
     prompt_parts = [
         generation_prompt.strip(),
         f"\n\n## Question:\nSystem Prompt:\n{question.get('system_prompt', '')}",
@@ -398,15 +455,7 @@ async def _generate_round_rubrics(
         prompt_parts.extend(
             [
                 f"## Continuation {index}:",
-                json.dumps(
-                    {
-                        "summary": continuation.get("summary", {}),
-                        "trajectory_continuation": continuation.get("trajectory_continuation"),
-                        **({"note": continuation["note"]} if continuation.get("note") else {}),
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                ),
+                _render_continuation_view(continuation),
                 "",
             ]
         )
@@ -442,16 +491,11 @@ async def _generate_round_rubrics(
                     temperature=temperature,
                     top_p=top_p,
                     max_tokens=max_tokens,
-                    response_format=copy.deepcopy(
-                        REQUIRED_RUBRIC_GENERATION_RESPONSE_FORMAT
-                        if require_first_rubric and not generated
-                        else RUBRIC_GENERATION_RESPONSE_FORMAT
-                    ),
-                    model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
+                    model_kwargs=freeform_thought_model_kwargs(model_kwargs),
                 )
-        assistant_content = assistant_message.get("content_no_thinking")
+        assistant_content = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
         conversation_messages.append(assistant_message)
-        parsed_candidate = extract_json_from_response(assistant_content)
+        parsed_candidate = extract_last_json_object(assistant_content)
         if parsed_candidate == {}:
             if require_first_rubric and not generated:
                 last_error = "Expected one complete rubric before returning {}."
@@ -459,10 +503,15 @@ async def _generate_round_rubrics(
                 break
         elif parsed_candidate is None:
             last_error = "Expected a JSON object or {}, but no JSON object could be parsed."
+        elif not {"polarity", "weight", "title", "description", "metadata", "scale"}.issubset(parsed_candidate):
+            last_error = "Expected polarity, weight, title, description, metadata, and scale fields."
         else:
             parsed = _convert_rubric_item(task_text, parsed_candidate, round_index)
             if parsed is None:
-                last_error = "Expected a rubric object with polarity, title, description, and a 1-5 scale."
+                last_error = (
+                    "Expected a rubric object with polarity, positive weight, title, description, metadata, "
+                    "and a 1-5 scale."
+                )
         if parsed is None:
             format_errors.append({"turn_index": turn_index, "error": last_error})
             conversation_messages.append(
@@ -470,8 +519,9 @@ async def _generate_round_rubrics(
                     "role": "user",
                     "content": (
                         last_error
-                        + " Return a single complete flat JSON rubric with polarity, title, description, metadata, "
-                        + f"and scale fields, or return {{}} only after at least one complete rubric has been generated. {continue_prompt}"
+                        + " Follow the output format example above. The final JSON must contain polarity, positive weight, title, "
+                        + "description, metadata, and scale fields, or contain {} only after at least "
+                        + f"one complete rubric has been generated. {continue_prompt}"
                     ),
                 }
             )
@@ -495,6 +545,16 @@ async def _generate_round_rubrics(
     )
 
 
+def _rubric_judge_view(rubric: RubricRecord) -> dict[str, Any]:
+    return {
+        "title": rubric.title,
+        "direction": rubric.direction,
+        "description": rubric.description,
+        "scale": rubric.scale,
+        "metadata": rubric.metadata,
+    }
+
+
 async def _score_round(
     *,
     question: dict[str, str],
@@ -513,27 +573,21 @@ async def _score_round(
     calls = []
     mapping: list[tuple[int, str, RubricRecord]] = []
     question_text = f"System Prompt:\n{question.get('system_prompt', '')}\n\nUser Prompt:\n{question.get('user_prompt', '')}"
+    parent_trajectory_text = _render_trajectory_segment(shared_context.get("latest_agent_trajectory"))
     for view_index, continuation in enumerate(continuations):
         node_id = continuation.get("node_id")
-        response_text = json.dumps(
-            {
-                "summary": continuation.get("summary", {}),
-                "trajectory_continuation": continuation.get("trajectory_continuation"),
-                **({"note": continuation["note"]} if continuation.get("note") else {}),
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+        response_text = _render_continuation_view(continuation)
         for rubric in rubrics:
+            judge_rubric = _rubric_judge_view(rubric)
             criterion = "\n".join(
                 [
-                    f"Title: {rubric.title}",
-                    f"Type: {rubric.direction}",
-                    f"Description: {rubric.description}",
+                    f"Title: {judge_rubric['title']}",
+                    f"Type: {judge_rubric['direction']}",
+                    f"Description: {judge_rubric['description']}",
                     "Scale:",
-                    *[f"{score}: {rubric.scale[str(score)]}" for score in range(1, 6)],
+                    *[f"{score}: {judge_rubric['scale'][str(score)]}" for score in range(1, 6)],
                     "Metadata:",
-                    json.dumps(rubric.metadata, indent=2, ensure_ascii=False)
+                    json.dumps(judge_rubric["metadata"], indent=2, ensure_ascii=False),
                 ]
             )
 
@@ -541,38 +595,56 @@ async def _score_round(
                 *,
                 response_text: str = response_text,
                 criterion: str = criterion,
-            ) -> tuple[str, int, str | None, dict[str, Any]]:
-                async for attempt in retry(
-                    logger=logger,
-                    abort_exceptions=LitellmModel.abort_exceptions,
-                    model_name=model_name,
-                    async_retry=True,
-                ):
-                    with attempt:
-                        prompt_parts = [
-                            judge_prompt.strip(),
-                            f"\n\n## Question:\n{question_text}\n",
-                            f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n",
-                            f"## Parent Trajectory:\n{shared_context.get('latest_agent_trajectory')}\n",
-                            f"## Continuation Trajectory:\n{response_text}\n",
-                            f"## Criterion:\n{criterion}",
-                        ]
-                        prompt = "".join(prompt_parts)
-                        assistant_message = await route_completion_message(
-                            route_name="rubric_judge",
+            ) -> tuple[int, str | None, dict[str, Any]]:
+                prompt_parts = [
+                    judge_prompt.strip(),
+                    f"\n\n## Question:\n{question_text}\n",
+                    f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n",
+                    f"## Parent Trajectory:\n{parent_trajectory_text}\n",
+                    f"## Continuation Trajectory:\n{response_text}\n",
+                    f"## Criterion:\n{criterion}",
+                ]
+                messages = [{"role": "user", "content": "".join(prompt_parts)}]
+                last_message: dict[str, Any] | None = None
+                try:
+                    for _ in range(MAX_FORMAT_CORRECTION_ROUNDS):
+                        async for attempt in retry(
+                            logger=logger,
+                            abort_exceptions=LitellmModel.abort_exceptions,
                             model_name=model_name,
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=temperature,
-                            top_p=top_p,
-                            max_tokens=max_tokens,
-                            response_format=copy.deepcopy(JUDGE_RESPONSE_FORMAT),
-                            model_kwargs={**(model_kwargs or {}), "enable_json_schema_validation": True},
+                            async_retry=True,
+                        ):
+                            with attempt:
+                                assistant_message = await route_completion_message(
+                                    route_name="rubric_judge",
+                                    model_name=model_name,
+                                    messages=messages,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    max_tokens=max_tokens,
+                                    model_kwargs=freeform_thought_model_kwargs(model_kwargs),
+                                )
+                        last_message = assistant_message
+                        messages.append(assistant_message)
+                        response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
+                        score_raw = _parse_judge_score(response)
+                        if score_raw is not None:
+                            return score_raw, None, assistant_message
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": RUBRIC_JUDGE_FORMAT_CORRECTION_PROMPT.strip(),
+                            }
                         )
-                        score_raw = _parse_judge_score(assistant_message.get("content_no_thinking"))
-                        if score_raw is None:
-                            return 1, "InvalidJudgeResponse", assistant_message
-                        return score_raw, None, assistant_message
-                raise RuntimeError("Judge retry loop exited without result")
+                except Exception:
+                    return 1, "InvalidJudgeResponse", last_message or {
+                        "role": "assistant",
+                        "content": "",
+                    }
+                return 1, "InvalidJudgeResponse", last_message or {
+                    "role": "assistant",
+                    "content": "",
+                }
             calls.append(_judge_single())
             mapping.append((view_index, node_id, rubric))
     responses = await asyncio.gather(*calls)
@@ -780,12 +852,15 @@ def _avg_scores_from_rubrics(
 ) -> dict[str, float]:
     if not rubrics:
         return {node_id: 0.0 for node_id in node_ids}
+    normalized_weights = _normalized_weight_by_rubric(rubrics)
     rewards: dict[str, float] = {}
     for node_id in node_ids:
         score_lookup = score_lookup_by_node[node_id]
-        rewards[node_id] = (
-            sum(score_lookup.get(rubric.rubric_id, 0.0) * rubric.weight for rubric in rubrics)
-            / len(rubrics)
+        rewards[node_id] = sum(
+            score_lookup.get(rubric.rubric_id, 0.0)
+            * normalized_weights[rubric.rubric_id]
+            * (-1.0 if rubric.direction == "negative" else 1.0)
+            for rubric in rubrics
         )
     return rewards
 
@@ -798,6 +873,7 @@ def _pc_avg_scores_from_rubrics(
 ) -> dict[str, float]:
     if not rubrics:
         return {node_id: 0.5 for node_id in node_ids}
+    normalized_weights = _normalized_weight_by_rubric(rubrics)
     rewards: dict[str, float] = {}
     for node_id in node_ids:
         total = 0.0
@@ -805,11 +881,23 @@ def _pc_avg_scores_from_rubrics(
         for rubric in rubrics:
             raw = score_lookup.get(rubric.rubric_id, 0.0)
             if rubric.direction == "negative":
-                total += 0.5 * (1.0 - raw)
+                contribution = 0.5 * (1.0 - raw)
             else:
-                total += raw
-        rewards[node_id] = total / len(rubrics)
+                contribution = raw
+            total += normalized_weights[rubric.rubric_id] * contribution
+        rewards[node_id] = total
     return rewards
+
+
+def _normalized_weight_by_rubric(rubrics: list[RubricRecord]) -> dict[str, float]:
+    importance_by_rubric: dict[str, float] = {}
+    for rubric in rubrics:
+        importance = abs(float(rubric.weight))
+        if not math.isfinite(importance) or importance <= 0.0:
+            raise ValueError(f"Rubric {rubric.rubric_id} has invalid weight {rubric.weight!r}")
+        importance_by_rubric[rubric.rubric_id] = importance
+    total = sum(importance_by_rubric.values())
+    return {rubric_id: importance / total for rubric_id, importance in importance_by_rubric.items()}
 
 
 # NOTE: the correlation score will be unstable when there are very few data points

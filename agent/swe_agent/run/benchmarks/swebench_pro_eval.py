@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -20,6 +21,8 @@ from swe_agent.run.benchmarks.container_runtime import (
 
 
 SWEBENCH_PRO_DATASET_NAMES = {"ScaleAI/SWE-bench_Pro"}
+_OFFICIAL_EVAL_LOAD_LOCK = threading.Lock()
+_OFFICIAL_CWD_LOCK = threading.RLock()
 
 
 def is_swebench_pro_dataset_name(dataset_name: str) -> bool:
@@ -75,9 +78,14 @@ def _node_local_singularity_eval_lock(instance: dict[str, Any]) -> Iterator[None
     if select_container_backend() != "singularity":
         yield
         return
-    repo = str(instance.get("repo") or instance.get("dockerhub_tag") or "unknown")
-    repo_hash = hashlib.sha1(repo.encode("utf-8")).hexdigest()[:12]
-    lock_path = Path("/tmp") / f"rler-swebench-pro-eval-{os.getuid()}-{repo_hash}.lock"
+    lock_scope = os.environ.get("RLER_SWEBENCH_PRO_EVAL_LOCK_SCOPE", "repo")
+    lock_key = (
+        str(instance.get("instance_id") or "unknown")
+        if lock_scope == "instance"
+        else str(instance.get("repo") or instance.get("dockerhub_tag") or "unknown")
+    )
+    lock_hash = hashlib.sha1(lock_key.encode("utf-8")).hexdigest()[:12]
+    lock_path = Path("/tmp") / f"rler-swebench-pro-eval-{os.getuid()}-{lock_hash}.lock"
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
@@ -147,9 +155,34 @@ def _eval_with_singularity(
         cwd="/",
         timeout=timeout,
     )
+    command = "bash /workspace/entryscript.sh"
+    if _needs_isolated_nodebb_service(instance):
+        # Raw Apptainer exec does not run the Docker image entrypoint.  Without
+        # a private network and an explicitly managed Redis, NodeBB tests can
+        # accidentally share a node-level Redis across independent patches.
+        # That is both nondeterministic and can poison later evaluations with
+        # Redis MISCONF after a failed background save.
+        config = getattr(env, "config", None)
+        prewarm_command = _nodebb_dependency_prewarm_command(str(files.get("run_script.sh") or ""))
+        if prewarm_command:
+            prewarm = env.execute({"command": prewarm_command}, cwd="/app", timeout=timeout)
+            raise_for_container_error(prewarm)
+            if prewarm.get("returncode") != 0:
+                raise RuntimeError(
+                    "Could not prewarm NodeBB test dependencies before network isolation:\n"
+                    + str(prewarm.get("output") or "")[-4000:]
+                )
+        if config is not None and hasattr(config, "exec_args"):
+            config.exec_args = [*config.exec_args, "--net", "--network", "none"]
+        command = _isolated_nodebb_command()
     try:
-        result = env.execute({"command": "bash /workspace/entryscript.sh"}, cwd="/", timeout=timeout)
+        result = env.execute({"command": command}, cwd="/", timeout=timeout)
         raise_for_container_error(result)
+        if result.get("returncode") == 88:
+            raise RuntimeError(
+                "Could not start the isolated NodeBB Redis service:\n"
+                + str(result.get("output") or "")[-4000:]
+            )
     finally:
         if hasattr(env, "cleanup"):
             env.cleanup()
@@ -162,6 +195,77 @@ def _eval_with_singularity(
         output = official.collect_outputs_local(workspace_dir, str(output_dir), uid, prefix)
         official.save_entryscript_copy(str(output_dir), uid, prefix, entryscript_content)
     return output
+
+
+def _needs_isolated_nodebb_service(instance: dict[str, Any]) -> bool:
+    enabled = os.environ.get("RLER_SWEBENCH_PRO_ISOLATE_NODEBB", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return False
+    instance_id = str(instance.get("instance_id") or "").removeprefix("instance_")
+    return instance_id.startswith("NodeBB__")
+
+
+def _isolated_nodebb_command() -> str:
+    return r'''
+set -u
+export npm_config_offline=true
+export npm_config_audit=false
+export npm_config_fund=false
+redis_log="/tmp/rler-swebench-pro-redis-$$.log"
+cleanup_redis() {
+  redis-cli -h 127.0.0.1 -p 6379 shutdown nosave >/dev/null 2>&1 || true
+  if [ -n "${redis_pid:-}" ]; then
+    kill "$redis_pid" >/dev/null 2>&1 || true
+    wait "$redis_pid" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_redis EXIT
+redis-server \
+  --bind 127.0.0.1 \
+  --port 6379 \
+  --save '' \
+  --appendonly no \
+  --stop-writes-on-bgsave-error no \
+  --dir /tmp >"$redis_log" 2>&1 &
+redis_pid=$!
+redis_ready=0
+for _ in $(seq 1 100); do
+  if redis-cli -h 127.0.0.1 -p 6379 ping >/dev/null 2>&1; then
+    redis_ready=1
+    break
+  fi
+  sleep 0.1
+done
+if [ "$redis_ready" -ne 1 ]; then
+  cat "$redis_log"
+  exit 88
+fi
+bash /workspace/entryscript.sh
+rc=$?
+cleanup_redis
+trap - EXIT
+exit "$rc"
+'''.strip()
+
+
+def _nodebb_dependency_prewarm_command(run_script: str) -> str:
+    """Extract the deterministic dependency setup used by Pro NodeBB scripts."""
+    commands: list[str] = []
+    in_prepare = False
+    for raw_line in run_script.splitlines():
+        line = raw_line.strip()
+        if line.startswith("prepare_test_environment()"):
+            in_prepare = True
+            continue
+        if in_prepare and line == "}":
+            break
+        if not in_prepare:
+            continue
+        if line == "cp install/package.json ." or line.startswith("npm install "):
+            commands.append(line)
+    if not any(command.startswith("npm install ") for command in commands):
+        return ""
+    return "set -e\ncd /app\n" + "\n".join(commands)
 
 
 def _result(
@@ -201,26 +305,28 @@ def _official_repo_root() -> Path:
 
 def _load_official_eval(root: Path) -> Any:
     module_name = f"_swebench_pro_official_{hashlib.sha1(str(root).encode('utf-8')).hexdigest()[:8]}"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-    sys.path.insert(0, str(root))
-    spec = importlib.util.spec_from_file_location(module_name, root / "swe_bench_pro_eval.py")
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load official SWE-bench Pro evaluator from {root}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    with _OFFICIAL_EVAL_LOAD_LOCK:
+        if module_name in sys.modules:
+            return sys.modules[module_name]
+        sys.path.insert(0, str(root))
+        spec = importlib.util.spec_from_file_location(module_name, root / "swe_bench_pro_eval.py")
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load official SWE-bench Pro evaluator from {root}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
 
 
 @contextlib.contextmanager
 def _official_cwd(root: Path) -> Iterator[None]:
-    previous = Path.cwd()
-    os.chdir(root)
-    try:
-        yield
-    finally:
-        os.chdir(previous)
+    with _OFFICIAL_CWD_LOCK:
+        previous = Path.cwd()
+        os.chdir(root)
+        try:
+            yield
+        finally:
+            os.chdir(previous)
 
 
 def _parse_test_list(value: Any) -> list[str]:

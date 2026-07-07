@@ -3,6 +3,7 @@ import copy
 import json
 import logging
 import os
+import re
 import time
 import weakref
 from dataclasses import dataclass
@@ -157,9 +158,38 @@ def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
                     json_start = response.find("{", json_start + 1)
                     continue
         break
-    
+
     LOGGER.warning(f"Could not decode JSON from response: {repr(response)}")
     return None
+
+
+def extract_last_json_object(response: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(response, str):
+        return None
+    decoder = json.JSONDecoder()
+    candidates: List[tuple[int, int, Dict[str, Any]]] = []
+    for match in re.finditer(r"\{", response):
+        try:
+            parsed, length = decoder.raw_decode(response[match.start() :])
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            candidates.append((match.start() + length, match.start(), parsed))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], -item[1]))[2]
+
+
+def freeform_thought_model_kwargs(model_kwargs: Dict[str, Any] | None) -> Dict[str, Any]:
+    kwargs = copy.deepcopy(model_kwargs or {})
+    extra_body = kwargs.setdefault("extra_body", {})
+    if not isinstance(extra_body, dict):
+        raise TypeError("model_kwargs.extra_body must be a dict")
+    chat_template_kwargs = extra_body.setdefault("chat_template_kwargs", {})
+    if not isinstance(chat_template_kwargs, dict):
+        raise TypeError("model_kwargs.extra_body.chat_template_kwargs must be a dict")
+    chat_template_kwargs["enable_thinking"] = True
+    return kwargs
 
 
 def load_jsonlines(file):
@@ -220,6 +250,7 @@ async def run_litellm_completion_async(
             or "ContextWindowExceededError" in type(exc).__name__
             or "Requested token count exceeds" in _exc_msg
             or "longer than the model's context length" in _exc_msg
+            or "maximum context length" in _exc_msg
         )
         if _is_overflow:
             print(f"Error in run_litellm_completion_async (FATAL, raising): {exc}")

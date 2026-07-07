@@ -192,7 +192,7 @@ model:
     <exception>{{output.exception_info}}</exception>
     {% endif -%}
     <returncode>{{output.returncode}}</returncode>
-    {% if output.output | length < 4000 -%}
+    {% if output.output | length < 3000 -%}
     <output>
     {{ output.output -}}
     </output>
@@ -204,15 +204,15 @@ model:
     If you're using grep or find and it produced too much output, you can use a more selective search pattern.
     If you really need to see something from the full command's output, you can redirect output to a file and then search in that file.
     </warning>
-    {%- set elided_chars = output.output | length - 4000 -%}
+    {%- set elided_chars = output.output | length - 3000 -%}
     <output_head>
-    {{ output.output[:2000] }}
+    {{ output.output[:1500] }}
     </output_head>
     <elided_chars>
     {{ elided_chars }} characters elided
     </elided_chars>
     <output_tail>
-    {{ output.output[-2000:] }}
+    {{ output.output[-1500:] }}
     </output_tail>
     {%- endif -%}
   format_error_template: |
