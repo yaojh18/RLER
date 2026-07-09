@@ -31,6 +31,7 @@ from swe_agent.parallel_utils import (
     _atomic_write_json as _write_json,
     compact_workspace_meta,
     extract_terminal_patch_from_session,
+    messages_from_first_assistant,
     rubric_score_record,
 )
 from swe_agent.prompt import (
@@ -172,7 +173,11 @@ async def _summarize_aggregate_trajectory(
             if parsed is None and full_response != response:
                 parsed = _parse_persistent_state_response(full_response)
             if parsed is not None:
-                return {"state": parsed, "messages": messages, "format_error": None}
+                return {
+                    "state": {**copy.deepcopy(EMPTY_PERSISTENT_STATE), **parsed},
+                    "messages": messages,
+                    "format_error": None,
+                }
             last_error = "No JSON object could be parsed from the summary response."
             messages.append(
                 {
@@ -279,8 +284,13 @@ async def _generate_aggregate_rubrics(
             print(response)
         parsed = extract_last_json_object(response)
         full_response = assistant_message.get("content") or ""
-        if parsed is None and full_response != response:
-            parsed = extract_last_json_object(full_response)
+        if full_response != response:
+            full_candidate = extract_last_json_object(full_response)
+            if parsed is None or (
+                isinstance(full_candidate, dict)
+                and _convert_rubric_item(task_text, full_candidate, round_index) is not None
+            ):
+                parsed = full_candidate
         if parsed == {}:
             if generated:
                 stop_reason = "empty_object"
@@ -289,28 +299,21 @@ async def _generate_aggregate_rubrics(
         elif not isinstance(parsed, dict):
             last_error = "Expected a JSON object or {}, but no JSON object could be parsed."
         else:
-            required_fields = {"polarity", "weight", "title", "description", "metadata", "scale"}
-            if not required_fields.issubset(parsed):
+            parsed_rubric = _convert_rubric_item(task_text, parsed, round_index)
+            if parsed_rubric is None:
                 last_error = (
                     "Expected a rubric object with polarity, positive weight, title, description, metadata, "
                     "and a 1-5 scale."
                 )
-            else:
-                parsed_rubric = _convert_rubric_item(task_text, parsed, round_index)
-                if parsed_rubric is None:
-                    last_error = (
-                        "Expected a rubric object with polarity, positive weight, title, description, metadata, "
-                        "and a 1-5 scale."
-                    )
-                elif re.sub(r"\s+", " ", parsed_rubric.title).strip().casefold() in {
-                    re.sub(r"\s+", " ", rubric.title).strip().casefold() for rubric in generated
-                }:
-                    last_error = (
-                        f"The rubric title {parsed_rubric.title!r} duplicates one already generated in this "
-                        "aggregate conversation. Generate a criterion with a different title and judging focus, "
-                        "or return {} if no useful non-redundant criterion remains."
-                    )
-                    parsed_rubric = None
+            elif re.sub(r"\s+", " ", parsed_rubric.title).strip().casefold() in {
+                re.sub(r"\s+", " ", rubric.title).strip().casefold() for rubric in generated
+            }:
+                last_error = (
+                    f"The rubric title {parsed_rubric.title!r} duplicates one already generated in this "
+                    "aggregate conversation. Generate a criterion with a different title and judging focus, "
+                    "or return {} if no useful non-redundant criterion remains."
+                )
+                parsed_rubric = None
 
         if parsed_rubric is None:
             format_errors.append({"turn_index": turn_index, "error": last_error})
@@ -383,7 +386,7 @@ async def _score_aggregate_summaries(
                 *,
                 summary_text: str = summary_text,
                 criterion: str = criterion,
-            ) -> tuple[dict[str, Any], int, str | None]:
+            ) -> tuple[list[dict[str, Any]], int, str | None]:
                 user_prompt = "\n".join(
                     [
                         "## Question:",
@@ -396,7 +399,6 @@ async def _score_aggregate_summaries(
                         criterion,
                     ]
                 )
-                last_message: dict[str, Any] | None = None
                 messages = [
                     {"role": "system", "content": AGGREGATE_RUBRIC_JUDGE_PROMPT.strip()},
                     {"role": "user", "content": user_prompt},
@@ -419,7 +421,6 @@ async def _score_aggregate_summaries(
                                     max_tokens=max_tokens,
                                     model_kwargs=freeform_thought_model_kwargs(model_kwargs),
                                 )
-                        last_message = assistant_message
                         messages.append(assistant_message)
                         response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
                         score_raw = _parse_judge_score(response)
@@ -427,7 +428,7 @@ async def _score_aggregate_summaries(
                         if score_raw is None and full_response != response:
                             score_raw = _parse_judge_score(full_response)
                         if score_raw is not None:
-                            return assistant_message, score_raw, None
+                            return messages_from_first_assistant(messages), score_raw, None
                         messages.append(
                             {
                                 "role": "user",
@@ -435,13 +436,13 @@ async def _score_aggregate_summaries(
                             }
                         )
                     return (
-                        last_message or {"role": "assistant", "content": ""},
+                        messages_from_first_assistant(messages),
                         1,
                         "InvalidAggregateJudgeScore",
                     )
                 except Exception as exc:
                     return (
-                        last_message or {"role": "assistant", "content": ""},
+                        messages_from_first_assistant(messages),
                         1,
                         f"{type(exc).__name__}: {exc}",
                     )
@@ -456,10 +457,11 @@ async def _score_aggregate_summaries(
         if isinstance(response, Exception):
             view_errors.setdefault(summary_index, f"{type(response).__name__}: {response}")
             continue
-        judge_response, score_raw, error = response
+        judge_messages, score_raw, error = response
         if error is not None:
             view_errors.setdefault(summary_index, error)
-        record = rubric_score_record(rubric, score_raw, judge_response)
+        record = rubric_score_record(rubric, score_raw, judge_messages)
+        record["judge_error"] = error
         per_view_scores[summary_index].append(record)
         rubric_values.setdefault(rubric.rubric_id, []).append(float(record["score_normalized"]))
     variances = {
@@ -801,7 +803,7 @@ class AggregateTrajectoryRunner:
         summary_results = await asyncio.gather(*summary_calls)
         for candidate, summary_result in zip(candidates, summary_results):
             state = summary_result["state"]
-            candidate["summary_messages"] = summary_result["messages"]
+            candidate["summary_messages"] = messages_from_first_assistant(summary_result["messages"])
             candidate["summary_format_error"] = summary_result.get("format_error")
             candidate["compressed_view"] = {
                 "compressed_trajectory": state,
@@ -813,9 +815,12 @@ class AggregateTrajectoryRunner:
                 {
                     "node_id": candidate["node_id"],
                     "summary": candidate["compressed_view"],
-                    "messages": candidate.get("summary_messages", []),
                     "format_error": candidate.get("summary_format_error"),
                 },
+            )
+            _write_json(
+                candidate["node_dir"] / "summary_message.json",
+                candidate.get("summary_messages", []),
             )
 
         rubric_sample = await _generate_aggregate_rubrics(
@@ -886,8 +891,19 @@ class AggregateTrajectoryRunner:
             for record in candidate.get("score_records", []):
                 score_by_rubric.setdefault(record["rubric_id"], {})[candidate["node_id"]] = float(record.get("score_normalized", 0.0))
         average_rubric_judged_scores = judged.get("average_rubric_judged_scores", {})
+        judge_messages = [
+            {
+                "node_id": candidate["node_id"],
+                "rubric_id": record["rubric_id"],
+                "messages": copy.deepcopy(record.get("judge_message") or []),
+                "error": record.get("judge_error"),
+            }
+            for candidate in candidates
+            for record in candidate.get("score_records", [])
+        ]
 
         _write_json(self.run_dir / "rubric_message.json", {"messages": judged["rubric_sample"]["messages"]})
+        _write_json(self.run_dir / "judge_message.json", judge_messages)
         _write_json(
             self.run_dir / "rubric.json",
             {
@@ -917,7 +933,10 @@ class AggregateTrajectoryRunner:
                         "terminal_patch_from_fallback": bool(candidate.get("terminal_patch_from_fallback")),
                         "terminal_evaluation": candidate.get("terminal_evaluation"),
                         "summary_format_error": candidate.get("summary_format_error"),
-                        "scores": candidate.get("score_records", []),
+                        "scores": [
+                            {key: copy.deepcopy(value) for key, value in record.items() if key != "judge_message"}
+                            for record in candidate.get("score_records", [])
+                        ],
                     }
                     for candidate in candidates
                 ],
@@ -1100,9 +1119,8 @@ def run_aggregate(
                 environment_config["environment_class"] = select_container_environment_class(
                     environment_config.get("environment_class", "docker")
                 )
-                image_name = get_swebench_docker_image_name(instance)
                 if environment_config.get("environment_class") == "docker":
-                    environment_config["image"] = image_name
+                    environment_config["image"] = get_swebench_docker_image_name(instance)
                 elif environment_config.get("environment_class") == "singularity":
                     environment_config["image"] = get_swebench_singularity_image_name(instance)
                 if instance.get("expected_output_json"):

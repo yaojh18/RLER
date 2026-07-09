@@ -87,6 +87,7 @@ from swe_agent.trajectory_search import (
     _update_persistent_state,
     _build_step_cards,
     _collect_workspace_meta,
+    _container_environment_kind,
     _docker_commit,
 )
 
@@ -318,6 +319,7 @@ class ForkGroup:
     pc_rubric_samples: list[dict[str, Any]] = field(default_factory=list)
     pc_judge_response: dict[str, Any] = field(default_factory=dict)
     summary: dict[str, Any] = field(default_factory=dict)
+    summary_messages: list[dict[str, Any]] = field(default_factory=list)
     experience_bank_update: dict[str, Any] = field(default_factory=dict)
     experience_bank_message: list[dict[str, Any]] = field(default_factory=list)
     pc_experience_bank_update: dict[str, Any] = field(default_factory=dict)
@@ -416,6 +418,9 @@ class TrajectorySearchParallelRunner:
         self.task_id = instance["instance_id"]
         self.run_id = f"{self.task_id}-{time.strftime('%Y%m%d-%H%M%S')}"
         self.base_image = str(self.backend.environment_config["image"])
+        self.environment_class = _container_environment_kind(
+            str(self.backend.environment_config.get("environment_class", "docker"))
+        )
         self.docker_executable = str(
             self.backend.environment_config.get("executable", "docker")
         )
@@ -452,7 +457,6 @@ class TrajectorySearchParallelRunner:
             score_bank = provided_score_banks.get(scope)
             if score_bank is None:
                 score_bank = ScoreRubricBank(max_active_rubrics=config.max_active_rubrics, scope=scope)
-                score_bank.initialize(self.task)
             self.score_banks[scope] = score_bank
             experience_bank = provided_experience_banks.get(scope)
             if experience_bank is None:
@@ -701,12 +705,14 @@ class TrajectorySearchParallelRunner:
     def _checkpoint_environment(self, session: Any, tag_kind: str) -> str | None:
         """Checkpoint the session filesystem for future Lane B forks."""
         env = session.agent.env
-        sandbox_dir = getattr(env, "sandbox_dir", None)
-        if sandbox_dir is not None:
+        if self.environment_class == "singularity":
+            sandbox_dir = getattr(env, "sandbox_dir", None)
+            if sandbox_dir is None:
+                raise RuntimeError("Singularity trajectory-search session has no sandbox_dir to checkpoint")
             return str(self._copy_singularity_sandbox(Path(sandbox_dir), tag_kind))
 
-        container_id = getattr(session.agent.env, "container_id", None) or getattr(
-            session.agent.env, "_container_id", None
+        container_id = getattr(env, "container_id", None) or getattr(
+            env, "_container_id", None
         )
         if not container_id:
             return None
@@ -732,6 +738,8 @@ class TrajectorySearchParallelRunner:
         return tag
 
     def _delete_image(self, image_tag: str) -> None:
+        if self.environment_class != "docker":
+            raise RuntimeError("Docker image cleanup was requested for a Singularity trajectory-search runner")
         if self.config.keep_images:
             return
         if image_tag == self.base_image:
@@ -748,8 +756,10 @@ class TrajectorySearchParallelRunner:
             logger.warning("Failed to delete image %s: %s", image_tag, exc)
 
     def _delete_checkpoint(self, checkpoint_ref: str) -> None:
-        path = Path(checkpoint_ref)
-        if path.is_absolute():
+        if self.environment_class == "singularity":
+            path = Path(checkpoint_ref)
+            if not path.is_absolute():
+                raise RuntimeError(f"Singularity checkpoint is not an absolute sandbox path: {checkpoint_ref}")
             if not self.config.keep_images:
                 shutil.rmtree(path, ignore_errors=True)
             return
@@ -768,13 +778,15 @@ class TrajectorySearchParallelRunner:
             except Exception:
                 pass
         self._live_sessions = []
-        for tag in list(self._created_image_tags):
-            self._delete_image(tag)
-        self._created_image_tags = []
-        for sandbox_dir in list(self._created_sandbox_dirs):
-            if not self.config.keep_images:
-                shutil.rmtree(sandbox_dir, ignore_errors=True)
-        self._created_sandbox_dirs = []
+        if self.environment_class == "docker":
+            for tag in list(self._created_image_tags):
+                self._delete_image(tag)
+            self._created_image_tags = []
+        else:
+            for sandbox_dir in list(self._created_sandbox_dirs):
+                if not self.config.keep_images:
+                    shutil.rmtree(sandbox_dir, ignore_errors=True)
+            self._created_sandbox_dirs = []
 
     # -- Lane B: per-mid_cp forks --------------------------------------------
 
@@ -836,8 +848,13 @@ class TrajectorySearchParallelRunner:
         env_section = resumed["environment"]
         env_config = env_section["config"]
         env_state = env_section["state"]
-        env_type = str(env_section.get("type_path", "")).lower()
-        if "singularity" in env_type:
+        snapshot_environment_class = _container_environment_kind(str(env_section.get("type_path", "")))
+        if snapshot_environment_class != self.environment_class:
+            raise RuntimeError(
+                f"Snapshot environment {snapshot_environment_class!r} does not match runner "
+                f"environment {self.environment_class!r}"
+            )
+        if self.environment_class == "singularity":
             branch_sandbox = self._copy_singularity_sandbox(
                 Path(mid_cp.image_tag),
                 f"lane-b-g{mid_cp.idx:03d}-{branch_index:02d}",
@@ -1148,6 +1165,14 @@ class TrajectorySearchParallelRunner:
         extra_prompt_sections.extend(experience_context.extra_prompt_sections)
         retrieved_experiences = copy.deepcopy(experience_context.retrieved)
         retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
+        generation_context = {
+            "question": copy.deepcopy(question),
+            "previous_state": copy.deepcopy(previous_state),
+            "latest_shared_segment": copy.deepcopy(latest_shared_segment),
+            "continuations": copy.deepcopy(continuations),
+            "retrieved_rubric_experiences": [asdict(experience) for experience in retrieved_experiences],
+            "previous_generated_rubrics": [asdict(rubric) for rubric in score_context.existing_rubrics],
+        }
 
         score_batch = await _generate_and_score_rubric_batch(
             sample_count=cfg.n,
@@ -1207,7 +1232,6 @@ class TrajectorySearchParallelRunner:
             for branch in group.branches
         }
         aggregate_judge_response: dict[str, dict[str, Any]] = {}
-        group_reward_by_rubric: dict[str, float] = {}
         rubric_samples: list[dict[str, Any]] = []
         node_ids = [branch.node_id for branch in group.branches]
         for sample_index, generated_sample in enumerate(score_batch["generated_samples"]):
@@ -1244,7 +1268,6 @@ class TrajectorySearchParallelRunner:
                     judge_response_for_sample.setdefault(rubric_id, {}).setdefault(node_id, {})["error"] = error.get("error")
                     aggregate_judge_response.setdefault(rubric_id, {}).setdefault(node_id, {})["error"] = error.get("error")
 
-            group_reward_by_rubric.update(metrics["reward_by_rubric"])
             avg_scores = _avg_scores_from_rubrics(
                 node_ids=node_ids,
                 score_lookup_by_node=evaluation["score_lookup_by_node"],
@@ -1274,6 +1297,7 @@ class TrajectorySearchParallelRunner:
                 "rubric_list_id": generated_sample.rubric_list_id,
                 "generated": [asdict(rubric) for rubric in generated_sample.generated],
                 "messages": copy.deepcopy(generated_sample.messages),
+                "generation_context": copy.deepcopy(generation_context),
                 "format_errors": copy.deepcopy(generated_sample.format_errors or []),
                 "terminal_error": generated_sample.terminal_error,
                 "generated_titles": [rubric.title for rubric in generated_sample.generated],
@@ -1296,10 +1320,7 @@ class TrajectorySearchParallelRunner:
             }
             rubric_samples.append(sample_payload)
 
-        bank_update = score_bank.update_after_round(
-            generated=group_generated_rubrics,
-            rewards=group_reward_by_rubric,
-        )
+        bank_update = score_bank.update_from_model(generated=group_generated_rubrics)
         score_bank.set_state(
             active_bank=copy.deepcopy(bank_update.active_after),
             inactive_bank=copy.deepcopy(bank_update.inactive_after),
@@ -1332,6 +1353,7 @@ class TrajectorySearchParallelRunner:
                 }
             )
         summary_update_messages: list[dict[str, Any]] = []
+        summary_update_errors: list[str] = []
         while self._summary_processed_segments < len(segments):
             segment = copy.deepcopy(segments[self._summary_processed_segments])
             self._summary_recent_segments.append(segment)
@@ -1353,6 +1375,8 @@ class TrajectorySearchParallelRunner:
             )
             self._summary_persistent_state = copy.deepcopy(update_payload["state"])
             summary_update_messages.extend(copy.deepcopy(update_payload["messages"]))
+            if update_payload.get("error"):
+                summary_update_errors.append(str(update_payload["error"]))
 
         previous_state = copy.deepcopy(self._summary_persistent_state)
         recent_segments = copy.deepcopy(self._summary_recent_segments)
@@ -1361,8 +1385,9 @@ class TrajectorySearchParallelRunner:
         group.summary = {
             "persistent_state": previous_state,
             "recent_segments": recent_segments,
-            "persistent_state_update_messages": summary_update_messages,
+            "persistent_state_errors": summary_update_errors,
         }
+        group.summary_messages = summary_update_messages
 
         continuations = [
             self._build_continuation_view_lane_b(b) for b in group.branches
@@ -2202,7 +2227,7 @@ class TrajectorySearchParallelRunner:
                                     ],
                                 ),
                                 "group_index": group.group_index,
-                                "messages": copy.deepcopy(sample["messages"]),
+                                "generation_context": copy.deepcopy(sample.get("generation_context", {})),
                             }
                             for group in instance_record.groups
                             for sample in getattr(group, spec["samples_attr"])
@@ -2296,6 +2321,8 @@ class TrajectorySearchParallelRunner:
             parent_payload,
         )
         _atomic_write_json(gdir / "summary.json", group.summary)
+        if group.summary_messages:
+            _atomic_write_json(gdir / "summary_message.json", group.summary_messages)
         sibling_rubrics_dir = gdir / "sibling_rubrics"
         pc_rubrics_dir = gdir / "pc_rubrics"
         sibling_rubrics_dir.mkdir(parents=True, exist_ok=True)
@@ -2405,16 +2432,26 @@ class TrajectorySearchParallelRunner:
             rubric_payload = {
                 k: copy.deepcopy(v)
                 for k, v in sample.items()
-                if k not in {"messages", "judge_response", "retrieve_messages"}
+                if k not in {"messages", "judge_response", "retrieve_messages", "generation_context"}
             }
             _atomic_write_json(rubric_dir / "rubric.json", rubric_payload)
             _atomic_write_json(rubric_dir / "rubric_message.json", sample["messages"])
             _atomic_write_json(rubric_dir / "rubric_retrieve_message.json", sample["retrieve_messages"])
+            judge_messages = [
+                {
+                    "rubric_id": rubric_id,
+                    "node_id": node_id,
+                    "messages": copy.deepcopy(entry.get("judge_message") or []),
+                    "error": entry.get("error"),
+                }
+                for rubric_id, by_node in sample["judge_response"].items()
+                for node_id, entry in by_node.items()
+            ]
+            _atomic_write_json(rubric_dir / "judge_message.json", judge_messages)
             _atomic_write_json(
                 rubric_dir / "judge.json",
                 {
                     "rubric_list_id": sample["rubric_list_id"],
-                    "judge_response": sample["judge_response"],
                     "judge_errors": sample["judge_errors"],
                     "score_by_rubric": sample["score_by_rubric"],
                     "judge_error_by_rubric": sample["judge_error_by_rubric"],

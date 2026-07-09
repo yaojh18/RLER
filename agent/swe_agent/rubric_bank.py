@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import json
 import math
 import logging
 import re
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -40,6 +42,53 @@ def _truncate_middle(text: str, limit: int) -> str:
     if head + tail >= len(text):
         return text
     return text[:head] + OBSERVATION_TRUNCATION_MARKER + text[-tail:]
+
+
+def render_compact_markdown(value: Any) -> str:
+    """Render prompt context without JSON punctuation or string escaping."""
+
+    def scalar_text(item: Any) -> str:
+        if item is None:
+            return "None"
+        if isinstance(item, bool):
+            return "true" if item else "false"
+        return str(item)
+
+    def render(item: Any, indent: int) -> list[str]:
+        prefix = " " * indent
+        if isinstance(item, dict):
+            if not item:
+                return [prefix + "None"]
+            rows: list[str] = []
+            for key, child in item.items():
+                if isinstance(child, (dict, list)):
+                    rows.append(f"{prefix}- **{key}**:")
+                    rows.extend(render(child, indent + 2))
+                    continue
+                text = scalar_text(child)
+                if "\n" not in text:
+                    rows.append(f"{prefix}- **{key}**: {text}")
+                    continue
+                rows.append(f"{prefix}- **{key}**:")
+                rows.extend(f"{prefix}  {line}" for line in text.splitlines())
+            return rows
+        if isinstance(item, list):
+            if not item:
+                return [prefix + "None"]
+            rows = []
+            for child in item:
+                if isinstance(child, (dict, list)):
+                    rows.append(prefix + "-")
+                    rows.extend(render(child, indent + 2))
+                    continue
+                text = scalar_text(child)
+                lines = text.splitlines() or [""]
+                rows.append(f"{prefix}- {lines[0]}")
+                rows.extend(f"{prefix}  {line}" for line in lines[1:])
+            return rows
+        return [prefix + scalar_text(item)]
+
+    return "\n".join(render(value, 0))
 
 
 @dataclass
@@ -103,87 +152,6 @@ def _public_experience(experience: RubricExperience | dict[str, Any]) -> dict[st
     payload = asdict(experience) if isinstance(experience, RubricExperience) else copy.deepcopy(experience)
     payload.pop("experience_id", None)
     return payload
-
-
-def _first_user_message(messages: Any) -> str:
-    if not isinstance(messages, list):
-        return ""
-    for message in messages:
-        if isinstance(message, dict) and message.get("role") == "user":
-            content = message.get("content", "")
-            return content if isinstance(content, str) else ""
-    return ""
-
-
-def _section_text(text: str, header: str, next_header: str | None = None) -> str:
-    start = text.find(header)
-    if start < 0:
-        return ""
-    start += len(header)
-    end = text.find(next_header, start) if next_header else -1
-    return text[start:end if end >= 0 else len(text)].strip()
-
-
-def _json_after_header(text: str, header: str) -> Any:
-    start = text.find(header)
-    if start < 0:
-        return None
-    json_start = text.find("{", start + len(header))
-    if json_start < 0:
-        return None
-    try:
-        parsed, _ = json.JSONDecoder().raw_decode(text[json_start:])
-        return parsed
-    except json.JSONDecodeError:
-        return None
-
-
-def _json_from_section(text: str, header: str, next_header: str | None = None) -> Any:
-    section = _section_text(text, header, next_header)
-    if not section or section == "None":
-        return None
-    starts = [position for position in (section.find("{"), section.find("[")) if position >= 0]
-    if not starts:
-        return None
-    json_start = min(starts)
-    try:
-        parsed, _ = json.JSONDecoder().raw_decode(section[json_start:])
-        return parsed
-    except json.JSONDecodeError:
-        return None
-
-
-def _extract_continuations_from_prompt(prompt: str) -> list[dict[str, Any]]:
-    continuations = []
-    for match in re.finditer(r"^## Continuation (\d+):\s*$", prompt, flags=re.MULTILINE):
-        parsed = _json_after_header(prompt[match.start():], match.group(0))
-        if isinstance(parsed, dict):
-            continuations.append(
-                {
-                    "sample_index": int(match.group(1)),
-                    **parsed,
-                }
-            )
-    return continuations
-
-
-def _extract_generation_context_from_messages(messages: Any) -> dict[str, Any]:
-    prompt = _first_user_message(messages)
-    if not prompt:
-        return {}
-    context: dict[str, Any] = {
-        "question": _section_text(prompt, "## Question:", "## Previous Persistent State:"),
-        "previous_state": _json_from_section(prompt, "## Previous Persistent State:", "## Parent Trajectory:"),
-        "latest_shared_segment": _json_from_section(prompt, "## Parent Trajectory:", "## Agent Trajectory Continuations:"),
-        "continuations": _extract_continuations_from_prompt(prompt),
-    }
-    retrieved = _json_from_section(prompt, "## Retrieved Rubric Experiences:")
-    if isinstance(retrieved, list):
-        context["retrieved_rubric_experiences"] = retrieved
-    previous_generated_rubrics = _json_from_section(prompt, "## Existing Rubrics:")
-    if isinstance(previous_generated_rubrics, list):
-        context["previous_generated_rubrics"] = previous_generated_rubrics
-    return context
 
 
 def gold_patch_skeleton(gold_patch: str, max_chars: int = 4096) -> str:
@@ -495,19 +463,47 @@ def _convert_rubric_item(
 ) -> RubricRecord | None:
     if not isinstance(item, dict):
         return None
+    normalized_keys = {
+        re.sub(r"[^a-z0-9]+", "_", str(key).strip().casefold()).strip("_"): value
+        for key, value in item.items()
+    }
+    aliases = {
+        "direction": "polarity",
+        "type": "polarity",
+        "name": "title",
+        "criterion": "description",
+        "importance": "weight",
+    }
+    for source, target in aliases.items():
+        if target not in normalized_keys and source in normalized_keys:
+            normalized_keys[target] = normalized_keys[source]
+    item = normalized_keys
     direction = item.get("polarity", None)
+    if isinstance(direction, str):
+        direction = direction.strip().lower()
     if direction not in {"positive", "negative"}:
         return None
     title = item.get("title", None)
-    if title is None or not isinstance(title, str):
+    if title is None or not isinstance(title, str) or not title.strip():
         return None
+    title = title.strip()
     description = item.get("description", None)
-    if description is None or not isinstance(description, str):
+    if description is None or not isinstance(description, str) or not description.strip():
         return None
-    scale = {str(score): text for score, text in (item.get("scale") or {}).items()}
+    description = description.strip()
+    raw_scale = item.get("scale") or {}
+    if isinstance(raw_scale, list) and len(raw_scale) == 5:
+        raw_scale = {str(index): text for index, text in enumerate(raw_scale, start=1)}
+    if not isinstance(raw_scale, dict):
+        return None
+    scale = {}
+    for score, text in raw_scale.items():
+        score_match = re.fullmatch(r"(?:score[_\s-]*)?([1-5])", str(score).strip().casefold())
+        if score_match is not None:
+            scale[score_match.group(1)] = text
     if set(scale) != {"1", "2", "3", "4", "5"}:
         return None
-    scale_text = {isinstance(text, str) for _, text in (item.get("scale") or {}).items()}
+    scale_text = {isinstance(text, str) for text in scale.values()}
     if not scale_text or not all(scale_text):
         return None
     metadata_raw = item.get("metadata") or {}
@@ -573,8 +569,9 @@ class ScoreRubricBank:
         if self.active_bank:
             sections.append(
                 "## Existing Rubrics:\n"
-                + json.dumps(
-                    [{
+                + render_compact_markdown(
+                    [
+                        {
                             "polarity": rubric.direction,
                             "weight": rubric.weight,
                             "title": rubric.title,
@@ -583,7 +580,8 @@ class ScoreRubricBank:
                             "metadata": rubric.metadata,
                         }
                         for rubric in self.active_bank
-                    ])
+                    ]
+                )
             )
         return RubricBankGenerationContext(
             existing_rubrics=copy.deepcopy(self.active_bank),
@@ -620,6 +618,70 @@ class ScoreRubricBank:
             active_after=active_after,
             inactive_after=inactive_after,
         )
+
+    def update_from_model(self, *, generated: list[RubricRecord]) -> RubricBankRoundUpdate:
+        active_before = copy.deepcopy(self.active_bank)
+        selected_by_title: dict[str, RubricRecord] = {}
+        for rubric in generated:
+            selected_by_title[rubric.title.strip().casefold()] = copy.deepcopy(rubric)
+        active_after = list(selected_by_title.values())[: self.max_active_rubrics]
+        active_ids = {rubric.rubric_id for rubric in active_after}
+        inactive_after: list[RubricRecord] = []
+        inactive_ids: set[str] = set()
+        for rubric in active_before + self.inactive_bank:
+            if rubric.rubric_id in active_ids or rubric.rubric_id in inactive_ids:
+                continue
+            inactive_after.append(copy.deepcopy(rubric))
+            inactive_ids.add(rubric.rubric_id)
+        return RubricBankRoundUpdate(
+            rubrics=active_after,
+            active_before=active_before,
+            active_after=active_after,
+            inactive_after=inactive_after,
+        )
+
+
+def _normalize_experience_title(title: str) -> str:
+    normalized = unicodedata.normalize("NFKC", title)
+    normalized = normalized.translate(str.maketrans({"‘": '"', "’": '"', "“": '"', "”": '"', "'": '"'}))
+    return " ".join(normalized.split()).casefold()
+
+
+def _fuzzy_experience_title(title: str) -> str:
+    return " ".join(re.findall(r"\w+", _normalize_experience_title(title)))
+
+
+def _match_experience_title(title: str, available_titles: list[str]) -> str | None:
+    normalized = _normalize_experience_title(title)
+    exact_matches = [candidate for candidate in available_titles if _normalize_experience_title(candidate) == normalized]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    query = _fuzzy_experience_title(title)
+    containment_matches = [
+        candidate
+        for candidate in available_titles
+        if query
+        and (
+            query in _fuzzy_experience_title(candidate)
+            or _fuzzy_experience_title(candidate) in query
+        )
+    ]
+    if len(containment_matches) == 1:
+        return containment_matches[0]
+    ranked = sorted(
+        (
+            difflib.SequenceMatcher(None, query, _fuzzy_experience_title(candidate)).ratio(),
+            candidate,
+        )
+        for candidate in available_titles
+    )
+    if not ranked:
+        return None
+    best_score, best_title = ranked[-1]
+    second_score = ranked[-2][0] if len(ranked) > 1 else 0.0
+    if best_score >= 0.88 and best_score - second_score >= 0.15:
+        return best_title
+    return None
 
 
 class ExperienceRubricBank:
@@ -686,16 +748,18 @@ class ExperienceRubricBank:
         if retrieved:
             sections.append(
                 "## Retrieved Rubric Experiences:\n" +
-                json.dumps([
-                    {
-                        "title": item.title,
-                        "description": item.description,
-                        "context": item.context,
-                        "experience": item.experience,
-                        "reference_golden_rubrics": item.metadata.get("reference_golden_rubrics", None),
-                    }
-                    for item in retrieved
-                ])
+                render_compact_markdown(
+                    [
+                        {
+                            "title": item.title,
+                            "description": item.description,
+                            "context": item.context,
+                            "experience": item.experience,
+                            "reference_golden_rubrics": item.metadata.get("reference_golden_rubrics", None),
+                        }
+                        for item in retrieved
+                    ]
+                )
             )
         return RubricBankGenerationContext(
             existing_rubrics=[],
@@ -723,24 +787,24 @@ class ExperienceRubricBank:
             [
                 self.retrieval_prompt.strip(),
                 "## Experience Short-view:",
-                json.dumps([
-                    {
-                        "title": item.title,
-                        "description": item.description,
-                    }
+                "\n\n".join(
+                    f"### {item.title}\n{item.description}"
                     for item in self.experiences.values()
-                ]),
+                ),
                 "## Current Round Context:",
-                json.dumps({
-                    "question": question,
-                    "previous_state": previous_state,
-                    "parent trajectory": latest_shared_segment,
-                    "continuations": continuations,
-                })
+                render_compact_markdown(
+                    {
+                        "question": question,
+                        "previous_state": previous_state,
+                        "parent trajectory": latest_shared_segment,
+                        "continuations": continuations,
+                    }
+                ),
             ]
         )
         messages = [{"role": "user", "content": prompt}]
         requested_titles = []
+        available_titles = list(self.experiences)
         for _ in range(4):
             async for attempt in retry(
                 logger=logger,
@@ -761,13 +825,30 @@ class ExperienceRubricBank:
             response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
             messages.append(assistant_message)
             parsed = extract_last_json_object(response)
-            if (
-                isinstance(parsed, dict)
-                and isinstance(parsed.get("titles"), list)
-                and all(isinstance(title, str) for title in parsed["titles"])
+            full_response = assistant_message.get("content") or ""
+            if parsed is None and full_response != response:
+                parsed = extract_last_json_object(full_response)
+            parsed_titles = None
+            if isinstance(parsed, dict):
+                for key in ("titles", "experience_titles", "selected_titles"):
+                    if key in parsed:
+                        parsed_titles = parsed[key]
+                        break
+            if isinstance(parsed_titles, str):
+                parsed_titles = [parsed_titles]
+            if isinstance(parsed_titles, list) and all(
+                isinstance(item, dict) and isinstance(item.get("title"), str) for item in parsed_titles
             ):
-                requested_titles = [title for title in parsed["titles"][: self.retrieve_top_k] if title in self.experiences]
-                if len(requested_titles) == len(parsed["titles"][: self.retrieve_top_k]):
+                parsed_titles = [item["title"] for item in parsed_titles]
+            if isinstance(parsed_titles, list) and all(isinstance(title, str) for title in parsed_titles):
+                requested_titles = []
+                for title in parsed_titles:
+                    matched_title = _match_experience_title(title, available_titles)
+                    if matched_title is not None and matched_title not in requested_titles:
+                        requested_titles.append(matched_title)
+                    if len(requested_titles) >= self.retrieve_top_k:
+                        break
+                if not parsed_titles or requested_titles:
                     break
                 messages.append(
                     {
@@ -940,7 +1021,9 @@ class ExperienceRubricBank:
         gt_skeleton = gold_patch_skeleton(instance.get("patch", ""))
         attempts = []
         for payload in rubric_payloads:
-            generation_context = _extract_generation_context_from_messages(payload.get("messages"))
+            generation_context = payload.get("generation_context")
+            if not isinstance(generation_context, dict):
+                generation_context = {}
             avg_scores = payload.get("average_rubric_judged_scores", {})
             ordered_node_ids = [str(node_id) for node_id in avg_scores]
             generated = payload.get("generated", [])
@@ -1007,12 +1090,14 @@ class ExperienceRubricBank:
                 [
                     self.update_prompt.strip(),
                     "## Current Rubric Bank:",
-                    json.dumps([
-                        {"title": item.title, "description": item.description}
-                        for item in self.experiences.values()
-                    ]),
+                    render_compact_markdown(
+                        [
+                            {"title": item.title, "description": item.description}
+                            for item in self.experiences.values()
+                        ]
+                    ),
                     "## Previous Rubric Generation Attempt:",
-                    json.dumps(
+                    render_compact_markdown(
                         {
                             "instance_id": evidence.get("instance_id"),
                             **attempt_evidence,
@@ -1065,9 +1150,9 @@ class ExperienceRubricBank:
                                 "The response did not match a valid retrieve/add/update/delete action schema, or it referenced an invalid bank title. "
                                 "For add/update, title, description, context, experience, metadata.analysis, and "
                                 "metadata.reference_golden_rubrics must be top-level fields in the new flat format. "
-                                "Current valid experience titles are: "
-                                + json.dumps(valid_titles, ensure_ascii=False)
-                                + ". Follow the output format example above with a corrected single action or {}."
+                                "Current valid experience titles are:\n"
+                                + render_compact_markdown(valid_titles)
+                                + "\nFollow the output format example above with a corrected single action or {}."
                             ),
                         }
                     )
@@ -1082,7 +1167,7 @@ class ExperienceRubricBank:
                             "role": "user",
                             "content": (
                                 "## Retrieved Existing Experiences:\n"
-                                + json.dumps(retrieved)
+                                + render_compact_markdown(retrieved)
                                 + "\n\nUse this retrieved context to decide the next add, update, delete, or retrieve action. "
                                 + "Follow the output format example above, or return {} when no "
                                 + "more bank changes are needed for this rubric generation attempt."

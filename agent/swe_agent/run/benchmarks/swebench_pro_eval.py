@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -73,6 +74,23 @@ def evaluate_swebench_pro_instances(
             return evaluations
 
 
+def _isolated_singularity_exec_args(
+    exec_args: list[str],
+    *,
+    isolated_network: bool,
+) -> list[str]:
+    """Add runtime namespaces without duplicating caller-provided flags."""
+    result = list(exec_args)
+    for value in ("--pid", "--contain"):
+        if value not in result:
+            result.append(value)
+    if isolated_network:
+        for value in ("--net", "--network", "none"):
+            if value not in result:
+                result.append(value)
+    return result
+
+
 @contextlib.contextmanager
 def _node_local_singularity_eval_lock(instance: dict[str, Any]) -> Iterator[None]:
     if select_container_backend() != "singularity":
@@ -81,11 +99,17 @@ def _node_local_singularity_eval_lock(instance: dict[str, Any]) -> Iterator[None
     lock_scope = os.environ.get("RLER_SWEBENCH_PRO_EVAL_LOCK_SCOPE", "repo")
     lock_key = (
         str(instance.get("instance_id") or "unknown")
-        if lock_scope == "instance"
+        if lock_scope == "instance" or _needs_isolated_nodebb_service(instance)
         else str(instance.get("repo") or instance.get("dockerhub_tag") or "unknown")
     )
-    lock_hash = hashlib.sha1(lock_key.encode("utf-8")).hexdigest()[:12]
-    lock_path = Path("/tmp") / f"rler-swebench-pro-eval-{os.getuid()}-{lock_hash}.lock"
+    # Pyxis ranks may each receive a private /tmp.  A host-mounted lock root,
+    # when configured by a batch experiment, makes this genuinely node-local
+    # across ranks while the hostname keeps different nodes independent.
+    node_key = f"{socket.gethostname()}:{lock_key}"
+    lock_hash = hashlib.sha1(node_key.encode("utf-8")).hexdigest()[:12]
+    lock_root = Path(os.environ.get("RLER_SWEBENCH_PRO_EVAL_LOCK_ROOT", "/tmp"))
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_root / f"rler-swebench-pro-eval-{os.getuid()}-{lock_hash}.lock"
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
@@ -155,6 +179,16 @@ def _eval_with_singularity(
         cwd="/",
         timeout=timeout,
     )
+    config = getattr(env, "config", None)
+    if (
+        os.environ.get("RLER_SWEBENCH_PRO_ISOLATE_RUNTIME") == "1"
+        and config is not None
+        and hasattr(config, "exec_args")
+    ):
+        config.exec_args = _isolated_singularity_exec_args(
+            list(config.exec_args),
+            isolated_network=False,
+        )
     command = "bash /workspace/entryscript.sh"
     if _needs_isolated_nodebb_service(instance):
         # Raw Apptainer exec does not run the Docker image entrypoint.  Without
@@ -162,7 +196,6 @@ def _eval_with_singularity(
         # accidentally share a node-level Redis across independent patches.
         # That is both nondeterministic and can poison later evaluations with
         # Redis MISCONF after a failed background save.
-        config = getattr(env, "config", None)
         prewarm_command = _nodebb_dependency_prewarm_command(str(files.get("run_script.sh") or ""))
         if prewarm_command:
             prewarm = env.execute({"command": prewarm_command}, cwd="/app", timeout=timeout)
@@ -173,7 +206,10 @@ def _eval_with_singularity(
                     + str(prewarm.get("output") or "")[-4000:]
                 )
         if config is not None and hasattr(config, "exec_args"):
-            config.exec_args = [*config.exec_args, "--net", "--network", "none"]
+            config.exec_args = _isolated_singularity_exec_args(
+                list(config.exec_args),
+                isolated_network=True,
+            )
         command = _isolated_nodebb_command()
     try:
         result = env.execute({"command": command}, cwd="/", timeout=timeout)

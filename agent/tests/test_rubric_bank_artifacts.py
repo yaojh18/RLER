@@ -1,28 +1,61 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from agent_rl import ChatCompletion
 from agent_rl import run_utils
 import swe_agent.trajectory_search as trajectory_search
+import swe_agent.trajectory_search_parallel as trajectory_search_parallel
 from swe_agent.exceptions import FormatError
 from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel
 from swe_agent.models.utils.actions_text import parse_regex_actions
 from swe_agent.parallel_utils import NodeArtifactBundle
 from swe_agent.parallel_utils import PatchEvalManager
 from swe_agent.parallel_utils import RubricArtifactBundle
+from swe_agent.parallel_utils import _write_base_artifacts
 from swe_agent.parallel_utils import progress_reward
 from swe_agent.rubric_bank import ExperienceRubricBank
+from swe_agent.rubric_bank import RubricExperience
 from swe_agent.rubric_bank import RubricRecord
 from swe_agent.rubric_bank import ScoreRubricBank
+from swe_agent.rubric_bank import _match_experience_title
+from swe_agent.rubric_bank import _convert_rubric_item
+from swe_agent.rubric_bank import render_compact_markdown
+
+
+def test_rubric_converter_accepts_unambiguous_field_aliases_and_scale_list():
+    rubric = _convert_rubric_item(
+        "task",
+        {
+            "Direction": "positive",
+            "Importance": "1.5",
+            "Name": "Contract coverage",
+            "Criterion": "The continuation verifies the exposed contract.",
+            "Scale": ["none", "weak", "partial", "strong", "complete"],
+            "Metadata": {"stage": "validation"},
+        },
+        1,
+    )
+    assert rubric is not None
+    assert rubric.weight == 1.5
+    assert rubric.scale["5"] == "complete"
 from swe_agent.run.search_swe_agent import _flush_experience_bank_summaries
+from swe_agent.run.search_swe_agent import build_arg_parser
 from swe_agent.trajectory_search import (
     SearchConfig,
+    SearchNode,
     TrajectorySearchRunner,
+    _avg_scores_from_rubrics,
     _combine_score_results,
+    _generate_and_score_rubric_batch,
     _normalize_terminal_patch_text,
+    _pc_avg_scores_from_rubrics,
+    _resume_snapshot_payload,
+    _select_beam_branches,
 )
+from swe_agent.trajectory_search_parallel import TrajectorySearchParallelRunner
 
 
 def test_route_completion_message_requires_reasoning_for_structured_sglang(monkeypatch):
@@ -165,6 +198,254 @@ def test_terminal_patch_normalization_preserves_patch_newline():
     assert _normalize_terminal_patch_text(" \n\t") == ""
 
 
+def test_finalize_outputs_reuses_selected_node_terminal_artifacts(tmp_path):
+    task_id = "repo__pkg-1"
+    node_id = "node-r005-s00-final"
+    node_dir = tmp_path / "nodes" / node_id
+    node_dir.mkdir(parents=True)
+    terminal_messages = {
+        "messages": [
+            {"role": "user", "message": "task"},
+            {"role": "assistant", "message": "terminal answer"},
+        ],
+        "model_name": "terminal-model",
+    }
+    terminal_patch = "diff --git a/pkg.py b/pkg.py\n--- a/pkg.py\n+++ b/pkg.py\n@@ -1 +1 @@\n-a\n+b\n"
+    (node_dir / "terminal_messages.json").write_text(json.dumps(terminal_messages), encoding="utf-8")
+    (node_dir / "terminal_patch.json").write_text(
+        json.dumps(
+            {
+                task_id: {
+                    "model_name_or_path": "terminal-model",
+                    "instance_id": task_id,
+                    "model_patch": terminal_patch,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    runner.run_dir = tmp_path
+    runner.nodes_dir = tmp_path / "nodes"
+    runner.task_id = task_id
+    runner.policy_model_name = "policy-model"
+    runner.search_config = SearchConfig(
+        calculate_gt_reward=True,
+        evaluate_final_patch=False,
+        write_artifacts=True,
+    )
+    runner.nodes = {
+        node_id: SearchNode(
+            node_id=node_id,
+            parent_id="root",
+            round_index=5,
+            depth=5,
+            session_id="session",
+            status="frontier",
+            submission="intermediate patch",
+            policy_model_name="policy-model",
+        )
+    }
+    runner.finished_node_ids = []
+    runner.frontier_ids = [node_id]
+    runner.best_node_id = node_id
+    runner._node_judge_cache = {node_id: {"overall_score": 1.0}}
+    runner._node_snapshot_cache = {
+        node_id: {
+            "agent": {
+                "state": {
+                    "messages": [
+                        {"role": "user", "content": "task"},
+                        {"role": "assistant", "content": "intermediate answer"},
+                    ]
+                }
+            }
+        }
+    }
+    runner._save_manifest = lambda: None
+
+    runner._finalize_outputs()
+
+    assert json.loads((tmp_path / "messages.json").read_text()) == terminal_messages
+    model_patch = json.loads((tmp_path / "model_patch.json").read_text())
+    assert model_patch[task_id]["model_name_or_path"] == "terminal-model"
+    assert model_patch[task_id]["model_patch"] == terminal_patch
+    assert runner.nodes[node_id].submission == terminal_patch
+
+
+def test_checkpoint_environment_copies_singularity_sandbox(tmp_path, monkeypatch):
+    source = tmp_path / "source-sandbox"
+    source.mkdir()
+    (source / "state.txt").write_text("checkpointed", encoding="utf-8")
+    monkeypatch.setattr(trajectory_search.tempfile, "gettempdir", lambda: str(tmp_path))
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    runner.task_id = "repo__pkg-1"
+    runner.environment_class = "singularity"
+    session = SimpleNamespace(
+        agent=SimpleNamespace(env=SimpleNamespace(sandbox_dir=source, container_id="must-not-be-used"))
+    )
+
+    checkpoint, image_id = runner._checkpoint_environment(session, "unused-docker-tag")
+
+    assert image_id == ""
+    assert (Path(checkpoint) / "state.txt").read_text(encoding="utf-8") == "checkpointed"
+
+
+def test_singularity_checkpoint_sweep_does_not_call_docker(tmp_path, monkeypatch):
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    runner.frontier_ids = []
+    runner.nodes = {}
+    runner.base_image = "/images/base.sif"
+    runner.environment_class = "singularity"
+    runner.docker_executable = "definitely-missing-docker-executable"
+    runner.image_repository = "rler-search/test"
+    runner._node_snapshot_cache = {
+        "node-a": {"metadata": {"checkpoint_image_tag": str(sandbox)}}
+    }
+
+    monkeypatch.setattr(
+        trajectory_search.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Docker must not be called")),
+    )
+
+    runner._sweep_checkpoint_images(remove_all=True)
+
+    assert not sandbox.exists()
+
+
+def test_resume_snapshot_uses_environment_specific_ownership():
+    base_snapshot = {
+        "session_id": "session",
+        "status": "paused",
+        "spec": {},
+        "agent": {},
+        "model": {},
+        "environment": {
+            "type_path": "swe_agent.environments.singularity.SingularityEnvironment",
+            "config": {"image": "/images/base.sif", "reuse_sandbox_dir": None},
+            "state": {"sandbox_dir": "/tmp/old-sandbox", "owns_sandbox": True},
+        },
+    }
+
+    singularity_payload = _resume_snapshot_payload(
+        base_snapshot,
+        image_tag="/tmp/checkpoint-sandbox",
+        image_id="",
+    )
+    assert singularity_payload["environment"]["state"] == {"owns_sandbox": True}
+
+    docker_snapshot = json.loads(json.dumps(base_snapshot))
+    docker_snapshot["environment"]["type_path"] = "swe_agent.environments.docker.DockerEnvironment"
+    docker_payload = _resume_snapshot_payload(
+        docker_snapshot,
+        image_tag="rler-search/test:checkpoint",
+        image_id="sha256:123",
+    )
+    assert docker_payload["environment"]["state"] == {"owns_container": True}
+
+
+def test_docker_checkpoint_and_sweep_do_not_use_singularity_paths(monkeypatch):
+    committed = []
+    docker_calls = []
+
+    def fake_commit(executable, container_id, image_tag):
+        committed.append((executable, container_id, image_tag))
+        return image_tag, "sha256:checkpoint"
+
+    def fake_run(command, **kwargs):
+        docker_calls.append(command)
+        if command[1:3] == ["image", "ls"]:
+            return SimpleNamespace(returncode=0, stdout="rler-search/test:old\n")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(trajectory_search, "_docker_commit", fake_commit)
+    monkeypatch.setattr(trajectory_search.subprocess, "run", fake_run)
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    runner.environment_class = "docker"
+    runner.docker_executable = "docker"
+    runner.image_repository = "rler-search/test"
+    runner.base_image = "base:latest"
+    runner.frontier_ids = []
+    runner.nodes = {}
+    runner._node_snapshot_cache = {
+        "node-a": {"metadata": {"checkpoint_image_tag": "rler-search/test:old"}}
+    }
+    session = SimpleNamespace(
+        agent=SimpleNamespace(env=SimpleNamespace(container_id="container-123", sandbox_dir="/must/not/use"))
+    )
+
+    checkpoint = runner._checkpoint_environment(session, "rler-search/test:new")
+    runner._sweep_checkpoint_images(remove_all=True)
+
+    assert checkpoint == ("rler-search/test:new", "sha256:checkpoint")
+    assert committed == [("docker", "container-123", "rler-search/test:new")]
+    assert docker_calls[-1] == ["docker", "image", "rm", "-f", "rler-search/test:old"]
+
+
+def test_session_disposal_dispatches_by_environment(monkeypatch):
+    subprocess_calls = []
+    monkeypatch.setattr(
+        trajectory_search.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess_calls.append(command),
+    )
+    singularity_cleanups = []
+    singularity_runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    singularity_runner.environment_class = "singularity"
+    singularity_runner.docker_executable = "apptainer"
+    singularity_env = SimpleNamespace(
+        sandbox_dir="/tmp/sandbox",
+        container_id="must-not-be-used",
+        cleanup=lambda: singularity_cleanups.append(True),
+    )
+    singularity_runner._dispose_session(SimpleNamespace(agent=SimpleNamespace(env=singularity_env)))
+
+    docker_runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    docker_runner.environment_class = "docker"
+    docker_runner.docker_executable = "docker"
+    docker_env = SimpleNamespace(container_id="container-123", sandbox_dir="/must/not/use")
+    docker_runner._dispose_session(SimpleNamespace(agent=SimpleNamespace(env=docker_env)))
+
+    assert singularity_cleanups == [True]
+    assert subprocess_calls == [["docker", "rm", "-f", "container-123"]]
+    assert docker_env.container_id is None
+
+
+def test_parallel_checkpoint_dispatches_by_environment(tmp_path, monkeypatch):
+    singularity_runner = TrajectorySearchParallelRunner.__new__(TrajectorySearchParallelRunner)
+    singularity_runner.environment_class = "singularity"
+    singularity_runner._copy_singularity_sandbox = lambda source, tag: tmp_path / "checkpoint"
+    singularity_session = SimpleNamespace(
+        agent=SimpleNamespace(env=SimpleNamespace(sandbox_dir=tmp_path, container_id="must-not-be-used"))
+    )
+    assert singularity_runner._checkpoint_environment(singularity_session, "mid") == str(tmp_path / "checkpoint")
+
+    commits = []
+    monkeypatch.setattr(
+        trajectory_search_parallel,
+        "_docker_commit",
+        lambda executable, container_id, image_tag, inspect_image: commits.append(
+            (executable, container_id, image_tag, inspect_image)
+        ),
+    )
+    docker_runner = TrajectorySearchParallelRunner.__new__(TrajectorySearchParallelRunner)
+    docker_runner.environment_class = "docker"
+    docker_runner.docker_executable = "docker"
+    docker_runner.image_repository = "rler-pds/test"
+    docker_runner._created_image_tags = []
+    docker_session = SimpleNamespace(
+        agent=SimpleNamespace(env=SimpleNamespace(container_id="container-456", sandbox_dir=tmp_path))
+    )
+    checkpoint = docker_runner._checkpoint_environment(docker_session, "mid")
+
+    assert checkpoint.startswith("rler-pds/test:mid-")
+    assert commits == [("docker", "container-456", checkpoint, False)]
+
+
 def test_score_result_combines_active_bank_and_generated_scores():
     active_score = {
         "rubric_id": "active-rubric",
@@ -185,28 +466,37 @@ def test_score_result_combines_active_bank_and_generated_scores():
     assert combined_errors == [{"rubric_id": "active-rubric", "error": "retry"}]
 
 
-def test_score_rubric_bank_keeps_active_rubrics_with_current_reward():
+def test_score_rubric_bank_uses_model_output_as_next_active_bank():
     bank = ScoreRubricBank(max_active_rubrics=2)
+    active = RubricRecord(
+        rubric_id="active-rubric",
+        title="Active",
+        direction="positive",
+        description="Existing active rubric.",
+        scale={str(i): str(i) for i in range(1, 6)},
+        weight=1,
+        source_round=0,
+        reward=None,
+    )
+    generated = RubricRecord(
+        rubric_id="generated-rubric",
+        title="Generated",
+        direction="positive",
+        description="Model-selected rubric.",
+        scale={str(i): str(i) for i in range(1, 6)},
+        weight=2,
+        source_round=1,
+        reward=None,
+    )
     bank.set_state(
-        active_bank=[
-            RubricRecord(
-                rubric_id="active-rubric",
-                title="Active",
-                direction="positive",
-                description="Existing active rubric.",
-                scale={str(i): str(i) for i in range(1, 6)},
-                weight=1,
-                source_round=0,
-                reward=None,
-            )
-        ],
+        active_bank=[active],
         inactive_bank=[],
     )
 
-    update = bank.update_after_round(generated=[], rewards={"active-rubric": 0.5})
+    update = bank.update_from_model(generated=[generated])
 
-    assert update.active_after[0].rubric_id == "active-rubric"
-    assert update.active_after[0].reward == 0.5
+    assert [rubric.rubric_id for rubric in update.active_after] == ["generated-rubric"]
+    assert [rubric.rubric_id for rubric in update.inactive_after] == ["active-rubric"]
 
 
 def test_patch_eval_manager_writes_error_payload_when_evaluation_raises(tmp_path):
@@ -270,7 +560,133 @@ def test_patch_eval_manager_writes_error_payload_when_evaluation_raises(tmp_path
     assert result["rubric_update_payloads"][0]["scope"] == "siblings"
 
 
-def test_rubric_scope_judges_active_bank_once_before_generated(monkeypatch):
+def test_rubric_base_artifacts_use_dedicated_message_files(tmp_path):
+    rubric_dir = tmp_path / "rubrics" / "siblings" / "rubric-r001-s00"
+    messages = [{"role": "assistant", "content": "{}"}]
+    retrieve_messages = [{"role": "assistant", "content": '{"titles": []}'}]
+    judge_messages = [
+        {
+            "node_id": "node-a",
+            "rubric_id": "rubric-1",
+            "messages": [{"role": "assistant", "content": '{"score": 4}'}],
+            "error": None,
+        }
+    ]
+    summary_messages = [{"role": "assistant", "content": '{"state": "ready"}'}]
+    bundle = RubricArtifactBundle(
+        rubric_dir=rubric_dir,
+        rubric_payload={"rubric_list_id": "rubric-r001-s00"},
+        messages_payload=messages,
+        retrieve_messages_payload=retrieve_messages,
+        judge_messages_payload=judge_messages,
+        summary_messages_payload=summary_messages,
+    )
+
+    _write_base_artifacts(rubric_bundles=[bundle])
+
+    assert json.loads((rubric_dir / "rubric_message.json").read_text()) == messages
+    assert json.loads((rubric_dir / "rubric_retrieve_message.json").read_text()) == retrieve_messages
+    assert json.loads((rubric_dir / "judge_message.json").read_text()) == judge_messages
+    assert json.loads((rubric_dir / "summary_message.json").read_text()) == summary_messages
+    assert not (rubric_dir / "messages.json").exists()
+
+
+def test_persistent_state_format_failure_reuses_parent_and_keeps_assistant_suffix(monkeypatch):
+    parent_state = {"current_state": "keep this"}
+
+    async def fake_route_completion_message(**kwargs):
+        return {
+            "role": "assistant",
+            "content": "no parseable object",
+            "content_no_thinking": "no parseable object",
+        }
+
+    monkeypatch.setattr(trajectory_search, "route_completion_message", fake_route_completion_message)
+    result = asyncio.run(
+        trajectory_search._update_persistent_state(
+            system_prompt="system",
+            user_prompt="task",
+            previous_state=parent_state,
+            evicted_step_cards=[{"step_index": 0}],
+            workspace_meta={},
+            model_name="dummy",
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=16,
+        )
+    )
+
+    assert result["state"] == parent_state
+    assert result["error"] == "InvalidPersistentStateResponse"
+    assert result["messages"][0]["role"] == "assistant"
+    assert all(message["content"] != "task" for message in result["messages"])
+
+
+def test_experience_retrieval_accepts_normalized_valid_subset(monkeypatch, tmp_path):
+    bank = ExperienceRubricBank(bank_path=tmp_path / "bank.json", scope="siblings", retrieve_top_k=2)
+    title = 'Do not reward "already fixed" conclusions'
+    bank.experiences = {
+        title: RubricExperience(
+            experience_id="exp-1",
+            title=title,
+            description="desc",
+            metadata={},
+            context="context",
+            experience="experience",
+        )
+    }
+    calls = []
+
+    async def fake_route_completion_message(**kwargs):
+        calls.append(kwargs)
+        return {
+            "role": "assistant",
+            "content": '{"titles": ["Do not reward ‘already fixed’ conclusions", "invented"]}',
+            "content_no_thinking": '{"titles": ["Do not reward ‘already fixed’ conclusions", "invented"]}',
+        }
+
+    monkeypatch.setattr("swe_agent.rubric_bank.route_completion_message", fake_route_completion_message)
+    retrieved, messages = asyncio.run(
+        bank._retrieve(
+            question={},
+            previous_state={},
+            latest_shared_segment=None,
+            continuations=[],
+            model_name="dummy",
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=16,
+            model_kwargs=None,
+        )
+    )
+
+    assert [item.title for item in retrieved] == [title]
+    assert len(calls) == 1
+    assert messages[-1]["role"] == "assistant"
+
+
+def test_experience_title_fuzzy_match_accepts_unique_containment_and_requires_a_clear_margin():
+    titles = [
+        "Avoid task-restatement rubrics for import normalization fixes",
+        "End-to-End Watcher Metrics, Not Utility-Only Progress",
+        "Require End-to-End Watcher Metrics, Not Buffer-Only Progress",
+    ]
+
+    assert _match_experience_title(
+        "Do not reward task-restatement rubrics for import normalization fixes",
+        titles,
+    ) == titles[0]
+    assert _match_experience_title(
+        "End-to-End Watcher Metrics, Not Buffer-Only Progress",
+        titles,
+    ) == titles[2]
+    assert _match_experience_title(
+        "End-to-End Watcher Metrics Progress",
+        titles,
+    ) is None
+
+
+def test_rubric_scope_only_judges_model_selected_rubrics(monkeypatch):
     active = RubricRecord(
         rubric_id="active-rubric",
         title="Active",
@@ -294,17 +710,7 @@ def test_rubric_scope_judges_active_bank_once_before_generated(monkeypatch):
     calls = []
 
     async def fake_score_round(**kwargs):
-        rubric_ids = [rubric.rubric_id for rubric in kwargs["rubrics"]]
-        calls.append(("score", rubric_ids))
-        if rubric_ids == ["active-rubric"]:
-            return (
-                [
-                    [{"rubric_id": "active-rubric", "score_normalized": 1.0}],
-                    [{"rubric_id": "active-rubric", "score_normalized": 0.0}],
-                ],
-                [],
-            )
-        raise AssertionError(f"Unexpected direct score call: {rubric_ids}")
+        raise AssertionError("Existing rubrics must be re-output by the model before judging")
 
     async def fake_generate_and_score_batch(**kwargs):
         calls.append(("generate", None))
@@ -361,10 +767,10 @@ def test_rubric_scope_judges_active_bank_once_before_generated(monkeypatch):
         )
     )
 
-    assert calls == [("score", ["active-rubric"]), ("generate", None)]
+    assert calls == [("generate", None)]
     sample = result["samples"][0]
-    assert sample["average_rubric_judged_scores"] == {"node-a": 0.5, "node-b": 0.0}
-    assert sample["active_after"][0].rubric_id == "active-rubric"
+    assert sample["average_rubric_judged_scores"] == {"node-a": 0.0, "node-b": 0.0}
+    assert sample["active_after"][0].rubric_id == "generated-rubric"
 
 
 def test_experience_bank_evidence_uses_average_judged_scores_and_does_not_write(tmp_path):
@@ -377,6 +783,7 @@ def test_experience_bank_evidence_uses_average_judged_scores_and_does_not_write(
             {
                 "rubric_id": "rubric-1",
                 "direction": "positive",
+                "weight": 1.0,
                 "title": "Semantic Fix",
                 "description": "Rewards a real fix.",
                 "metadata": {},
@@ -477,10 +884,293 @@ def test_trajectory_search_experience_updates_are_written_by_runner(tmp_path):
     assert sibling_message.exists()
     assert pc_bank.exists()
     assert not (tmp_path / "rubrics" / "siblings" / "round_001" / "rubric_bank.json").exists()
-    assert sorted(json.loads(sibling_bank.read_text())) == ["after", "before", "generated"]
-    assert runner.experience_banks["siblings"].seen_payloads[0]["messages"] == [
-        {"role": "user", "content": "siblings"}
+    assert sorted(json.loads(sibling_bank.read_text())) == ["actions", "after", "before"]
+    assert "messages" not in runner.experience_banks["siblings"].seen_payloads[0]
+    assert runner.experience_banks["siblings"].seen_payloads[0]["generation_context"] == {}
+
+
+def test_prompt_context_uses_compact_markdown():
+    rendered = render_compact_markdown(
+        {
+            "question": "line one\nline two",
+            "rubrics": [{"title": "Focused check", "weight": 1.0}],
+        }
+    )
+
+    assert "- **question**:" in rendered
+    assert "- **title**: Focused check" in rendered
+    assert '"question"' not in rendered
+    assert "\\n" not in rendered
+
+
+def test_search_defaults_to_search_outputs_and_tmp_logs():
+    args = build_arg_parser().parse_args([])
+
+    assert args.output_root.name == "search_outputs"
+    assert args.output_root.parent.name == "agent"
+    assert args.beam_size == 2
+
+
+def test_round_parent_selection_uses_same_depth_and_beam_size():
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    runner.search_config = SearchConfig(m=8, beam_size=2)
+    runner.frontier_ids = ["a", "b", "older"]
+    runner.nodes = {
+        node_id: SearchNode(
+            node_id=node_id,
+            parent_id="root",
+            round_index=1,
+            depth=depth,
+            session_id=node_id,
+            status="frontier",
+        )
+        for node_id, depth in (("a", 2), ("b", 2), ("older", 1))
+    }
+
+    assert runner._round_parent_ids() == ["a", "b"]
+    runner.search_config.beam_size = 1
+    assert runner._round_parent_ids() == ["a"]
+
+
+def test_beam_selection_generalizes_baseline_and_ablation_three_rules():
+    def branch(node_id, score, regressed):
+        return {"node_id": node_id, "score": score, "regressed_vs_parent": regressed}
+
+    branches = [
+        branch("valid-a", 0.8, False),
+        branch("valid-b", 0.7, False),
+        branch("valid-c", 0.6, False),
+        branch("regressed-a", 0.9, True),
+        branch("regressed-b", 0.5, True),
     ]
+    baseline = _select_beam_branches(
+        branches,
+        beam_width=1,
+        retention_limit=2,
+        strategy="best",
+    )
+    assert [item["node_id"] for item in baseline] == ["valid-a", "valid-b"]
+
+    paired = _select_beam_branches(
+        branches,
+        beam_width=2,
+        retention_limit=4,
+        strategy="best",
+    )
+    assert [item["node_id"] for item in paired] == ["valid-a", "valid-b"]
+
+    four_valid = _select_beam_branches(
+        [
+            branch("valid-a", 0.8, False),
+            branch("valid-b", 0.7, False),
+            branch("valid-c", 0.6, False),
+            branch("valid-d", 0.5, False),
+            branch("valid-e", 0.4, False),
+        ],
+        beam_width=2,
+        retention_limit=4,
+        strategy="best",
+    )
+    assert [item["node_id"] for item in four_valid] == [
+        "valid-a",
+        "valid-b",
+        "valid-c",
+        "valid-d",
+    ]
+
+    one_valid = _select_beam_branches(
+        [branches[0], branches[3], branches[4]],
+        beam_width=2,
+        retention_limit=4,
+        strategy="best",
+    )
+    assert [item["node_id"] for item in one_valid] == ["valid-a", "regressed-a"]
+    assert _select_beam_branches(
+        [branches[3], branches[4]],
+        beam_width=2,
+        retention_limit=4,
+        strategy="best",
+    ) == []
+
+
+def test_multi_parent_judging_context_maps_each_continuation_to_its_parent():
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    runner.search_config = SearchConfig(n=1)
+    runner.system_prompt = "system"
+    runner.task = "task"
+    runner.rubric_model_name = "rubric-model"
+    runner.judge_model_name = "judge-model"
+    runner.rubric_model_kwargs = {}
+    runner.judge_model_kwargs = {}
+    runner.score_banks = {"siblings": None, "pc": None}
+    runner.experience_banks = {"siblings": None, "pc": None}
+    runner._node_judge_cache = {}
+    captured = []
+
+    async def fake_scope_judging(**kwargs):
+        captured.append(kwargs)
+        sample = {
+            "sample_index": 0,
+            "selected": False,
+            "average_rubric_judged_scores": {
+                branch["node_id"]: 0.5 for branch in kwargs["continuations"]
+            },
+        }
+        return {"scope": kwargs["scope_spec"]["scope"], "samples": [sample], "valid_samples": [sample]}
+
+    runner._run_rubric_scope_judging = fake_scope_judging
+    parent_contexts = []
+    branches = []
+    for parent_index in (1, 2):
+        parent_id = f"parent-{parent_index}"
+        parent_contexts.append(
+            {
+                "node": SearchNode(
+                    node_id=parent_id,
+                    parent_id="root",
+                    round_index=1,
+                    depth=1,
+                    session_id=parent_id,
+                    status="frontier",
+                ),
+                "judge": {
+                    "persistent_state": {"current_state": f"state-{parent_index}"},
+                    "recent_segments": [
+                        {"step_cards": [{"step_index": parent_index}], "segment_step_range": [0, 1]}
+                    ],
+                },
+            }
+        )
+        for child_index in (1, 2):
+            branches.append(
+                {
+                    "node_id": f"child-{parent_index}-{child_index}",
+                    "parent_id": parent_id,
+                    "recent_segments": [
+                        {"step_cards": [{"step_index": child_index}], "segment_step_range": [1, 2]}
+                    ],
+                    "workspace_meta": {},
+                    "result": {},
+                }
+            )
+
+    asyncio.run(
+        runner._prepare_round_judging(
+            parent_contexts=parent_contexts,
+            branch_records=branches,
+            round_index=2,
+            compare_parent=True,
+        )
+    )
+
+    context = captured[0]["shared_context"]
+    assert [item["continuations"] for item in context["previous_persistent_state"]["parent_states"]] == [
+        "1-2",
+        "3-4",
+    ]
+    assert [item["parent_index"] for item in captured[0]["continuations"]] == [1, 1, 2, 2]
+    rendered_state = trajectory_search._render_persistent_state(context["previous_persistent_state"])
+    assert "### Persistent State of Parent 1 (Continuations 1-2)" in rendered_state
+    assert "### Persistent State of Parent 2 (Continuations 3-4)" in rendered_state
+    assert "parent_states" not in rendered_state
+    rendered = trajectory_search._render_trajectory_segment(context["latest_agent_trajectory"])
+    assert "Parent 1 (Continuations 1-2)" in rendered
+    assert "Parent 2 (Continuations 3-4)" in rendered
+
+
+def test_duplicate_rubrics_are_judged_and_weighted_once(monkeypatch):
+    rubric = RubricRecord(
+        rubric_id="same-rubric",
+        title="Same",
+        direction="positive",
+        description="Same criterion.",
+        scale={str(index): str(index) for index in range(1, 6)},
+        weight=1.0,
+        source_round=1,
+    )
+    other = RubricRecord(
+        rubric_id="other-rubric",
+        title="Other",
+        direction="positive",
+        description="Other criterion.",
+        scale={str(index): str(index) for index in range(1, 6)},
+        weight=1.0,
+        source_round=1,
+    )
+    judged_rubrics = []
+
+    async def fake_generate(**kwargs):
+        return trajectory_search.RubricGenerationSample(
+            sample_index=0,
+            rubric_list_id="rubric-r001-s00",
+            generated=[rubric, rubric, other],
+            messages=[],
+        )
+
+    async def fake_score(**kwargs):
+        judged_rubrics.extend(kwargs["rubrics"])
+        return ([[]], [])
+
+    monkeypatch.setattr(trajectory_search, "_generate_round_rubrics", fake_generate)
+    monkeypatch.setattr(trajectory_search, "_score_round", fake_score)
+    result = asyncio.run(
+        _generate_and_score_rubric_batch(
+            sample_count=1,
+            round_index=1,
+            generation_kwargs={},
+            generation_prompt="generate",
+            rubric_list_prefix="rubric",
+            question={},
+            shared_context={"previous_persistent_state": {}, "latest_agent_trajectory": None},
+            continuations=[{"node_id": "node"}],
+            extra_prompt_sections=[],
+            judge_kwargs={},
+        )
+    )
+
+    assert [item.rubric_id for item in judged_rubrics] == ["same-rubric", "other-rubric"]
+    assert [item.rubric_id for item in result["sample_generated_rubrics"][0]] == [
+        "same-rubric",
+        "other-rubric",
+    ]
+    scores = {"node": {"same-rubric": 1.0, "other-rubric": 0.0}}
+    assert _avg_scores_from_rubrics(
+        node_ids=["node"],
+        score_lookup_by_node=scores,
+        rubrics=[rubric, rubric, other],
+    ) == {"node": 0.5}
+    assert _pc_avg_scores_from_rubrics(
+        node_ids=["node"],
+        score_lookup_by_node=scores,
+        rubrics=[rubric, rubric, other],
+    ) == {"node": 0.5}
+
+
+def test_rubric_artifact_payload_excludes_all_message_fields():
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    sample = {
+        "rubric_list_id": "rubric-r001-s00",
+        "round_index": 1,
+        "generated": [],
+        "format_errors": [],
+        "terminal_error": None,
+        "variance_by_rubric": {},
+        "redundency_by_rubric": {},
+        "judge_error_by_rubric": {},
+        "reward_by_rubric": {},
+        "judge_errors": [],
+        "retrieved": [],
+        "retrieve_messages": [{"role": "user", "content": "retrieve"}],
+        "messages": [{"role": "user", "content": "generate"}],
+        "score_by_rubric": {},
+        "average_rubric_judged_scores": {},
+        "generated_titles": [],
+        "selected": False,
+    }
+
+    payload = runner._rubric_artifact_payload(sample, "root")
+
+    assert not any("message" in key for key in payload)
 
 
 def test_search_runner_flushes_final_root_experience_bank_summary(tmp_path):

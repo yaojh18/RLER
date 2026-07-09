@@ -8,7 +8,9 @@ import math
 import os
 import random
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -35,6 +37,7 @@ from swe_agent.parallel_utils import (
     RubricArtifactBundle,
     _atomic_write_json,
     gap_redundancy,
+    messages_from_first_assistant,
     rubric_score_record,
 )
 from swe_agent.run.run_swe_agent import build_messages, evaluate_swebench_instance_patches, make_evaluation_payload
@@ -48,6 +51,7 @@ from swe_agent.rubric_bank import (
     ScoreRubricBank,
     _convert_rubric_item,
     _truncate_middle,
+    render_compact_markdown,
 )
 
 
@@ -70,6 +74,7 @@ class SearchConfig:
     n: int = 1
     k: int = 20
     p: int = 1
+    beam_size: int = 2
     max_rounds: int = 5
     step_limit: int = 100
     max_active_rubrics: int = 6
@@ -89,6 +94,7 @@ class SearchConfig:
     write_artifacts: bool = True
     strategy: Literal["best", "probability", "random"] = "best"
     rubric_bank_strategy: Literal["score", "experience", "both"] = "score"
+    update_experience_bank: bool = False
 
 
 @dataclass
@@ -232,6 +238,16 @@ def _render_step_cards(step_cards: list[dict[str, Any]]) -> str:
 def _render_trajectory_segment(segment: dict[str, Any] | None) -> str:
     if not segment:
         return "None"
+    if segment.get("parent_views"):
+        return "\n\n".join(
+            "\n".join(
+                [
+                    f"### Parent {parent['parent_index']} (Continuations {parent['continuations']})",
+                    _render_trajectory_segment(parent.get("trajectory")),
+                ]
+            )
+            for parent in segment["parent_views"]
+        )
     parts: list[str] = []
     step_range = segment.get("segment_step_range")
     if isinstance(step_range, list) and len(step_range) == 2:
@@ -240,13 +256,33 @@ def _render_trajectory_segment(segment: dict[str, Any] | None) -> str:
     return "\n\n".join(parts)
 
 
+def _render_persistent_state(state: dict[str, Any] | None) -> str:
+    if not state or not state.get("parent_states"):
+        return render_compact_markdown(state)
+    return "\n\n".join(
+        "\n".join(
+            [
+                (
+                    f"### Persistent State of Parent {parent['parent_index']} "
+                    f"(Continuations {parent['continuations']})"
+                ),
+                render_compact_markdown(parent.get("state")),
+            ]
+        )
+        for parent in state["parent_states"]
+    )
+
+
 def _render_continuation_view(continuation: dict[str, Any]) -> str:
-    parts = [
+    parts = []
+    if continuation.get("parent_index") is not None:
+        parts.append(f"Parent: {continuation['parent_index']}")
+    parts.extend([
         "Summary:",
-        json.dumps(continuation.get("summary", {}), indent=2, ensure_ascii=False),
+        render_compact_markdown(continuation.get("summary", {})),
         "Trajectory:",
         _render_trajectory_segment(continuation.get("trajectory_continuation")),
-    ]
+    ])
     if continuation.get("note"):
         parts.extend(["Note:", str(continuation["note"])])
     return "\n".join(parts)
@@ -366,14 +402,14 @@ async def _update_persistent_state(
     model_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if evicted_step_cards is None:
-        return {"state": copy.deepcopy(previous_state), "messages": []}
+        return {"state": copy.deepcopy(previous_state), "messages": [], "error": None}
     prompt = "\n\n".join(
         [
             PERSISTENT_STATE_UPDATE_PROMPT.strip(),
             f"\n\n## Question:\n System Prompt:\n{system_prompt}\n User Prompt:\n{user_prompt}",
-            f"## Previous Persistent State:\n{json.dumps(previous_state, indent=2, ensure_ascii=False)}",
+            f"## Previous Persistent State:\n{_render_persistent_state(previous_state)}",
             f"## Evicted Older Trajectory:\n{_render_step_cards(evicted_step_cards)}",
-            f"## Workspace Metadata:\n{json.dumps(workspace_meta, indent=2, ensure_ascii=False)}",
+            f"## Workspace Metadata:\n{render_compact_markdown(workspace_meta)}",
         ]
     )
     messages = [{"role": "user", "content": prompt}]
@@ -397,30 +433,84 @@ async def _update_persistent_state(
         response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
         messages.append(assistant_message)
         parsed = _parse_persistent_state_response(response)
+        full_response = assistant_message.get("content") or ""
+        if parsed is None and full_response != response:
+            parsed = _parse_persistent_state_response(full_response)
         if parsed is not None:
-            return {"state": parsed, "messages": copy.deepcopy(messages)}
+            return {
+                "state": {**copy.deepcopy(previous_state), **parsed},
+                "messages": messages_from_first_assistant(messages),
+                "error": None,
+            }
         messages.append(
             {
                 "role": "user",
                 "content": STRUCTURED_SUMMARY_FORMAT_CORRECTION_PROMPT.strip(),
             }
         )
-    raise ValueError("InvalidPersistentStateResponse")
+    return {
+        "state": copy.deepcopy(previous_state),
+        "messages": messages_from_first_assistant(messages),
+        "error": "InvalidPersistentStateResponse",
+    }
 
 
 def _parse_judge_score(response: str) -> int | None:
     parsed = extract_last_json_object(response)
-    if not isinstance(parsed, dict) or "score" not in parsed:
+    score = None
+    if isinstance(parsed, dict):
+        for key in ("score", "judged_score", "rating"):
+            if key in parsed:
+                score = parsed[key]
+                break
+    if score is None:
+        matches = re.findall(
+            r"(?im)^\s*(?:final\s+)?score\s*[:=]\s*([1-5](?:\.0)?(?:\s*/\s*5)?)\s*$",
+            response,
+        )
+        if len(matches) == 1:
+            score = matches[0]
+    if isinstance(score, bool):
         return None
-    score = parsed.get("score")
-    if isinstance(score, bool) or not isinstance(score, int):
+    if isinstance(score, str):
+        score = score.strip()
+        match = re.fullmatch(r"([1-5])(?:\.0)?(?:\s*/\s*5)?", score)
+        if match is None:
+            return None
+        score = int(match.group(1))
+    elif isinstance(score, float):
+        if not score.is_integer():
+            return None
+        score = int(score)
+    if not isinstance(score, int):
         return None
     return score if 1 <= score <= 5 else None
 
 
 def _parse_persistent_state_response(response: str) -> dict[str, Any] | None:
     parsed = extract_last_json_object(response)
-    return parsed if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict):
+        return None
+    for wrapper_key in ("persistent_state", "summary", "state"):
+        if isinstance(parsed.get(wrapper_key), dict):
+            parsed = parsed[wrapper_key]
+            break
+    expected = set(EMPTY_PERSISTENT_STATE)
+    normalized = {
+        re.sub(r"[^a-z0-9]+", "_", str(key).strip().casefold()).strip("_"): value
+        for key, value in parsed.items()
+    }
+    present = expected.intersection(normalized)
+    if not present:
+        return None
+    state = {}
+    for key in present:
+        value = normalized[key]
+        if isinstance(value, str):
+            state[key] = value
+        elif value is not None:
+            state[key] = render_compact_markdown(value)
+    return state
 
 
 async def _generate_round_rubrics(
@@ -440,14 +530,14 @@ async def _generate_round_rubrics(
     generation_prompt: str = SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
     continue_prompt: str = RUBRIC_GENERATION_CONTINUE_PROMPT,
     rubric_list_prefix: str = "rubric",
-    require_first_rubric: bool = False,
+    require_first_rubric: bool = True,
 ) -> RubricGenerationSample:
     latest_shared_segment_text = _render_trajectory_segment(latest_shared_segment)
     prompt_parts = [
         generation_prompt.strip(),
         f"\n\n## Question:\nSystem Prompt:\n{question.get('system_prompt', '')}",
         f"\nUser Prompt:\n{question.get('user_prompt', '')}",
-        f"\n## Previous Persistent State:\n{json.dumps(previous_state, ensure_ascii=False, indent=2)}",
+        f"\n## Previous Persistent State:\n{_render_persistent_state(previous_state)}",
         f"\n## Parent Trajectory:\n{latest_shared_segment_text}\n",
     ]
     prompt_parts.append("## Agent Trajectory Continuations:")
@@ -496,40 +586,40 @@ async def _generate_round_rubrics(
         assistant_content = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
         conversation_messages.append(assistant_message)
         parsed_candidate = extract_last_json_object(assistant_content)
+        full_response = assistant_message.get("content") or ""
+        if full_response != assistant_content:
+            full_candidate = extract_last_json_object(full_response)
+            if parsed_candidate is None or (
+                isinstance(full_candidate, dict)
+                and _convert_rubric_item(task_text, full_candidate, round_index) is not None
+            ):
+                parsed_candidate = full_candidate
         if parsed_candidate == {}:
             if require_first_rubric and not generated:
-                last_error = "Expected one complete rubric before returning {}."
+                last_error = "You returned {} before generating any rubric."
             else:
                 break
         elif parsed_candidate is None:
             last_error = "Expected a JSON object or {}, but no JSON object could be parsed."
-        elif not {"polarity", "weight", "title", "description", "metadata", "scale"}.issubset(parsed_candidate):
-            last_error = "Expected polarity, weight, title, description, metadata, and scale fields."
         else:
             parsed = _convert_rubric_item(task_text, parsed_candidate, round_index)
             if parsed is None:
                 last_error = (
-                    "Expected a rubric object with polarity, positive weight, title, description, metadata, "
+                    "Expected a JSON rubric object with polarity, positive weight, title, description, metadata, "
                     "and a 1-5 scale."
                 )
         if parsed is None:
             format_errors.append({"turn_index": turn_index, "error": last_error})
-            conversation_messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        last_error
-                        + " Follow the output format example above. The final JSON must contain polarity, positive weight, title, "
-                        + "description, metadata, and scale fields, or contain {} only after at least "
-                        + f"one complete rubric has been generated. {continue_prompt}"
-                    ),
-                }
+            correction = (
+                last_error
+                + " Follow the output format example above. You must return at least one complete rubric object with polarity, positive weight, "
+                + "title, description, metadata, and scale. Existing rubrics are not reused automatically; to reuse one, "
+                + "output its full rubric object now."
             )
+            conversation_messages.append({"role": "user", "content": correction})
             turn_index += 1
             continue
         generated.append(parsed)
-        if require_first_rubric:
-            break
         if len(generated) >= MAX_RUBRICS:
             length_error = f"Reached max rubrics={MAX_RUBRICS}."
             break
@@ -587,7 +677,7 @@ async def _score_round(
                     "Scale:",
                     *[f"{score}: {judge_rubric['scale'][str(score)]}" for score in range(1, 6)],
                     "Metadata:",
-                    json.dumps(judge_rubric["metadata"], indent=2, ensure_ascii=False),
+                    render_compact_markdown(judge_rubric["metadata"]),
                 ]
             )
 
@@ -595,17 +685,16 @@ async def _score_round(
                 *,
                 response_text: str = response_text,
                 criterion: str = criterion,
-            ) -> tuple[int, str | None, dict[str, Any]]:
+            ) -> tuple[int, str | None, list[dict[str, Any]]]:
                 prompt_parts = [
                     judge_prompt.strip(),
                     f"\n\n## Question:\n{question_text}\n",
-                    f"## Previous Persistent State:\n{shared_context.get('previous_persistent_state')}\n",
+                    f"## Previous Persistent State:\n{_render_persistent_state(shared_context.get('previous_persistent_state'))}\n",
                     f"## Parent Trajectory:\n{parent_trajectory_text}\n",
                     f"## Continuation Trajectory:\n{response_text}\n",
                     f"## Criterion:\n{criterion}",
                 ]
                 messages = [{"role": "user", "content": "".join(prompt_parts)}]
-                last_message: dict[str, Any] | None = None
                 try:
                     for _ in range(MAX_FORMAT_CORRECTION_ROUNDS):
                         async for attempt in retry(
@@ -624,12 +713,14 @@ async def _score_round(
                                     max_tokens=max_tokens,
                                     model_kwargs=freeform_thought_model_kwargs(model_kwargs),
                                 )
-                        last_message = assistant_message
                         messages.append(assistant_message)
                         response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
                         score_raw = _parse_judge_score(response)
+                        full_response = assistant_message.get("content") or ""
+                        if score_raw is None and full_response != response:
+                            score_raw = _parse_judge_score(full_response)
                         if score_raw is not None:
-                            return score_raw, None, assistant_message
+                            return score_raw, None, messages_from_first_assistant(messages)
                         messages.append(
                             {
                                 "role": "user",
@@ -637,22 +728,16 @@ async def _score_round(
                             }
                         )
                 except Exception:
-                    return 1, "InvalidJudgeResponse", last_message or {
-                        "role": "assistant",
-                        "content": "",
-                    }
-                return 1, "InvalidJudgeResponse", last_message or {
-                    "role": "assistant",
-                    "content": "",
-                }
+                    return 1, "InvalidJudgeResponse", messages_from_first_assistant(messages)
+                return 1, "InvalidJudgeResponse", messages_from_first_assistant(messages)
             calls.append(_judge_single())
             mapping.append((view_index, node_id, rubric))
     responses = await asyncio.gather(*calls)
     per_view_scores: list[list[dict[str, Any]]] = [[] for _ in continuations]
     errors: list[dict[str, str]] = []
     for (view_index, node_id, rubric), response in zip(mapping, responses):
-        score_raw, error, judge_message = response
-        record = rubric_score_record(rubric, score_raw, judge_message)
+        score_raw, error, judge_messages = response
+        record = rubric_score_record(rubric, score_raw, judge_messages)
         per_view_scores[view_index].append(record)
         if error is not None:
             errors.append(
@@ -678,7 +763,7 @@ async def _generate_and_score_rubric_batch(
     extra_prompt_sections: list[str],
     judge_kwargs: dict[str, Any],
     judge_prompt: str = SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
-    require_first_rubric: bool = False,
+    require_first_rubric: bool = True,
 ) -> dict[str, Any]:
     generated_samples = await asyncio.gather(
         *[
@@ -699,16 +784,10 @@ async def _generate_and_score_rubric_batch(
         ],
     )
 
-    sample_generated_rubrics: list[list[RubricRecord]] = []
-    for generated_sample in generated_samples:
-        seen_rubric_ids: set[str] = set()
-        generated_rubrics: list[RubricRecord] = []
-        for rubric in generated_sample.generated:
-            if rubric.rubric_id in seen_rubric_ids:
-                continue
-            seen_rubric_ids.add(rubric.rubric_id)
-            generated_rubrics.append(rubric)
-        sample_generated_rubrics.append(generated_rubrics)
+    sample_generated_rubrics = [
+        _deduplicate_rubrics(generated_sample.generated)
+        for generated_sample in generated_samples
+    ]
 
     generated_score_tasks: dict[int, asyncio.Task] = {
         sample_index: asyncio.create_task(
@@ -844,12 +923,24 @@ def _rubric_metrics_payload(metrics: dict[str, Any], include_ids: set[str]) -> d
     }
 
 
+def _deduplicate_rubrics(rubrics: list[RubricRecord]) -> list[RubricRecord]:
+    seen_rubric_ids: set[str] = set()
+    unique_rubrics: list[RubricRecord] = []
+    for rubric in rubrics:
+        if rubric.rubric_id in seen_rubric_ids:
+            continue
+        seen_rubric_ids.add(rubric.rubric_id)
+        unique_rubrics.append(rubric)
+    return unique_rubrics
+
+
 def _avg_scores_from_rubrics(
     *,
     node_ids: list[str],
     score_lookup_by_node: dict[str, dict[str, float]],
     rubrics: list[RubricRecord],
 ) -> dict[str, float]:
+    rubrics = _deduplicate_rubrics(rubrics)
     if not rubrics:
         return {node_id: 0.0 for node_id in node_ids}
     normalized_weights = _normalized_weight_by_rubric(rubrics)
@@ -871,6 +962,7 @@ def _pc_avg_scores_from_rubrics(
     score_lookup_by_node: dict[str, dict[str, float]],
     rubrics: list[RubricRecord],
 ) -> dict[str, float]:
+    rubrics = _deduplicate_rubrics(rubrics)
     if not rubrics:
         return {node_id: 0.5 for node_id in node_ids}
     normalized_weights = _normalized_weight_by_rubric(rubrics)
@@ -938,6 +1030,39 @@ def _sample_by_strategy(
     return [items[i] for i in indices]
 
 
+def _select_beam_branches(
+    branches: list[dict[str, Any]],
+    *,
+    beam_width: int,
+    retention_limit: int,
+    strategy: str,
+) -> list[dict[str, Any]]:
+    non_regressed = [branch for branch in branches if not branch["regressed_vs_parent"]]
+    if not non_regressed or retention_limit <= 0:
+        return []
+    keep_count = min(retention_limit, len(non_regressed))
+    if keep_count >= beam_width:
+        keep_count -= keep_count % beam_width
+    selected = _sample_by_strategy(
+        non_regressed,
+        [branch["score"] for branch in non_regressed],
+        count=keep_count,
+        strategy=strategy,
+    )
+    target_width = min(beam_width, retention_limit)
+    if len(selected) < target_width:
+        regressed = [branch for branch in branches if branch["regressed_vs_parent"]]
+        selected.extend(
+            _sample_by_strategy(
+                regressed,
+                [branch["score"] for branch in regressed],
+                count=target_width - len(selected),
+                strategy="best",
+            )
+        )
+    return selected
+
+
 def _docker_commit(
     executable: str,
     container_id: str,
@@ -964,12 +1089,27 @@ def _docker_commit(
     return image_tag, image_id
 
 
+def _container_environment_kind(environment_class: str) -> Literal["docker", "singularity"]:
+    normalized = environment_class.strip().lower()
+    if normalized == "docker" or normalized.endswith(".dockerenvironment"):
+        return "docker"
+    if normalized == "singularity" or normalized.endswith(".singularityenvironment"):
+        return "singularity"
+    raise ValueError(f"Trajectory search requires a Docker or Singularity environment, got {environment_class!r}")
+
+
 def _resume_snapshot_payload(
     snapshot: dict[str, Any],
     *,
     image_tag: str,
     image_id: str,
 ) -> dict[str, Any]:
+    environment_kind = _container_environment_kind(snapshot["environment"]["type_path"])
+    environment_state = (
+        {"owns_container": True}
+        if environment_kind == "docker"
+        else {"owns_sandbox": True}
+    )
     payload = {
         "session_id": snapshot["session_id"],
         "status": snapshot["status"],
@@ -982,7 +1122,7 @@ def _resume_snapshot_payload(
                 **copy.deepcopy(snapshot["environment"]["config"]),
                 "image": image_tag,
             },
-            "state": {"owns_container": True},
+            "state": environment_state,
         },
         "last_step_index": snapshot.get("last_step_index", -1),
         "last_event_id": None,
@@ -1032,16 +1172,25 @@ class TrajectorySearchRunner:
         self.task_id = instance["instance_id"]
         self.run_id = f"{self.task_id}-{time.strftime('%Y%m%d-%H%M%S')}"
         self.base_image = str(self.backend.environment_config.get("image", ""))
-        self.docker_executable = str(self.backend.environment_config.get("executable", "docker"))
+        self.environment_class = _container_environment_kind(
+            str(self.backend.environment_config.get("environment_class", "docker"))
+        )
+        self.docker_executable = str(
+            self.backend.environment_config.get("executable")
+            or os.environ.get("MSWEA_DOCKER_EXECUTABLE", "docker")
+        )
         self.manifest_path = self.run_dir / "run_manifest.json"
         self.node_index_path = self.run_dir / "node_index.jsonl"
-        base_image_lookup = subprocess.run(
-            [self.docker_executable, "image", "inspect", self.base_image, "--format", "{{.Id}}"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.base_image_id = base_image_lookup.stdout.strip() or None if base_image_lookup.returncode == 0 else None
+        if self.environment_class == "singularity":
+            self.base_image_id = None
+        else:
+            base_image_lookup = subprocess.run(
+                [self.docker_executable, "image", "inspect", self.base_image, "--format", "{{.Id}}"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.base_image_id = base_image_lookup.stdout.strip() or None if base_image_lookup.returncode == 0 else None
         self.nodes: dict[str, SearchNode] = {}
         self.frontier_ids: list[str] = []
         uses_experience_bank = self.search_config.rubric_bank_strategy in {"experience", "both"}
@@ -1125,14 +1274,17 @@ class TrajectorySearchRunner:
             if self.resume and self.manifest_path.exists():
                 self._load_manifest()
             else:
-                self._initialize_root()            
+                self._initialize_root()
             while self.current_round < self.search_config.max_rounds:
                 if self.frontier_ids and self.nodes[self.frontier_ids[0]].status == "finished":
                     break
                 if len(self.frontier_ids) == 0:
                     break
+                parent_ids = self._round_parent_ids()
+                if not parent_ids:
+                    break
                 self.current_round += 1
-                round_rubric_records = self._run_round(self.frontier_ids[0], self.current_round)
+                round_rubric_records = self._run_round(parent_ids, self.current_round)
                 if any(bank is not None for bank in self.experience_banks.values()):
                     rubric_update_records.extend(round_rubric_records)
                 self._save_manifest()
@@ -1140,9 +1292,11 @@ class TrajectorySearchRunner:
             patch_eval_payloads = []
             if self.patch_eval_manager is not None:
                 patch_eval_payloads = self.patch_eval_manager.wait()
-            if not self.peaceful_exit_triggered:
+            if self.search_config.update_experience_bank and not self.peaceful_exit_triggered:
                 self._update_experience_banks(rubric_update_records, patch_eval_payloads)
-            elif any(bank is not None for bank in self.experience_banks.values()):
+            elif self.search_config.update_experience_bank and any(
+                bank is not None for bank in self.experience_banks.values()
+            ):
                 logger.warning(
                     "Skipping experience bank update for %s because peaceful_exit was triggered.",
                     self.task_id,
@@ -1152,12 +1306,22 @@ class TrajectorySearchRunner:
             if self.patch_eval_manager is not None:
                 self.patch_eval_manager.close()
             self.artifact_writer.close()
-            self._sweep_checkpoint_images()
+            self._sweep_checkpoint_images(remove_all=True)
             if self.nodes:
                 self._save_manifest()
             while self._manifest_futures:
                 self._manifest_futures.pop(0).result()
             self._manifest_executor.shutdown(wait=True, cancel_futures=False)
+
+    def _round_parent_ids(self) -> list[str]:
+        first_parent = self.nodes[self.frontier_ids[0]]
+        parent_limit = min(self.search_config.beam_size, self.search_config.m)
+        return [
+            node_id
+            for node_id in self.frontier_ids
+            if self.nodes[node_id].depth == first_parent.depth
+            and self.nodes[node_id].status == "frontier"
+        ][:parent_limit]
 
 
     def _update_experience_banks(
@@ -1192,7 +1356,7 @@ class TrajectorySearchRunner:
                         {},
                     ),
                     "round_index": int(record["round_index"]),
-                    "messages": copy.deepcopy(record["messages"]),
+                    "generation_context": copy.deepcopy(record.get("generation_context", {})),
                 }
                 for record in rubric_update_records
                 if record.get("scope") == spec["scope"] and isinstance(record.get("rubric_payload"), dict)
@@ -1339,6 +1503,12 @@ class TrajectorySearchRunner:
 
     def _dispose_session(self, session: Any) -> None:
         env = getattr(session.agent, "env", None)
+        if env is None:
+            return
+        if self.environment_class == "singularity":
+            if hasattr(env, "cleanup"):
+                env.cleanup()
+            return
         container_id = getattr(env, "container_id", None)
         if container_id:
             subprocess.run([self.docker_executable, "rm", "-f", container_id], check=False, capture_output=True, text=True)
@@ -1346,14 +1516,60 @@ class TrajectorySearchRunner:
             setattr(env, "container_id", None)
             setattr(env, "_owns_container", False)
 
-    def _sweep_checkpoint_images(self) -> None:
-        keep_tags = {
+    def _checkpoint_environment(self, session: Any, image_tag: str) -> tuple[str, str]:
+        env = session.agent.env
+        if self.environment_class == "docker":
+            container_id = getattr(env, "container_id", None)
+            if not container_id:
+                raise RuntimeError("Docker trajectory-search session has no container_id to checkpoint")
+            return _docker_commit(
+                self.docker_executable,
+                container_id,
+                image_tag,
+            )
+        sandbox_dir = getattr(env, "sandbox_dir", None)
+        if sandbox_dir is None:
+            raise RuntimeError("Singularity trajectory-search session has no sandbox_dir to checkpoint")
+        source = Path(sandbox_dir)
+        if not source.is_dir():
+            raise FileNotFoundError(f"Singularity sandbox does not exist: {source}")
+        safe_task_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in self.task_id)[:80]
+        destination = Path(tempfile.gettempdir()) / f"swe-agent-{safe_task_id}-{uuid.uuid4().hex[:6]}"
+        destination.mkdir(parents=True, exist_ok=False)
+        try:
+            subprocess.run(
+                ["cp", "-a", "--reflink=auto", f"{source}/.", str(destination)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
+        return str(destination), ""
+
+    def _sweep_checkpoint_images(self, *, remove_all: bool = False) -> None:
+        keep_tags = set() if remove_all else {
             image_tag
             for node_id in self.frontier_ids
             if node_id in self.nodes
             for image_tag in [((self._node_snapshot_cache.get(node_id) or {}).get("metadata", {}) or {}).get("checkpoint_image_tag")]
             if image_tag and image_tag != self.base_image
         }
+        checkpoint_tags = {
+            image_tag
+            for snapshot in self._node_snapshot_cache.values()
+            for image_tag in [((snapshot.get("metadata", {}) or {}).get("checkpoint_image_tag"))]
+            if image_tag and image_tag != self.base_image
+        }
+        if self.environment_class == "singularity":
+            for sandbox_tag in checkpoint_tags - keep_tags:
+                sandbox_path = Path(sandbox_tag)
+                if not sandbox_path.is_absolute():
+                    logger.warning("Skipping non-absolute Singularity checkpoint path: %s", sandbox_tag)
+                    continue
+                shutil.rmtree(sandbox_path, ignore_errors=True)
+            return
         listed = subprocess.run(
             [self.docker_executable, "image", "ls", self.image_repository, "--format", "{{.Repository}}:{{.Tag}}"],
             check=False,
@@ -1402,12 +1618,11 @@ class TrajectorySearchRunner:
         messages = snapshot["agent"]["state"].get("messages", [])
         self.system_prompt = messages[0].get("content", "") if messages else ""
         self.user_prompt = messages[1].get("content", "") if len(messages) > 1 else self.task
-        initial_task_text = "\n\n".join(part for part in [self.system_prompt, self.user_prompt] if part)  
         root_rubric_round = {"generated": []}
         if self.experience_bank is not None:
             root_rubric_round["retrieved"] = []
         if self.rubric_bank is not None:
-            self.rubric_bank.initialize(initial_task_text or self.task)
+            self.rubric_bank.set_state(active_bank=[], inactive_bank=[])
             root_rubric_round.update(
                 {
                     "active_bank_before": [],
@@ -1416,7 +1631,7 @@ class TrajectorySearchRunner:
                 }
             )
         if self.pc_rubric_bank is not None:
-            self.pc_rubric_bank.initialize(initial_task_text or self.task)
+            self.pc_rubric_bank.set_state(active_bank=[], inactive_bank=[])
             root_rubric_round.update(
                 {
                     "pc_active_bank_before": [],
@@ -1479,6 +1694,7 @@ class TrajectorySearchRunner:
                 "judge_prompt": SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
                 "rubric_list_prefix": "rubric",
                 "include_variance_reward": True,
+                "require_first_rubric": True,
             }
         ]
         if compare_parent:
@@ -1491,6 +1707,7 @@ class TrajectorySearchRunner:
                     "judge_prompt": PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
                     "rubric_list_prefix": "pc-rubric",
                     "include_variance_reward": False,
+                    "require_first_rubric": True,
                 }
             )
         return specs
@@ -1512,13 +1729,13 @@ class TrajectorySearchRunner:
         score_bank = scope_spec["score_bank"]
         experience_bank = scope_spec["experience_bank"]
         extra_prompt_sections: list[str] = []
+        existing_rubrics = []
         retrieved_experiences = []
         retrieve_messages: list[dict[str, Any]] = []
-        active_bank_rubrics: list[RubricRecord] = []
         if score_bank is not None:
             score_context = score_bank.build_generation_context()
-            active_bank_rubrics = copy.deepcopy(score_context.existing_rubrics)
             extra_prompt_sections.extend(score_context.extra_prompt_sections)
+            existing_rubrics = copy.deepcopy(score_context.existing_rubrics)
         if experience_bank is not None:
             experience_context = await experience_bank.build_generation_context(
                 question=question,
@@ -1535,17 +1752,14 @@ class TrajectorySearchRunner:
             retrieved_experiences = copy.deepcopy(experience_context.retrieved)
             retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
         extra_prompt_sections.extend(section for section in scope_spec.get("extra_prompt_sections", []) if section)
-
-        active_score_result = None
-        if active_bank_rubrics:
-            active_score_result = await _score_round(
-                question=question,
-                shared_context=shared_context,
-                continuations=continuations,
-                rubrics=active_bank_rubrics,
-                **judge_kwargs,
-                judge_prompt=scope_spec["judge_prompt"],
-            )
+        generation_context = {
+            "question": copy.deepcopy(question),
+            "previous_state": copy.deepcopy(previous_state),
+            "latest_shared_segment": copy.deepcopy(latest_shared_segment),
+            "continuations": copy.deepcopy(continuations),
+            "retrieved_rubric_experiences": [asdict(experience) for experience in retrieved_experiences],
+            "previous_generated_rubrics": [asdict(rubric) for rubric in existing_rubrics],
+        }
 
         score_batch = await _generate_and_score_rubric_batch(
             sample_count=self.search_config.n,
@@ -1566,14 +1780,10 @@ class TrajectorySearchRunner:
         valid_rubric_samples: list[dict[str, Any]] = []
         for sample_index, generated_sample in enumerate(score_batch["generated_samples"]):
             generated_rubrics = score_batch["sample_generated_rubrics"][sample_index]
-            scoring_rubrics = active_bank_rubrics + generated_rubrics
+            scoring_rubrics = generated_rubrics
             combined_score_batch = {
                 "generated_score_results": {
-                    sample_index: _combine_score_results(
-                        active_score_result,
-                        score_batch["generated_score_results"][sample_index],
-                        continuation_count=len(continuations),
-                    )
+                    sample_index: score_batch["generated_score_results"][sample_index]
                 },
             }
             evaluation = _rubric_sample_evaluation(
@@ -1584,14 +1794,26 @@ class TrajectorySearchRunner:
                 include_variance_reward=bool(scope_spec["include_variance_reward"]),
             )
             metrics = evaluation["metrics"]
+            judge_error_by_call = {
+                (error.get("node_id"), error.get("rubric_id")): error.get("error")
+                for error in evaluation["judge_errors"]
+            }
+            judge_messages = []
+            for node_id, score_records in zip(node_ids, evaluation["scored_continuations"]):
+                for record in score_records:
+                    judge_messages.append(
+                        {
+                            "node_id": node_id,
+                            "rubric_id": record["rubric_id"],
+                            "messages": copy.deepcopy(record.get("judge_message") or []),
+                            "error": judge_error_by_call.get((node_id, record["rubric_id"])),
+                        }
+                    )
             active_before = []
             active_after = []
             inactive_after = []
             if score_bank is not None:
-                bank_update = score_bank.update_after_round(
-                    generated=generated_rubrics,
-                    rewards=metrics["reward_by_rubric"],
-                )
+                bank_update = score_bank.update_from_model(generated=generated_rubrics)
                 active_before = bank_update.active_before
                 active_after = bank_update.active_after
                 inactive_after = bank_update.inactive_after
@@ -1613,14 +1835,16 @@ class TrajectorySearchRunner:
                 "sample_index": generated_sample.sample_index,
                 "round_index": round_index,
                 "rubric_list_id": generated_sample.rubric_list_id,
-                "generated": generated_sample.generated,
+                "generated": generated_rubrics,
                 "messages": generated_sample.messages,
+                "generation_context": copy.deepcopy(generation_context),
                 "format_errors": copy.deepcopy(generated_sample.format_errors or []),
                 "terminal_error": generated_sample.terminal_error,
-                "generated_titles": [rubric.title for rubric in generated_sample.generated],
+                "generated_titles": [rubric.title for rubric in generated_rubrics],
                 **_rubric_metrics_payload(metrics, scored_rubric_ids),
                 "average_rubric_judged_scores": avg_scores,
                 "judge_errors": evaluation["judge_errors"],
+                "judge_messages": judge_messages,
                 "selected": False,
             }
             if experience_bank is not None:
@@ -1647,19 +1871,22 @@ class TrajectorySearchRunner:
             "valid_samples": valid_rubric_samples,
         }
 
-    async def _prepare_round_judging(
+    async def _prepare_parent_judging_context(
         self,
         *,
         parent_node: SearchNode,
         parent_judge: dict[str, Any],
         branch_records: list[dict[str, Any]],
         round_index: int,
-        compare_parent: bool,
+        parent_index: int,
+        include_parent_index: bool,
     ) -> dict[str, Any]:
         parent_state = parent_judge["persistent_state"]
         parent_recent_segments = copy.deepcopy(parent_judge.get("recent_segments", []))
         latest_shared_segment = copy.deepcopy(parent_recent_segments[-1]) if parent_recent_segments else None
         updated_parent_state = copy.deepcopy(parent_state)
+        summary_messages: list[dict[str, Any]] = []
+        summary_error: str | None = None
         evicted_step_cards = None
         if len(parent_recent_segments) >= 2:
             evicted_step_cards = copy.deepcopy(parent_recent_segments[0].get("step_cards", []))
@@ -1682,12 +1909,14 @@ class TrajectorySearchRunner:
                 model_kwargs=self.rubric_model_kwargs,
             )
             updated_parent_state = copy.deepcopy(update_payload["state"])
-        question = {"system_prompt": self.system_prompt, "user_prompt": self.task}
-        shared_context = {
-            "previous_persistent_state": updated_parent_state,
-            "latest_agent_trajectory": latest_shared_segment,
-        }
-        continuations = []
+            summary_messages = copy.deepcopy(update_payload["messages"])
+            summary_error = update_payload.get("error")
+            if summary_error:
+                logger.warning(
+                    "Persistent-state update failed for %s round %d; reusing the parent state.",
+                    self.task_id,
+                    round_index,
+                )
         for branch in branch_records:
             branch["persistent_state"] = copy.deepcopy(updated_parent_state)
             step_cards = branch["recent_segments"][-1].get("step_cards", []) if branch["recent_segments"] else []
@@ -1706,7 +1935,103 @@ class TrajectorySearchRunner:
                 },
                 "trajectory_continuation": copy.deepcopy(branch["recent_segments"][-1]) if branch["recent_segments"] else None,
             }
-            continuations.append(branch["continuation_view"])
+            if include_parent_index:
+                branch["continuation_view"]["parent_index"] = parent_index
+        return {
+            "parent_index": parent_index,
+            "parent_id": parent_node.node_id,
+            "persistent_state": updated_parent_state,
+            "latest_shared_segment": latest_shared_segment,
+            "summary_messages": summary_messages,
+            "summary_error": summary_error,
+        }
+
+    async def _prepare_round_judging(
+        self,
+        *,
+        parent_contexts: list[dict[str, Any]],
+        branch_records: list[dict[str, Any]],
+        round_index: int,
+        compare_parent: bool,
+    ) -> dict[str, Any]:
+        prepared_parents = await asyncio.gather(
+            *[
+                self._prepare_parent_judging_context(
+                    parent_node=context["node"],
+                    parent_judge=context["judge"],
+                    branch_records=[
+                        branch
+                        for branch in branch_records
+                        if branch["parent_id"] == context["node"].node_id
+                    ],
+                    round_index=round_index,
+                    parent_index=parent_index,
+                    include_parent_index=len(parent_contexts) > 1,
+                )
+                for parent_index, context in enumerate(parent_contexts, start=1)
+            ]
+        )
+        if len(prepared_parents) == 1:
+            previous_state = prepared_parents[0]["persistent_state"]
+            latest_shared_segment = prepared_parents[0]["latest_shared_segment"]
+            summary_messages = prepared_parents[0]["summary_messages"]
+            summary_error = prepared_parents[0]["summary_error"]
+        else:
+            parent_rows = []
+            for parent in prepared_parents:
+                continuation_indices = [
+                    index
+                    for index, branch in enumerate(branch_records, start=1)
+                    if branch["parent_id"] == parent["parent_id"]
+                ]
+                continuation_range = (
+                    f"{continuation_indices[0]}-{continuation_indices[-1]}"
+                    if continuation_indices
+                    else "<none>"
+                )
+                parent_rows.append({**parent, "continuations": continuation_range})
+            previous_state = {
+                "parent_states": [
+                    {
+                        "parent_index": parent["parent_index"],
+                        "continuations": parent["continuations"],
+                        "state": parent["persistent_state"],
+                    }
+                    for parent in parent_rows
+                ]
+            }
+            latest_shared_segment = {
+                "parent_views": [
+                    {
+                        "parent_index": parent["parent_index"],
+                        "continuations": parent["continuations"],
+                        "trajectory": parent["latest_shared_segment"],
+                    }
+                    for parent in parent_rows
+                ]
+            }
+            summary_messages = [
+                {
+                    "parent_index": parent["parent_index"],
+                    "parent_id": parent["parent_id"],
+                    "messages": parent["summary_messages"],
+                }
+                for parent in parent_rows
+                if parent["summary_messages"]
+            ]
+            summary_errors = {
+                parent["parent_id"]: parent["summary_error"]
+                for parent in parent_rows
+                if parent["summary_error"]
+            }
+            summary_error = summary_errors or None
+
+        question = {"system_prompt": self.system_prompt, "user_prompt": self.task}
+        shared_context = {
+            "previous_persistent_state": previous_state,
+            "latest_agent_trajectory": latest_shared_segment,
+        }
+        continuations = [branch["continuation_view"] for branch in branch_records]
         rubric_generation_kwargs = {
             "model_name": self.rubric_model_name,
             "temperature": self.search_config.rubric_temperature,
@@ -1728,7 +2053,7 @@ class TrajectorySearchRunner:
                     scope_spec=scope_spec,
                     question=question,
                     shared_context=shared_context,
-                    previous_state=updated_parent_state,
+                    previous_state=previous_state,
                     latest_shared_segment=latest_shared_segment,
                     continuations=continuations,
                     node_ids=node_ids,
@@ -1779,17 +2104,14 @@ class TrajectorySearchRunner:
             "selected_sample_index": selected_sample["sample_index"],
             "selected_sample": selected_sample,
             "selected_pc_sample": selected_pc_sample,
+            "summary_messages": summary_messages,
+            "summary_error": summary_error,
         }
 
     def _rubric_bank_payload_fields(self, sample: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = {}
-        if "retrieved" in sample or "retrieve_messages" in sample:
-            payload.update(
-                {
-                    "retrieved": copy.deepcopy(sample.get("retrieved", [])),
-                    "retrieve_messages": copy.deepcopy(sample.get("retrieve_messages")),
-                }
-            )
+        if "retrieved" in sample:
+            payload["retrieved"] = copy.deepcopy(sample.get("retrieved", []))
         if "active_before" in sample and "active_after" in sample and "inactive_after" in sample:
             payload.update(
                 {
@@ -1816,10 +2138,11 @@ class TrajectorySearchRunner:
         payload.update(self._rubric_bank_payload_fields(sample))
         return payload
 
-    def _rubric_artifact_payload(self, sample: dict[str, Any], parent_id: str) -> dict[str, Any]:
+    def _rubric_artifact_payload(self, sample: dict[str, Any], parent_ids: str | list[str]) -> dict[str, Any]:
+        parent_ids = [parent_ids] if isinstance(parent_ids, str) else parent_ids
         payload = {
             **self._rubric_round_payload(sample),
-            "parent_node_id": parent_id,
+            "parent_node_id": parent_ids[0],
             "score_by_rubric": copy.deepcopy(sample["score_by_rubric"]),
             "average_rubric_judged_scores": copy.deepcopy(sample["average_rubric_judged_scores"]),
             "generated_titles": list(sample["generated_titles"]),
@@ -1827,17 +2150,26 @@ class TrajectorySearchRunner:
             "gt_by_rubric": {},
             "reward": 0.0,
         }
+        if len(parent_ids) > 1:
+            payload["parent_node_ids"] = list(parent_ids)
         return payload
 
-    def _run_round(self, parent_id: str, round_index: int) -> list[dict[str, Any]]:
-        parent_node = self.nodes[parent_id]
-        if parent_id not in self._node_snapshot_cache:
-            raise RuntimeError(f"Node {parent_id} does not have a cached restorable snapshot")
-        if parent_id not in self._node_judge_cache:
-            raise RuntimeError(f"Node {parent_id} does not have a cached judge payload")
-        parent_snapshot = copy.deepcopy(self._node_snapshot_cache[parent_id])
-        parent_judge = copy.deepcopy(self._node_judge_cache[parent_id])
-        parent_rubric_round = copy.deepcopy(self._node_rubric_round_cache.get(parent_id))
+    def _run_round(self, parent_ids: list[str], round_index: int) -> list[dict[str, Any]]:
+        parent_contexts = []
+        for parent_id in parent_ids:
+            if parent_id not in self._node_snapshot_cache:
+                raise RuntimeError(f"Node {parent_id} does not have a cached restorable snapshot")
+            if parent_id not in self._node_judge_cache:
+                raise RuntimeError(f"Node {parent_id} does not have a cached judge payload")
+            parent_contexts.append(
+                {
+                    "node": self.nodes[parent_id],
+                    "snapshot": copy.deepcopy(self._node_snapshot_cache[parent_id]),
+                    "judge": copy.deepcopy(self._node_judge_cache[parent_id]),
+                }
+            )
+        primary_parent_id = parent_ids[0]
+        parent_rubric_round = copy.deepcopy(self._node_rubric_round_cache.get(primary_parent_id))
         if self.rubric_bank is not None:
             active_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("active_bank_after", [])]
             inactive_bank = [RubricRecord(**rubric) for rubric in parent_rubric_round.get("inactive_bank_after", [])]
@@ -1850,20 +2182,28 @@ class TrajectorySearchRunner:
         branch_records: list[dict[str, Any]] = []
         valid_branch_records: list[dict[str, Any]] = []
         policy_generation_errors: list[dict[str, Any]] = []
-        sample_plan: list[tuple[str, str]] = []
-        sample_count = self.search_config.m if parent_id == "root" else self.search_config.m
-        if self.student_policy_model_name:
-            teacher_count = (sample_count + 1) // 2
-            student_count = sample_count // 2
-            sample_plan = [("teacher", self.policy_model_name)] * teacher_count + [("student", self.student_policy_model_name)] * student_count
-        else:
-            sample_plan = [("teacher", self.policy_model_name)] * sample_count
+        sample_plan: list[tuple[dict[str, Any], int, str, str]] = []
+        samples_per_parent, extra_samples = divmod(self.search_config.m, len(parent_contexts))
+        for parent_index, context in enumerate(parent_contexts, start=1):
+            sample_count = samples_per_parent + int(parent_index <= extra_samples)
+            if self.student_policy_model_name:
+                teacher_count = (sample_count + 1) // 2
+                policy_plan = [("teacher", self.policy_model_name)] * teacher_count
+                policy_plan += [("student", self.student_policy_model_name)] * (sample_count - teacher_count)
+            else:
+                policy_plan = [("teacher", self.policy_model_name)] * sample_count
+            sample_plan.extend(
+                (context, parent_index, policy_source, policy_model_name)
+                for policy_source, policy_model_name in policy_plan
+            )
 
-        # Run the m sibling branches in parallel using a thread pool.
-        # Each thread owns its own docker session; the underlying sglang server
-        # batches their token generations naturally for higher GPU utilization.
+        # Each branch owns its container session; sglang batches their generations.
         def _run_one_branch(sample_index_and_plan):
-            sample_index, (policy_source, policy_model_name) = sample_index_and_plan
+            sample_index, (parent_context, parent_index, policy_source, policy_model_name) = sample_index_and_plan
+            parent_node = parent_context["node"]
+            parent_id = parent_node.node_id
+            parent_snapshot = parent_context["snapshot"]
+            parent_judge = parent_context["judge"]
             node_id = f"node-r{round_index:03d}-s{sample_index:02d}-{uuid.uuid4().hex[:6]}"
             _t_br_start = time.perf_counter()
             try:
@@ -1936,6 +2276,8 @@ class TrajectorySearchRunner:
                 }
                 rec = {
                     "node_id": node_id,
+                    "parent_id": parent_id,
+                    "parent_index": parent_index,
                     "result": result,
                     "policy_source": policy_source,
                     "policy_model_name": policy_model_name,
@@ -1971,6 +2313,8 @@ class TrajectorySearchRunner:
                 recent_segments = recent_segments[-2:]
             rec = {
                 "node_id": node_id,
+                "parent_id": parent_id,
+                "parent_index": parent_index,
                 "session": session,
                 "result": result,
                 "snapshot_after": snapshot_after,
@@ -1999,59 +2343,72 @@ class TrajectorySearchRunner:
         for rec, err_text in ordered_results:
             branch_records.append(rec)
             if err_text is not None:
-                policy_generation_errors.append({"node_id": rec["node_id"], "error": err_text})
+                policy_generation_errors.append(
+                    {"node_id": rec["node_id"], "parent_id": rec["parent_id"], "error": err_text}
+                )
             elif rec["is_valid"]:
                 valid_branch_records.append(rec)
 
         if len(valid_branch_records) < 2:
-            self.peaceful_exit(branch_records, parent_id)
+            self.peaceful_exit(branch_records, parent_ids)
             return []
 
         judged = asyncio.run(
             self._prepare_round_judging(
-                parent_node=parent_node,
-                parent_judge=parent_judge,
+                parent_contexts=parent_contexts,
                 branch_records=valid_branch_records,
                 round_index=round_index,
-                compare_parent=parent_id != "root",
+                compare_parent=primary_parent_id != "root",
             )
         )
         node_round_records = []
         valid_branches: list[dict[str, Any]] = []
         pc_scores = judged.get("pc_scores")
         pc_regression_threshold = 0.5 + self.search_config.regression_margin
-        for branch, sibling_score, pc_score in zip(valid_branch_records, judged["siblings_scores"], pc_scores if pc_scores is not None else [None] * len(valid_branch_records)):
+        for branch, sibling_score, pc_score in zip(
+            valid_branch_records,
+            judged["siblings_scores"],
+            pc_scores if pc_scores is not None else [None] * len(valid_branch_records),
+        ):
             branch["score"] = float(sibling_score)
-            branch["regressed_vs_parent"] = parent_id != "root" and pc_score is not None and pc_score < pc_regression_threshold
+            branch["regressed_vs_parent"] = (
+                primary_parent_id != "root"
+                and pc_score is not None
+                and pc_score < pc_regression_threshold
+            )
             valid_branches.append(branch)
             node_round_records.append({
                 "node_id": branch["node_id"],
+                "parent_id": branch["parent_id"],
                 "score": branch["score"],
                 "siblings_score": branch["score"],
                 "pc_score": float(pc_score) if pc_score is not None else None,
                 "regressed_vs_parent": branch["regressed_vs_parent"],
             })
-        valid_branches.sort(key=lambda branch: (branch["score"], branch["result"]["status"] == "finished"), reverse=True)
-        frontier_branches = (
-            valid_branches
-            if parent_id == "root" or pc_scores is None
-            else [branch for branch in valid_branches if not branch["regressed_vs_parent"]]
+        valid_branches.sort(
+            key=lambda branch: (branch["score"], branch["result"]["status"] == "finished"),
+            reverse=True,
         )
-        chosen_branches = _sample_by_strategy(
-            frontier_branches,
-            [branch["score"] for branch in frontier_branches],
-            count=self.search_config.p,
+        chosen_branches = _select_beam_branches(
+            valid_branches,
+            beam_width=len(parent_contexts),
+            retention_limit=self.search_config.p,
             strategy=self.search_config.strategy,
         )
         top_child_ids = [branch["node_id"] for branch in chosen_branches]
-        regressed = parent_id != "root" and pc_scores is not None and not top_child_ids
+        regressed = primary_parent_id != "root" and pc_scores is not None and not top_child_ids
         candidate_frontier_ids = list(top_child_ids)
         candidate_frontier_ids.extend(
-            node_id for node_id in previous_frontier if node_id != parent_id and node_id not in candidate_frontier_ids
+            node_id
+            for node_id in previous_frontier
+            if node_id not in parent_ids and node_id not in candidate_frontier_ids
         )
         kept_child_ids = set(top_child_ids)
         if regressed:
-            self.best_node_id = parent_id
+            self.best_node_id = max(
+                parent_ids,
+                key=lambda node_id: float(self._node_judge_cache[node_id].get("overall_score", 0.0)),
+            )
 
         round_rubric_path = self.rubrics_dir / f"round_{round_index:03d}.json"
         rubric_sample_payloads = []
@@ -2059,14 +2416,14 @@ class TrajectorySearchRunner:
         rubric_artifact_bundles: list[RubricArtifactBundle] = []
         for sample in judged["rubric_samples"]:
             rubric_dir = self.rubrics_dir / "siblings" / sample["rubric_list_id"]
-            rubric_payload = self._rubric_artifact_payload(sample, parent_id)
+            rubric_payload = self._rubric_artifact_payload(sample, parent_ids)
             rubric_sample_payloads.append(rubric_payload)
             rubric_update_records.append(
                 {
                     "scope": "siblings",
                     "round_index": round_index,
                     "rubric_payload": rubric_payload,
-                    "messages": sample["messages"],
+                    "generation_context": copy.deepcopy(sample["generation_context"]),
                 }
             )
             rubric_artifact_bundles.append(
@@ -2074,7 +2431,13 @@ class TrajectorySearchRunner:
                     rubric_dir=rubric_dir,
                     rubric_payload=rubric_payload,
                     messages_payload=sample["messages"],
-                    retrieve_messages_payload=rubric_payload.get("retrieve_messages"),
+                    retrieve_messages_payload=sample.get("retrieve_messages"),
+                    judge_messages_payload=sample.get("judge_messages"),
+                    summary_messages_payload=(
+                        judged.get("summary_messages")
+                        if sample["selected"] and judged.get("summary_messages")
+                        else None
+                    ),
                     round_summary_path=round_rubric_path,
                     selected_for_round_summary=bool(sample["selected"]),
                 )
@@ -2082,14 +2445,14 @@ class TrajectorySearchRunner:
         pc_rubric_sample_payloads = []
         for sample in judged.get("pc_rubric_samples") or []:
             rubric_dir = self.rubrics_dir / "pc" / sample["rubric_list_id"]
-            rubric_payload = self._rubric_artifact_payload(sample, parent_id)
+            rubric_payload = self._rubric_artifact_payload(sample, parent_ids)
             pc_rubric_sample_payloads.append(rubric_payload)
             rubric_update_records.append(
                 {
                     "scope": "pc",
                     "round_index": round_index,
                     "rubric_payload": rubric_payload,
-                    "messages": sample["messages"],
+                    "generation_context": copy.deepcopy(sample["generation_context"]),
                 }
             )
             rubric_artifact_bundles.append(
@@ -2097,23 +2460,27 @@ class TrajectorySearchRunner:
                     rubric_dir=rubric_dir,
                     rubric_payload=rubric_payload,
                     messages_payload=sample["messages"],
-                    retrieve_messages_payload=rubric_payload.get("retrieve_messages"),
+                    retrieve_messages_payload=sample.get("retrieve_messages"),
+                    judge_messages_payload=sample.get("judge_messages"),
                     scope="pc",
                 )
             )
 
         selected_sample = judged["selected_sample"]
         round_payload = {
-            **self._rubric_artifact_payload(selected_sample, parent_id),
+            **self._rubric_artifact_payload(selected_sample, parent_ids),
             "round_index": round_index,
-            "parent_id": parent_id,
+            "parent_id": primary_parent_id,
             "selected_sample_index": judged["selected_sample_index"],
             "selected_rubric_list_id": selected_sample["rubric_list_id"],
             "regressed": regressed,
             "node_scores": node_round_records,
             "policy_generation_errors": policy_generation_errors,
+            "persistent_state_error": judged.get("summary_error"),
             "rubric_samples": rubric_sample_payloads,
         }
+        if len(parent_ids) > 1:
+            round_payload["parent_ids"] = list(parent_ids)
         if self.rubric_bank is not None:
             self.rubric_bank.set_state(
                 active_bank=copy.deepcopy(selected_sample["active_after"]),
@@ -2139,16 +2506,13 @@ class TrajectorySearchRunner:
             if not branch["keep_snapshot"]:
                 continue
             image_tag = f"{self.image_repository}:round-{round_index:03d}-{branch['node_id'][-6:]}"
-            image_tag, image_id = _docker_commit(
-                self.docker_executable,
-                getattr(branch["session"].agent.env, "container_id", None),
-                image_tag,
-            )
+            image_tag, image_id = self._checkpoint_environment(branch["session"], image_tag)
             branch["image_tag"] = image_tag
             branch["image_id"] = image_id
 
         artifact_bundles: list[NodeArtifactBundle] = []
         for branch in branch_records:
+            branch_parent = self.nodes[branch["parent_id"]]
             if not branch["is_valid"]:
                 artifact_bundles.append(
                     NodeArtifactBundle(
@@ -2156,9 +2520,9 @@ class TrajectorySearchRunner:
                         node_dir=self.nodes_dir / branch["node_id"],
                         node_payload={
                             "node_id": branch["node_id"],
-                            "parent_id": parent_id,
+                            "parent_id": branch["parent_id"],
                             "round_index": round_index,
-                            "depth": parent_node.depth + 1,
+                            "depth": branch_parent.depth + 1,
                             "status": "error",
                             "error": branch.get("error"),
                             "policy_source": branch["policy_source"],
@@ -2172,9 +2536,9 @@ class TrajectorySearchRunner:
                 continue
             node = SearchNode(
                 node_id=branch["node_id"],
-                parent_id=parent_id,
+                parent_id=branch["parent_id"],
                 round_index=round_index,
-                depth=parent_node.depth + 1,
+                depth=branch_parent.depth + 1,
                 session_id=branch["snapshot_after"]["session_id"],
                 status="finished" if branch["result"]["status"] == "finished" and branch["keep_snapshot"] else ("frontier" if branch["keep_snapshot"] else "dropped"),
                 step_start=branch["step_start"],
@@ -2185,7 +2549,10 @@ class TrajectorySearchRunner:
                 policy_model_name=branch["policy_model_name"],
             )
             judge_payload = {
-                "persistent_state": branch.get("persistent_state", copy.deepcopy(parent_judge.get("persistent_state", EMPTY_PERSISTENT_STATE))),
+                "persistent_state": branch.get(
+                    "persistent_state",
+                    copy.deepcopy(self._node_judge_cache[branch["parent_id"]].get("persistent_state", EMPTY_PERSISTENT_STATE)),
+                ),
                 "recent_segments": branch["recent_segments"],
                 "workspace_meta": branch["workspace_meta"],
                 "overall_score": branch["score"],
@@ -2222,10 +2589,10 @@ class TrajectorySearchRunner:
                 _patch = _normalize_terminal_patch_text(terminal_result.get("submission", ""))
                 if not _patch:
                     # Agent didn't explicitly submit (ran out of step budget mid-edit).
-                    # Fall back to the actual git diff inside the docker container so we
+                    # Fall back to the actual git diff inside the active container so we
                     # don't lose real intermediate work. Run from the agent's current
-                    # working directory rather than hardcoding /testbed — ReBench docker
-                    # images don't mount the repo at /testbed.
+                    # working directory rather than hardcoding /testbed; ReBench images
+                    # do not mount the repo there.
                     try:
                         _diff = branch["session"].agent.env.execute(
                             {"command": "git add -N . >/dev/null 2>&1; git diff"},
@@ -2281,8 +2648,12 @@ class TrajectorySearchRunner:
             if node_id in self.nodes and self.nodes[node_id].status in {"frontier", "finished"}
         ]
         gt_extra_json_writes: list[tuple[Path, Any]] = [(round_rubric_path, round_payload)]
-        self.nodes[parent_id].status = "archived"
-        non_gt_extra_json_writes = [(self.nodes_dir / parent_id/ "node.json", asdict(self.nodes[parent_id]))]
+        for parent_id in parent_ids:
+            self.nodes[parent_id].status = "archived"
+        non_gt_extra_json_writes = [
+            (self.nodes_dir / parent_id / "node.json", asdict(self.nodes[parent_id]))
+            for parent_id in parent_ids
+        ]
         for branch in valid_branch_records:
             self._dispose_session(branch["session"])
 
@@ -2340,14 +2711,35 @@ class TrajectorySearchRunner:
             raise RuntimeError(f"Node {final_node_id} does not have a cached restorable snapshot")
         snapshot = copy.deepcopy(self._node_snapshot_cache[final_node_id])
         final_policy_model_name = final_node.policy_model_name or self.policy_model_name
+        final_messages = build_messages(
+            snapshot["agent"]["state"].get("messages", []),
+            model_name=final_policy_model_name,
+            preserve_token_fields=True,
+        )
+        final_patch = final_node.submission or ""
+        if self.search_config.calculate_gt_reward:
+            terminal_patch_path = self.nodes_dir / final_node_id / "terminal_patch.json"
+            terminal_messages_path = self.nodes_dir / final_node_id / "terminal_messages.json"
+            if terminal_patch_path.is_file():
+                terminal_patch_payload = json.loads(terminal_patch_path.read_text(encoding="utf-8"))
+                task_payload = terminal_patch_payload.get(self.task_id, {})
+                if isinstance(task_payload, dict):
+                    final_patch = str(task_payload.get("model_patch") or "")
+                    final_policy_model_name = str(
+                        task_payload.get("model_name_or_path") or final_policy_model_name
+                    )
+            if terminal_messages_path.is_file():
+                terminal_messages = json.loads(terminal_messages_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(terminal_messages, dict)
+                    and isinstance(terminal_messages.get("messages"), list)
+                ) or isinstance(terminal_messages, list):
+                    final_messages = terminal_messages
+        final_node.submission = final_patch
         if self.search_config.write_artifacts:
             _atomic_write_json(
                 self.run_dir / "messages.json",
-                build_messages(
-                    snapshot["agent"]["state"].get("messages", []),
-                    model_name=final_policy_model_name,
-                    preserve_token_fields=True,
-                ),
+                final_messages,
             )
             _atomic_write_json(
                 self.run_dir / "model_patch.json",
@@ -2355,12 +2747,12 @@ class TrajectorySearchRunner:
                     self.task_id: {
                         "model_name_or_path": final_policy_model_name,
                         "instance_id": self.task_id,
-                        "model_patch": final_node.submission,
+                        "model_patch": final_patch,
                     }
                 },
             )
         if self.search_config.evaluate_final_patch:
-            patch_text = final_node.submission or ""
+            patch_text = final_patch
             if not patch_text.strip():
                 if self.search_config.write_artifacts:
                     _atomic_write_json(
@@ -2389,7 +2781,7 @@ class TrajectorySearchRunner:
             self.frontier_ids = [final_node_id]
         self._save_manifest()
 
-    def peaceful_exit(self, branch_records, parent_id: str) -> None:
+    def peaceful_exit(self, branch_records, parent_ids: list[str]) -> None:
         self.peaceful_exit_triggered = True
         error_records = [
             {"node_id": branch.get("node_id"), "error": branch.get("error")}
@@ -2397,8 +2789,8 @@ class TrajectorySearchRunner:
             if branch.get("error")
         ]
         logger.warning(
-            "Peaceful exit for parent %s with %d branches (%d valid). Errors: %s",
-            parent_id,
+            "Peaceful exit for parents %s with %d branches (%d valid). Errors: %s",
+            ",".join(parent_ids),
             len(branch_records),
             sum(1 for branch in branch_records if branch.get("is_valid")),
             error_records,
@@ -2407,11 +2799,15 @@ class TrajectorySearchRunner:
             if branch.get("session") is not None:
                 self._dispose_session(branch["session"])
                 branch["session"] = None
-        self.nodes[parent_id].status = "archived"
-        non_gt_extra_json_writes = [(self.nodes_dir / parent_id / "node.json", asdict(self.nodes[parent_id]))]
+        for parent_id in parent_ids:
+            self.nodes[parent_id].status = "archived"
+        non_gt_extra_json_writes = [
+            (self.nodes_dir / parent_id / "node.json", asdict(self.nodes[parent_id]))
+            for parent_id in parent_ids
+        ]
         self.artifact_writer.submit_round(
             extra_json_writes=non_gt_extra_json_writes,
             write_gt_files=False,
         )
-        self.frontier_ids = [node_id for node_id in self.frontier_ids if node_id != parent_id]
-        self.best_node_id = self.frontier_ids[0] if self.frontier_ids else parent_id
+        self.frontier_ids = [node_id for node_id in self.frontier_ids if node_id not in parent_ids]
+        self.best_node_id = self.frontier_ids[0] if self.frontier_ids else parent_ids[0]

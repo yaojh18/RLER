@@ -24,10 +24,8 @@ from swe_agent.run.benchmarks.swebench import (
 )
 from swe_agent.run.run_swe_agent import (
     DEFAULT_COMPLETION_MAX_TOKENS,
-    DEFAULT_LOG_ROOT,
     DEFAULT_MAX_MODEL_LEN,
     DEFAULT_MODEL_CLASS,
-    DEFAULT_OUTPUT_ROOT,
     DEFAULT_STEP_LIMIT,
     DEFAULT_SUBSET,
     DEFAULT_SPLIT,
@@ -54,6 +52,18 @@ from swe_agent.rubric_bank import ExperienceRubricBank
 from swe_agent.trajectory_search import SearchConfig, TrajectorySearchRunner
 from swe_agent.serving import SGLangChatService
 from swe_agent.parallel_utils import _atomic_write_json
+
+
+DEFAULT_PRM_EXPERIENCE_BANK = (
+    Path(__file__).resolve().parents[4] / "exp" / "prm_eval" / "artifacts" / "experience_bank.json"
+)
+DEFAULT_SEARCH_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "search_outputs"
+DEFAULT_SEARCH_LOG_ROOT = Path(
+    os.environ.get(
+        "SEARCH_SWE_AGENT_LOG_ROOT",
+        Path(__file__).resolve().parents[4] / "tmp" / "trajectory_search" / "logs",
+    )
+)
 
 
 def _flush_experience_bank_summaries(
@@ -95,9 +105,8 @@ def _run_single_instance(
     environment_config["environment_class"] = select_container_environment_class(
         environment_config.get("environment_class", "docker")
     )
-    image_name = get_swebench_docker_image_name(instance)
     if environment_config.get("environment_class") == "docker":
-        environment_config["image"] = image_name
+        environment_config["image"] = get_swebench_docker_image_name(instance)
     elif environment_config.get("environment_class") == "singularity":
         environment_config["image"] = get_swebench_singularity_image_name(instance)
     if is_rebench_instance(instance):
@@ -159,7 +168,7 @@ def run_search(
         split=args.split,
         model_name=model_name,
     )
-    run_log_path = DEFAULT_LOG_ROOT / f"search-{timestamp}.log"
+    run_log_path = DEFAULT_SEARCH_LOG_ROOT / f"search-{timestamp}.log"
     run_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     gpu_id: int | None = None
@@ -200,13 +209,11 @@ def run_search(
         if required_env and not os.getenv(required_env):
             raise RuntimeError(f"{required_env} is not set for model {args.openai_model}")
         # RouteTextbasedModel takes the token-in/token-out path against sglang
-        # /generate; it requires api_base in model_kwargs. When the openai
-        # backend points at a local OpenAI-compatible sglang server (e.g. a
-        # DSv4 teacher hosted on a GCP node), pick up the same endpoint
-        # litellm uses (OPENAI_API_BASE) so RouteTextbasedModel can post to
-        # /generate on it. Fallback env SEARCH_SWE_OPENAI_API_BASE lets the
-        # caller override without disturbing litellm's own routing.
-        openai_api_base = os.environ.get("SEARCH_SWE_OPENAI_API_BASE") or os.environ.get("OPENAI_API_BASE")
+        # /generate; it requires api_base in model_kwargs. Only use that path
+        # when the caller explicitly provides a local sglang endpoint. A
+        # general OPENAI_API_BASE may instead be a LiteLLM chat route and must
+        # remain on the normal chat-completions path.
+        openai_api_base = os.environ.get("SEARCH_SWE_OPENAI_API_BASE")
         if openai_api_base:
             shared_model_kwargs["api_base"] = openai_api_base
             shared_model_kwargs.setdefault("api_key", os.environ.get("OPENAI_API_KEY", "EMPTY"))
@@ -309,6 +316,7 @@ def run_search(
             n=args.n,
             k=args.k,
             p=args.p,
+            beam_size=args.beam_size,
             step_limit=args.step_limit,
             max_rounds=args.max_rounds,
             max_active_rubrics=args.max_active_rubrics,
@@ -328,6 +336,7 @@ def run_search(
             write_artifacts=args.write_artifacts,
             strategy=args.strategy,
             rubric_bank_strategy=args.rubric_bank_strategy,
+            update_experience_bank=args.update_experience_bank,
         )
         rubric_model_name = args.rubric_model or model_name
         judge_model_name = args.judge_model or model_name
@@ -335,13 +344,15 @@ def run_search(
         judge_model_kwargs = dict(shared_model_kwargs)
         experience_banks = None
         if search_config.rubric_bank_strategy in {"experience", "both"}:
+            if not args.experience_bank.is_file():
+                raise FileNotFoundError(f"Experience bank not found: {args.experience_bank}")
             experience_banks = {
                 "siblings": ExperienceRubricBank(
-                    bank_path=run_root / "siblings_rubric_bank.json",
+                    bank_path=args.experience_bank,
                     scope="siblings",
                 ),
                 "pc": ExperienceRubricBank(
-                    bank_path=run_root / "pc_rubric_bank.json",
+                    bank_path=args.experience_bank,
                     retrieval_prompt=PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
                     update_prompt=PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
                     scope="pc",
@@ -407,7 +418,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--instance-id", action=ParseInstanceIds, nargs="+", default=None)
     parser.add_argument("--subset", default=DEFAULT_SUBSET)
     parser.add_argument("--split", default=DEFAULT_SPLIT)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_SEARCH_OUTPUT_ROOT)
     parser.add_argument("--resume-run-dir", type=Path, default=None)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--step-limit", type=int, default=DEFAULT_STEP_LIMIT)
@@ -424,26 +435,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slime-model", default=DEFAULT_SERVE_MODEL)
     parser.add_argument("--model-retry-attempts", type=int, default=2)
     parser.add_argument("--completion-max-tokens", type=int, default=DEFAULT_COMPLETION_MAX_TOKENS)
-    parser.add_argument("--m", type=int, default=2)
-    parser.add_argument("--n", type=int, default=2)
+    parser.add_argument("--m", type=int, default=8)
+    parser.add_argument("--n", type=int, default=1)
     parser.add_argument("--k", type=int, default=20)
-    parser.add_argument("--p", type=int, default=1)
+    parser.add_argument("--p", type=int, default=4)
+    parser.add_argument("--beam-size", type=int, default=2)
     parser.add_argument("--max-rounds", type=int, default=5)
     parser.add_argument("--max-active-rubrics", type=int, default=6)
     parser.add_argument("--policy-temperature", type=float, default=1.0)
     parser.add_argument("--policy-top-p", type=float, default=0.95)
     parser.add_argument("--rubric-temperature", type=float, default=1.0)
     parser.add_argument("--rubric-top-p", type=float, default=0.95)
-    parser.add_argument("--rubric-max-tokens", type=int, default=4096)
+    parser.add_argument("--rubric-max-tokens", type=int, default=8096)
     parser.add_argument("--judge-temperature", type=float, default=0.1)
     parser.add_argument("--judge-top-p", type=float, default=0.95)
-    parser.add_argument("--judge-max-tokens", type=int, default=4096)
+    parser.add_argument("--judge-max-tokens", type=int, default=8096)
     parser.add_argument("--regression-margin", type=float, default=0.0)
     parser.add_argument("--rubric-model", default=None)
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--calculate-gt-reward", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--strategy", choices=["best", "probability", "random"], default="random")
+    parser.add_argument("--strategy", choices=["best", "probability", "random"], default="best")
     parser.add_argument("--rubric-bank-strategy", choices=["score", "experience", "both"], default="both")
+    parser.add_argument("--experience-bank", type=Path, default=DEFAULT_PRM_EXPERIENCE_BANK)
+    parser.add_argument("--update-experience-bank", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
     parser.add_argument("--student-model", default=None)
     parser.add_argument("--evaluate-final-patch", action="store_true", default=True)

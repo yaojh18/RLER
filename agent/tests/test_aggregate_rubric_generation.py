@@ -253,17 +253,95 @@ def test_last_json_parser_ignores_all_text_before_and_after_the_final_object():
         "metadata": {"draft": 1},
         "score": 4,
     }
-    assert trajectory_search._parse_persistent_state_response('prefix {"custom": 1} suffix') == {"custom": 1}
+    assert trajectory_search._parse_persistent_state_response('prefix {"custom": 1} suffix') is None
+    persistent = trajectory_search._parse_persistent_state_response(
+        'prefix {"summary": {"Current State": "working", "worklog": ["one", "two"]}} suffix'
+    )
+    assert persistent is not None
+    assert persistent["current_state"] == "working"
+    assert "one" in persistent["worklog"]
+    assert set(persistent) == {"current_state", "worklog"}
     assert trajectory_search._parse_judge_score('{"score": 4, "reason": "extra fields are allowed"}') == 4
+    assert trajectory_search._parse_judge_score('{"score": "4"}') == 4
+    assert trajectory_search._parse_judge_score('{"score": 4.0}') == 4
+    assert trajectory_search._parse_judge_score("analysis\nFinal score: 4/5") == 4
+    assert trajectory_search._parse_judge_score('{"rating": "3.0"}') == 3
+    assert trajectory_search._parse_judge_score('{"score": 4.5}') is None
+
+
+def test_relaxed_json_parser_recovers_unquoted_rubric_strings():
+    response = '''Thought before the final answer.
+```json
+{
+  "polarity": "negative",
+  "weight": 1.0,
+  "title": "Test expectations",
+  "description": The fix changes the message but does not update exact assertions.
+  "scale": {
+    "1": All assertions are updated
+    "2": Most assertions are updated,
+    "3": "No assertions are updated",
+    "4": "The change is submitted without verification",
+    "5": "Known-broken assertions remain"
+  },
+  "metadata": {"stage": "tests"}
+}
+```
+'''
+    parsed = extract_last_json_object(response)
+    assert parsed is not None
+    assert parsed["description"].startswith("The fix changes")
+    assert parsed["scale"]["1"] == "All assertions are updated"
+    assert trajectory_search._convert_rubric_item("task", parsed, 2) is not None
+
+
+def test_trajectory_judge_messages_start_at_first_assistant(monkeypatch):
+    rubric = trajectory_search._convert_rubric_item("task", _rubric("Criterion"), 1)
+    assert rubric is not None
+    responses = iter(["not json", '{"score": "4"}'])
+
+    async def fake_route_completion_message(**kwargs):
+        content = next(responses)
+        return {
+            "role": "assistant",
+            "content": content,
+            "content_no_thinking": content,
+        }
+
+    monkeypatch.setattr(trajectory_search, "route_completion_message", fake_route_completion_message)
+    scores, errors = asyncio.run(
+        trajectory_search._score_round(
+            question={"system_prompt": "System", "user_prompt": "Task"},
+            shared_context={"previous_persistent_state": {}, "latest_agent_trajectory": []},
+            continuations=[{"node_id": "node", "summary": {}, "trajectory_continuation": []}],
+            rubrics=[rubric],
+            model_name="test-model",
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=32,
+        )
+    )
+
+    assert errors == []
+    assert scores[0][0]["score_raw"] == 4
+    assert [message["role"] for message in scores[0][0]["judge_message"]] == [
+        "assistant",
+        "user",
+        "assistant",
+    ]
 
 
 def test_trajectory_rubric_generation_uses_freeform_markdown_json(monkeypatch):
     calls = []
+    responses = [
+        _freeform_json(_rubric("Trajectory Criterion")),
+        _freeform_json({}),
+    ]
 
     async def fake_route_completion_message(**kwargs):
         _assert_freeform_call(kwargs)
         calls.append(copy.deepcopy(kwargs))
-        content = _freeform_json(_rubric("Trajectory Criterion"))
+        content = responses.pop(0)
         return {
             "role": "assistant",
             "content": content,
@@ -293,8 +371,51 @@ def test_trajectory_rubric_generation_uses_freeform_markdown_json(monkeypatch):
     assert "response_format" not in calls[0]
     assert "enable_json_schema_validation" not in (calls[0].get("model_kwargs") or {})
     assert "THOUGHT:" in calls[0]["messages"][0]["content"]
-    assert [message["role"] for message in calls[0]["messages"]] == ["user"]
+    assert [message["role"] for message in sample.messages] == ["user", "assistant", "user", "assistant"]
     assert "User Prompt:\nTask" in calls[0]["messages"][0]["content"]
+
+
+def test_trajectory_rubric_generation_corrects_empty_first_response(monkeypatch):
+    responses = [
+        _freeform_json({}),
+        _freeform_json(_rubric("Reused Criterion")),
+        _freeform_json({}),
+    ]
+
+    async def fake_route_completion_message(**kwargs):
+        content = responses.pop(0)
+        return {
+            "role": "assistant",
+            "content": content,
+            "content_no_thinking": content,
+            "usage": {},
+        }
+
+    monkeypatch.setattr(trajectory_search, "route_completion_message", fake_route_completion_message)
+    sample = asyncio.run(
+        trajectory_search._generate_round_rubrics(
+            question={"system_prompt": "System", "user_prompt": "Task"},
+            previous_state=copy.deepcopy(trajectory_search.EMPTY_PERSISTENT_STATE),
+            latest_shared_segment=None,
+            continuations=[{"node_id": "node", "summary": {}, "trajectory_continuation": []}],
+            model_name="test-model",
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=128,
+            round_index=2,
+        )
+    )
+
+    assert [rubric.title for rubric in sample.generated] == ["Reused Criterion"]
+    assert [message["role"] for message in sample.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert "Existing rubrics are not reused automatically" in sample.messages[2]["content"]
 
 
 def test_aggregate_summary_uses_freeform_markdown_json(monkeypatch):
@@ -388,7 +509,7 @@ def test_aggregate_summary_retries_with_format_correction(monkeypatch):
 
 
 def test_aggregate_summary_falls_back_to_full_content_for_json(monkeypatch):
-    summary = {"custom": "accepted"}
+    summary = {"current_state": "accepted"}
 
     async def fake_route_completion_message(**kwargs):
         _assert_freeform_call(kwargs)
@@ -412,7 +533,8 @@ def test_aggregate_summary_falls_back_to_full_content_for_json(monkeypatch):
         )
     )
 
-    assert result["state"] == summary
+    assert result["state"]["current_state"] == "accepted"
+    assert set(result["state"]) == set(trajectory_search.EMPTY_PERSISTENT_STATE)
     assert result["format_error"] is None
 
 

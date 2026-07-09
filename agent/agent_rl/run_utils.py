@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import copy
 import json
 import logging
@@ -163,6 +164,58 @@ def extract_json_from_response(response: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _repair_json_object_text(candidate: str) -> str:
+    """Repair common line-oriented JSON mistakes without guessing structure."""
+    lines = candidate.strip().splitlines()
+    repaired: List[str] = []
+    member_re = re.compile(r'^(?P<indent>\s*)"(?P<key>[^"\\]+)"\s*:\s*(?P<value>.*?)\s*$')
+    json_scalar_re = re.compile(r'-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null')
+
+    for line in lines:
+        match = member_re.match(line)
+        if match is None:
+            repaired.append(line)
+            continue
+        raw_value = match.group("value").rstrip()
+        comma = "," if raw_value.endswith(",") else ""
+        value = raw_value[:-1].rstrip() if comma else raw_value
+        if value and not (
+            value.startswith(('"', "{", "["))
+            or json_scalar_re.fullmatch(value)
+        ):
+            value = json.dumps(value, ensure_ascii=False)
+        repaired.append(f'{match.group("indent")}"{match.group("key")}": {value}{comma}')
+
+    # Models often omit the comma after a bare string or a nested object. Only
+    # insert one when the following line is unambiguously another object member.
+    for index in range(len(repaired) - 1):
+        current = repaired[index].rstrip()
+        following = repaired[index + 1].lstrip()
+        if not re.match(r'"[^"\\]+"\s*:', following):
+            continue
+        if current.endswith((",", "{", "[")):
+            continue
+        if member_re.match(current) is not None or current in {"}", "]"}:
+            repaired[index] = current + ","
+
+    return re.sub(r",\s*([}\]])", r"\1", "\n".join(repaired))
+
+
+def _load_relaxed_json_object(candidate: str) -> Optional[Dict[str, Any]]:
+    cleaned = candidate.strip().encode("utf-8").decode("utf-8-sig")
+    for value in (cleaned, _repair_json_object_text(cleaned)):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            try:
+                parsed = ast.literal_eval(value)
+            except (SyntaxError, ValueError):
+                continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def extract_last_json_object(response: str) -> Optional[Dict[str, Any]]:
     if not isinstance(response, str):
         return None
@@ -175,6 +228,17 @@ def extract_last_json_object(response: str) -> Optional[Dict[str, Any]]:
             continue
         if isinstance(parsed, dict):
             candidates.append((match.start() + length, match.start(), parsed))
+    # If the final object is malformed, a strict-only scan can silently return
+    # an earlier draft object from the thought text. Only repair suffixes ending
+    # at the final closing brace; normal valid responses stay on the fast path.
+    final_end = response.rfind("}") + 1
+    if candidates and max(candidates, key=lambda item: (item[0], -item[1]))[0] == final_end:
+        return max(candidates, key=lambda item: (item[0], -item[1]))[2]
+    opening_positions = [match.start() for match in re.finditer(r"\{", response[:final_end])][-64:]
+    for start in opening_positions:
+        parsed = _load_relaxed_json_object(response[start:final_end])
+        if parsed is not None:
+            candidates.append((final_end, start, parsed))
     if not candidates:
         return None
     return max(candidates, key=lambda item: (item[0], -item[1]))[2]

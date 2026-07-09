@@ -237,6 +237,13 @@ def _normalize_message(message: dict[str, Any]) -> dict[str, Any]:
         item["content_no_thinking"] = message["content_no_thinking"]
     return item
 
+
+def messages_from_first_assistant(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for index, message in enumerate(messages):
+        if message.get("role") == "assistant":
+            return copy.deepcopy(messages[index:])
+    return []
+
 def _normalize_messages(payload: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_messages = payload if isinstance(payload, list) else payload.get("messages")
     messages = [_normalize_message(message) for message in source_messages]
@@ -308,8 +315,10 @@ class NodeArtifactBundle:
 class RubricArtifactBundle:
     rubric_dir: Path
     rubric_payload: dict[str, Any]
-    messages_payload: dict[str, Any]
+    messages_payload: list[dict[str, Any]]
     retrieve_messages_payload: list[dict[str, Any]] | None = None
+    judge_messages_payload: list[dict[str, Any]] | None = None
+    summary_messages_payload: list[dict[str, Any]] | None = None
     round_summary_path: Path | None = None
     selected_for_round_summary: bool = False
     scope: str = "siblings"
@@ -450,9 +459,13 @@ def _write_base_artifacts(
             _atomic_write_json(bundle.node_dir / "terminal_patch.json", bundle.terminal_patch_payload)
     for bundle in rubric_bundles or []:
         bundle.rubric_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_write_json(bundle.rubric_dir / "messages.json", bundle.messages_payload)
+        _atomic_write_json(bundle.rubric_dir / "rubric_message.json", bundle.messages_payload)
         if bundle.retrieve_messages_payload is not None:
             _atomic_write_json(bundle.rubric_dir / "rubric_retrieve_message.json", bundle.retrieve_messages_payload)
+        if bundle.judge_messages_payload is not None:
+            _atomic_write_json(bundle.rubric_dir / "judge_message.json", bundle.judge_messages_payload)
+        if bundle.summary_messages_payload is not None:
+            _atomic_write_json(bundle.rubric_dir / "summary_message.json", bundle.summary_messages_payload)
     for path, payload in extra_json_writes or []:
         _atomic_write_json(path, payload)
 

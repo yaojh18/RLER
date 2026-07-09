@@ -10,9 +10,10 @@ SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT = """
 You are an expert evaluator generating adaptive rubrics to assess agent trajectory continuations.
 
 ## Task
-Identify the single most discriminative criterion that distinguishes high-quality from low-quality agent trajectory continuations and is not already covered by the existing rubrics. Capture subtle quality differences that existing rubrics miss.
-This is a multi-turn rubric generation setting. At each turn, generate at most one new rubric. Existing Rubrics contains previously generated rubrics and should be used to understand the current evaluation gap and avoid redundancy.
-If no additional high-impact, non-redundant rubric remains, return an empty JSON object: {}.
+Identify the single most discriminative rubric to output next for judging the current trajectory continuations. Capture subtle quality differences that existing rubrics miss.
+This is a multi-turn rubric generation setting. At each turn, output exactly one rubric object or an empty JSON object `{}`. The rubric object may be either a newly generated rubric or a reused/adapted existing rubric. Existing Rubrics contains previously generated rubrics that may be reused/adapted and should be used to understand the current evaluation gap and avoid redundancy.
+Every generation sample must output at least one non-empty rubric before it may return `{}`. Existing rubrics are not reused automatically; reuse requires outputting the full rubric object again.
+If no further rubric should be output in this multi-turn generation process, return an empty JSON object: {}.
 
 ## Output Components
 - **Title**: Concise abstract label (general, not task-specific)
@@ -37,18 +38,18 @@ Represent this choice using the `polarity` field in the rubric object.
 
 ### 2. Grounded Current Distinction
 - Focus the rubric on the differences between the continuations, not on the shared context
-- If continuations differ in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files, score that concrete process evidence
-- If continuations differ in source changes, score the observable patch behavior: changed files, symbols, API contracts, data flow, compatibility boundaries, edge cases, or tests
+- If continuations differ in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files, define a rubric around that concrete process evidence
+- If continuations differ in source changes, define a rubric around the observable patch behavior: changed files, symbols, API contracts, data flow, compatibility boundaries, edge cases, or tests
 - If continuations share the same visible core behavior, do not separate them using harmless formatting, error-message wording, local variable placement, scratch scripts, or transient test scaffolding unless those details create an observable behavioral risk
 - Do not create standalone style rubrics for DRYness, helper extraction, formatting, comments, or cleanup. Such details are only valid when the visible diff shows a concrete behavioral, compatibility, or maintainability risk that affects the task outcome
 - Do not reward majority behavior just because most continuations share it; reward the behavior best supported by the visible evidence
 - Avoid vague criteria such as "thoroughness", "correctness", "best practice", or "complete implementation" unless the rubric defines the concrete evidence being scored
 
 ### 3. Novelty & Non-Redundancy
-- Never duplicate existing or generated rubrics in meaning/scope
+- Do not generate a new rubric that duplicates any existing or already generated rubric in meaning/scope. Re-outputing an existing rubric as a reused/adapted rubric is allowed and is not considered duplication.
 - Identify uncovered quality dimensions
 - Add granular criteria if existing rubrics are broad
-- Return empty lists if existing rubrics are comprehensive
+- Return `{}` only when no remaining existing rubric should be reused/adapted and no new non-redundant rubric should be generated
 - Do not generate semantically equivalent rubrics, e.g., "Runs targeted validation" as a positive rubric and "Does not run targeted validation" as a negative rubric.
 - Choose only the more discriminative direction
 
@@ -58,28 +59,34 @@ Represent this choice using the `polarity` field in the rubric object.
 - Do not create a negative rubric merely because a continuation lacks a desirable behavior
 - For negative rubrics, every scale anchor must measure severity of the flaw: 1 means the flaw is absent or minimal, and 5 means the flaw is clearly and severely present. Never write a negative rubric whose scale rewards the good behavior at 5.
 
-### 5. Previous Generated Rubrics & Experiences (Optional)
-- This guideline applies only when exisiting, previous generated rubrics or retrieved rubric experiences are provided
-- Use previous rubrics to understand what is already covered, then add only a non-redundant uncovered criterion
-- Treat retrieved rubric experiences as optional hypotheses. Use them only when the current continuations match the prior lesson
-- If a previous rubric or experience would turn a precise current distinction into a broad generic rubric, ignore it
+### 5. Previous Generated Rubrics & Experiences
+- In each turn, output exactly one rubric object or `{}`. A non-empty output may either reuse/adapt a previously generated rubric if it is still applicable and discriminative for the current trajectory continuations, or generate one new rubric, optionally informed by retrieved experiences.
+- If a concrete, important trajectory behavior gap is not captured by any existing rubric or experience, generate a new rubric for that missing evaluation criterion. This is especially needed when you identify task-specific mistakes at the specific agent stage.
+- Rubric reuse is opt-in, not automatic. Previously generated rubrics are not used by the judge merely because they appear under Existing Rubrics. To reuse an existing rubric, output the full rubric object in one generation turn. Any existing rubric that is not output in the current multi-turn generation process is considered dropped and will not participate in judging.
+- You may freely modify `weight` or other details of an existing rubric or reference golden rubric in the experience to better reflect the judging importance and focus at the current stage. A modified existing rubric still counts as reuse/adaptation as long as it is derived from an existing rubric.
+- Use previous rubrics and experiences to understand what is already covered, then output only one useful next rubric: either a reused/adapted existing rubric or a non-redundant uncovered criterion.
+- An experience is guidance about when a rubric is useful or misleading. Treat its `context` and `experience` fields as applicability conditions, not as facts about the current task.
+- `metadata.reference_golden_rubrics` contains candidate criteria learned from earlier cases. You may adapt a candidate's polarity, scope, wording, metadata, scale, or weight only when the current continuations match the prior lesson.
+- Do not copy a reference rubric merely because it was retrieved. A copied or adapted rubric must be independently relevant and judgeable from the current task and trajectory continuations.
+- Retrieved experiences are not privileged oracles. Never infer the current final patch, hidden tests, or outcome from their presence.
+- If a previous rubric or experience would turn a precise current distinction into a broad generic or misleading rubric, ignore it.
 
 ## Selection Strategy
 
-### Quantity: 0-1 rubric total per turn, and 1-5 total rubrics in total (fewer high-quality > many generic)
-- Generate exactly one rubric only if it adds meaningful new discriminative value
-- Otherwise return an empty object: {}
+### Quantity: in each turn, output exactly one rubric object or return `{}`. Across the full multi-turn generation process, output at least 1 and at most 6 non-empty rubrics in total.
+- Output exactly one rubric object if the next rubric should participate in judging, whether it is newly generated or reused/adapted from existing rubrics.
+- Return `{}` only when no remaining existing rubric should be reused/adapted and no new high-impact, non-redundant rubric should be generated.
 
 ### Polarity Selection Based on Response Patterns:
 - **More positive**: When continuations lack sophistication but avoid major errors
 - **More negative**: When systematic failure patterns are present
 - **Balanced across turns**: When both excellence gaps and failure modes exist
-- **Empty object**: When existing rubrics are already comprehensive
+- **Empty object**: When no further rubric should be output: all useful existing rubrics have already been reused/adapted in previous generation turns, and no new high-impact, non-redundant rubric remains
 
 ## Analysis Process
 1. Group continuations by quality level
 2. Find factors separating higher/lower clusters
-3. Check if factors covered by existing rubrics
+3. Check if factors are covered by rubrics already output in the current multi-turn generation process
 4. Select the single criterion with the highest discriminative value
 
 ## Output Format Example
@@ -108,7 +115,7 @@ THOUGHT: <your reasoning process>
 
 </format_example>
 
-If no new high-impact, non-redundant rubric should be added, output:
+If no further rubric should be output in this multi-turn generation process, output:
 <format_example>
 
 THOUGHT: <your reasoning process>
@@ -124,23 +131,24 @@ THOUGHT: <your reasoning process>
 2. **Previous Persistent State**: Current memory state with summary of past findings and milestones
 3. **Parent Trajectory**: The most recent agent trajectory
 4. **Agent Trajectory Continuations**: Multiple agent trajectories continued from the latest trajectory (Continuation 1, Continuation 2, etc.)
-5. **Existing Rubrics** (optional): Previously generated rubrics
+5. **Existing Rubrics** (optional): Previously generated rubrics available for reuse/adaptation and redundancy checking. They are not automatically used for judging unless explicitly output as full rubric objects in the current multi-turn generation process.
 
 ## Critical Reminders
 - Each rubric must distinguish between the actual provided continuations
 - Exclude rubrics applying equally to all continuations
-- Prefer empty lists over redundancy when existing rubrics are comprehensive
+- Prefer `{}` over redundant rubric generation when no remaining existing rubric should be reused/adapted and no new non-redundant rubric remains
 - Focus on observable, objective, actionable criteria
 - Quality over quantity: 1 excellent rubric > multiple mediocre ones
 - The shared context is common to all continuations. Focus the rubric on differences between the continuations themselves
-- Do not return empty lists when there are visible differences in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
+- Do not return `{}` when there is still a useful existing rubric to reuse/adapt or a visible, important, non-redundant difference in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
+- Never output a list of rubrics. Each generation turn must output exactly one rubric object or `{}`
 - Output in the required format. Do not restate the question, previous state, agent trajectories, or existing rubrics in the response.
 
-Generate only the most impactful, non-redundant rubrics revealing meaningful quality differences.
+Generate only the most impactful, non-redundant rubric revealing meaningful quality differences, or explicitly reuse/adapt one existing rubric that should participate in judging.
 """
 
 RUBRIC_GENERATION_CONTINUE_PROMPT = (
-    "Generate the next best rubric or return an empty object. Follow the output format example above."
+    "Output the next rubric that should participate in judging, either newly generated or reused/adapted from existing rubrics, or return an empty object `{}` to stop. Output exactly one rubric object or `{}`; never output a list."
 )
 
 SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT = """
@@ -183,9 +191,10 @@ PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT = """
 You are an expert evaluator generating adaptive rubrics to assess agent progress for SWE tasks.
 
 ## Task
-Generate the single most useful criterion for judging whether each continuation improves, stays equivalent, or regresses relative to the provided parent trajectory and is not already covered by the existing rubrics. Capture subtle quality differences that existing rubrics miss.
-This is a multi-turn rubric generation setting. At each turn, generate at most one new rubric. Existing Rubrics contains previously generated parent-child rubrics and should be used to understand the current evaluation gap and avoid redundancy.
-If no additional high-impact, non-redundant rubric remains, return an empty JSON object: {}. Treat previously generated rubrics and retrieved experiences as guidance; they count as coverage only when they match the current parent baseline, child delta, and visible evidence.
+Identify the single most useful rubric to output next for judging whether each continuation improves, stays equivalent, or regresses relative to the provided parent trajectory. Capture subtle quality differences that existing rubrics miss.
+This is a multi-turn rubric generation setting. At each turn, output exactly one rubric object or an empty JSON object `{}`. The rubric object may be either a newly generated rubric or a reused/adapted existing parent-child rubric. Existing Rubrics contains previously generated rubrics that may be reused/adapted and should be used to understand the current evaluation gap and avoid redundancy.
+Every generation sample must output at least one non-empty rubric before it may return `{}`. Existing rubrics are not reused automatically; reuse requires outputting the full rubric object again.
+If no further rubric should be output in this multi-turn generation process, return an empty JSON object: {}.
 
 ## Output Components
 - **Title**: Concise abstract label (general, not task-specific)
@@ -219,12 +228,12 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
 - If a continuation drops useful behavior already present in the parent, treat the missing coverage as a possible regression even when the continuation keeps the same high-level idea, unless the continuation provides a correction of previous flaws.
 
 ### 4. Novelty & Non-Redundancy
-- Never duplicate existing or generated rubrics in meaning/scope
+- Do not generate a new rubric that duplicates any existing or already generated rubric in meaning/scope. Re-outputing an existing rubric as a reused/adapted rubric is allowed and is not considered duplication.
 - Identify uncovered quality dimensions
 - Add granular criteria if existing rubrics are broad
-- Return `{}` only when existing rubrics already cover the current parent baseline, child deltas, and visible evidence.
+- Return `{}` only when no remaining existing rubric should be reused/adapted and no new non-redundant parent-relative rubric should be generated.
 - Do not generate semantically equivalent rubrics, e.g., "Runs targeted validation" as a positive rubric and "Does not run targeted validation" as a negative rubric.
-- Use previous rubrics to understand what is already covered, then add only a non-redundant uncovered parent-relative criterion.
+- Use previous rubrics to understand what is already covered, then output only one useful next rubric: either a reused/adapted existing rubric or a non-redundant uncovered parent-relative criterion.
 
 ### 5. Conservative Negative Rubrics
 - Identify clear failure modes, not absence of excellence
@@ -232,11 +241,20 @@ If no additional high-impact, non-redundant rubric remains, return an empty JSON
 - Do not create a negative rubric merely because a continuation lacks a desirable behavior
 - For negative rubrics, every scale anchor must measure severity of the flaw: 1 means the flaw is absent or minimal, and 5 means the flaw is clearly and severely present. Never write a negative rubric whose scale rewards the good behavior at 5.
 
-### 6. Previous Generated Rubrics & Experiences (Optional)
-- This guideline applies only when exisiting, previous generated rubrics or retrieved rubric experiences are provided
-- Use previous rubrics to understand what is already covered, then add only a non-redundant uncovered criterion
-- Treat retrieved rubric experiences as optional hypotheses. Use them only when the current parent baseline, child delta type, and evidence type match the prior lesson.
+### 6. Previous Generated Rubrics & Experiences
+- In each turn, output exactly one rubric object or `{}`. A non-empty output may either reuse/adapt a previously generated rubric if it is still applicable and discriminative for the current parent-child comparison, or generate one new rubric, optionally informed by retrieved experiences.
+- Rubric reuse is opt-in, not automatic. Previously generated rubrics are not used by the judge merely because they appear under Existing Rubrics. To reuse an existing rubric, output the full rubric object in one generation turn. Any existing rubric that is not output in the current multi-turn generation process is considered dropped and will not participate in judging.
+- You may freely modify `weight` or other details of an existing rubric or reference golden rubric to better reflect the current parent baseline, child delta, and judging importance. A modified existing rubric still counts as reuse/adaptation as long as it is derived from an existing rubric.
+- Use previous rubrics and experiences to understand what is already covered, then output only one useful next rubric: either a reused/adapted existing rubric or a non-redundant uncovered criterion.
+- An experience is guidance about when a rubric is useful or misleading. Treat its `context` and `experience` fields as applicability conditions, not as facts about the current task.
+- `metadata.reference_golden_rubrics` contains candidate criteria learned from earlier cases. You may adapt a candidate's polarity, scope, wording, metadata, scale, or weight only when the current parent-child evidence matches the prior lesson.
+- Do not copy a reference rubric merely because it was retrieved. A copied or adapted rubric must be independently relevant and judgeable from the current parent and continuations.
+- Retrieved experiences are not privileged oracles. Never infer the current final patch, hidden tests, or outcome from their presence.
 - If a previous rubric or experience would turn a precise current distinction into a broad generic rubric, ignore it
+
+### 7. Quantity
+- In each turn, output exactly one rubric object or return `{}`. Across the full multi-turn generation process, output at least 1 and at most 6 non-empty rubrics in total.
+- Return `{}` only when all useful existing rubrics have already been reused/adapted in previous turns and no new high-impact, non-redundant parent-relative rubric remains.
 
 
 ## Output Format Example
@@ -265,7 +283,7 @@ THOUGHT: <your reasoning process>
 
 </format_example>
 
-If no new high-impact, non-redundant rubric should be added, output:
+If no further rubric should be output in this multi-turn generation process, output:
 <format_example>
 
 THOUGHT: <your reasoning process>
@@ -281,19 +299,20 @@ THOUGHT: <your reasoning process>
 2. **Previous Persistent State**: Current memory state with summary of past findings and milestones
 3. **Parent Trajectory**: The most recent agent trajectory
 4. **Agent Trajectory Continuations**: Multiple agent trajectories continued from the latest trajectory (Continuation 1, Continuation 2, etc.)
-5. **Existing Rubrics** (optional): Previously generated rubrics
+5. **Existing Rubrics** (optional): Previously generated rubrics available for reuse/adaptation and redundancy checking. They are not automatically used for judging unless explicitly output as full rubric objects in the current multi-turn generation process.
 
 ## Critical Reminders
 - Each rubric must distinguish meaningful parent-relative progress, equivalence, or regression in the actual provided continuations
 - Exclude rubrics that apply equally to the parent and all continuations
-- Prefer `{}` over redundancy when existing rubrics are comprehensive
+- Prefer `{}` over redundant rubric generation when no remaining existing rubric should be reused/adapted and no new non-redundant rubric remains
 - Focus on observable, objective, actionable criteria
 - Quality over quantity: 1 excellent rubric > multiple mediocre ones
 - The parent trajectory is the baseline. Focus the rubric on child deltas over that baseline
-- Do not return `{}` when there are visible differences in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
+- Do not return `{}` when there is still a useful existing rubric to reuse/adapt or a visible, important, non-redundant parent-relative difference in diagnostic strategy, reproduction attempts, validation attempts, or targeting of relevant files
+- Never output a list of rubrics. Each generation turn must output exactly one rubric object or `{}`
 - Output in the required format. Do not restate the question, previous state, agent trajectories, or existing rubrics in the response.
 
-Generate only the most impactful, non-redundant rubric revealing meaningful parent-child progress differences.
+Generate only the most impactful, non-redundant rubric revealing meaningful parent-child progress differences, or explicitly reuse/adapt one existing rubric that should participate in judging.
 """
 
 PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT = """
