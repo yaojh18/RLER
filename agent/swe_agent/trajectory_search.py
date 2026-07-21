@@ -62,6 +62,7 @@ OUTPUT_RE = re.compile(r"<output>\s*(.*?)</output>", re.DOTALL)
 PR_DESCRIPTION_RE = re.compile(r"<pr_description>\s*(.*?)\s*</pr_description>", re.DOTALL)
 MAX_OBSERVATION_CHARS = 512
 MIN_OBSERVATION_SECTION_CHARS = 128
+MAX_WORKSPACE_DIFF_CHARS = 4000
 MAX_RUBRICS = 6
 MAX_RUBRIC_GENERATION_ROUNDS = 10
 MAX_FORMAT_CORRECTION_ROUNDS = 4
@@ -83,7 +84,7 @@ class SearchConfig:
     rubric_temperature: float = 0.0
     rubric_top_p: float = 1.0
     rubric_max_tokens: int = 1024
-    judge_temperature: float = 0.0
+    judge_temperature: float = 0.01
     judge_top_p: float = 1.0
     judge_max_tokens: int = 1024
     regression_margin: float = 0.0
@@ -95,6 +96,8 @@ class SearchConfig:
     strategy: Literal["best", "probability", "random"] = "best"
     rubric_bank_strategy: Literal["score", "experience", "both"] = "score"
     update_experience_bank: bool = False
+    score_tie_break: bool = True
+    stop_on_first_round_no_variance: bool = False
 
 
 @dataclass
@@ -281,7 +284,9 @@ def _render_continuation_view(continuation: dict[str, Any]) -> str:
         "Summary:",
         render_compact_markdown(continuation.get("summary", {})),
         "Trajectory:",
-        _render_trajectory_segment(continuation.get("trajectory_continuation")),
+        _render_trajectory_segment(
+            continuation.get("raw_continuation", continuation.get("trajectory_continuation"))
+        ),
     ])
     if continuation.get("note"):
         parts.extend(["Note:", str(continuation["note"])])
@@ -299,8 +304,8 @@ import subprocess
 
 requested_cwd = {json.dumps(cwd)}
 
-def run(cmd):
-    completed = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+def run(*cmd):
+    completed = subprocess.run(cmd, text=True, capture_output=True)
     return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
 
 cwd = requested_cwd
@@ -309,7 +314,7 @@ for candidate in (requested_cwd, "/testbed", os.getcwd()):
         cwd = candidate
         break
 os.chdir(cwd)
-git_root_ok, git_root, _ = run("git rev-parse --show-toplevel")
+git_root_ok, git_root, _ = run("git", "rev-parse", "--show-toplevel")
 if git_root_ok == 0 and git_root and os.path.isdir(git_root):
     cwd = git_root
     os.chdir(cwd)
@@ -322,27 +327,42 @@ payload = {{
     "untracked_files": [],
     "status": [],
     "diff_stat": "",
+    "full_diff": "",
     "current_patch_chars": 0,
     "workspace_fingerprint": None,
 }}
-git_ok, _, _ = run("git rev-parse --is-inside-work-tree")
+git_ok, _, _ = run("git", "rev-parse", "--is-inside-work-tree")
 payload["git_repo"] = git_ok == 0
 
 if payload["git_repo"]:
-    _, head_commit, _ = run("git rev-parse HEAD")
-    _, changed_files, _ = run("git diff --name-only --diff-filter=ACMRTUXB")
-    _, untracked_files, _ = run("git ls-files --others --exclude-standard")
-    _, status, _ = run("git status --porcelain=v1")
-    _, diff_stat, _ = run("git diff --stat --compact-summary")
-    _, full_diff, _ = run("git diff --no-ext-diff")
+    _, head_commit, _ = run("git", "rev-parse", "HEAD")
+    _, changed_files, _ = run(
+        "git", "diff", "--name-only", "--diff-filter=ACMRTUXB", "HEAD", "--"
+    )
+    _, untracked_files, _ = run("git", "ls-files", "--others", "--exclude-standard")
+    _, status, _ = run("git", "status", "--porcelain=v1")
+    _, diff_stat, _ = run("git", "diff", "--stat", "--compact-summary", "HEAD", "--")
+    _, full_diff, _ = run("git", "diff", "--binary", "--no-ext-diff", "HEAD", "--")
     changed = [line for line in changed_files.splitlines() if line.strip()]
     untracked = [line for line in untracked_files.splitlines() if line.strip()]
+    untracked_diffs = []
+    for rel_path in untracked:
+        returncode, untracked_diff, _ = run(
+            "git", "diff", "--binary", "--no-index", "--", "/dev/null", rel_path
+        )
+        if returncode in (0, 1) and untracked_diff:
+            untracked_diffs.append(untracked_diff)
+    if untracked_diffs:
+        full_diff = "\n".join(
+            [part for part in [full_diff, *untracked_diffs] if part]
+        )
     status_lines = [line for line in status.splitlines() if line.strip()]
     payload["head_commit"] = head_commit
     payload["changed_files"] = changed
     payload["untracked_files"] = untracked
     payload["status"] = status_lines
     payload["diff_stat"] = diff_stat
+    payload["full_diff"] = full_diff
     payload["current_patch_chars"] = len(full_diff)
     fingerprints = {{}}
     for rel_path in changed + untracked:
@@ -373,11 +393,12 @@ PY"""
     if not isinstance(parsed, dict):
         return {**EMPTY_WORKSPACE_META, "cwd": cwd}
     workspace_meta = {**EMPTY_WORKSPACE_META, **parsed}
-    workspace_meta["cwd"] = cwd
     workspace_meta["changed_files"] = list(workspace_meta.get("changed_files", []))
     workspace_meta["untracked_files"] = list(workspace_meta.get("untracked_files", []))
     workspace_meta["status"] = list(workspace_meta.get("status", []))
-    workspace_meta["current_patch_chars"] = int(workspace_meta.get("current_patch_chars", 0) or 0)
+    full_diff = str(workspace_meta.pop("full_diff", "") or "")
+    workspace_meta["git_diff"] = _truncate_middle(full_diff, MAX_WORKSPACE_DIFF_CHARS)
+    workspace_meta["current_patch_chars"] = len(full_diff)
     return workspace_meta
 
 
@@ -455,21 +476,17 @@ async def _update_persistent_state(
     }
 
 
-def _parse_judge_score(response: str) -> int | None:
+def _parse_judge_result(response: str) -> tuple[str, int] | None:
     parsed = extract_last_json_object(response)
-    score = None
-    if isinstance(parsed, dict):
-        for key in ("score", "judged_score", "rating"):
-            if key in parsed:
-                score = parsed[key]
-                break
-    if score is None:
-        matches = re.findall(
-            r"(?im)^\s*(?:final\s+)?score\s*[:=]\s*([1-5](?:\.0)?(?:\s*/\s*5)?)\s*$",
-            response,
-        )
-        if len(matches) == 1:
-            score = matches[0]
+    if not isinstance(parsed, dict):
+        return None
+    evidence = parsed.get("evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        return None
+    score = next(
+        (parsed[key] for key in ("score", "judged_score", "rating") if key in parsed),
+        None,
+    )
     if isinstance(score, bool):
         return None
     if isinstance(score, str):
@@ -484,7 +501,7 @@ def _parse_judge_score(response: str) -> int | None:
         score = int(score)
     if not isinstance(score, int):
         return None
-    return score if 1 <= score <= 5 else None
+    return (evidence.strip(), score) if 1 <= score <= 5 else None
 
 
 def _parse_persistent_state_response(response: str) -> dict[str, Any] | None:
@@ -685,7 +702,7 @@ async def _score_round(
                 *,
                 response_text: str = response_text,
                 criterion: str = criterion,
-            ) -> tuple[int, str | None, list[dict[str, Any]]]:
+            ) -> tuple[int, str, str | None, list[dict[str, Any]]]:
                 prompt_parts = [
                     judge_prompt.strip(),
                     f"\n\n## Question:\n{question_text}\n",
@@ -715,12 +732,13 @@ async def _score_round(
                                 )
                         messages.append(assistant_message)
                         response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
-                        score_raw = _parse_judge_score(response)
+                        judge_result = _parse_judge_result(response)
                         full_response = assistant_message.get("content") or ""
-                        if score_raw is None and full_response != response:
-                            score_raw = _parse_judge_score(full_response)
-                        if score_raw is not None:
-                            return score_raw, None, messages_from_first_assistant(messages)
+                        if judge_result is None and full_response != response:
+                            judge_result = _parse_judge_result(full_response)
+                        if judge_result is not None:
+                            evidence, score_raw = judge_result
+                            return score_raw, evidence, None, messages_from_first_assistant(messages)
                         messages.append(
                             {
                                 "role": "user",
@@ -728,16 +746,21 @@ async def _score_round(
                             }
                         )
                 except Exception:
-                    return 1, "InvalidJudgeResponse", messages_from_first_assistant(messages)
-                return 1, "InvalidJudgeResponse", messages_from_first_assistant(messages)
+                    return 1, "", "InvalidJudgeResponse", messages_from_first_assistant(messages)
+                return 1, "", "InvalidJudgeResponse", messages_from_first_assistant(messages)
             calls.append(_judge_single())
             mapping.append((view_index, node_id, rubric))
     responses = await asyncio.gather(*calls)
     per_view_scores: list[list[dict[str, Any]]] = [[] for _ in continuations]
     errors: list[dict[str, str]] = []
     for (view_index, node_id, rubric), response in zip(mapping, responses):
-        score_raw, error, judge_messages = response
-        record = rubric_score_record(rubric, score_raw, judge_messages)
+        score_raw, evidence, error, judge_messages = response
+        record = rubric_score_record(
+            rubric,
+            score_raw,
+            judge_messages,
+            evidence=evidence,
+        )
         per_view_scores[view_index].append(record)
         if error is not None:
             errors.append(
@@ -992,6 +1015,162 @@ def _normalized_weight_by_rubric(rubrics: list[RubricRecord]) -> dict[str, float
     return {rubric_id: importance / total for rubric_id, importance in importance_by_rubric.items()}
 
 
+def _tie_break_generation_prompt(base_prompt: str, *, scope: str) -> str:
+    task_start = base_prompt.index("## Task\n") + len("## Task\n")
+    continuation = "\nThis is a multi-turn rubric generation setting."
+    task_end = base_prompt.index(continuation, task_start)
+    if scope == "pc":
+        task = (
+            "The displayed continuations are the currently highest-scoring branches "
+            "tied under the existing parent-child rubric portfolio. Identify the single "
+            "most discriminative non-redundant parent-relative rubric to output next "
+            "that can resolve this tie from visible evidence."
+        )
+    else:
+        task = (
+            "The displayed continuations are the currently highest-scoring branches "
+            "tied under the existing rubric portfolio. Identify the single most "
+            "discriminative non-redundant rubric to output next that can resolve this "
+            "tie from visible evidence."
+        )
+    return base_prompt[:task_start] + task + base_prompt[task_end:]
+
+
+async def _run_score_tie_break(
+    *,
+    scope: str,
+    round_index: int,
+    generation_prompt: str,
+    rubric_list_prefix: str,
+    judge_prompt: str,
+    question: dict[str, Any],
+    shared_context: dict[str, Any],
+    continuations: list[dict[str, Any]],
+    extra_prompt_sections: list[str],
+    generation_kwargs: dict[str, Any],
+    judge_kwargs: dict[str, Any],
+    initial_rubrics: list[RubricRecord],
+    initial_score_by_rubric: dict[str, dict[str, float]],
+    initial_scores: dict[str, float],
+) -> dict[str, Any] | None:
+    if len(initial_scores) < 2 or not initial_rubrics:
+        return None
+    top_score = max(initial_scores.values())
+    tied_node_ids = [
+        node_id
+        for node_id, score in initial_scores.items()
+        if math.isclose(score, top_score, rel_tol=1e-12, abs_tol=1e-12)
+    ]
+    if len(tied_node_ids) < 2:
+        return None
+    by_node_id = {continuation["node_id"]: continuation for continuation in continuations}
+    tied_continuations = [by_node_id[node_id] for node_id in tied_node_ids]
+    tie_scores = {
+        rubric_id: {
+            node_id: scores[node_id]
+            for node_id in tied_node_ids
+            if node_id in scores
+        }
+        for rubric_id, scores in initial_score_by_rubric.items()
+    }
+    existing_tie_section = "\n".join(
+        [
+            "## Existing Tie-Producing Rubrics",
+            render_compact_markdown([asdict(rubric) for rubric in initial_rubrics]),
+            "",
+            "## Existing Scores For The Tied Branches",
+            render_compact_markdown(tie_scores),
+        ]
+    )
+    tie_sections = list(extra_prompt_sections)
+    experience_index = next(
+        (
+            index
+            for index, section in enumerate(tie_sections)
+            if section.lstrip().startswith("## Retrieved Rubric Experiences:")
+        ),
+        len(tie_sections),
+    )
+    tie_sections.insert(experience_index, existing_tie_section)
+    batch = await _generate_and_score_rubric_batch(
+        sample_count=1,
+        round_index=round_index,
+        generation_kwargs=generation_kwargs,
+        generation_prompt=_tie_break_generation_prompt(
+            generation_prompt, scope=scope
+        ),
+        rubric_list_prefix=f"{rubric_list_prefix}-tie",
+        question=question,
+        shared_context=shared_context,
+        continuations=tied_continuations,
+        extra_prompt_sections=tie_sections,
+        judge_kwargs=judge_kwargs,
+        judge_prompt=judge_prompt,
+        require_first_rubric=True,
+    )
+    generated_sample = batch["generated_samples"][0]
+    rubrics = batch["sample_generated_rubrics"][0]
+    if not rubrics:
+        return {
+            "status": "fallback",
+            "tied_node_ids": tied_node_ids,
+            "reason": "no_valid_tie_break_rubric",
+            "messages": generated_sample.messages,
+            "format_errors": generated_sample.format_errors or [],
+            "terminal_error": generated_sample.terminal_error,
+        }
+    evaluation = _rubric_sample_evaluation(
+        score_batch=batch,
+        sample_index=0,
+        node_ids=tied_node_ids,
+        scoring_rubrics=rubrics,
+        include_variance_reward=False,
+    )
+    score_fn = _pc_avg_scores_from_rubrics if scope == "pc" else _avg_scores_from_rubrics
+    secondary_scores = score_fn(
+        node_ids=tied_node_ids,
+        score_lookup_by_node=evaluation["score_lookup_by_node"],
+        rubrics=rubrics,
+    )
+    spread = max(secondary_scores.values()) - min(secondary_scores.values())
+    adjusted_scores = copy.deepcopy(initial_scores)
+    if spread > 0:
+        for node_id, score in secondary_scores.items():
+            adjusted_scores[node_id] = top_score + 1e-6 * (
+                (score - min(secondary_scores.values())) / spread
+            )
+    judge_messages = []
+    error_by_call = {
+        (error.get("node_id"), error.get("rubric_id")): error.get("error")
+        for error in evaluation["judge_errors"]
+    }
+    for node_id, records in zip(tied_node_ids, evaluation["scored_continuations"]):
+        for record in records:
+            judge_messages.append(
+                {
+                    "tie_break": True,
+                    "node_id": node_id,
+                    "rubric_id": record["rubric_id"],
+                    "messages": copy.deepcopy(record.get("judge_message") or []),
+                    "error": error_by_call.get((node_id, record["rubric_id"])),
+                }
+            )
+    return {
+        "status": "success",
+        "tied_node_ids": tied_node_ids,
+        "generated": [asdict(rubric) for rubric in rubrics],
+        "messages": generated_sample.messages,
+        "format_errors": generated_sample.format_errors or [],
+        "terminal_error": generated_sample.terminal_error,
+        "judge_messages": judge_messages,
+        "judge_errors": evaluation["judge_errors"],
+        "score_by_rubric": evaluation["metrics"]["score_by_rubric"],
+        "secondary_scores": secondary_scores,
+        "pre_tie_scores": initial_scores,
+        "adjusted_scores": adjusted_scores,
+    }
+
+
 # NOTE: the correlation score will be unstable when there are very few data points
 def _redundancy_reward(
     candidate_scores: list[float],
@@ -1061,6 +1240,28 @@ def _select_beam_branches(
             )
         )
     return selected
+
+
+def _first_round_gt_gate(
+    evaluations: dict[str, dict[str, Any]],
+    *,
+    branch_count: int,
+) -> dict[str, Any]:
+    ground_truth_reward_by_node = {
+        node_id: float(payload["reward"])
+        for node_id, payload in evaluations.items()
+        if payload.get("reward") is not None
+    }
+    resolved_branch_count = sum(
+        reward == 2.0 for reward in ground_truth_reward_by_node.values()
+    )
+    return {
+        "continue_search": 0 < resolved_branch_count < branch_count,
+        "branch_count": branch_count,
+        "evaluated_branch_count": len(ground_truth_reward_by_node),
+        "resolved_branch_count": resolved_branch_count,
+        "ground_truth_reward_by_node": ground_truth_reward_by_node,
+    }
 
 
 def _docker_commit(
@@ -1205,21 +1406,15 @@ class TrajectorySearchRunner:
         provided_experience_banks = experience_banks if experience_banks is not None else {}
         if uses_experience_bank:
             siblings_experience_bank = provided_experience_banks.get("siblings")
-            self.experience_bank = (siblings_experience_bank if isinstance(siblings_experience_bank, ExperienceRubricBank)
-                else ExperienceRubricBank(
-                    retrieval_prompt=RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
-                    update_prompt=RUBRIC_EXPERIENCE_UPDATE_PROMPT,
-                    scope="siblings",
-                )
-            )
             pc_experience_bank = provided_experience_banks.get("pc")
-            self.pc_experience_bank = (pc_experience_bank if isinstance(pc_experience_bank, ExperienceRubricBank)
-                else ExperienceRubricBank(
-                    retrieval_prompt=PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
-                    update_prompt=PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
-                    scope="pc",
+            if not isinstance(siblings_experience_bank, ExperienceRubricBank) or not isinstance(
+                pc_experience_bank, ExperienceRubricBank
+            ):
+                raise ValueError(
+                    "Experience rubric search requires frozen siblings and pc banks"
                 )
-            )
+            self.experience_bank = siblings_experience_bank
+            self.pc_experience_bank = pc_experience_bank
         else:
             self.experience_bank = None
             self.pc_experience_bank = None
@@ -1232,6 +1427,7 @@ class TrajectorySearchRunner:
             "pc": self.pc_experience_bank,
         }
         self.current_round = 0
+        self.continue_after_first_round: bool | None = None
         self.system_prompt = ""
         self.user_prompt = ""
         self.best_node_id: str | None = None
@@ -1276,6 +1472,12 @@ class TrajectorySearchRunner:
             else:
                 self._initialize_root()
             while self.current_round < self.search_config.max_rounds:
+                if (
+                    self.search_config.stop_on_first_round_no_variance
+                    and self.current_round >= 1
+                    and self.continue_after_first_round is False
+                ):
+                    break
                 if self.frontier_ids and self.nodes[self.frontier_ids[0]].status == "finished":
                     break
                 if len(self.frontier_ids) == 0:
@@ -1438,6 +1640,7 @@ class TrajectorySearchRunner:
             "best_node_id": self.best_node_id,
             "finished_node_ids": list(self.finished_node_ids),
             "current_round": self.current_round,
+            "continue_after_first_round": self.continue_after_first_round,
             "peaceful_exit_triggered": self.peaceful_exit_triggered,
             "system_prompt": self.system_prompt,
             "user_prompt": self.user_prompt,
@@ -1478,9 +1681,20 @@ class TrajectorySearchRunner:
         self.best_node_id = manifest.get("best_node_id")
         self.finished_node_ids = list(manifest.get("finished_node_ids", []))
         self.current_round = int(manifest.get("current_round", 0))
+        self.continue_after_first_round = manifest.get("continue_after_first_round")
         self.peaceful_exit_triggered = bool(manifest.get("peaceful_exit_triggered", False))
         self.system_prompt = manifest.get("system_prompt", "")
         self.user_prompt = manifest.get("user_prompt", "")
+        completed_round = 0
+        while (self.rubrics_dir / f"round_{completed_round + 1:03d}.json").is_file():
+            completed_round += 1
+        if self.current_round > completed_round:
+            logger.warning(
+                "Resume manifest reached round %d, but artifacts are complete only through round %d; retrying the interrupted round.",
+                self.current_round,
+                completed_round,
+            )
+            self.current_round = completed_round
         if self.rubric_bank is not None:
             active_bank = [RubricRecord(**rubric) for rubric in manifest.get("active_bank", [])]
             inactive_bank = [RubricRecord(**rubric) for rubric in manifest.get("inactive_bank", [])]
@@ -1490,14 +1704,35 @@ class TrajectorySearchRunner:
             pc_inactive_bank = [RubricRecord(**rubric) for rubric in manifest.get("pc_inactive_bank", [])]
             self.pc_rubric_bank.set_state(active_bank=pc_active_bank, inactive_bank=pc_inactive_bank)
         self.nodes = {}
+        self._node_judge_cache = {}
+        self._node_snapshot_cache = {}
+        self._node_rubric_round_cache = {}
+        round_payloads: dict[int, dict[str, Any]] = {}
         for node_id in manifest.get("node_ids", []):
             node_path = self.nodes_dir / node_id / "node.json"
             if node_path.exists():
-                self.nodes[node_id] = SearchNode(**json.loads(node_path.read_text(encoding="utf-8")))
+                node = SearchNode(**json.loads(node_path.read_text(encoding="utf-8")))
+                self.nodes[node_id] = node
                 judge_path = node_path.parent / "judge.json"
                 snapshot_path = node_path.parent / "snapshot.json"
                 if judge_path.exists():
-                    self._node_judge_cache[node_id] = json.loads(judge_path.read_text(encoding="utf-8"))
+                    judge = json.loads(judge_path.read_text(encoding="utf-8"))
+                    self._node_judge_cache[node_id] = judge
+                    if isinstance(judge.get("rubric_round"), dict):
+                        self._node_rubric_round_cache[node_id] = copy.deepcopy(
+                            judge["rubric_round"]
+                        )
+                if node_id not in self._node_rubric_round_cache and node.round_index > 0:
+                    if node.round_index not in round_payloads:
+                        round_path = self.rubrics_dir / f"round_{node.round_index:03d}.json"
+                        if round_path.exists():
+                            round_payloads[node.round_index] = json.loads(
+                                round_path.read_text(encoding="utf-8")
+                            )
+                    if node.round_index in round_payloads:
+                        self._node_rubric_round_cache[node_id] = copy.deepcopy(
+                            round_payloads[node.round_index]
+                        )
                 if snapshot_path.exists():
                     self._node_snapshot_cache[node_id] = json.loads(snapshot_path.read_text(encoding="utf-8"))
 
@@ -1743,10 +1978,10 @@ class TrajectorySearchRunner:
                 latest_shared_segment=latest_shared_segment,
                 continuations=continuations,
                 model_name=self.rubric_model_name,
-                temperature=self.search_config.rubric_temperature,
                 top_p=self.search_config.rubric_top_p,
-                max_tokens=self.search_config.rubric_max_tokens,
                 model_kwargs=self.rubric_model_kwargs,
+                instance_id=self.task_id,
+                round_index=round_index,
             )
             extra_prompt_sections.extend(experience_context.extra_prompt_sections)
             retrieved_experiences = copy.deepcopy(experience_context.retrieved)
@@ -1829,6 +2064,31 @@ class TrajectorySearchRunner:
                     score_lookup_by_node=evaluation["score_lookup_by_node"],
                     rubrics=scoring_rubrics,
                 )
+            tie_break = None
+            tie_break_messages: list[dict[str, Any]] = []
+            if self.search_config.score_tie_break and scoring_rubrics:
+                tie_break_result = await _run_score_tie_break(
+                    scope=scope_spec["scope"],
+                    round_index=round_index,
+                    generation_prompt=scope_spec["generation_prompt"],
+                    rubric_list_prefix=scope_spec["rubric_list_prefix"],
+                    judge_prompt=scope_spec["judge_prompt"],
+                    question=question,
+                    shared_context=shared_context,
+                    continuations=continuations,
+                    extra_prompt_sections=extra_prompt_sections,
+                    generation_kwargs=generation_kwargs,
+                    judge_kwargs=judge_kwargs,
+                    initial_rubrics=scoring_rubrics,
+                    initial_score_by_rubric=metrics["score_by_rubric"],
+                    initial_scores=avg_scores,
+                )
+                if tie_break_result is not None:
+                    tie_break = copy.deepcopy(tie_break_result)
+                    tie_break_messages = tie_break.pop("messages", [])
+                    judge_messages.extend(tie_break.pop("judge_messages", []))
+                    if tie_break.get("status") == "success":
+                        avg_scores = copy.deepcopy(tie_break["adjusted_scores"])
             scored_rubric_ids = {rubric.rubric_id for rubric in scoring_rubrics}
             sample_payload = {
                 "scope": scope_spec["scope"],
@@ -1845,6 +2105,8 @@ class TrajectorySearchRunner:
                 "average_rubric_judged_scores": avg_scores,
                 "judge_errors": evaluation["judge_errors"],
                 "judge_messages": judge_messages,
+                "tie_break": tie_break,
+                "tie_break_messages": tie_break_messages,
                 "selected": False,
             }
             if experience_bank is not None:
@@ -1921,19 +2183,15 @@ class TrajectorySearchRunner:
             branch["persistent_state"] = copy.deepcopy(updated_parent_state)
             step_cards = branch["recent_segments"][-1].get("step_cards", []) if branch["recent_segments"] else []
             workspace_meta = branch.get("workspace_meta", {})
-            result = branch.get("result", {})
             branch["continuation_view"] = {
                 "node_id": branch["node_id"],
                 "summary": {
                     "step_count": len(step_cards),
                     "changed_files": list(workspace_meta.get("changed_files", []))[:8],
                     "untracked_files": list(workspace_meta.get("untracked_files", []))[:8],
-                    "diff_stat": workspace_meta.get("diff_stat", ""),
-                    "current_patch_chars": int(workspace_meta.get("current_patch_chars", 0) or 0),
-                    "result_status": result.get("status", ""),
-                    "exit_status": result.get("exit_status", ""),
+                    "git_diff": workspace_meta.get("git_diff", ""),
                 },
-                "trajectory_continuation": copy.deepcopy(branch["recent_segments"][-1]) if branch["recent_segments"] else None,
+                "raw_continuation": copy.deepcopy(branch["recent_segments"][-1]) if branch["recent_segments"] else None,
             }
             if include_parent_index:
                 branch["continuation_view"]["parent_index"] = parent_index
@@ -2135,6 +2393,8 @@ class TrajectorySearchRunner:
             "reward_by_rubric": copy.deepcopy(sample["reward_by_rubric"]),
             "judge_errors": copy.deepcopy(sample["judge_errors"]),
         }
+        if sample.get("tie_break") is not None:
+            payload["tie_break"] = copy.deepcopy(sample["tie_break"])
         payload.update(self._rubric_bank_payload_fields(sample))
         return payload
 
@@ -2350,6 +2610,8 @@ class TrajectorySearchRunner:
                 valid_branch_records.append(rec)
 
         if len(valid_branch_records) < 2:
+            if round_index == 1 and self.patch_eval_manager is not None:
+                self.continue_after_first_round = False
             self.peaceful_exit(branch_records, parent_ids)
             return []
 
@@ -2433,6 +2695,7 @@ class TrajectorySearchRunner:
                     messages_payload=sample["messages"],
                     retrieve_messages_payload=sample.get("retrieve_messages"),
                     judge_messages_payload=sample.get("judge_messages"),
+                    tie_break_messages_payload=sample.get("tie_break_messages"),
                     summary_messages_payload=(
                         judged.get("summary_messages")
                         if sample["selected"] and judged.get("summary_messages")
@@ -2462,6 +2725,7 @@ class TrajectorySearchRunner:
                     messages_payload=sample["messages"],
                     retrieve_messages_payload=sample.get("retrieve_messages"),
                     judge_messages_payload=sample.get("judge_messages"),
+                    tie_break_messages_payload=sample.get("tie_break_messages"),
                     scope="pc",
                 )
             )
@@ -2664,11 +2928,24 @@ class TrajectorySearchRunner:
                 extra_json_writes=non_gt_extra_json_writes,
                 write_gt_files=False,
             )
-            self.patch_eval_manager.submit_round(
+            patch_eval_future = self.patch_eval_manager.submit_round(
                 artifact_bundles,
                 rubric_artifact_bundles,
                 extra_json_writes=gt_extra_json_writes,
             )
+            if (
+                round_index == 1
+                and self.search_config.stop_on_first_round_no_variance
+            ):
+                patch_eval_payload = patch_eval_future.result()
+                first_round_gt_gate = _first_round_gt_gate(
+                    patch_eval_payload["evaluations"],
+                    branch_count=len(branch_records),
+                )
+                self.continue_after_first_round = first_round_gt_gate["continue_search"]
+                round_payload["first_round_gt_gate"] = first_round_gt_gate
+                if self.search_config.write_artifacts:
+                    _atomic_write_json(round_rubric_path, round_payload)
         else:
             self.artifact_writer.submit_round(
                 artifact_bundles,

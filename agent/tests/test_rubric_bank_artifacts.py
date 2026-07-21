@@ -16,11 +16,10 @@ from swe_agent.parallel_utils import PatchEvalManager
 from swe_agent.parallel_utils import RubricArtifactBundle
 from swe_agent.parallel_utils import _write_base_artifacts
 from swe_agent.parallel_utils import progress_reward
+from swe_agent.prompt import PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT
 from swe_agent.rubric_bank import ExperienceRubricBank
-from swe_agent.rubric_bank import RubricExperience
 from swe_agent.rubric_bank import RubricRecord
 from swe_agent.rubric_bank import ScoreRubricBank
-from swe_agent.rubric_bank import _match_experience_title
 from swe_agent.rubric_bank import _convert_rubric_item
 from swe_agent.rubric_bank import render_compact_markdown
 
@@ -49,6 +48,7 @@ from swe_agent.trajectory_search import (
     TrajectorySearchRunner,
     _avg_scores_from_rubrics,
     _combine_score_results,
+    _first_round_gt_gate,
     _generate_and_score_rubric_batch,
     _normalize_terminal_patch_text,
     _pc_avg_scores_from_rubrics,
@@ -56,6 +56,113 @@ from swe_agent.trajectory_search import (
     _select_beam_branches,
 )
 from swe_agent.trajectory_search_parallel import TrajectorySearchParallelRunner
+
+
+def test_first_round_gt_gate_only_continues_for_mixed_resolved_branches():
+    assert _first_round_gt_gate(
+        {"node-1": {"reward": 2.0}, "node-2": {"reward": 0.5}},
+        branch_count=2,
+    )["continue_search"] is True
+    assert _first_round_gt_gate(
+        {"node-1": {"reward": 2.0}, "node-2": {"reward": 2.0}},
+        branch_count=2,
+    )["continue_search"] is False
+    assert _first_round_gt_gate(
+        {"node-1": {"reward": 0.5}, "node-2": {"reward": 0.0}},
+        branch_count=2,
+    )["continue_search"] is False
+
+
+def test_singularity_defaults_hide_host_bind_paths(monkeypatch):
+    from swe_agent.environments.singularity import (
+        SingularityEnvironmentConfig,
+        _runtime_environment,
+    )
+
+    config = SingularityEnvironmentConfig(image="image.sif")
+    assert config.exec_args[-2:] == [
+        "--no-mount",
+        "home,cwd,tmp,hostfs,bind-paths",
+    ]
+    monkeypatch.setenv("APPTAINER_BIND", "/tmp:/tmp")
+    monkeypatch.setenv("SINGULARITY_BINDPATH", "/workspace:/workspace")
+    environment = _runtime_environment()
+    assert "APPTAINER_BIND" not in environment
+    assert "SINGULARITY_BINDPATH" not in environment
+
+
+def test_partially_initialized_singularity_environment_can_cleanup():
+    from swe_agent.environments.singularity import SingularityEnvironment
+
+    environment = SingularityEnvironment.__new__(SingularityEnvironment)
+    environment._owns_sandbox = True
+
+    environment.cleanup()
+
+
+def test_singularity_evaluator_keeps_only_explicit_bind_paths(monkeypatch, tmp_path):
+    from swe_agent.run.benchmarks import container_runtime
+
+    captured = {}
+
+    class FakeEnvironment:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.sandbox_dir = tmp_path / "sandbox"
+            self.sandbox_dir.mkdir()
+
+    monkeypatch.setattr(container_runtime, "select_container_backend", lambda: "singularity")
+    monkeypatch.setattr(container_runtime, "resolve_singularity_image", lambda *_: tmp_path / "image.sif")
+    monkeypatch.setattr(container_runtime, "SingularityEnvironment", FakeEnvironment)
+    source = tmp_path / "evaluation"
+    source.mkdir()
+    container_runtime.make_bound_environment(
+        image="image",
+        instance={},
+        binds=[(source, "/eval")],
+        cwd="/testbed",
+        timeout=60,
+    )
+
+    assert captured["exec_args"][:4] == [
+        "--cleanenv",
+        "--no-home",
+        "--no-mount",
+        "home,cwd,tmp,hostfs",
+    ]
+    assert captured["exec_args"][4:] == [
+        "--bind",
+        f"{source.resolve()}:/eval",
+    ]
+
+
+def test_new_continuation_view_renders_raw_trajectory_and_truncated_diff():
+    assert trajectory_search.MAX_WORKSPACE_DIFF_CHARS == 4000
+    long_diff = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n" + ("+changed\n" * 500)
+    summary = trajectory_search._truncate_middle(long_diff, 300)
+    assert len(summary) <= 300
+    assert "diff --git a/a.py b/a.py" in summary
+    assert "+changed" in summary
+
+    rendered = trajectory_search._render_continuation_view(
+        {
+            "node_id": "node-1",
+            "summary": {"git_diff": summary},
+            "raw_continuation": {
+                "segment_step_range": [0, 1],
+                "step_cards": [
+                    {
+                        "step_index": 1,
+                        "assistant_message": "Run `pwd`.",
+                        "commands": ["pwd"],
+                        "observation": "/testbed",
+                    }
+                ],
+            },
+        }
+    )
+    assert "Trajectory:\nSegment step range: 0-1" in rendered
+    assert "pwd" in rendered
 
 
 def test_route_completion_message_requires_reasoning_for_structured_sglang(monkeypatch):
@@ -348,6 +455,51 @@ def test_resume_snapshot_uses_environment_specific_ownership():
     assert docker_payload["environment"]["state"] == {"owns_container": True}
 
 
+def test_load_manifest_restores_round_rubric_cache(tmp_path):
+    node = SearchNode(
+        node_id="node-r001-s00-test",
+        parent_id="root",
+        round_index=1,
+        depth=1,
+        session_id="session",
+        status="frontier",
+    )
+    node_dir = tmp_path / "nodes" / node.node_id
+    node_dir.mkdir(parents=True)
+    (tmp_path / "rubrics").mkdir()
+    (node_dir / "node.json").write_text(json.dumps(node.__dict__))
+    round_payload = {
+        "round_index": 1,
+        "active_bank_after": [{"rubric_id": "rubric-r001-s00"}],
+    }
+    (tmp_path / "rubrics" / "round_001.json").write_text(json.dumps(round_payload))
+    (tmp_path / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": "resume-test",
+                "frontier_ids": [node.node_id],
+                "best_node_id": node.node_id,
+                "finished_node_ids": [],
+                "current_round": 2,
+                "node_ids": [node.node_id],
+            }
+        )
+    )
+
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    runner.run_id = "initial"
+    runner.manifest_path = tmp_path / "run_manifest.json"
+    runner.nodes_dir = tmp_path / "nodes"
+    runner.rubrics_dir = tmp_path / "rubrics"
+    runner.rubric_bank = None
+    runner.pc_rubric_bank = None
+
+    runner._load_manifest()
+
+    assert runner.current_round == 1
+    assert runner._node_rubric_round_cache[node.node_id] == round_payload
+
+
 def test_docker_checkpoint_and_sweep_do_not_use_singularity_paths(monkeypatch):
     committed = []
     docker_calls = []
@@ -573,12 +725,14 @@ def test_rubric_base_artifacts_use_dedicated_message_files(tmp_path):
         }
     ]
     summary_messages = [{"role": "assistant", "content": '{"state": "ready"}'}]
+    tie_break_messages = [{"role": "assistant", "content": '{"rubrics": []}'}]
     bundle = RubricArtifactBundle(
         rubric_dir=rubric_dir,
         rubric_payload={"rubric_list_id": "rubric-r001-s00"},
         messages_payload=messages,
         retrieve_messages_payload=retrieve_messages,
         judge_messages_payload=judge_messages,
+        tie_break_messages_payload=tie_break_messages,
         summary_messages_payload=summary_messages,
     )
 
@@ -587,6 +741,7 @@ def test_rubric_base_artifacts_use_dedicated_message_files(tmp_path):
     assert json.loads((rubric_dir / "rubric_message.json").read_text()) == messages
     assert json.loads((rubric_dir / "rubric_retrieve_message.json").read_text()) == retrieve_messages
     assert json.loads((rubric_dir / "judge_message.json").read_text()) == judge_messages
+    assert json.loads((rubric_dir / "tie_break_message.json").read_text()) == tie_break_messages
     assert json.loads((rubric_dir / "summary_message.json").read_text()) == summary_messages
     assert not (rubric_dir / "messages.json").exists()
 
@@ -620,70 +775,6 @@ def test_persistent_state_format_failure_reuses_parent_and_keeps_assistant_suffi
     assert result["error"] == "InvalidPersistentStateResponse"
     assert result["messages"][0]["role"] == "assistant"
     assert all(message["content"] != "task" for message in result["messages"])
-
-
-def test_experience_retrieval_accepts_normalized_valid_subset(monkeypatch, tmp_path):
-    bank = ExperienceRubricBank(bank_path=tmp_path / "bank.json", scope="siblings", retrieve_top_k=2)
-    title = 'Do not reward "already fixed" conclusions'
-    bank.experiences = {
-        title: RubricExperience(
-            experience_id="exp-1",
-            title=title,
-            description="desc",
-            metadata={},
-            context="context",
-            experience="experience",
-        )
-    }
-    calls = []
-
-    async def fake_route_completion_message(**kwargs):
-        calls.append(kwargs)
-        return {
-            "role": "assistant",
-            "content": '{"titles": ["Do not reward ‘already fixed’ conclusions", "invented"]}',
-            "content_no_thinking": '{"titles": ["Do not reward ‘already fixed’ conclusions", "invented"]}',
-        }
-
-    monkeypatch.setattr("swe_agent.rubric_bank.route_completion_message", fake_route_completion_message)
-    retrieved, messages = asyncio.run(
-        bank._retrieve(
-            question={},
-            previous_state={},
-            latest_shared_segment=None,
-            continuations=[],
-            model_name="dummy",
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=16,
-            model_kwargs=None,
-        )
-    )
-
-    assert [item.title for item in retrieved] == [title]
-    assert len(calls) == 1
-    assert messages[-1]["role"] == "assistant"
-
-
-def test_experience_title_fuzzy_match_accepts_unique_containment_and_requires_a_clear_margin():
-    titles = [
-        "Avoid task-restatement rubrics for import normalization fixes",
-        "End-to-End Watcher Metrics, Not Utility-Only Progress",
-        "Require End-to-End Watcher Metrics, Not Buffer-Only Progress",
-    ]
-
-    assert _match_experience_title(
-        "Do not reward task-restatement rubrics for import normalization fixes",
-        titles,
-    ) == titles[0]
-    assert _match_experience_title(
-        "End-to-End Watcher Metrics, Not Buffer-Only Progress",
-        titles,
-    ) == titles[2]
-    assert _match_experience_title(
-        "End-to-End Watcher Metrics Progress",
-        titles,
-    ) is None
 
 
 def test_rubric_scope_only_judges_model_selected_rubrics(monkeypatch):
@@ -740,7 +831,13 @@ def test_rubric_scope_only_judges_model_selected_rubrics(monkeypatch):
     monkeypatch.setattr(trajectory_search, "_score_round", fake_score_round)
     monkeypatch.setattr(trajectory_search, "_generate_and_score_rubric_batch", fake_generate_and_score_batch)
     runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
-    runner.search_config = SearchConfig(n=1, rubric_temperature=0.0, rubric_top_p=1.0, rubric_max_tokens=16)
+    runner.search_config = SearchConfig(
+        n=1,
+        rubric_temperature=0.0,
+        rubric_top_p=1.0,
+        rubric_max_tokens=16,
+        score_tie_break=False,
+    )
     runner.rubric_model_name = "dummy"
     runner.rubric_model_kwargs = {}
 
@@ -776,6 +873,10 @@ def test_rubric_scope_only_judges_model_selected_rubrics(monkeypatch):
 def test_experience_bank_evidence_uses_average_judged_scores_and_does_not_write(tmp_path):
     bank_path = tmp_path / "siblings_rubric_bank.json"
     bank = ExperienceRubricBank(bank_path=bank_path, scope="siblings")
+    assert (
+        ExperienceRubricBank(scope="pc").update_prompt
+        == PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT
+    )
     payload = {
         "messages": [{"role": "user", "content": "prompt"}],
         "average_rubric_judged_scores": {"node-a": 0.2, "node-b": 0.8},
@@ -904,11 +1005,22 @@ def test_prompt_context_uses_compact_markdown():
 
 
 def test_search_defaults_to_search_outputs_and_tmp_logs():
-    args = build_arg_parser().parse_args([])
+    parser = build_arg_parser()
+    args = parser.parse_args([])
 
     assert args.output_root.name == "search_outputs"
     assert args.output_root.parent.name == "agent"
     assert args.beam_size == 2
+    assert args.experience_bank.name == "nemotron_ultra"
+    assert args.judge_temperature == 0.01
+    assert args.score_tie_break is True
+    assert args.stop_on_first_round_no_variance is False
+    assert SearchConfig().judge_temperature == 0.01
+    assert SearchConfig().score_tie_break is True
+    assert SearchConfig().stop_on_first_round_no_variance is False
+    assert parser.parse_args(
+        ["--stop-on-first-round-no-variance"]
+    ).stop_on_first_round_no_variance is True
 
 
 def test_round_parent_selection_uses_same_depth_and_beam_size():
@@ -1069,6 +1181,8 @@ def test_multi_parent_judging_context_maps_each_continuation_to_its_parent():
         "3-4",
     ]
     assert [item["parent_index"] for item in captured[0]["continuations"]] == [1, 1, 2, 2]
+    assert all(item.get("node_id") for item in captured[0]["continuations"])
+    assert all(item.get("raw_continuation") for item in captured[0]["continuations"])
     rendered_state = trajectory_search._render_persistent_state(context["previous_persistent_state"])
     assert "### Persistent State of Parent 1 (Continuations 1-2)" in rendered_state
     assert "### Persistent State of Parent 2 (Continuations 3-4)" in rendered_state
@@ -1144,6 +1258,109 @@ def test_duplicate_rubrics_are_judged_and_weighted_once(monkeypatch):
         score_lookup_by_node=scores,
         rubrics=[rubric, rubric, other],
     ) == {"node": 0.5}
+
+
+def test_score_tie_break_only_rescores_tied_nodes(monkeypatch):
+    tie_rubric = RubricRecord(
+        rubric_id="tie-rubric",
+        title="Tie breaker",
+        direction="positive",
+        description="Distinguishes the visible tied branches.",
+        scale={str(index): str(index) for index in range(1, 6)},
+        weight=1.0,
+        source_round=1,
+    )
+    captured = {}
+
+    async def fake_batch(**kwargs):
+        captured.update(kwargs)
+        return {
+            "generated_samples": [
+                SimpleNamespace(
+                    sample_index=0,
+                    rubric_list_id="rubric-r001-s00-tie",
+                    generated=[tie_rubric],
+                    messages=[{"role": "assistant", "content": "rubric"}],
+                    format_errors=[],
+                    terminal_error=None,
+                )
+            ],
+            "sample_generated_rubrics": [[tie_rubric]],
+            "generated_score_results": {
+                0: (
+                    [
+                        [
+                            {
+                                "rubric_id": "tie-rubric",
+                                "score_normalized": 0.2,
+                                "judge_message": [],
+                            }
+                        ],
+                        [
+                            {
+                                "rubric_id": "tie-rubric",
+                                "score_normalized": 0.8,
+                                "judge_message": [],
+                            }
+                        ],
+                    ],
+                    [],
+                )
+            },
+        }
+
+    monkeypatch.setattr(trajectory_search, "_generate_and_score_rubric_batch", fake_batch)
+    initial_rubric = RubricRecord(
+        rubric_id="initial",
+        title="Initial",
+        direction="positive",
+        description="Initial score.",
+        scale={str(index): str(index) for index in range(1, 6)},
+        weight=1.0,
+        source_round=1,
+    )
+    result = asyncio.run(
+        trajectory_search._run_score_tie_break(
+            scope="siblings",
+            round_index=1,
+            generation_prompt=(
+                "## Task\nOriginal task.\n"
+                "This is a multi-turn rubric generation setting.\n"
+            ),
+            rubric_list_prefix="rubric-r001-s00",
+            judge_prompt="judge",
+            question={},
+            shared_context={},
+            continuations=[
+                {"node_id": "node-a"},
+                {"node_id": "node-b"},
+                {"node_id": "node-c"},
+            ],
+            extra_prompt_sections=[
+                "active-rubrics",
+                "## Retrieved Rubric Experiences:\nexperience-a",
+            ],
+            generation_kwargs={},
+            judge_kwargs={},
+            initial_rubrics=[initial_rubric],
+            initial_score_by_rubric={
+                "initial": {"node-a": 0.5, "node-b": 0.5, "node-c": 0.2}
+            },
+            initial_scores={"node-a": 0.5, "node-b": 0.5, "node-c": 0.2},
+        )
+    )
+
+    assert [item["node_id"] for item in captured["continuations"]] == ["node-a", "node-b"]
+    assert captured["extra_prompt_sections"][0] == "active-rubrics"
+    assert captured["extra_prompt_sections"][1].startswith(
+        "## Existing Tie-Producing Rubrics"
+    )
+    assert captured["extra_prompt_sections"][2].startswith(
+        "## Retrieved Rubric Experiences:"
+    )
+    assert "currently highest-scoring branches" in captured["generation_prompt"]
+    assert result["adjusted_scores"]["node-b"] > result["adjusted_scores"]["node-a"]
+    assert result["adjusted_scores"]["node-c"] == 0.2
 
 
 def test_rubric_artifact_payload_excludes_all_message_fields():

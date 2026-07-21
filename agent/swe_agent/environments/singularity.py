@@ -17,6 +17,21 @@ from swe_agent.exceptions import Submitted
 from swe_agent.utils.serialize import recursive_merge
 
 
+_BIND_ENV_VARS = (
+    "APPTAINER_BIND",
+    "APPTAINER_BINDPATH",
+    "SINGULARITY_BIND",
+    "SINGULARITY_BINDPATH",
+)
+
+
+def _runtime_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in _BIND_ENV_VARS:
+        environment.pop(name, None)
+    return environment
+
+
 def singularity_available(executable: str | None = None) -> bool:
     executable = executable or singularity_executable()
     try:
@@ -99,7 +114,12 @@ class SingularityEnvironmentConfig(BaseModel):
     """Number of retries for building the sandbox if an error occurs."""
     global_args: list[str] = ["--quiet"]
     """Global arguments passed before the subcommand (e.g., --quiet, --debug)."""
-    exec_args: list[str] = ["--cleanenv", "--no-home"]
+    exec_args: list[str] = [
+        "--cleanenv",
+        "--no-home",
+        "--no-mount",
+        "home,cwd,tmp,hostfs,bind-paths",
+    ]
     """Arguments passed to `singularity exec`."""
     reuse_sandbox_dir: str | None = None
     """Reuse an existing sandbox directory instead of building a new one."""
@@ -169,6 +189,7 @@ class SingularityEnvironment:
             result = subprocess.run(
                 cmd,
                 text=True,
+                env=_runtime_environment(),
                 timeout=timeout or self.config.timeout,
                 encoding="utf-8",
                 errors="replace",
@@ -212,8 +233,9 @@ class SingularityEnvironment:
             )
 
     def cleanup(self):
-        if self._owns_sandbox:
-            shutil.rmtree(self.sandbox_dir, ignore_errors=True)
+        sandbox_dir = getattr(self, "sandbox_dir", None)
+        if getattr(self, "_owns_sandbox", False) and sandbox_dir is not None:
+            shutil.rmtree(sandbox_dir, ignore_errors=True)
 
     def __del__(self):
         """Cleanup sandbox when object is destroyed."""

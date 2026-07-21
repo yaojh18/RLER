@@ -47,15 +47,16 @@ from swe_agent.run.run_swe_agent import (
     _resolve_model_name
 )
 from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
-from swe_agent.prompt import PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT, PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT
 from swe_agent.rubric_bank import ExperienceRubricBank
 from swe_agent.trajectory_search import SearchConfig, TrajectorySearchRunner
 from swe_agent.serving import SGLangChatService
 from swe_agent.parallel_utils import _atomic_write_json
 
 
-DEFAULT_PRM_EXPERIENCE_BANK = (
-    Path(__file__).resolve().parents[4] / "exp" / "prm_eval" / "artifacts" / "experience_bank.json"
+DEFAULT_FROZEN_EXPERIENCE_BANK = (
+    Path(__file__).resolve().parents[3]
+    / "experience"
+    / "nemotron_ultra"
 )
 DEFAULT_SEARCH_OUTPUT_ROOT = Path(__file__).resolve().parents[2] / "search_outputs"
 DEFAULT_SEARCH_LOG_ROOT = Path(
@@ -115,6 +116,12 @@ def _run_single_instance(
     elif instance.get("expected_output_json"):
         environment_config["cwd"] = "/testbed"
         environment_config.setdefault("dataset_name", "r2egym")
+    else:
+        environment_config["cwd"] = (
+            instance.get("swebench_workdir")
+            or environment_config.get("cwd")
+            or "/testbed"
+        )
     runner = TrajectorySearchRunner(
         instance=instance,
         backend=SWEAgentRolloutBackend(
@@ -337,6 +344,8 @@ def run_search(
             strategy=args.strategy,
             rubric_bank_strategy=args.rubric_bank_strategy,
             update_experience_bank=args.update_experience_bank,
+            score_tie_break=args.score_tie_break,
+            stop_on_first_round_no_variance=args.stop_on_first_round_no_variance,
         )
         rubric_model_name = args.rubric_model or model_name
         judge_model_name = args.judge_model or model_name
@@ -344,8 +353,12 @@ def run_search(
         judge_model_kwargs = dict(shared_model_kwargs)
         experience_banks = None
         if search_config.rubric_bank_strategy in {"experience", "both"}:
-            if not args.experience_bank.is_file():
-                raise FileNotFoundError(f"Experience bank not found: {args.experience_bank}")
+            if not args.experience_bank.is_dir():
+                raise FileNotFoundError(
+                    f"Frozen experience checkpoint not found: {args.experience_bank}"
+                )
+            if search_config.update_experience_bank:
+                raise ValueError("A frozen experience checkpoint cannot be updated in place")
             experience_banks = {
                 "siblings": ExperienceRubricBank(
                     bank_path=args.experience_bank,
@@ -353,8 +366,6 @@ def run_search(
                 ),
                 "pc": ExperienceRubricBank(
                     bank_path=args.experience_bank,
-                    retrieval_prompt=PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
-                    update_prompt=PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
                     scope="pc",
                 ),
             }
@@ -447,7 +458,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rubric-temperature", type=float, default=1.0)
     parser.add_argument("--rubric-top-p", type=float, default=0.95)
     parser.add_argument("--rubric-max-tokens", type=int, default=8096)
-    parser.add_argument("--judge-temperature", type=float, default=0.1)
+    parser.add_argument("--judge-temperature", type=float, default=0.01)
     parser.add_argument("--judge-top-p", type=float, default=0.95)
     parser.add_argument("--judge-max-tokens", type=int, default=8096)
     parser.add_argument("--regression-margin", type=float, default=0.0)
@@ -456,8 +467,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--calculate-gt-reward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--strategy", choices=["best", "probability", "random"], default="best")
     parser.add_argument("--rubric-bank-strategy", choices=["score", "experience", "both"], default="both")
-    parser.add_argument("--experience-bank", type=Path, default=DEFAULT_PRM_EXPERIENCE_BANK)
+    parser.add_argument(
+        "--experience-bank",
+        type=Path,
+        default=DEFAULT_FROZEN_EXPERIENCE_BANK,
+        help="Frozen scoped experience checkpoint directory.",
+    )
     parser.add_argument("--update-experience-bank", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--score-tie-break",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate one additional discriminative rubric when the top branch score is tied.",
+    )
+    parser.add_argument(
+        "--stop-on-first-round-no-variance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Stop after round 1 when its terminal rewards are all resolved or all unresolved.",
+    )
     parser.add_argument("--student-backend", choices=["vllm", "openai", "slime"], default="slime")
     parser.add_argument("--student-model", default=None)
     parser.add_argument("--evaluate-final-patch", action="store_true", default=True)

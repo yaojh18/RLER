@@ -1,23 +1,29 @@
 from __future__ import annotations
 
 import copy
-import difflib
 import hashlib
 import json
 import math
 import logging
 import re
-import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from agent_rl.run_utils import extract_last_json_object, freeform_thought_model_kwargs, route_completion_message
+from agent_rl.run_utils import (
+    extract_last_json_object,
+    freeform_thought_model_kwargs,
+    route_completion_message,
+)
 
 from swe_agent.models.litellm_model import LitellmModel
 from swe_agent.models.utils.retry import retry
+from swe_agent.experience_retrieval import (
+    WeightedKeywordExperienceRetriever,
+    _text_values,
+)
 from swe_agent.prompt import (
-    RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
+    PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
     RUBRIC_EXPERIENCE_UPDATE_PROMPT,
     _seed_experiences,
     _seed_rubrics,
@@ -27,6 +33,7 @@ from swe_agent.prompt import (
 logger = logging.getLogger(__name__)
 OBSERVATION_TRUNCATION_MARKER = "\n[... Observation truncated due to length ...]\n"
 MAX_TERMINAL_PATCH_SECTION_CHARS = 4096
+RETRIEVAL_SUMMARY_CONTEXT_CHARS = 48_000
 
 
 def _truncate_middle(text: str, limit: int) -> str:
@@ -91,6 +98,72 @@ def render_compact_markdown(value: Any) -> str:
     return "\n".join(render(value, 0))
 
 
+def _retrieval_trajectory_excerpt(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    cards = value.get("step_cards") or []
+    return {
+        "segment_step_range": value.get("segment_step_range"),
+        "visible_step_card_count": value.get("visible_step_card_count"),
+        "recent_steps": [
+            {
+                "step_index": card.get("step_index"),
+                "assistant_message": _truncate_middle(
+                    str(card.get("assistant_message") or ""), 900
+                ),
+                "observation": _truncate_middle(
+                    str(card.get("observation") or ""), 900
+                ),
+            }
+            for card in cards[-2:]
+        ],
+    }
+
+
+def _retrieval_summary_context(
+    context: dict[str, Any], *, instance_id: str, round_index: int
+) -> dict[str, Any]:
+    continuations = [
+        {
+            "node_id": item.get("node_id"),
+            "parent_index": item.get("parent_index"),
+            "workspace_summary": item.get("summary"),
+            "recent_trajectory": _retrieval_trajectory_excerpt(
+                item.get("raw_continuation", item.get("trajectory_continuation"))
+            ),
+        }
+        for item in context.get("continuations") or []
+    ]
+    state = {
+        "repository": instance_id.rsplit("-", 1)[0],
+        "round": round_index,
+        "problem": _truncate_middle(_text_values(context.get("question")), 10_000),
+        "previous_persistent_state": _truncate_middle(
+            _text_values(context.get("previous_state")), 8_000
+        ),
+        "parent_trajectory": _retrieval_trajectory_excerpt(
+            context.get("parent_trajectory")
+        ),
+        "continuations": continuations,
+    }
+    if len(render_compact_markdown(state)) <= RETRIEVAL_SUMMARY_CONTEXT_CHARS:
+        return state
+    return {
+        "repository": state["repository"],
+        "round": round_index,
+        "problem": state["problem"],
+        "previous_persistent_state": state["previous_persistent_state"],
+        "continuations": [
+            {
+                "node_id": item["node_id"],
+                "parent_index": item["parent_index"],
+                "workspace_summary": item["workspace_summary"],
+            }
+            for item in continuations
+        ],
+    }
+
+
 @dataclass
 class RubricRecord:
     rubric_id: str
@@ -152,27 +225,6 @@ def _public_experience(experience: RubricExperience | dict[str, Any]) -> dict[st
     payload = asdict(experience) if isinstance(experience, RubricExperience) else copy.deepcopy(experience)
     payload.pop("experience_id", None)
     return payload
-
-
-def gold_patch_skeleton(gold_patch: str, max_chars: int = 4096) -> str:
-    rows: list[str] = []
-    current_file = ""
-    for line in (gold_patch or "").splitlines():
-        if line.startswith("diff --git "):
-            parts = line.split()
-            current_file = parts[2][2:] if len(parts) >= 3 and parts[2].startswith("a/") else (parts[2] if len(parts) >= 3 else "")
-            rows.append(line)
-        elif line.startswith("@@"):
-            rows.append(f"{current_file}: {line}")
-        elif line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
-            stripped = line[1:].strip()
-            if stripped:
-                signature = re.sub(r"\s+", " ", stripped)
-                rows.append(f"{line[0]} {signature[:160]}")
-    text = "\n".join(rows)
-    if len(text) <= max_chars:
-        return text
-    return _truncate_middle(text, max_chars)
 
 
 def evaluation_tests_not_shared(items: list[dict[str, Any]], *, test_key: str) -> dict[str, list[str]]:
@@ -641,63 +693,27 @@ class ScoreRubricBank:
         )
 
 
-def _normalize_experience_title(title: str) -> str:
-    normalized = unicodedata.normalize("NFKC", title)
-    normalized = normalized.translate(str.maketrans({"‘": '"', "’": '"', "“": '"', "”": '"', "'": '"'}))
-    return " ".join(normalized.split()).casefold()
-
-
-def _fuzzy_experience_title(title: str) -> str:
-    return " ".join(re.findall(r"\w+", _normalize_experience_title(title)))
-
-
-def _match_experience_title(title: str, available_titles: list[str]) -> str | None:
-    normalized = _normalize_experience_title(title)
-    exact_matches = [candidate for candidate in available_titles if _normalize_experience_title(candidate) == normalized]
-    if len(exact_matches) == 1:
-        return exact_matches[0]
-    query = _fuzzy_experience_title(title)
-    containment_matches = [
-        candidate
-        for candidate in available_titles
-        if query
-        and (
-            query in _fuzzy_experience_title(candidate)
-            or _fuzzy_experience_title(candidate) in query
-        )
-    ]
-    if len(containment_matches) == 1:
-        return containment_matches[0]
-    ranked = sorted(
-        (
-            difflib.SequenceMatcher(None, query, _fuzzy_experience_title(candidate)).ratio(),
-            candidate,
-        )
-        for candidate in available_titles
-    )
-    if not ranked:
-        return None
-    best_score, best_title = ranked[-1]
-    second_score = ranked[-2][0] if len(ranked) > 1 else 0.0
-    if best_score >= 0.88 and best_score - second_score >= 0.15:
-        return best_title
-    return None
-
-
 class ExperienceRubricBank:
     def __init__(
         self,
         *,
         bank_path: Path | None = None,
-        retrieve_top_k: int = 4,
-        retrieval_prompt: str = RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
-        update_prompt: str = RUBRIC_EXPERIENCE_UPDATE_PROMPT,
+        update_prompt: str | None = None,
         scope: str = "siblings",
     ) -> None:
-        self.bank_path = Path(bank_path) if bank_path is not None else None
-        self.retrieve_top_k = retrieve_top_k
-        self.retrieval_prompt = retrieval_prompt
-        self.update_prompt = update_prompt
+        source_path = Path(bank_path) if bank_path is not None else None
+        self.retriever = None
+        if source_path is not None and source_path.is_dir():
+            self.retriever = WeightedKeywordExperienceRetriever(
+                source_path, scope=scope
+            )
+            source_path = source_path / "bank" / scope / "experience_bank.json"
+        self.bank_path = source_path
+        self.update_prompt = update_prompt or (
+            PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT
+            if scope == "pc"
+            else RUBRIC_EXPERIENCE_UPDATE_PROMPT
+        )
         self.scope = scope
         self.experiences: dict[str, RubricExperience] = (
             self.load() if self.bank_path and self.bank_path.exists() else _seed_experience_records(scope=self.scope)
@@ -712,13 +728,41 @@ class ExperienceRubricBank:
         experiences = {}
         for item in items if isinstance(items, list) else []:
             if isinstance(item, dict):
-                experience = _convert_experience(item, str(item.get("experience_id") or "") or None)
+                if self.retriever is not None:
+                    required = (
+                        "experience_id",
+                        "title",
+                        "description",
+                        "context",
+                        "experience",
+                    )
+                    if any(not str(item.get(key) or "").strip() for key in required):
+                        raise ValueError("Frozen experience is missing a required text field")
+                    if not isinstance(item.get("metadata"), dict):
+                        raise ValueError("Frozen experience metadata must be an object")
+                    experience = RubricExperience(
+                        experience_id=str(item["experience_id"]).strip(),
+                        title=str(item["title"]).strip(),
+                        description=str(item["description"]).strip(),
+                        context=str(item["context"]).strip(),
+                        experience=str(item["experience"]).strip(),
+                        metadata=copy.deepcopy(item["metadata"]),
+                    )
+                else:
+                    experience = _convert_experience(
+                        item, str(item.get("experience_id") or "") or None
+                    )
                 if experience is not None:
-                    experiences[experience.title] = experience
+                    key = experience.experience_id if self.retriever is not None else experience.title
+                    experiences[key] = experience
         return experiences or _seed_experience_records(scope=self.scope)
 
     def to_list(self) -> list[dict[str, Any]]:
         return [asdict(experience) for experience in self.experiences.values()]
+
+    @property
+    def is_frozen(self) -> bool:
+        return self.retriever is not None
 
     async def build_generation_context(
         self,
@@ -728,34 +772,58 @@ class ExperienceRubricBank:
         latest_shared_segment: dict[str, Any] | None,
         continuations: list[dict[str, Any]],
         model_name: str,
-        temperature: float,
         top_p: float,
-        max_tokens: int,
         model_kwargs: dict[str, Any] | None = None,
+        instance_id: str = "",
+        round_index: int = 0,
     ) -> RubricBankGenerationContext:
-        retrieved, retrieve_messages = await self._retrieve(
-            question=question,
-            previous_state=previous_state,
-            latest_shared_segment=latest_shared_segment,
-            continuations=continuations,
+        if self.retriever is None:
+            raise RuntimeError(
+                "Experience retrieval requires a frozen checkpoint directory"
+            )
+        context = {
+            "question": question,
+            "previous_state": previous_state,
+            "parent_trajectory": latest_shared_segment,
+            "continuations": continuations,
+        }
+        experience_ids, retrieve_messages = await self.retriever.retrieve(
+            context=context,
+            context_markdown=render_compact_markdown(
+                _retrieval_summary_context(
+                    context,
+                    instance_id=instance_id,
+                    round_index=round_index,
+                )
+            ),
+            instance_id=instance_id,
             model_name=model_name,
-            temperature=temperature,
             top_p=top_p,
-            max_tokens=max_tokens,
             model_kwargs=model_kwargs,
         )
+        by_id = {
+            experience.experience_id: experience
+            for experience in self.experiences.values()
+        }
+        retrieved = [
+            by_id[experience_id]
+            for experience_id in experience_ids
+            if experience_id in by_id
+        ]
         sections = []
         if retrieved:
             sections.append(
-                "## Retrieved Rubric Experiences:\n" +
-                render_compact_markdown(
+                "## Retrieved Rubric Experiences:\n"
+                + render_compact_markdown(
                     [
                         {
                             "title": item.title,
                             "description": item.description,
                             "context": item.context,
                             "experience": item.experience,
-                            "reference_golden_rubrics": item.metadata.get("reference_golden_rubrics", None),
+                            "reference_golden_rubrics": item.metadata.get(
+                                "reference_golden_rubrics"
+                            ),
                         }
                         for item in retrieved
                     ]
@@ -768,109 +836,6 @@ class ExperienceRubricBank:
             retrieve_messages=copy.deepcopy(retrieve_messages),
         )
 
-    async def _retrieve(
-        self,
-        *,
-        question: dict[str, Any],
-        previous_state: dict[str, Any],
-        latest_shared_segment: dict[str, Any] | None,
-        continuations: list[dict[str, Any]],
-        model_name: str,
-        temperature: float,
-        top_p: float,
-        max_tokens: int,
-        model_kwargs: dict[str, Any] | None,
-    ) -> tuple[list[RubricExperience], list[dict[str, Any]]]:
-        if not self.experiences:
-            return [], []
-        prompt = "\n\n".join(
-            [
-                self.retrieval_prompt.strip(),
-                "## Experience Short-view:",
-                "\n\n".join(
-                    f"### {item.title}\n{item.description}"
-                    for item in self.experiences.values()
-                ),
-                "## Current Round Context:",
-                render_compact_markdown(
-                    {
-                        "question": question,
-                        "previous_state": previous_state,
-                        "parent trajectory": latest_shared_segment,
-                        "continuations": continuations,
-                    }
-                ),
-            ]
-        )
-        messages = [{"role": "user", "content": prompt}]
-        requested_titles = []
-        available_titles = list(self.experiences)
-        for _ in range(4):
-            async for attempt in retry(
-                logger=logger,
-                abort_exceptions=LitellmModel.abort_exceptions,
-                model_name=model_name,
-                async_retry=True,
-            ):
-                with attempt:
-                    assistant_message = await route_completion_message(
-                        route_name="rubric_generation",
-                        model_name=model_name,
-                        messages=messages,
-                        temperature=temperature,
-                        top_p=top_p,
-                        max_tokens=max_tokens,
-                        model_kwargs=freeform_thought_model_kwargs(model_kwargs),
-                    )
-            response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
-            messages.append(assistant_message)
-            parsed = extract_last_json_object(response)
-            full_response = assistant_message.get("content") or ""
-            if parsed is None and full_response != response:
-                parsed = extract_last_json_object(full_response)
-            parsed_titles = None
-            if isinstance(parsed, dict):
-                for key in ("titles", "experience_titles", "selected_titles"):
-                    if key in parsed:
-                        parsed_titles = parsed[key]
-                        break
-            if isinstance(parsed_titles, str):
-                parsed_titles = [parsed_titles]
-            if isinstance(parsed_titles, list) and all(
-                isinstance(item, dict) and isinstance(item.get("title"), str) for item in parsed_titles
-            ):
-                parsed_titles = [item["title"] for item in parsed_titles]
-            if isinstance(parsed_titles, list) and all(isinstance(title, str) for title in parsed_titles):
-                requested_titles = []
-                for title in parsed_titles:
-                    matched_title = _match_experience_title(title, available_titles)
-                    if matched_title is not None and matched_title not in requested_titles:
-                        requested_titles.append(matched_title)
-                    if len(requested_titles) >= self.retrieve_top_k:
-                        break
-                if not parsed_titles or requested_titles:
-                    break
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Some requested titles do not exist in the experience index. Follow the output format example "
-                            "above using only existing titles, or {\"titles\": []}."
-                        ),
-                    }
-                )
-                continue
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Expected {\"titles\": [\"existing experience title\"]} in the final JSON. Follow the output "
-                        "format example above."
-                    ),
-                }
-            )
-        return [self.experiences[title] for title in requested_titles], messages
-
     async def update_after_instance(
         self,
         *,
@@ -882,6 +847,8 @@ class ExperienceRubricBank:
         max_tokens: int,
         model_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if self.retriever is not None:
+            raise RuntimeError("Frozen retrieval checkpoints cannot be updated in place")
         before = self.to_list()
         grouped_payloads = self._group_payloads_by_index(rubric_payloads or [])
         if grouped_payloads is None:
@@ -1018,7 +985,6 @@ class ExperienceRubricBank:
         instance: dict[str, Any],
         rubric_payloads: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        gt_skeleton = gold_patch_skeleton(instance.get("patch", ""))
         attempts = []
         for payload in rubric_payloads:
             generation_context = payload.get("generation_context")
@@ -1060,7 +1026,7 @@ class ExperienceRubricBank:
                     "generation_context": copy.deepcopy(generation_context),
                     "retrieved_experience": [_public_experience(item) for item in payload.get("retrieved", [])],
                     "generated_rubrics": generated_rubrics,
-                    "gt_skeleton": gt_skeleton,
+                    "gt_patch": instance.get("patch", ""),
                     "terminal_patch": str(payload.get("terminal_patch") or ""),
                     "passed_tests": str(payload.get("passed_tests") or ""),
                     "gt_scores": _rounded_score_list(ground_truth_by_node, ordered_node_ids),

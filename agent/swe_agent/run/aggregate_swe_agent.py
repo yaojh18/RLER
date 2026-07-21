@@ -100,7 +100,7 @@ from swe_agent.trajectory_search import (
     _build_step_cards,
     _collect_workspace_meta,
     _convert_rubric_item,
-    _parse_judge_score,
+    _parse_judge_result,
     _parse_persistent_state_response,
     _render_step_cards,
     _rubric_judge_view,
@@ -386,7 +386,7 @@ async def _score_aggregate_summaries(
                 *,
                 summary_text: str = summary_text,
                 criterion: str = criterion,
-            ) -> tuple[list[dict[str, Any]], int, str | None]:
+            ) -> tuple[list[dict[str, Any]], int, str, str | None]:
                 user_prompt = "\n".join(
                     [
                         "## Question:",
@@ -423,12 +423,18 @@ async def _score_aggregate_summaries(
                                 )
                         messages.append(assistant_message)
                         response = assistant_message.get("content_no_thinking") or assistant_message.get("content") or ""
-                        score_raw = _parse_judge_score(response)
+                        judge_result = _parse_judge_result(response)
                         full_response = assistant_message.get("content") or ""
-                        if score_raw is None and full_response != response:
-                            score_raw = _parse_judge_score(full_response)
-                        if score_raw is not None:
-                            return messages_from_first_assistant(messages), score_raw, None
+                        if judge_result is None and full_response != response:
+                            judge_result = _parse_judge_result(full_response)
+                        if judge_result is not None:
+                            evidence, score_raw = judge_result
+                            return (
+                                messages_from_first_assistant(messages),
+                                score_raw,
+                                evidence,
+                                None,
+                            )
                         messages.append(
                             {
                                 "role": "user",
@@ -438,12 +444,14 @@ async def _score_aggregate_summaries(
                     return (
                         messages_from_first_assistant(messages),
                         1,
+                        "",
                         "InvalidAggregateJudgeScore",
                     )
                 except Exception as exc:
                     return (
                         messages_from_first_assistant(messages),
                         1,
+                        "",
                         f"{type(exc).__name__}: {exc}",
                     )
 
@@ -457,10 +465,15 @@ async def _score_aggregate_summaries(
         if isinstance(response, Exception):
             view_errors.setdefault(summary_index, f"{type(response).__name__}: {response}")
             continue
-        judge_messages, score_raw, error = response
+        judge_messages, score_raw, evidence, error = response
         if error is not None:
             view_errors.setdefault(summary_index, error)
-        record = rubric_score_record(rubric, score_raw, judge_messages)
+        record = rubric_score_record(
+            rubric,
+            score_raw,
+            judge_messages,
+            evidence=evidence,
+        )
         record["judge_error"] = error
         per_view_scores[summary_index].append(record)
         rubric_values.setdefault(rubric.rubric_id, []).append(float(record["score_normalized"]))
@@ -1126,6 +1139,12 @@ def run_aggregate(
                 if instance.get("expected_output_json"):
                     environment_config["cwd"] = "/testbed"
                     environment_config.setdefault("dataset_name", "r2egym")
+                else:
+                    environment_config["cwd"] = (
+                        instance.get("swebench_workdir")
+                        or environment_config.get("cwd")
+                        or "/testbed"
+                    )
                 backend = SWEAgentRolloutBackend(
                     model=instance_config.get("model", {}),
                     environment=instance_config.get("environment", {}),

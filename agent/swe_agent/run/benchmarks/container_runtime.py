@@ -44,7 +44,12 @@ def make_bound_environment(
             run_args.extend(["-v", f"{src}:{dst}"])
         return DockerEnvironment(image=image, cwd=cwd, timeout=timeout, run_args=run_args)
 
-    exec_args = ["--cleanenv", "--no-home"]
+    exec_args = [
+        "--cleanenv",
+        "--no-home",
+        "--no-mount",
+        "home,cwd,tmp,hostfs",
+    ]
     for src, dst in bind_specs:
         exec_args.extend(["--bind", f"{src}:{dst}"])
     env = SingularityEnvironment(

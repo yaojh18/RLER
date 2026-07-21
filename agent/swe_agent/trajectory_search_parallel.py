@@ -65,8 +65,6 @@ from swe_agent.parallel_utils import (
 from swe_agent.prompt import (
     EMPTY_PERSISTENT_STATE,
     EMPTY_WORKSPACE_META,
-    PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
-    PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
     PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
     PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
     SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
@@ -82,6 +80,7 @@ from swe_agent.rubric_bank import ExperienceRubricBank, ScoreRubricBank, build_t
 from swe_agent.trajectory_search import (
     _avg_scores_from_rubrics,
     _generate_and_score_rubric_batch,
+    _run_score_tie_break,
     _rubric_metrics_payload,
     _rubric_sample_evaluation,
     _update_persistent_state,
@@ -196,7 +195,7 @@ class ParallelSearchConfig:
     rubric_temperature: float = 1.0
     rubric_top_p: float = 0.95
     rubric_max_tokens: int = 4096
-    judge_temperature: float = 0.1
+    judge_temperature: float = 0.01
     judge_top_p: float = 0.95
     judge_max_tokens: int = 1024
     psu_max_tokens: int = 4096
@@ -216,6 +215,7 @@ class ParallelSearchConfig:
     # working copy.
     fallback_patch_penalty: float = 0.5
     no_action_patch_penalty: float = -0.1
+    score_tie_break: bool = True
 
     def __post_init__(self) -> None:
         if self.p <= 0:
@@ -459,21 +459,16 @@ class TrajectorySearchParallelRunner:
                 score_bank = ScoreRubricBank(max_active_rubrics=config.max_active_rubrics, scope=scope)
             self.score_banks[scope] = score_bank
             experience_bank = provided_experience_banks.get(scope)
-            if experience_bank is None:
-                experience_kwargs: dict[str, Any] = {"scope": scope}
-                if scope == "pc":
-                    experience_kwargs.update(
-                        {
-                            "retrieval_prompt": PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT,
-                            "update_prompt": PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT,
-                        }
+            if not self.skip_lane_c:
+                if not isinstance(experience_bank, ExperienceRubricBank):
+                    raise ValueError(
+                        "Parallel rubric search requires frozen siblings and pc banks"
                     )
-                experience_bank = ExperienceRubricBank(**experience_kwargs)
-            self.experience_banks[scope] = experience_bank
+                self.experience_banks[scope] = experience_bank
         self.rubric_bank = self.score_banks["siblings"]
         self.pc_rubric_bank = self.score_banks["pc"]
-        self.experience_bank = self.experience_banks["siblings"]
-        self.pc_experience_bank = self.experience_banks["pc"]
+        self.experience_bank = self.experience_banks.get("siblings")
+        self.pc_experience_bank = self.experience_banks.get("pc")
         self._summary_persistent_state = copy.deepcopy(EMPTY_PERSISTENT_STATE)
         self._summary_recent_segments: list[dict[str, Any]] = []
         self._summary_processed_segments = 0
@@ -1120,12 +1115,9 @@ class TrajectorySearchParallelRunner:
                 "step_count": len(step_cards),
                 "changed_files": list(workspace.get("changed_files", []))[:8],
                 "untracked_files": list(workspace.get("untracked_files", []))[:8],
-                "diff_stat": workspace.get("diff_stat", ""),
-                "current_patch_chars": int(workspace.get("current_patch_chars", 0) or 0),
-                "result_status": branch.status,
-                "exit_status": "Submitted" if branch.terminated_early else "",
+                "git_diff": workspace.get("git_diff", ""),
             },
-            "trajectory_continuation": {
+            "raw_continuation": {
                 "step_cards": step_cards,
                 "segment_step_range": [step_start, step_end],
             },
@@ -1155,10 +1147,10 @@ class TrajectorySearchParallelRunner:
             latest_shared_segment=latest_shared_segment,
             continuations=continuations,
             model_name=self.rubric_model_name,
-            temperature=cfg.rubric_temperature,
             top_p=cfg.rubric_top_p,
-            max_tokens=cfg.rubric_max_tokens,
             model_kwargs=self.rubric_model_kwargs,
+            instance_id=self.task_id,
+            round_index=group.group_index + 1,
         )
         score_context = score_bank.build_generation_context()
         extra_prompt_sections = list(score_context.extra_prompt_sections)
@@ -1174,29 +1166,31 @@ class TrajectorySearchParallelRunner:
             "previous_generated_rubrics": [asdict(rubric) for rubric in score_context.existing_rubrics],
         }
 
+        generation_kwargs = {
+            "model_name": self.rubric_model_name,
+            "temperature": cfg.rubric_temperature,
+            "top_p": cfg.rubric_top_p,
+            "max_tokens": cfg.rubric_max_tokens,
+            "model_kwargs": self.rubric_model_kwargs,
+        }
+        judge_kwargs = {
+            "model_name": self.judge_model_name,
+            "temperature": cfg.judge_temperature,
+            "top_p": cfg.judge_top_p,
+            "max_tokens": cfg.judge_max_tokens,
+            "model_kwargs": self.judge_model_kwargs,
+        }
         score_batch = await _generate_and_score_rubric_batch(
             sample_count=cfg.n,
             round_index=group.group_index + 1,
-            generation_kwargs={
-                "model_name": self.rubric_model_name,
-                "temperature": cfg.rubric_temperature,
-                "top_p": cfg.rubric_top_p,
-                "max_tokens": cfg.rubric_max_tokens,
-                "model_kwargs": self.rubric_model_kwargs,
-            },
+            generation_kwargs=generation_kwargs,
             generation_prompt=generation_prompt,
             rubric_list_prefix=rubric_list_prefix,
             question=question,
             shared_context=shared_context,
             continuations=continuations,
             extra_prompt_sections=extra_prompt_sections,
-            judge_kwargs={
-                "model_name": self.judge_model_name,
-                "temperature": cfg.judge_temperature,
-                "top_p": cfg.judge_top_p,
-                "max_tokens": cfg.judge_max_tokens,
-                "model_kwargs": self.judge_model_kwargs,
-            },
+            judge_kwargs=judge_kwargs,
             judge_prompt=judge_prompt,
         )
         model_response = {
@@ -1273,6 +1267,32 @@ class TrajectorySearchParallelRunner:
                 score_lookup_by_node=evaluation["score_lookup_by_node"],
                 rubrics=scoring_rubrics,
             )
+            tie_break = None
+            tie_break_messages: list[dict[str, Any]] = []
+            tie_break_judge_messages: list[dict[str, Any]] = []
+            if cfg.score_tie_break and scoring_rubrics:
+                tie_break_result = await _run_score_tie_break(
+                    scope=scope,
+                    round_index=group.group_index + 1,
+                    generation_prompt=generation_prompt,
+                    rubric_list_prefix=rubric_list_prefix,
+                    judge_prompt=judge_prompt,
+                    question=question,
+                    shared_context=shared_context,
+                    continuations=continuations,
+                    extra_prompt_sections=extra_prompt_sections,
+                    generation_kwargs=generation_kwargs,
+                    judge_kwargs=judge_kwargs,
+                    initial_rubrics=scoring_rubrics,
+                    initial_score_by_rubric=metrics["score_by_rubric"],
+                    initial_scores=avg_scores,
+                )
+                if tie_break_result is not None:
+                    tie_break = copy.deepcopy(tie_break_result)
+                    tie_break_messages = tie_break.pop("messages", [])
+                    tie_break_judge_messages = tie_break.pop("judge_messages", [])
+                    if tie_break.get("status") == "success":
+                        avg_scores = copy.deepcopy(tie_break["adjusted_scores"])
             ordered_node_ids = list(avg_scores)
             ground_truth_by_node = (
                 copy.deepcopy(pc_label_by_node)
@@ -1306,6 +1326,9 @@ class TrajectorySearchParallelRunner:
                 "average_rubric_judged_scores": avg_scores,
                 "judge_errors": evaluation["judge_errors"],
                 "judge_response": judge_response_for_sample,
+                "tie_break": tie_break,
+                "tie_break_messages": tie_break_messages,
+                "tie_break_judge_messages": tie_break_judge_messages,
                 "gt_by_rubric": {
                     rubric.rubric_id: {
                         "child_scores": metrics["score_by_rubric"].get(rubric.rubric_id, {}),
@@ -2161,16 +2184,6 @@ class TrajectorySearchParallelRunner:
                     len(instance_record.groups),
                 )
             if getattr(self, "skip_lane_c", False):
-                for scope in self.rubric_scopes:
-                    bank_state = self.experience_banks[scope].to_list()
-                    _atomic_write_json(
-                        self.run_dir / f"{scope}_rubric_bank.json",
-                        {
-                            "before": copy.deepcopy(bank_state),
-                            "after": copy.deepcopy(bank_state),
-                            "lane_c_skipped": True,
-                        },
-                    )
                 instance_record.completed = (
                     instance_record.lane_a.error is None
                     and all(
@@ -2203,6 +2216,7 @@ class TrajectorySearchParallelRunner:
                     **experience_update_attrs[scope],
                 }
                 for scope in self.rubric_scopes
+                if not self.experience_banks[scope].is_frozen
             ]
             experience_update_payloads = await asyncio.gather(
                 *[
@@ -2432,11 +2446,24 @@ class TrajectorySearchParallelRunner:
             rubric_payload = {
                 k: copy.deepcopy(v)
                 for k, v in sample.items()
-                if k not in {"messages", "judge_response", "retrieve_messages", "generation_context"}
+                if k
+                not in {
+                    "messages",
+                    "judge_response",
+                    "retrieve_messages",
+                    "generation_context",
+                    "tie_break_messages",
+                    "tie_break_judge_messages",
+                }
             }
             _atomic_write_json(rubric_dir / "rubric.json", rubric_payload)
             _atomic_write_json(rubric_dir / "rubric_message.json", sample["messages"])
             _atomic_write_json(rubric_dir / "rubric_retrieve_message.json", sample["retrieve_messages"])
+            if sample.get("tie_break_messages"):
+                _atomic_write_json(
+                    rubric_dir / "tie_break_message.json",
+                    sample["tie_break_messages"],
+                )
             judge_messages = [
                 {
                     "rubric_id": rubric_id,
@@ -2447,6 +2474,7 @@ class TrajectorySearchParallelRunner:
                 for rubric_id, by_node in sample["judge_response"].items()
                 for node_id, entry in by_node.items()
             ]
+            judge_messages.extend(copy.deepcopy(sample.get("tie_break_judge_messages") or []))
             _atomic_write_json(rubric_dir / "judge_message.json", judge_messages)
             _atomic_write_json(
                 rubric_dir / "judge.json",

@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "method": "weighted field-level BM25 reciprocal-rank fusion",
+  "candidate_limit": 6,
+  "rerank": false,
+  "query_summary": {
+    "model_role": "rubric_generation",
+    "temperature": 0.01,
+    "max_tokens": 4096
+  },
+  "empty_query_fields": "skip",
+  "query_fields": [
+    "problem",
+    "prior",
+    "continuations",
+    "stage",
+    "llm_contract",
+    "llm_state",
+    "symbols"
+  ],
+  "document_fields": [
+    "full",
+    "routing",
+    "lesson",
+    "features",
+    "keywords"
+  ],
+  "query_weights": {
+    "problem": 0.0,
+    "prior": 0.6,
+    "continuations": 0.0,
+    "stage": 0.69,
+    "llm_contract": 1.48,
+    "llm_state": 4.01,
+    "symbols": 0.05
+  },
+  "document_weights": {
+    "full": 0.19,
+    "keywords": 1.39
+  },
+  "fit_population": 473,
+  "recall_at_6": 0.8858350951374208,
+  "fit_objective": "maximize oracle recall@6 with supervised keyword variants; all production weights rounded to two decimals"
+}

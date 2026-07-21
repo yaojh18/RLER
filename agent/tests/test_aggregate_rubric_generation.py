@@ -194,7 +194,10 @@ def test_score_models_do_not_receive_rubric_weight(monkeypatch):
     async def fake_route_completion_message(**kwargs):
         _assert_freeform_call(kwargs)
         captured_messages.append(copy.deepcopy(kwargs["messages"]))
-        content = _freeform_json({"score": 4}, thought="Apply only the supplied criterion.")
+        content = _freeform_json(
+            {"evidence": "The visible edit satisfies the criterion.", "score": 4},
+            thought="Apply only the supplied criterion.",
+        )
         return {
             "role": "assistant",
             "content": content,
@@ -236,6 +239,7 @@ def test_score_models_do_not_receive_rubric_weight(monkeypatch):
         model_input = json.dumps(messages, ensure_ascii=False)
         assert "937.125" not in model_input
         assert "Weight:" not in model_input
+        assert model_input.index('\\"evidence\\"') < model_input.index('\\"score\\"')
 
 
 def test_last_json_parser_ignores_all_text_before_and_after_the_final_object():
@@ -261,12 +265,23 @@ def test_last_json_parser_ignores_all_text_before_and_after_the_final_object():
     assert persistent["current_state"] == "working"
     assert "one" in persistent["worklog"]
     assert set(persistent) == {"current_state", "worklog"}
-    assert trajectory_search._parse_judge_score('{"score": 4, "reason": "extra fields are allowed"}') == 4
-    assert trajectory_search._parse_judge_score('{"score": "4"}') == 4
-    assert trajectory_search._parse_judge_score('{"score": 4.0}') == 4
-    assert trajectory_search._parse_judge_score("analysis\nFinal score: 4/5") == 4
-    assert trajectory_search._parse_judge_score('{"rating": "3.0"}') == 3
-    assert trajectory_search._parse_judge_score('{"score": 4.5}') is None
+    assert trajectory_search._parse_judge_result(
+        '{"evidence": "visible diff", "score": 4, "reason": "extra fields are allowed"}'
+    ) == ("visible diff", 4)
+    assert trajectory_search._parse_judge_result(
+        '{"evidence": "test output", "score": "4"}'
+    ) == ("test output", 4)
+    assert trajectory_search._parse_judge_result(
+        '{"evidence": "source edit", "score": 4.0}'
+    ) == ("source edit", 4)
+    assert trajectory_search._parse_judge_result("analysis\nFinal score: 4/5") is None
+    assert trajectory_search._parse_judge_result(
+        '{"evidence": "trace", "rating": "3.0"}'
+    ) == ("trace", 3)
+    assert trajectory_search._parse_judge_result(
+        '{"evidence": "trace", "score": 4.5}'
+    ) is None
+    assert trajectory_search._parse_judge_result('{"score": 4}') is None
 
 
 def test_relaxed_json_parser_recovers_unquoted_rubric_strings():
@@ -298,7 +313,7 @@ def test_relaxed_json_parser_recovers_unquoted_rubric_strings():
 def test_trajectory_judge_messages_start_at_first_assistant(monkeypatch):
     rubric = trajectory_search._convert_rubric_item("task", _rubric("Criterion"), 1)
     assert rubric is not None
-    responses = iter(["not json", '{"score": "4"}'])
+    responses = iter(["not json", '{"evidence": "The visible patch matches.", "score": "4"}'])
 
     async def fake_route_completion_message(**kwargs):
         content = next(responses)
@@ -324,6 +339,7 @@ def test_trajectory_judge_messages_start_at_first_assistant(monkeypatch):
 
     assert errors == []
     assert scores[0][0]["score_raw"] == 4
+    assert scores[0][0]["evidence"] == "The visible patch matches."
     assert [message["role"] for message in scores[0][0]["judge_message"]] == [
         "assistant",
         "user",
@@ -634,42 +650,6 @@ def test_step_cards_bound_long_commands():
 
     assert len(cards[0]["commands"][0]) <= trajectory_search.MAX_OBSERVATION_CHARS
     assert "truncated due to length" in cards[0]["commands"][0]
-
-
-def test_experience_retrieval_uses_freeform_markdown_json(monkeypatch):
-    bank = rubric_bank.ExperienceRubricBank()
-    title = next(iter(bank.experiences))
-    calls = []
-
-    async def fake_route_completion_message(**kwargs):
-        _assert_freeform_call(kwargs)
-        calls.append(copy.deepcopy(kwargs))
-        content = _freeform_json({"titles": [title]}, thought="Match prior experience applicability.")
-        return {
-            "role": "assistant",
-            "content": content,
-            "content_no_thinking": content,
-            "usage": {},
-        }
-
-    monkeypatch.setattr(rubric_bank, "route_completion_message", fake_route_completion_message)
-    retrieved, _ = asyncio.run(
-        bank._retrieve(
-            question={"system_prompt": "System", "user_prompt": "Task"},
-            previous_state={},
-            latest_shared_segment=None,
-            continuations=[],
-            model_name="test-model",
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=128,
-            model_kwargs=None,
-        )
-    )
-
-    assert [item.title for item in retrieved] == [title]
-    assert "response_format" not in calls[0]
-    assert "THOUGHT:" in calls[0]["messages"][0]["content"]
 
 
 def test_experience_update_uses_freeform_markdown_json(monkeypatch):

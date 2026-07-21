@@ -163,7 +163,8 @@ Evaluate the provided continuation trajectory using the provided criterion and t
 - Score the continuation trajectory itself, not the underlying task or bug in the abstract
 - Use only evidence visible in the continuation trajectory. Do not hallucinate or infer unstated facts
 - Use the previous persistent state and latest agent trajectory only when it is needed to interpret the continuation
-- Keep the structured answer limited to the score field. Do not restate the full question, criterion, persistent state, or trajectories inside the JSON block.
+- Ground the score in exact visible trajectory evidence. In the final JSON object, put the evidence field before the score field.
+- Keep the structured answer limited to the evidence and score fields. Do not restate the full question, criterion, persistent state, or trajectories inside the JSON block.
 
 ## Output Format Example
 <format_example>
@@ -172,6 +173,7 @@ THOUGHT: <your reasoning process>
 
 ```json
 {
+  "evidence": "<exact visible evidence supporting the selected scale anchor>",
   "score": <a score on a scale of 1 to 5 indicating how appropriate the continuation is based on the scale of the given criterion>
 }
 ```
@@ -328,7 +330,8 @@ Evaluate the continuation against the parent trajectory using the provided crite
 - Use the parent trajectory, continuation trajectory, previous persistent state, and shared context only as evidence for the specified criterion.
 - If evidence is mixed or incomplete, choose the scale anchor best supported by the visible evidence rather than adding a new criterion.
 - Do not hallucinate hidden facts, unstated test results, or repository behavior not supported by the provided trajectories.
-- Keep the structured answer limited to the score field. Do not restate the full question, criterion, persistent state, or trajectories inside the JSON block.
+- Ground the score in exact visible parent/continuation evidence. In the final JSON object, put the evidence field before the score field.
+- Keep the structured answer limited to the evidence and score fields. Do not restate the full question, criterion, persistent state, or trajectories inside the JSON block.
 
 ## Output Format Example
 <format_example>
@@ -337,6 +340,7 @@ THOUGHT: <your reasoning process>
 
 ```json
 {
+  "evidence": "<exact visible evidence supporting the selected scale anchor>",
   "score": <integer from 1 to 5>
 }
 ```
@@ -350,57 +354,6 @@ THOUGHT: <your reasoning process>
 4. **Continuation Trajectory**: A agent trajectory continued from the parent trajectory to compare
 5. **Criterion**: The specific parent-child progress criterion to evaluate
 
-"""
-
-PC_RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT = """
-You are retrieving prior rubric-generation experiences to help generate adaptive parent-child progress rubrics for SWE-agent search.
-
-## Task
-Select the experience titles whose lessons should be appended to the rubric generation prompt before generating the next rubric.
-The downstream rubric generator will identify the single most discriminative, non-redundant criterion that judges whether continuations improved, stayed equivalent, or regressed relative to the parent trajectory. Retrieve experiences only when they can concretely help that decision.
-
-## Retrieval Targets
-Retrieve an experience only when it can help choose a parent-relative rubric for one of these evidence patterns:
-
-1. **Related instance or related problem**
-   - Same repository, library family, framework, task type, API surface, compatibility issue, build/configuration issue, workspace layout issue, or localization pattern.
-   - Use this when the prior experience contains a task-specific boundary that may transfer to the current rubric decision.
-
-2. **Parent-relative delta calibration**
-   - The prior lesson matches the current parent baseline and child delta: wrong/no-op parent plus real semantic fix, partial parent plus missing-piece fix, near-correct parent plus equivalent variants, or useful parent plus child regression.
-   - Use it when the lesson helps set the correct parent-child order, not merely the best child among siblings.
-
-3. **Evidence-priority conflict**
-   - The prior lesson resolves a conflict likely to recur here, such as process quality versus terminal semantics, obsolete tests versus intended behavior, broad refactor versus precise compatibility boundary, harmless variation versus task-defining difference, or majority behavior versus minority-correct behavior.
-   - Use it when the generator is uncertain and needs guidance about which visible evidence should dominate the PC rubric.
-
-4. **Invalid artifact or stale-rubric trap**
-   - The prior lesson identifies a recurring PC failure: empty/no-op patch, fake summary patch, fabricated or wrong repository target, synthetic-only fix, destructive full-file overwrite, loss of useful parent work, stale active rubric, or sibling-ranking rubric that ignores the parent baseline.
-   - Use it when the same trap is visible enough to affect parent-child progress judging.
-
-## Selection Rules
-- Retrieve only when the parent baseline, child delta type, and available evidence type all match the lesson. Shared broad words like "tests", "verification", "refactor", "search", or "compatibility" are not enough.
-- Do not retrieve an experience solely because it shares repository names, languages, or broad task categories if the evaluation difficulty is different.
-- Retrieve task/domain experiences only when the transferred boundary is visible in the current trajectories and behaviorally relevant to progress, equivalence, or regression.
-- Retrieve harmless-variation or redundant-parent lessons only when the parent already has the same core behavior and children only vary implementation details; never use them when children may be adding task-defining behavior missing from the parent.
-- Retrieve sibling-ranking lessons only when they explicitly explain how a child compares with the parent. A lesson about which child is best is insufficient.
-- Match retrieval to the parent state: wrong/no-op parent needs semantic-progress lessons; near-correct or correct parent needs tie-preservation or small-delta lessons; useful parent with invalid child artifacts needs regression lessons.
-- Do not retrieve an experience that would relax or ignore a distinction that is task-defining in the current samples. A prior lesson about harmless implementation variation applies only when the visible differences are actually semantically equivalent for this task.
-- Prefer an empty list over a broad, stale, or context-mismatched experience that could pull the generator away from the current parent-relative delta.
-- Do not output or invent internal IDs. Operate only on titles.
-
-## Output Format Example
-<format_example>
-
-THOUGHT: <your reasoning process>
-
-```json
-{
-  "titles": ["..."]
-}
-```
-
-</format_example>
 """
 
 PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT = """
@@ -649,7 +602,7 @@ THOUGHT: <your reasoning process>
 """
 
 RUBRIC_JUDGE_FORMAT_CORRECTION_PROMPT = """
-The previous response could not be parsed into a valid score. Return a corrected response following the output format example.
+The previous response could not be parsed into valid evidence and a score. Keep any substantive reasoning, then append a corrected final JSON object following the output format example.
 
 ## Output Format Example
 <format_example>
@@ -658,6 +611,7 @@ THOUGHT: <your reasoning process>
 
 ```json
 {
+  "evidence": "<exact visible evidence supporting the selected scale anchor>",
   "score": <integer from 1 to 5>
 }
 ```
@@ -684,58 +638,10 @@ EMPTY_WORKSPACE_META = {
     "untracked_files": [],
     "status": [],
     "diff_stat": "",
+    "git_diff": "",
     "current_patch_chars": 0,
     "workspace_fingerprint": None,
 }
-
-RUBRIC_EXPERIENCE_RETRIEVAL_PROMPT = """
-You are retrieving prior rubric-generation experiences to help generate adaptive rubrics for SWE-agent trajectory continuations.
-
-## Task
-Select the experience titles whose lessons should be appended to the rubric generation prompt before generating the next rubric.
-The downstream rubric generator will identify the single most discriminative, non-redundant criterion separating the current continuation samples. Retrieve experiences only when they can concretely help that decision.
-
-## Retrieval Targets
-Retrieve an experience including but not limited to the following types of lessons:
-
-1. **Related instance or related problem**
-   - Same repository, library family, framework, task type, API surface, compatibility issue, build/configuration issue, workspace layout issue, or localization pattern.
-   - Use this when the prior experience contains a task-specific boundary that may transfer to the current rubric decision.
-
-2. **Related evaluation difficulty**
-   - The current continuations are hard to rank for a reason seen before: visible process quality conflicts with semantic correctness, tests may encode obsolete behavior, a workaround may pass the real oracle, or a broad refactor may hide the actual compatibility boundary.
-   - Use this when the prior experience helps decide what evidence the rubric should privilege under uncertainty.
-
-3. **Historical counterexample to a likely rubric-model mistake**
-   - Retrieve prior cases where the rubric model made a high-frequency error that is likely to recur now, such as rewarding generic test running over semantic coverage, punishing a valid compatibility-preserving revert, treating any reproduction project as a solution, over-penalizing messy but oracle-correct code, or generating a process/editing rubric when the samples differ by functional behavior.
-   - Use this to warn the rubric generator away from a tempting but wrong criterion.
-
-## Inputs
-1. **Experience Index**: Existing experience titles with descriptions. Titles are the only retrieval handles.
-2. **Current Round Context**: The current problem, previous persistent state, latest shared trajectory segment, and candidate continuations.
-
-## Selection Rules
-- Do not retrieve an experience solely because it shares broad words like "tests", "verification", "refactor", "search", or "compatibility"; the current continuation behavior must match the prior lesson.
-- Do not retrieve an experience solely because it shares repository names, languages, or broad task categories if the evaluation difficulty is different.
-- Retrieve an experience only if its stated applicability condition matches the current continuation distribution.
-- Do not retrieve an experience that would relax or ignore a distinction that is task-defining in the current samples. A prior lesson about harmless implementation variation applies only when the visible differences are actually semantically equivalent for this task.
-- Do not retrieve an early-stage process lesson when the current samples already contain enough terminal code or patch evidence to judge the implementation directly, unless the same process failure is still visibly causing the bad implementation. Vice versa.
-- Return an empty list when the index contains no experience with a concrete target match.
-- Do not output or invent internal IDs. Operate only on titles.
-
-## Output Format Example
-<format_example>
-
-THOUGHT: <your reasoning process>
-
-```json
-{
-  "titles": ["..."]
-}
-```
-
-</format_example>
-"""
 
 RUBRIC_EXPERIENCE_UPDATE_PROMPT = """
 You are maintaining a compact rubric-generation experience bank for SWE-agent.
@@ -1976,7 +1882,8 @@ Evaluate the provided complete trajectory summary using only the provided criter
 - Score the complete trajectory as a standalone attempt for the task.
 - Use only evidence visible in the summary and task context. Do not infer hidden test results, unstated repository behavior, or patch effects.
 - If evidence is mixed or incomplete, choose the scale anchor best supported by visible evidence.
-- Keep the structured answer limited to the score field. Do not restate the full question, criterion, or trajectory inside the JSON block.
+- Ground the score in exact visible summary evidence. In the final JSON object, put the evidence field before the score field.
+- Keep the structured answer limited to the evidence and score fields. Do not restate the full question, criterion, or trajectory inside the JSON block.
 
 ## Output Format Example
 <format_example>
@@ -1985,6 +1892,7 @@ THOUGHT: <your reasoning process>
 
 ```json
 {
+  "evidence": "<exact visible evidence supporting the selected scale anchor>",
   "score": <integer from 1 to 5>
 }
 ```

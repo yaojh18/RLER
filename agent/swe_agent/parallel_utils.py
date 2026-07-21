@@ -205,7 +205,13 @@ def compact_workspace_meta(workspace_meta: dict[str, Any], *, file_limit: int = 
     }
 
 
-def rubric_score_record(rubric: Any, score_raw: int, judge_message: Any) -> dict[str, Any]:
+def rubric_score_record(
+    rubric: Any,
+    score_raw: int,
+    judge_message: Any,
+    *,
+    evidence: str | None = None,
+) -> dict[str, Any]:
     normalized = max(0.0, min(1.0, (float(score_raw) - 1.0) / 4.0))
     importance = abs(float(rubric.weight))
     directional_score = -normalized if rubric.direction == "negative" else normalized
@@ -224,6 +230,7 @@ def rubric_score_record(rubric: Any, score_raw: int, judge_message: Any) -> dict
         "score_raw": int(score_raw),
         "score_normalized": normalized,
         "weighted_score": importance * directional_score,
+        "evidence": evidence or "",
         "judge_message": judge_message,
     }
 
@@ -318,6 +325,7 @@ class RubricArtifactBundle:
     messages_payload: list[dict[str, Any]]
     retrieve_messages_payload: list[dict[str, Any]] | None = None
     judge_messages_payload: list[dict[str, Any]] | None = None
+    tie_break_messages_payload: list[dict[str, Any]] | None = None
     summary_messages_payload: list[dict[str, Any]] | None = None
     round_summary_path: Path | None = None
     selected_for_round_summary: bool = False
@@ -464,6 +472,8 @@ def _write_base_artifacts(
             _atomic_write_json(bundle.rubric_dir / "rubric_retrieve_message.json", bundle.retrieve_messages_payload)
         if bundle.judge_messages_payload is not None:
             _atomic_write_json(bundle.rubric_dir / "judge_message.json", bundle.judge_messages_payload)
+        if bundle.tie_break_messages_payload is not None:
+            _atomic_write_json(bundle.rubric_dir / "tie_break_message.json", bundle.tie_break_messages_payload)
         if bundle.summary_messages_payload is not None:
             _atomic_write_json(bundle.rubric_dir / "summary_message.json", bundle.summary_messages_payload)
     for path, payload in extra_json_writes or []:
