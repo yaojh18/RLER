@@ -1763,22 +1763,5 @@
       "instance_label": null,
       "label_policy": "globally_retrievable"
     }
-  },
-  "retired_experience_ids": [
-    "GE30A49A5B10A1",
-    "GE3145D11B4487",
-    "GE4CBC9E3FF5A4",
-    "GE5C6105330897",
-    "GE992813768655",
-    "GED19E8D1EB665",
-    "GEFB61FFCA6DAA",
-    "GEFBF4E63E295A",
-    "R0018",
-    "R0022",
-    "R0065",
-    "V37D449295081D39",
-    "V37DA625748E5AE3",
-    "V95FUSE_BE47A871C72E1540",
-    "V98FUSE_C4B4F3BDE53DC352"
-  ]
+  }
 }

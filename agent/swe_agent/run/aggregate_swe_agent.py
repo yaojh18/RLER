@@ -786,6 +786,11 @@ class AggregateTrajectoryRunner:
                 except Exception:
                     pass
         candidates.sort(key=lambda candidate: candidate["candidate_index"])
+        if len(candidates) != self.num_trajectories:
+            raise RuntimeError(
+                f"Expected {self.num_trajectories} completed candidate trajectories for "
+                f"{self.task_id}, found {len(candidates)}."
+            )
         if candidates:
             self.system_prompt = candidates[0].get("system_prompt") or self.system_prompt
             self.user_prompt = candidates[0].get("user_prompt") or self.user_prompt
