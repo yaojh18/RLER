@@ -1,32 +1,19 @@
-"""Lane-based parallel trajectory search.
+"""Training-oriented Lane A / Lane B / Lane C trajectory generation.
 
-Flat Lane A / Lane B / Lane C scheme, three concurrent lanes per instance:
+The topology is deliberately much smaller than TTS search:
 
-* Lane A (spine, NOT trained)
-    A single agent runs the problem linearly to terminal/submit. Never blocks.
-    Every `k` assistant turns: checkpoint the container filesystem,
-    emit a MidCp = {idx, image_tag, snapshot, asst_step}. Purely a fork-point
-    provider — its trajectory is NOT included in any training group.
+* ``depth1`` emits one GRPO group.  Lane B independently samples ``m`` strict
+  ``k``-step continuations from the root and Lane C judges the complete group.
+* ``depth2`` emits the same root group plus one beam group.  Lane A samples
+  ``p`` independent strict ``k``-step parents from the root.  Lane B samples
+  ``m / p`` strict ``k``-step children from each parent, and Lane C judges all
+  ``m`` parent+child trajectories as one group.
 
-* Lane B (M policy forks + one deterministic parent baseline per mid_cp)
-    For each mid_cp Lane A emits, fork M policy agents from that checkpoint
-    plus one judge-parameter parent baseline branch used only for
-    parent-child rubric labels. Each policy branch runs independently to
-    termination/limit and may switch generation parameters after the first
-    budget window. The baseline branch is not exported as a policy sample.
-
-* Lane C (summary + sibling/parent-child rubric and judge per fork-group)
-    Trigger: when all Lane B branches in group i have run to terminal/limit.
-    Lane C extracts the shared parent state/recent parent segment, then runs
-    sibling and parent-child rubric retrieve/generate/judge concurrently within
-    the group. Lane C is serialized only for rubric-bank state; it does not
-    block Lane A or other groups' Lane B rollout.
-
-GRPO bundle per fork-group: M trajectories sharing prompt = Lane A history
-up to mid_cp_i, each with its own continuation to termination. Per-branch
-reward is the configured weighted average of GT, sibling rubric, and
-parent-child rubric signals; GT weight defaults to zero. Downstream GRPO
-computes group-relative advantages from these exported rewards.
+There is no best-branch selection and no parent-child (PC) reward.  A parent
+is a randomly sampled policy continuation and is part of every corresponding
+child's trainable response.  Terminal continuation and SWE-bench evaluation
+are controlled by one validation-only flag and are disabled for training by
+default.
 """
 
 from __future__ import annotations
@@ -35,6 +22,7 @@ import asyncio
 import contextvars
 import copy
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -59,24 +47,22 @@ from swe_agent.parallel_utils import (
     _stamp_steps,
     _atomic_write_json,
     extract_terminal_patch_from_session,
-    progress_reward,
-    gap_corr,
 )
 from swe_agent.prompt import (
     EMPTY_PERSISTENT_STATE,
     EMPTY_WORKSPACE_META,
-    PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
-    PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
     SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
     SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
 )
 from swe_agent.run.run_swe_agent import (
     EvaluationRewardConfig,
+    _litellm_model_kwargs,
     build_messages,
     evaluate_swebench_instance_patches,
     make_evaluation_payload,
 )
-from swe_agent.rubric_bank import ExperienceRubricBank, ScoreRubricBank, build_terminal_update_evidence
+from swe_agent.rubric_bank import ExperienceRubricBank, ScoreRubricBank
+from swe_agent.usage import usage_context
 from swe_agent.trajectory_search import (
     _avg_scores_from_rubrics,
     _generate_and_score_rubric_batch,
@@ -92,6 +78,10 @@ from swe_agent.trajectory_search import (
 
 
 logger = logging.getLogger("swe_agent.trajectory_search_parallel")
+
+_POLICY_OVERLENGTH_EXIT_STATUSES = frozenset(
+    {"ContextWindowExceeded", "CompletionLengthExceeded"}
+)
 
 
 _HEAVY_TOKEN_KEYS = {
@@ -117,14 +107,101 @@ def _clone_without_heavy_token_fields(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
-def _pc_progress_label(*, child_gt: float | None, parent_gt: float | None) -> float:
-    child = float(child_gt or 0.0)
-    parent = float(parent_gt or 0.0)
-    if child > parent:
-        return 1.0
-    if child < parent:
-        return 0.0
-    return 0.5
+def _score_map_errors(
+    scores: Any,
+    *,
+    node_ids: list[str],
+    label: str,
+) -> list[str]:
+    """Validate exact, finite score coverage for the real runtime nodes."""
+    errors: list[str] = []
+    expected = set(node_ids)
+    if len(expected) != len(node_ids):
+        errors.append(f"{label}:duplicate_expected_node_ids")
+    if not isinstance(scores, dict):
+        errors.append(f"{label}:not_a_mapping")
+        return errors
+    actual = set(scores)
+    if actual != expected:
+        missing = sorted(str(node_id) for node_id in expected - actual)
+        extra = sorted(str(node_id) for node_id in actual - expected)
+        errors.append(f"{label}:coverage:missing={missing}:extra={extra}")
+    for node_id in expected & actual:
+        if isinstance(scores[node_id], bool) or not isinstance(
+            scores[node_id], (int, float)
+        ):
+            errors.append(f"{label}:non_numeric:{node_id}")
+            continue
+        try:
+            score = float(scores[node_id])
+        except (TypeError, ValueError, OverflowError):
+            errors.append(f"{label}:non_numeric:{node_id}")
+            continue
+        if not math.isfinite(score):
+            errors.append(f"{label}:non_finite:{node_id}:{score}")
+    return errors
+
+
+def _tie_break_errors(
+    payload: dict[str, Any] | None,
+    *,
+    node_ids: list[str],
+) -> list[str]:
+    """Return fatal tie-break errors while retaining recovery diagnostics."""
+    if payload is None:
+        return []
+    errors: list[str] = []
+    status = str(payload.get("status") or "")
+    if status not in {"success", "fallback"}:
+        errors.append(f"tie_break_status:{status or 'missing'}")
+    # The oracle records corrected format turns and generation-cap terminals
+    # even when a later rubric is usable. They remain in the artifact payload
+    # but are not failures by themselves.
+    for error in payload.get("judge_errors") or []:
+        errors.append(f"tie_break_judge:{error}")
+    for message in payload.get("judge_messages") or []:
+        if isinstance(message, dict) and message.get("error"):
+            errors.append(f"tie_break_judge:{message['error']}")
+    if status == "success":
+        errors.extend(
+            _score_map_errors(
+                payload.get("adjusted_scores"),
+                node_ids=node_ids,
+                label="tie_break_adjusted_scores",
+            )
+        )
+    return errors
+
+
+def _unexpected_rollout_exit(
+    result: dict[str, Any] | None, *, lane: str
+) -> str | None:
+    """Classify clean backend returns that nevertheless ended abnormally.
+
+    SWE-agent represents preflight context overflow and limits exhaustion as
+    structured exit messages, so ``session.step`` returns normally instead of
+    raising.  Empty exit status means the strict-k budget paused normally;
+    ``Submitted`` is the only successful terminal status.
+    """
+    exit_status = str((result or {}).get("exit_status") or "").strip()
+    if (
+        not exit_status
+        or exit_status == "Submitted"
+        or exit_status in _POLICY_OVERLENGTH_EXIT_STATUSES
+    ):
+        return None
+    return f"{lane}_exit_status:{exit_status}"
+
+
+def _policy_overlength_exit_status(
+    result: dict[str, Any] | None,
+) -> str | None:
+    exit_status = str((result or {}).get("exit_status") or "").strip()
+    return (
+        exit_status
+        if exit_status in _POLICY_OVERLENGTH_EXIT_STATUSES
+        else None
+    )
 
 
 def _build_parent_messages_payload(messages: list[dict[str, Any]], *, model_name: str) -> dict[str, Any]:
@@ -170,16 +247,18 @@ def _step_card_event_dicts(events: list[Any]) -> list[dict[str, Any]]:
 
 @dataclass
 class ParallelSearchConfig:
-    """Parallel search config. The public sampling knobs mirror SearchConfig:
-    m sibling branches, n rubric lists, k rollout steps per fork interval,
-    p active parents (currently p=1 for the single Lane A spine), and
-    max_rounds total fork-groups, counting the root fork as round 1."""
+    """Parallel training rollout configuration.
+
+    ``m`` is always the GRPO group cardinality.  In ``depth2``, ``p`` is the
+    number of independently sampled Lane-A parents and must divide ``m``.
+    """
 
     m: int = 8  # forks per mid_cp (NOT M-1)
     n: int = 1  # rubric-list samples per group
     k: int = 20  # assistant turns between Lane A checkpoints
-    p: int = 1  # parallel currently follows one Lane A spine
-    max_rounds: int = 5  # cap on fork-groups per instance; root counts
+    p: int = 2  # Lane-A beam parents in depth2
+    topology: str = "depth1"
+    max_rounds: int = 1  # retained for CLI compatibility; topology is explicit
     step_limit: int = 100  # hard cap for the whole trajectory
     max_active_rubrics: int = 6
 
@@ -191,14 +270,16 @@ class ParallelSearchConfig:
     lane_b_temperature: float = 1.0
     lane_b_top_p: float = 0.95
 
-    # Lane C (rubric/judge) reuses v0 defaults.
+    # Hosted GLM can spend more than the completed TTS launch's 8096-token
+    # budget on reasoning alone.  Keep enough room for its final structured
+    # answer; lower values remain available as explicit caller overrides.
     rubric_temperature: float = 1.0
     rubric_top_p: float = 0.95
-    rubric_max_tokens: int = 4096
+    rubric_max_tokens: int = 20480
     judge_temperature: float = 0.01
     judge_top_p: float = 0.95
-    judge_max_tokens: int = 1024
-    psu_max_tokens: int = 4096
+    judge_max_tokens: int = 20480
+    psu_max_tokens: int = 20480
 
     gt_eval_workers: int = 8
     lane_a_pool_size: int = 1  # Lane A is a single agent
@@ -206,9 +287,10 @@ class ParallelSearchConfig:
 
     keep_images: bool = False
     return_logprobs: bool = True
+    terminal_rollout: bool = False
     reward_kind: str = "joint"
     joint_alpha: float = 1.0
-    all_pass_reward: float = 2.0
+    all_pass_reward: float = 1.0
     disable_rubric: bool = False
     # Same recipe as v0: multiplicative penalty when the agent never invoked
     # the formal submit command and we fell back to `git diff` of the
@@ -238,6 +320,15 @@ class ParallelSearchConfig:
             raise ValueError("trajectory_search_parallel requires lane_b_pool_size > 0 when set.")
         if self.reward_kind not in {"hard", "soft", "joint", "f2p_only"}:
             raise ValueError(f"unsupported trajectory_search_parallel reward_kind={self.reward_kind!r}")
+        if self.topology not in {"depth1", "depth2"}:
+            raise ValueError(
+                "trajectory_search_parallel topology must be 'depth1' or 'depth2'"
+            )
+        if self.topology == "depth2" and self.m % self.p:
+            raise ValueError(
+                "trajectory_search_parallel depth2 requires m divisible by p "
+                f"(got m={self.m}, p={self.p})"
+            )
 
 
 @dataclass
@@ -261,6 +352,7 @@ class MidCp:
     parent_event_count: int = 0
     parent_turn_count: int = 0
     emitted_at: float = 0.0  # perf_counter timestamp
+    node_id: str = ""
 
 
 @dataclass
@@ -291,12 +383,19 @@ class LaneBBranch:
     terminated_early: bool = False  # True iff agent invoked formal submit
     terminal_patch: str = ""
     terminal_patch_from_fallback: bool = False
+    # Multiplicative reward adjustment for a policy overlength terminal.  GT
+    # rewards already apply this inside EvaluationRewardConfig; hosted-judge
+    # rewards apply it in lane_to_grpo_bundle.
+    reward_penalty: float = 1.0
+    overlength_reason: str | None = None
     error: str | None = None
     gt_score: float | None = None
     gt_payload: dict[str, Any] | None = None
     started_at: float = 0.0
     finished_at: float = 0.0
-    is_parent_baseline: bool = False
+    # ``None`` for the root group; 0..p-1 for a depth2 child.
+    beam_parent_index: int | None = None
+    beam_parent_node_id: str | None = None
 
 
 @dataclass
@@ -311,19 +410,20 @@ class ForkGroup:
     group_index: int  # = mid_cp.idx
     mid_cp: MidCp
     branches: list[LaneBBranch] = field(default_factory=list)
-    parent_branch: LaneBBranch | None = None
+    group_kind: str = "root"
+    # Empty for depth1/root.  For a beam group these are the independently
+    # sampled Lane-A parent checkpoints, in parent-index order.
+    parent_mid_cps: list[MidCp] = field(default_factory=list)
     rubric_model_response: dict[str, Any] = field(default_factory=dict)
     rubric_samples: list[dict[str, Any]] = field(default_factory=list)
     judge_response: dict[str, Any] = field(default_factory=dict)
-    pc_rubric_model_response: dict[str, Any] = field(default_factory=dict)
-    pc_rubric_samples: list[dict[str, Any]] = field(default_factory=list)
-    pc_judge_response: dict[str, Any] = field(default_factory=dict)
+    # Final oracle-equivalent score, keyed by the real runtime node id.
+    judge_score_by_node: dict[str, float] = field(default_factory=dict)
+    lane_c_errors: list[str] = field(default_factory=list)
     summary: dict[str, Any] = field(default_factory=dict)
     summary_messages: list[dict[str, Any]] = field(default_factory=list)
     experience_bank_update: dict[str, Any] = field(default_factory=dict)
     experience_bank_message: list[dict[str, Any]] = field(default_factory=list)
-    pc_experience_bank_update: dict[str, Any] = field(default_factory=dict)
-    pc_experience_bank_message: list[dict[str, Any]] = field(default_factory=list)
     persisted_parent_state: dict[str, Any] = field(default_factory=dict)
     lane_c_started_at: float = 0.0
     lane_c_done_at: float = 0.0
@@ -332,7 +432,7 @@ class ForkGroup:
 
 @dataclass
 class LaneAState:
-    """Lane A's overall record — for inspection / debug. NOT trained on."""
+    """Lane-A parent-generation record for inspection and usage accounting."""
 
     messages: list[dict[str, Any]] = field(default_factory=list)
     mid_cps: list[MidCp] = field(default_factory=list)
@@ -387,6 +487,8 @@ class TrajectorySearchParallelRunner:
         backend: SWEAgentRolloutBackend,
         run_dir: Path,
         policy_model_name: str,
+        policy_version: str | None = None,
+        enforce_policy_version: bool = False,
         rubric_model_name: str | None,
         judge_model_name: str | None,
         config: ParallelSearchConfig,
@@ -394,6 +496,9 @@ class TrajectorySearchParallelRunner:
         policy_base_url: str,
         rubric_base_url: str,
         api_key: str = "EMPTY",
+        policy_api_key: str | None = None,
+        rubric_api_key: str | None = None,
+        usage_group_prefix: str | None = None,
         policy_base_urls: list[str] | None = None,
         score_banks: dict[str, ScoreRubricBank] | None = None,
         experience_banks: dict[str, ExperienceRubricBank] | None = None,
@@ -402,6 +507,8 @@ class TrajectorySearchParallelRunner:
         self.backend = backend
         self.run_dir = Path(run_dir)
         self.policy_model_name = policy_model_name
+        self.policy_version = policy_version or policy_model_name
+        self.enforce_policy_version = bool(enforce_policy_version)
         self.rubric_model_name = rubric_model_name or policy_model_name
         self.judge_model_name = judge_model_name or self.rubric_model_name
         self.config = config
@@ -411,11 +518,20 @@ class TrajectorySearchParallelRunner:
             url.rstrip("/") for url in (policy_base_urls or [self.policy_base_url])
         ]
         self.rubric_base_url = rubric_base_url.rstrip("/")
-        self.api_key = api_key
+        # Keep the legacy ``api_key`` argument as a fallback, but never route
+        # the remote judge credential into local policy requests.
+        self.policy_api_key = policy_api_key or api_key
+        self.rubric_api_key = rubric_api_key or api_key
         self.skip_lane_c = bool(config.disable_rubric)
 
         self.task = instance["problem_statement"]
         self.task_id = instance["instance_id"]
+        requested_usage_prefix = (
+            str(usage_group_prefix).strip()
+            if usage_group_prefix is not None
+            else ""
+        )
+        self.usage_group_prefix = requested_usage_prefix or self.task_id
         self.run_id = f"{self.task_id}-{time.strftime('%Y%m%d-%H%M%S')}"
         self.base_image = str(self.backend.environment_config["image"])
         self.environment_class = _container_environment_kind(
@@ -434,23 +550,26 @@ class TrajectorySearchParallelRunner:
         self._live_sessions: list[Any] = []
         provided_score_banks = score_banks if score_banks is not None else {}
         provided_experience_banks = experience_banks if experience_banks is not None else {}
-        shared_extra_body = (
-            {"chat_template_kwargs": {"enable_thinking": True}}
-            if "qwen" in self.rubric_model_name.lower() or "qwen" in self.judge_model_name.lower()
-            else {}
-        )
         rubric_api_base = (
             self.rubric_base_url + "/v1"
             if not self.rubric_base_url.endswith("/v1")
             else self.rubric_base_url
         )
         self.rubric_model_kwargs: dict[str, Any] = {
+            **_litellm_model_kwargs(self.rubric_model_name),
             "api_base": rubric_api_base,
-            "api_key": self.api_key,
-            **({"extra_body": shared_extra_body} if shared_extra_body else {}),
+            "api_key": self.rubric_api_key,
+            "completion_backend": "litellm",
         }
-        self.judge_model_kwargs: dict[str, Any] = copy.deepcopy(self.rubric_model_kwargs)
-        self.rubric_scopes = ("siblings", "pc")
+        self.judge_model_kwargs: dict[str, Any] = {
+            **_litellm_model_kwargs(self.judge_model_name),
+            "api_base": rubric_api_base,
+            "api_key": self.rubric_api_key,
+            "completion_backend": "litellm",
+        }
+        # Training uses one sibling-judging scope only.  PC was a TTS search
+        # signal and is intentionally absent from the parallel trainer.
+        self.rubric_scopes = ("siblings",)
         self.score_banks: dict[str, ScoreRubricBank] = {}
         self.experience_banks: dict[str, ExperienceRubricBank] = {}
         for scope in self.rubric_scopes:
@@ -462,13 +581,11 @@ class TrajectorySearchParallelRunner:
             if not self.skip_lane_c:
                 if not isinstance(experience_bank, ExperienceRubricBank):
                     raise ValueError(
-                        "Parallel rubric search requires frozen siblings and pc banks"
+                        "Parallel rubric training requires a frozen siblings bank"
                     )
                 self.experience_banks[scope] = experience_bank
         self.rubric_bank = self.score_banks["siblings"]
-        self.pc_rubric_bank = self.score_banks["pc"]
         self.experience_bank = self.experience_banks.get("siblings")
-        self.pc_experience_bank = self.experience_banks.get("pc")
         self._summary_persistent_state = copy.deepcopy(EMPTY_PERSISTENT_STATE)
         self._summary_recent_segments: list[dict[str, Any]] = []
         self._summary_processed_segments = 0
@@ -478,6 +595,9 @@ class TrajectorySearchParallelRunner:
         # Captured by Lane A startup and reused by Lane C prompt construction.
         self.system_prompt = ""
         self.user_prompt = ""
+
+    def _usage_group_id(self, group_index: int) -> str:
+        return f"{self.usage_group_prefix}:g{group_index}"
 
     # -- session/docker plumbing ---------------------------------------------
     #
@@ -493,7 +613,9 @@ class TrajectorySearchParallelRunner:
             task_id=self.task_id,
             sample_index=0,
             policy_ref=self.policy_model_name,
-            policy_version=self.policy_model_name,
+            policy_version=(
+                self.policy_version if self.enforce_policy_version else None
+            ),
             dataset_name="swebench",
             ground_truth=self.instance.get("patch"),
             raw_user_query=self.task,
@@ -510,7 +632,7 @@ class TrajectorySearchParallelRunner:
             if not self.policy_base_url.endswith("/v1")
             else self.policy_base_url
         )
-        mk["api_key"] = self.api_key
+        mk["api_key"] = self.policy_api_key
         mk["temperature"] = float(self.config.policy_temperature)
         mk["top_p"] = float(self.config.policy_top_p)
         session.agent.model.config.model_name = _ensure_litellm_prefix(
@@ -665,9 +787,14 @@ class TrajectorySearchParallelRunner:
                 mk = session.agent.model.config.model_kwargs
             except Exception:
                 mk = {}
-            max_new_tokens = int(mk.get("max_tokens") or mk.get("max_completion_tokens") or 4096)
-            # 80960 = current --rollout-max-context-len in grpo.sh
-            sglang_ctx = int(os.environ.get("SWE_AGENT_LANES_SGLANG_CTX", "80960"))
+            max_new_tokens = int(
+                mk.get("max_tokens")
+                or mk.get("max_completion_tokens")
+                or 20480
+            )
+            sglang_ctx = int(
+                os.environ.get("SWE_AGENT_LANES_SGLANG_CTX", "128000")
+            )
             need = len(input_ids) + max_new_tokens
             return need > sglang_ctx
         except Exception as exc:
@@ -800,7 +927,7 @@ class TrajectorySearchParallelRunner:
         kwargs["api_base"] = (
             base_url + "/v1" if not base_url.endswith("/v1") else base_url
         )
-        kwargs["api_key"] = self.api_key
+        kwargs["api_key"] = self.policy_api_key
         kwargs["temperature"] = float(temperature)
         kwargs["top_p"] = float(top_p)
         if "model_name" in config_section:
@@ -823,7 +950,7 @@ class TrajectorySearchParallelRunner:
             "session_id": session_id,
             "status": mid_cp.snapshot["status"],
             "spec": copy.deepcopy(mid_cp.snapshot["spec"]),
-            "agent": mid_cp.snapshot["agent"],
+            "agent": copy.deepcopy(mid_cp.snapshot["agent"]),
             "model": copy.deepcopy(mid_cp.snapshot["model"]),
             "environment": copy.deepcopy(mid_cp.snapshot["environment"]),
             "last_step_index": -1,
@@ -831,7 +958,7 @@ class TrajectorySearchParallelRunner:
             "metadata": {"events": [], "model_turns": []},
         }
         if mid_cp.snapshot.get("memory") is not None:
-            resumed["memory"] = mid_cp.snapshot["memory"]
+            resumed["memory"] = copy.deepcopy(mid_cp.snapshot["memory"])
         resumed["spec"]["session_id"] = session_id
         lane_b_base_url = self.policy_base_urls[mid_cp.idx % len(self.policy_base_urls)]
         self._override_model_kwargs(
@@ -874,29 +1001,33 @@ class TrajectorySearchParallelRunner:
         branch_index: int,
         budget_steps: int,
         total_step_limit: int,
-        is_parent_baseline: bool,
         initial_temperature: float,
         initial_top_p: float,
+        group_index: int | None = None,
+        beam_parent_index: int | None = None,
+        beam_parent_node_id: str | None = None,
     ) -> LaneBBranch:
-        """Run a single Lane B branch end-to-end (blocking, called from
-        the executor): fork, run the first budget with Lane B sampling,
-        switch to terminal sampling if the branch is still live, then capture
-        the final trace and terminal patch. Lane C derives first-k views from
-        the final trace instead of this function materializing round state.
+        """Sample one Lane-B continuation.
 
-        GT eval is dispatched separately by `_run_fork_group` so that the
-        gt_pool can be shared across all groups."""
-        node_kind = "parent" if is_parent_baseline else f"b{branch_index:02d}"
-        node_id = f"lane-b-g{mid_cp.idx:03d}-{node_kind}-{uuid.uuid4().hex[:6]}"
+        Training stops after ``budget_steps``.  Only validation explicitly
+        enables ``terminal_rollout``, which also enables terminal patch
+        extraction and GT evaluation in the group orchestrator.
+        """
+        effective_group_index = mid_cp.idx if group_index is None else group_index
+        node_id = (
+            f"lane-b-g{effective_group_index:03d}-b{branch_index:02d}-"
+            f"{uuid.uuid4().hex[:6]}"
+        )
         branch = LaneBBranch(
-            group_index=mid_cp.idx,
+            group_index=effective_group_index,
             branch_index=branch_index,
             node_id=node_id,
             parent_image_tag=mid_cp.image_tag,
             policy_model_name=self.policy_model_name,
             parent_asst_step=mid_cp.asst_step,
             started_at=time.perf_counter(),
-            is_parent_baseline=is_parent_baseline,
+            beam_parent_index=beam_parent_index,
+            beam_parent_node_id=beam_parent_node_id,
         )
         session = None
         result: dict[str, Any] = {"status": "error", "exit_status": "not_started"}
@@ -918,34 +1049,33 @@ class TrajectorySearchParallelRunner:
             before_message_count = mid_cp.parent_message_count
             before_turn_count = len(session.model_turns)
 
-            if is_parent_baseline:
-                result = self._step_session(session, max_steps=self._branch_terminal_budget(mid_cp.asst_step))
-                workspace_meta = None
-            else:
-                result = self._step_session(session, max_steps=budget_steps)
-                workspace_meta = _collect_workspace_meta(session.agent.env)
-                first_phase_steps = int(result["executed_steps"])
-                logger.info(
-                    "[%s] lane_b g=%d b=%d first_phase_done dt=%.1fs steps=%d status=%s submitted=%s",
-                    self.task_id,
-                    mid_cp.idx,
-                    branch_index,
-                    time.perf_counter() - branch.started_at,
-                    first_phase_steps,
-                    result["status"],
-                    result["exit_status"] == "Submitted",
-                )
+            result = self._step_session(session, max_steps=budget_steps)
+            workspace_meta = _collect_workspace_meta(session.agent.env)
+            first_phase_steps = int(result["executed_steps"])
+            logger.info(
+                "[%s] lane_b g=%d b=%d first_phase_done dt=%.1fs steps=%d status=%s submitted=%s",
+                self.task_id,
+                effective_group_index,
+                branch_index,
+                time.perf_counter() - branch.started_at,
+                first_phase_steps,
+                result["status"],
+                result["exit_status"] == "Submitted",
+            )
 
-                terminal_result = result
-                if result["status"] != "finished":
-                    branch_step_end = mid_cp.asst_step + first_phase_steps
-                    remaining_steps = self._branch_terminal_budget(branch_step_end)
-                    branch_model_kwargs = session.agent.model.config.model_kwargs
-                    branch_model_kwargs["temperature"] = self.config.judge_temperature
-                    branch_model_kwargs["top_p"] = self.config.judge_top_p
-                    if remaining_steps > 0:
-                        terminal_result = self._step_session(session, max_steps=remaining_steps)
-                result = terminal_result
+            first_phase_exit_error = _unexpected_rollout_exit(
+                result, lane="lane_b"
+            )
+            if (
+                self.config.terminal_rollout
+                and first_phase_exit_error is None
+                and not str(result.get("exit_status") or "").strip()
+                and result["status"] != "finished"
+            ):
+                branch_step_end = mid_cp.asst_step + first_phase_steps
+                remaining_steps = self._branch_terminal_budget(branch_step_end)
+                if remaining_steps > 0:
+                    result = self._step_session(session, max_steps=remaining_steps)
 
             messages = copy.deepcopy(
                 session.agent.messages[before_message_count:]
@@ -963,13 +1093,27 @@ class TrajectorySearchParallelRunner:
             }
             branch.status = result["status"]
             branch.terminated_early = result["exit_status"] == "Submitted"
-            branch.terminal_patch, branch.terminal_patch_from_fallback = (
-                self._extract_terminal_patch(result, session)
-            )
+            overlength_status = _policy_overlength_exit_status(result)
+            exit_error = _unexpected_rollout_exit(result, lane="lane_b")
+            if exit_error is not None:
+                branch.error = exit_error
+            if overlength_status is not None:
+                branch.status = "policy_overlength"
+                branch.overlength_reason = overlength_status
+                branch.reward_penalty = float(
+                    self.config.fallback_patch_penalty
+                )
+                branch.terminal_patch, branch.terminal_patch_from_fallback = (
+                    self._extract_terminal_patch(result, session)
+                )
+            elif self.config.terminal_rollout:
+                branch.terminal_patch, branch.terminal_patch_from_fallback = (
+                    self._extract_terminal_patch(result, session)
+                )
             logger.info(
                 "[%s] lane_b g=%d b=%d done dt=%.1fs events=%d submitted=%s "
                 "status=%s patch_len=%d tokens_p=%d tokens_c=%d",
-                self.task_id, mid_cp.idx, branch_index,
+                self.task_id, effective_group_index, branch_index,
                 time.perf_counter() - branch.started_at,
                 len(branch.events), branch.terminated_early, branch.status,
                 len(branch.terminal_patch),
@@ -981,12 +1125,20 @@ class TrajectorySearchParallelRunner:
             branch.status = "error"
             logger.warning(
                 "[%s] lane_b g=%d b=%d FAILED dt=%.1fs %s",
-                self.task_id, mid_cp.idx, branch_index,
+                self.task_id, effective_group_index, branch_index,
                 time.perf_counter() - branch.started_at, branch.error,
             )
             if self._is_context_window_error(exc) and session is not None:
+                # Provider-side overflow is semantically identical to the
+                # structured pre-flight exit: keep the partial trajectory,
+                # collect the current diff, and let Lane C score it with the
+                # configured multiplicative penalty.
                 branch.error = None
-                branch.status = "context_overflow"
+                branch.status = "policy_overlength"
+                branch.overlength_reason = "ContextWindowExceeded"
+                branch.reward_penalty = float(
+                    self.config.fallback_patch_penalty
+                )
                 branch.terminated_early = False
                 branch.messages = copy.deepcopy(session.agent.messages[before_message_count:])
                 branch.events = _step_card_event_dicts(session.events[before_event_count:])
@@ -1005,7 +1157,7 @@ class TrajectorySearchParallelRunner:
                 logger.warning(
                     "[%s] lane_b g=%d b=%d stopped by context window dt=%.1fs "
                     "patch_len=%d tokens_p=%d tokens_c=%d",
-                    self.task_id, mid_cp.idx, branch_index,
+                    self.task_id, effective_group_index, branch_index,
                     time.perf_counter() - branch.started_at,
                     len(branch.terminal_patch),
                     branch.total_tokens["prompt"],
@@ -1109,7 +1261,7 @@ class TrajectorySearchParallelRunner:
         workspace = branch.workspace_meta or {}
         step_start = branch.parent_asst_step
         step_end = step_start + len(step_cards)
-        return {
+        view = {
             "node_id": branch.node_id,
             "summary": {
                 "step_count": len(step_cards),
@@ -1122,6 +1274,9 @@ class TrajectorySearchParallelRunner:
                 "segment_step_range": [step_start, step_end],
             },
         }
+        if branch.beam_parent_index is not None:
+            view["parent_index"] = branch.beam_parent_index + 1
+        return view
 
     async def _run_lane_c_scope(
         self,
@@ -1138,7 +1293,6 @@ class TrajectorySearchParallelRunner:
         generation_prompt: str,
         rubric_list_prefix: str,
         judge_prompt: str,
-        include_variance_reward: bool,
     ) -> dict[str, Any]:
         cfg = self.config
         experience_context = await experience_bank.build_generation_context(
@@ -1149,6 +1303,7 @@ class TrajectorySearchParallelRunner:
             model_name=self.rubric_model_name,
             top_p=cfg.rubric_top_p,
             model_kwargs=self.rubric_model_kwargs,
+            summary_max_tokens=cfg.psu_max_tokens,
             instance_id=self.task_id,
             round_index=group.group_index + 1,
         )
@@ -1157,6 +1312,15 @@ class TrajectorySearchParallelRunner:
         extra_prompt_sections.extend(experience_context.extra_prompt_sections)
         retrieved_experiences = copy.deepcopy(experience_context.retrieved)
         retrieve_messages = copy.deepcopy(experience_context.retrieve_messages)
+        retrieval_errors: list[str] = []
+        if (
+            retrieve_messages
+            and retrieve_messages[-1].get("role") == "user"
+            and "valid final JSON object" in str(
+                retrieve_messages[-1].get("content") or ""
+            )
+        ):
+            retrieval_errors.append("experience_retrieval_format_exhausted")
         generation_context = {
             "question": copy.deepcopy(question),
             "previous_state": copy.deepcopy(previous_state),
@@ -1219,24 +1383,32 @@ class TrajectorySearchParallelRunner:
             for rubric in generated_rubrics
         ]
 
-        parent_gt = group.parent_branch.gt_score
-        gt_by_node = {branch.node_id: float(branch.gt_score or 0.0) for branch in group.branches}
-        pc_label_by_node = {
-            branch.node_id: _pc_progress_label(child_gt=branch.gt_score, parent_gt=parent_gt)
-            for branch in group.branches
-        }
         aggregate_judge_response: dict[str, dict[str, Any]] = {}
         rubric_samples: list[dict[str, Any]] = []
+        valid_score_samples: list[dict[str, float]] = []
+        # Keep generation diagnostics in model_response/sample artifacts.
+        # Usability follows the oracle: a recovered sample is valid when it
+        # produced rubrics and complete judge scores.
+        scope_errors: list[str] = list(retrieval_errors)
+        if len(score_batch["generated_samples"]) != cfg.n:
+            scope_errors.append(
+                "rubric_sample_count:"
+                f"{len(score_batch['generated_samples'])}/{cfg.n}"
+            )
         node_ids = [branch.node_id for branch in group.branches]
         for sample_index, generated_sample in enumerate(score_batch["generated_samples"]):
             generated_rubrics = score_batch["sample_generated_rubrics"][sample_index]
             scoring_rubrics = generated_rubrics
+            if not scoring_rubrics:
+                scope_errors.append(
+                    f"rubric_sample_{sample_index}:no_valid_rubrics"
+                )
             evaluation = _rubric_sample_evaluation(
                 score_batch=score_batch,
                 sample_index=sample_index,
                 node_ids=node_ids,
                 scoring_rubrics=scoring_rubrics,
-                include_variance_reward=include_variance_reward,
+                include_variance_reward=True,
             )
             metrics = evaluation["metrics"]
             judge_response_for_sample: dict[str, dict[str, Any]] = {}
@@ -1270,7 +1442,21 @@ class TrajectorySearchParallelRunner:
             tie_break = None
             tie_break_messages: list[dict[str, Any]] = []
             tie_break_judge_messages: list[dict[str, Any]] = []
-            if cfg.score_tie_break and scoring_rubrics:
+            sample_errors = [
+                f"judge:{error}" for error in evaluation["judge_errors"]
+            ]
+            base_score_errors = _score_map_errors(
+                avg_scores,
+                node_ids=node_ids,
+                label=f"rubric_sample_{sample_index}_scores",
+            )
+            sample_errors.extend(base_score_errors)
+            scope_errors.extend(base_score_errors)
+            if (
+                cfg.score_tie_break
+                and scoring_rubrics
+                and not sample_errors
+            ):
                 tie_break_result = await _run_score_tie_break(
                     scope=scope,
                     round_index=group.group_index + 1,
@@ -1288,27 +1474,29 @@ class TrajectorySearchParallelRunner:
                     initial_scores=avg_scores,
                 )
                 if tie_break_result is not None:
+                    tie_errors = _tie_break_errors(
+                        tie_break_result,
+                        node_ids=node_ids,
+                    )
+                    sample_errors.extend(tie_errors)
+                    scope_errors.extend(tie_errors)
                     tie_break = copy.deepcopy(tie_break_result)
                     tie_break_messages = tie_break.pop("messages", [])
                     tie_break_judge_messages = tie_break.pop("judge_messages", [])
-                    if tie_break.get("status") == "success":
+                    if not tie_errors and tie_break.get("status") == "success":
                         avg_scores = copy.deepcopy(tie_break["adjusted_scores"])
-            ordered_node_ids = list(avg_scores)
-            ground_truth_by_node = (
-                copy.deepcopy(pc_label_by_node)
-                if scope == "pc"
-                else copy.deepcopy(gt_by_node)
-            )
-            reward = (
-                progress_reward(
-                    [ground_truth_by_node[node_id] for node_id in ordered_node_ids],
-                    [avg_scores[node_id] for node_id in ordered_node_ids],
-                )
-                if scope == "pc"
-                else gap_corr(
-                    [float(avg_scores[node_id]) for node_id in ordered_node_ids],
-                    [float(ground_truth_by_node[node_id]) for node_id in ordered_node_ids],
-                )
+            # Match trajectory_search: a node's final reward is the average
+            # of the oracle-weighted score over valid rubric-list samples.
+            # Training is fail-closed, so a judge error in any call prevents
+            # this rubric-list sample from contributing and ultimately leaves
+            # the group without a score map.
+            if (
+                scoring_rubrics
+                and not sample_errors
+            ):
+                valid_score_samples.append(copy.deepcopy(avg_scores))
+            scope_errors.extend(
+                f"judge:{error}" for error in evaluation["judge_errors"]
             )
             generated_ids = {rubric.rubric_id for rubric in generated_sample.generated}
             sample_payload = {
@@ -1329,14 +1517,7 @@ class TrajectorySearchParallelRunner:
                 "tie_break": tie_break,
                 "tie_break_messages": tie_break_messages,
                 "tie_break_judge_messages": tie_break_judge_messages,
-                "gt_by_rubric": {
-                    rubric.rubric_id: {
-                        "child_scores": metrics["score_by_rubric"].get(rubric.rubric_id, {}),
-                        "ground_truth_by_node": copy.deepcopy(ground_truth_by_node),
-                    }
-                    for rubric in scoring_rubrics
-                },
-                "reward": float(reward),
+                "reward": 0.0,
                 "retrieved": [asdict(experience) for experience in retrieved_experiences],
                 "retrieve_messages": copy.deepcopy(retrieve_messages),
                 "selected": False,
@@ -1348,11 +1529,33 @@ class TrajectorySearchParallelRunner:
             active_bank=copy.deepcopy(bank_update.active_after),
             inactive_bank=copy.deepcopy(bank_update.inactive_after),
         )
+        judge_score_by_node: dict[str, float] = {}
+        if (
+            not scope_errors
+            and len(valid_score_samples) == len(score_batch["generated_samples"])
+            and valid_score_samples
+        ):
+            aggregated_scores = {
+                node_id: sum(scores[node_id] for scores in valid_score_samples)
+                / len(valid_score_samples)
+                for node_id in node_ids
+            }
+            aggregate_errors = _score_map_errors(
+                aggregated_scores,
+                node_ids=node_ids,
+                label="judge_score_by_node",
+            )
+            if aggregate_errors:
+                scope_errors.extend(aggregate_errors)
+            else:
+                judge_score_by_node = aggregated_scores
         return {
             "scope": scope,
             "samples": rubric_samples,
             "judge_response": aggregate_judge_response,
             "model_response": model_response,
+            "judge_score_by_node": judge_score_by_node,
+            "errors": scope_errors,
         }
 
     async def _run_lane_c(
@@ -1404,6 +1607,39 @@ class TrajectorySearchParallelRunner:
         previous_state = copy.deepcopy(self._summary_persistent_state)
         recent_segments = copy.deepcopy(self._summary_recent_segments)
         latest_shared_segment = copy.deepcopy(recent_segments[-1]) if recent_segments else None
+        if group.parent_mid_cps:
+            # Same multi-parent context shape used by trajectory_search:
+            # parent 1 owns continuations 1..m/p, parent 2 the next range.
+            per_parent = len(group.branches) // len(group.parent_mid_cps)
+            latest_shared_segment = {
+                "parent_views": [
+                    {
+                        "parent_index": parent_index + 1,
+                        "continuations": (
+                            f"{parent_index * per_parent + 1}-"
+                            f"{(parent_index + 1) * per_parent}"
+                        ),
+                        "trajectory": {
+                            "step_cards": copy.deepcopy(parent_mid_cp.parent_step_cards),
+                            "segment_step_range": [0, parent_mid_cp.asst_step],
+                        },
+                    }
+                    for parent_index, parent_mid_cp in enumerate(group.parent_mid_cps)
+                ]
+            }
+            previous_state = {
+                "parent_states": [
+                    {
+                        "parent_index": parent_index + 1,
+                        "continuations": (
+                            f"{parent_index * per_parent + 1}-"
+                            f"{(parent_index + 1) * per_parent}"
+                        ),
+                        "state": copy.deepcopy(EMPTY_PERSISTENT_STATE),
+                    }
+                    for parent_index in range(len(group.parent_mid_cps))
+                ]
+            }
         group.persisted_parent_state = previous_state
         group.summary = {
             "persistent_state": previous_state,
@@ -1430,44 +1666,19 @@ class TrajectorySearchParallelRunner:
             "previous_persistent_state": previous_state,
             "latest_agent_trajectory": latest_shared_segment,
         }
-        pc_parent_trajectory = self._build_continuation_view_lane_b(group.parent_branch)
-        pc_shared_context = {
-            "previous_persistent_state": previous_state,
-            "latest_agent_trajectory": pc_parent_trajectory,
-        }
-        scope_config = {
-            "siblings": {
-                "shared_context": shared_context,
-                "latest_shared_segment": latest_shared_segment,
-                "generation_prompt": SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
-                "rubric_list_prefix": "rubric",
-                "judge_prompt": SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
-                "include_variance_reward": True,
-                "samples_attr": "rubric_samples",
-                "judge_attr": "judge_response",
-                "model_response_attr": "rubric_model_response",
-            },
-            "pc": {
-                "shared_context": pc_shared_context,
-                "latest_shared_segment": pc_parent_trajectory,
-                "generation_prompt": PC_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
-                "rubric_list_prefix": "pc-rubric",
-                "judge_prompt": PC_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
-                "include_variance_reward": False,
-                "samples_attr": "pc_rubric_samples",
-                "judge_attr": "pc_judge_response",
-                "model_response_attr": "pc_rubric_model_response",
-            },
-        }
-        scope_specs = [
-            {
-                "scope": scope,
-                "score_bank": self.score_banks[scope],
-                "experience_bank": self.experience_banks[scope],
-                **scope_config[scope],
-            }
-            for scope in self.rubric_scopes
-        ]
+        scope_specs = [{
+            "scope": "siblings",
+            "score_bank": self.rubric_bank,
+            "experience_bank": self.experience_bank,
+            "shared_context": shared_context,
+            "latest_shared_segment": latest_shared_segment,
+            "generation_prompt": SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT,
+            "rubric_list_prefix": "rubric",
+            "judge_prompt": SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+            "samples_attr": "rubric_samples",
+            "judge_attr": "judge_response",
+            "model_response_attr": "rubric_model_response",
+        }]
         try:
             scope_results = await asyncio.gather(
                 *[
@@ -1484,14 +1695,15 @@ class TrajectorySearchParallelRunner:
                         generation_prompt=spec["generation_prompt"],
                         rubric_list_prefix=spec["rubric_list_prefix"],
                         judge_prompt=spec["judge_prompt"],
-                        include_variance_reward=spec["include_variance_reward"],
                     )
                     for spec in scope_specs
                 ]
             )
         except Exception as exc:
             group.rubric_model_response = {"error": f"{type(exc).__name__}: {exc}"}
-            group.pc_rubric_model_response = {"error": f"{type(exc).__name__}: {exc}"}
+            group.lane_c_errors = [
+                f"lane_c_exception:{type(exc).__name__}:{exc}"
+            ]
             logger.warning("[%s] lane_c g=%d rubric_FAILED %s", self.task_id, group.group_index, exc)
             group.lane_c_done_at = time.perf_counter()
             return
@@ -1502,20 +1714,23 @@ class TrajectorySearchParallelRunner:
             setattr(group, spec["samples_attr"], result["samples"])
             setattr(group, spec["judge_attr"], result["judge_response"])
             setattr(group, spec["model_response_attr"], result["model_response"])
+            group.judge_score_by_node = copy.deepcopy(
+                result["judge_score_by_node"]
+            )
+            group.lane_c_errors = copy.deepcopy(result["errors"])
         group.lane_c_done_at = time.perf_counter()
         n_err = sum(
             1
-            for response in (group.judge_response, group.pc_judge_response)
+            for response in (group.judge_response,)
             for branch_map in response.values()
             for record in branch_map.values()
             if isinstance(record, dict) and record.get("error")
         )
         logger.info(
-            "[%s] lane_c g=%d judge_done dt=%.1fs err=%d siblings_rubrics=%d pc_rubrics=%d branches=%d",
+            "[%s] lane_c g=%d judge_done dt=%.1fs err=%d siblings_rubrics=%d branches=%d",
             self.task_id, group.group_index, time.perf_counter() - t_c,
             n_err,
             len(group.judge_response),
-            len(group.pc_judge_response),
             len(continuations),
         )
 
@@ -1540,51 +1755,77 @@ class TrajectorySearchParallelRunner:
         loop: asyncio.AbstractEventLoop,
         lane_b_pool: ThreadPoolExecutor,
         gt_pool: ThreadPoolExecutor,
+        group_index: int | None = None,
+        group_kind: str = "root",
+        parent_mid_cps: list[MidCp] | None = None,
     ) -> ForkGroup:
-        """Fork m Lane B branches from mid_cp, run them all in parallel,
-        evaluate GT scores concurrently. Returns the populated ForkGroup
-        ready for Lane C dispatch in step 4."""
+        """Sample one complete ``m``-branch training group.
+
+        A root group forks all branches from ``mid_cp``.  A beam group forks
+        ``m / p`` branches from each Lane-A parent checkpoint while retaining
+        ``mid_cp`` as the common training prompt.
+        """
         cfg = self.config
         t_group = time.perf_counter()
-        group = ForkGroup(group_index=mid_cp.idx, mid_cp=mid_cp)
-        first_budget = self._branch_initial_budget(mid_cp.asst_step)
-        total_budget = self._branch_total_budget_from_parent(mid_cp.asst_step)
-        if first_budget <= 0 or total_budget <= 0:
+        effective_group_index = mid_cp.idx if group_index is None else group_index
+        parent_mid_cps = list(parent_mid_cps or [])
+        group = ForkGroup(
+            group_index=effective_group_index,
+            mid_cp=mid_cp,
+            group_kind=group_kind,
+            parent_mid_cps=parent_mid_cps,
+        )
+        if parent_mid_cps:
+            per_parent = cfg.m // len(parent_mid_cps)
+            fork_plan = [
+                (parent_mid_cp, parent_index, parent_mid_cp.node_id)
+                for parent_index, parent_mid_cp in enumerate(parent_mid_cps)
+                for _ in range(per_parent)
+            ]
+        else:
+            fork_plan = [(mid_cp, None, None) for _ in range(cfg.m)]
+        if len(fork_plan) != cfg.m:
             raise RuntimeError(
-                f"fork_group g={mid_cp.idx} has no remaining step budget "
-                f"at parent_asst_step={mid_cp.asst_step}"
+                f"fork_group g={effective_group_index} expected {cfg.m} branches, "
+                f"planned {len(fork_plan)}"
             )
         logger.info(
-            "[%s] fork_group g=%d start m=%d parent_image=%s first_budget=%d total_budget=%d",
-            self.task_id, mid_cp.idx, cfg.m, mid_cp.image_tag, first_budget, total_budget,
+            "[%s] fork_group g=%d kind=%s start m=%d parents=%d",
+            self.task_id,
+            effective_group_index,
+            group_kind,
+            cfg.m,
+            len(parent_mid_cps),
         )
         branch_tasks: list[asyncio.Task] = []
-        branch_count = cfg.m if cfg.disable_rubric else cfg.m + 1
-        for bi in range(branch_count):
+        for bi, (branch_mid_cp, parent_index, parent_node_id) in enumerate(fork_plan):
+            first_budget = self._branch_initial_budget(branch_mid_cp.asst_step)
+            if first_budget <= 0:
+                raise RuntimeError(
+                    f"fork_group g={effective_group_index} has no remaining "
+                    f"budget at parent step {branch_mid_cp.asst_step}"
+                )
             ctx = contextvars.copy_context()
-            is_parent_baseline = bi == cfg.m
-            initial_temperature = (
-                cfg.judge_temperature if is_parent_baseline else cfg.lane_b_temperature
-            )
-            initial_top_p = cfg.judge_top_p if is_parent_baseline else cfg.lane_b_top_p
 
             def _wrapped(
-                mc=mid_cp,
+                mc=branch_mid_cp,
                 b=bi,
                 c=ctx,
-                parent=is_parent_baseline,
-                temperature=initial_temperature,
-                top_p=initial_top_p,
+                parent_idx=parent_index,
+                parent_id=parent_node_id,
+                budget=first_budget,
             ):
                 return c.run(
                     self._run_lane_b_branch,
                     mid_cp=mc,
                     branch_index=b,
-                    budget_steps=first_budget,
+                    budget_steps=budget,
                     total_step_limit=cfg.step_limit,
-                    is_parent_baseline=parent,
-                    initial_temperature=temperature,
-                    initial_top_p=top_p,
+                    initial_temperature=cfg.lane_b_temperature,
+                    initial_top_p=cfg.lane_b_top_p,
+                    group_index=effective_group_index,
+                    beam_parent_index=parent_idx,
+                    beam_parent_node_id=parent_id,
                 )
 
             future = loop.run_in_executor(lane_b_pool, _wrapped)
@@ -1618,18 +1859,16 @@ class TrajectorySearchParallelRunner:
             bi, item = await done
             if isinstance(item, BaseException):
                 err_branch = LaneBBranch(
-                    group_index=mid_cp.idx,
+                    group_index=effective_group_index,
                     branch_index=bi,
-                    node_id=(
-                        f"lane-b-g{mid_cp.idx:03d}-parent-err"
-                        if bi == cfg.m else f"lane-b-g{mid_cp.idx:03d}-b{bi:02d}-err"
-                    ),
-                    parent_image_tag=mid_cp.image_tag,
+                    node_id=f"lane-b-g{effective_group_index:03d}-b{bi:02d}-err",
+                    parent_image_tag=fork_plan[bi][0].image_tag,
                     policy_model_name=self.policy_model_name,
-                    parent_asst_step=mid_cp.asst_step,
+                    parent_asst_step=fork_plan[bi][0].asst_step,
                     error=f"executor: {type(item).__name__}: {item}",
                     status="error",
-                    is_parent_baseline=bi == cfg.m,
+                    beam_parent_index=fork_plan[bi][1],
+                    beam_parent_node_id=fork_plan[bi][2],
                 )
                 err_branch.gt_score = None
                 err_branch.gt_payload = make_evaluation_payload(
@@ -1638,16 +1877,13 @@ class TrajectorySearchParallelRunner:
                 branch = err_branch
             else:
                 branch = item
-            if branch.is_parent_baseline:
-                group.parent_branch = branch
-            else:
-                branches_by_index[bi] = branch
-                group.branches = [
-                    branches_by_index[index] for index in sorted(branches_by_index)
-                ]
+            branches_by_index[bi] = branch
+            group.branches = [
+                branches_by_index[index] for index in sorted(branches_by_index)
+            ]
             self._dump_group_scaffold(group)
             self._dump_branch(group, branch)
-            if branch.error is None:
+            if self.config.terminal_rollout and branch.error is None:
                 ctx = contextvars.copy_context()
                 gt_future = loop.run_in_executor(
                     gt_pool, lambda b=branch, c=ctx: c.run(self._evaluate_gt, b)
@@ -1659,36 +1895,27 @@ class TrajectorySearchParallelRunner:
         branches = [branches_by_index[index] for index in range(cfg.m)]
         group.branches = branches
 
-        # GT eval starts as each branch completes. Lane C still waits for the
-        # whole group and then runs in group_index order, preserving deterministic
-        # score-rubric-bank state transitions while making artifacts visible early.
+        # GT is validation-only.  Training branches stop at k and go directly
+        # to Lane C without patch extraction or evaluator work.
         for done in asyncio.as_completed(gt_tasks):
             branch = await done
             self._dump_branch(group, branch)
 
-        # Free the mid_cp image — all branches forked from it have terminated,
-        # been GT-scored. Lane C only reads the saved snapshot.
-        self._delete_checkpoint(mid_cp.image_tag)
+        for checkpoint in parent_mid_cps:
+            self._delete_checkpoint(checkpoint.image_tag)
         logger.info(
-            "[%s] fork_group g=%d done dt=%.1fs gt_scores=%s lane_c_dt=%.1fs",
-            self.task_id, mid_cp.idx, time.perf_counter() - t_group,
-            {
-                "children": [
-                    round(b.gt_score, 3) if b.gt_score is not None else None
-                    for b in branches
-                ],
-                "parent": (
-                    round(group.parent_branch.gt_score, 3)
-                    if group.parent_branch is not None and group.parent_branch.gt_score is not None
-                    else None
-                ),
-            },
+            "[%s] fork_group g=%d kind=%s done dt=%.1fs gt_scores=%s lane_c_dt=%.1fs",
+            self.task_id,
+            effective_group_index,
+            group_kind,
+            time.perf_counter() - t_group,
+            [round(b.gt_score, 3) if b.gt_score is not None else None for b in branches],
             (group.lane_c_done_at - group.lane_c_started_at)
             if group.lane_c_started_at else 0.0,
         )
         return group
 
-    # -- Lane A: linear spine ------------------------------------------------
+    # -- Lane A: root + independent beam parents -----------------------------
 
     def _start_lane_a(self, lane_a: LaneAState) -> Any:
         """Spin up Lane A's root session, capture system+user prompts.
@@ -1739,6 +1966,164 @@ class TrajectorySearchParallelRunner:
             "event_count": len(session.events),
         }
 
+    def _create_root_mid_cp(self, lane_a: LaneAState) -> MidCp:
+        """Create the common root checkpoint without sampling policy tokens."""
+        session = self._start_lane_a(lane_a)
+        try:
+            image_tag = self._checkpoint_environment(session, "mid-root")
+            if image_tag is None:
+                raise RuntimeError("root environment checkpoint returned None")
+            snapshot = self._make_resume_snapshot(session)
+            mid_cp = MidCp(
+                idx=0,
+                asst_step=0,
+                image_tag=image_tag,
+                snapshot=snapshot,
+                parent_messages_payload=_build_parent_messages_payload(
+                    session.agent.messages,
+                    model_name=self.policy_model_name,
+                ),
+                parent_step_cards=[],
+                parent_message_count=len(session.agent.messages),
+                parent_event_count=len(session.events),
+                parent_turn_count=len(session.model_turns),
+                emitted_at=time.perf_counter(),
+                node_id="root",
+            )
+            lane_a.mid_cps.append(mid_cp)
+            lane_a.status = "root_ready"
+            return mid_cp
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+            try:
+                env = getattr(getattr(session, "agent", None), "env", None)
+                if env is not None and hasattr(env, "cleanup"):
+                    env.cleanup()
+            except Exception:
+                pass
+            if session in self._live_sessions:
+                self._live_sessions.remove(session)
+
+    def _run_lane_a_parent(self, root_mid_cp: MidCp, parent_index: int) -> MidCp:
+        """Sample and checkpoint one independent strict-k Lane-A parent."""
+        node_id = (
+            f"lane-a-parent-{parent_index:02d}-{uuid.uuid4().hex[:6]}"
+        )
+        session = self._fork_lane_b(
+            mid_cp=root_mid_cp,
+            branch_index=parent_index,
+            node_id=node_id,
+            temperature=self.config.policy_temperature,
+            top_p=self.config.policy_top_p,
+        )
+        before_message_count = root_mid_cp.parent_message_count
+        before_event_count = len(session.events)
+        before_turn_count = len(session.model_turns)
+        try:
+            result = self._step_session(
+                session,
+                max_steps=self._branch_initial_budget(0),
+            )
+            overlength_status = _policy_overlength_exit_status(result)
+            exit_error = _unexpected_rollout_exit(
+                result, lane=f"lane_a_parent_{parent_index}"
+            )
+            if exit_error is not None:
+                raise RuntimeError(exit_error)
+            if overlength_status is not None:
+                patch, is_fallback = self._extract_terminal_patch(
+                    result, session
+                )
+                overflow_dir = self.run_dir / "groups" / "group_001"
+                _atomic_write_json(
+                    overflow_dir
+                    / f"beam_parent_{parent_index:02d}_overlength.json",
+                    {
+                        "node_id": node_id,
+                        "exit_status": overlength_status,
+                        "terminal_patch": patch,
+                        "terminal_patch_from_fallback": is_fallback,
+                    },
+                )
+                raise RuntimeError(
+                    f"Lane-A parent {parent_index} stopped by "
+                    f"{overlength_status}; beam group cannot form children"
+                )
+            messages = copy.deepcopy(
+                session.agent.messages[before_message_count:]
+            )
+            assistant_messages = [
+                message for message in messages
+                if message.get("role") == "assistant"
+            ]
+            if not assistant_messages:
+                raise RuntimeError(
+                    f"Lane-A parent {parent_index} produced no assistant turns"
+                )
+            snapshot = self._make_resume_snapshot(session)
+            image_tag = self._checkpoint_environment(
+                session, f"beam-parent-{parent_index:02d}"
+            )
+            if image_tag is None:
+                raise RuntimeError(
+                    f"Lane-A parent {parent_index} checkpoint returned None"
+                )
+            events = _step_card_event_dicts(
+                session.events[before_event_count:]
+            )
+            step_cards = _build_step_cards(events, 0)
+            asst_step = len(step_cards)
+            if asst_step <= 0:
+                raise RuntimeError(
+                    f"Lane-A parent {parent_index} produced no step cards"
+                )
+            turns = self._extract_turn_token_info_from_turns(
+                session.model_turns[before_turn_count:],
+                starting_turn_index=before_turn_count,
+            )
+            logger.info(
+                "[%s] lane_a parent=%d node=%s steps=%d status=%s",
+                self.task_id,
+                parent_index,
+                node_id,
+                asst_step,
+                result["status"],
+            )
+            return MidCp(
+                # Parent index is only for endpoint spreading/artifacts.  The
+                # beam training group receives its own group_index=1.
+                idx=parent_index + 1,
+                asst_step=asst_step,
+                image_tag=image_tag,
+                snapshot=snapshot,
+                parent_messages_payload=_build_parent_messages_payload(
+                    session.agent.messages,
+                    model_name=self.policy_model_name,
+                ),
+                parent_step_cards=step_cards,
+                parent_message_count=len(session.agent.messages),
+                parent_event_count=len(session.events),
+                parent_turn_count=len(session.model_turns),
+                emitted_at=time.perf_counter(),
+                node_id=node_id,
+            )
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+            try:
+                env = getattr(getattr(session, "agent", None), "env", None)
+                if env is not None and hasattr(env, "cleanup"):
+                    env.cleanup()
+            except Exception:
+                pass
+            if session in self._live_sessions:
+                self._live_sessions.remove(session)
+
     async def _lane_a_loop(
         self,
         *,
@@ -1747,7 +2132,11 @@ class TrajectorySearchParallelRunner:
         lane_a_pool: ThreadPoolExecutor,
         on_mid_cp=None,
     ) -> None:
-        """Drive Lane A: run in chunks of k, commit + emit
+        """Legacy pre-training driver retained for old artifact readers only.
+
+        The training entrypoint does not call this method; it uses
+        ``_create_root_mid_cp`` plus ``_run_lane_a_parent``.  Drive Lane A:
+        run in chunks of k, commit + emit
         a MidCp at each boundary, until the agent terminates or step_limit
         is reached. Lane A runs in a background thread (its agent calls
         block on sglang) so this coroutine just orchestrates."""
@@ -1877,6 +2266,9 @@ class TrajectorySearchParallelRunner:
                 cumulative_steps += len(new_step_cards)
                 lane_a.status = result["status"]
                 terminated = result["exit_status"] == "Submitted"
+                exit_error = _unexpected_rollout_exit(
+                    result, lane="lane_a"
+                )
                 logger.info(
                     "[%s] lane_a chunk=%d dt=%.1fs new_steps=%d cumulative=%d status=%s submitted=%s",
                     self.task_id,
@@ -1888,6 +2280,10 @@ class TrajectorySearchParallelRunner:
                     terminated,
                 )
 
+                if exit_error is not None:
+                    lane_a.error = exit_error
+                    lane_a.status = "error"
+                    break
                 if terminated:
                     lane_a.terminated_early = True
                     try:
@@ -2074,7 +2470,10 @@ class TrajectorySearchParallelRunner:
         loop = asyncio.get_running_loop()
         cfg = self.config
         lane_a_pool = ThreadPoolExecutor(
-            max_workers=cfg.lane_a_pool_size,
+            max_workers=max(
+                cfg.lane_a_pool_size,
+                cfg.p if cfg.topology == "depth2" else 1,
+            ),
             thread_name_prefix=f"lane-a-{self.task_id[:12]}",
         )
         lane_b_pool = ThreadPoolExecutor(
@@ -2120,6 +2519,26 @@ class TrajectorySearchParallelRunner:
                     self.task_id,
                     grp.group_index,
                 )
+            elif len(grp.branches) != cfg.m or any(
+                branch.error is not None for branch in grp.branches
+            ):
+                now = time.perf_counter()
+                grp.lane_c_started_at = grp.lane_c_started_at or now
+                grp.lane_c_done_at = grp.lane_c_done_at or now
+                logger.warning(
+                    "[%s] lane_c g=%d skipped: incomplete/errored policy group",
+                    self.task_id,
+                    grp.group_index,
+                )
+                # Preserve serialized group ordering even when fail-closed
+                # validation prevents a Lane-C request.
+                condition = self._lane_c_condition
+                async with condition:
+                    await condition.wait_for(
+                        lambda: self._next_lane_c_group_index == grp.group_index
+                    )
+                    self._next_lane_c_group_index += 1
+                    condition.notify_all()
             else:
                 await self._run_lane_c_in_order(grp)
                 self._dump_group(grp)
@@ -2132,33 +2551,92 @@ class TrajectorySearchParallelRunner:
                     )
             return grp
 
-        def _on_mid_cp(mid_cp: MidCp) -> None:
-            # Fire-and-track: each mid_cp emission spawns an async task that
-            # forks m Lane B branches, runs them to termination, then
-            # GT + Lane C concurrently. We do NOT await here — Lane A
-            # keeps producing more mid_cps.
-            coro = self._run_fork_group(
-                mid_cp=mid_cp,
-                loop=loop,
-                lane_b_pool=lane_b_pool,
-                gt_pool=gt_pool,
-            )
-            group_tasks.append(
-                asyncio.create_task(_await_group_then_callback(mid_cp.idx, coro))
-            )
-
         try:
-            await self._lane_a_loop(
-                lane_a=instance_record.lane_a,
-                loop=loop,
-                lane_a_pool=lane_a_pool,
-                on_mid_cp=_on_mid_cp,
-            )
-            # Lane A done. Wait for all fork-groups it spawned to finish.
+            with usage_context(
+                phase="train", group_id=self._usage_group_id(0)
+            ):
+                root_ctx = contextvars.copy_context()
+                root_mid_cp = await loop.run_in_executor(
+                    lane_a_pool,
+                    lambda c=root_ctx: c.run(
+                        self._create_root_mid_cp, instance_record.lane_a
+                    ),
+                )
+                root_coro = self._run_fork_group(
+                    mid_cp=root_mid_cp,
+                    loop=loop,
+                    lane_b_pool=lane_b_pool,
+                    gt_pool=gt_pool,
+                    group_index=0,
+                    group_kind="root",
+                )
+                group_tasks.append(
+                    asyncio.create_task(
+                        _await_group_then_callback(0, root_coro)
+                    )
+                )
+
+            if cfg.topology == "depth2":
+                with usage_context(
+                    phase="train", group_id=self._usage_group_id(1)
+                ):
+                    parent_futures = []
+                    for parent_index in range(cfg.p):
+                        parent_ctx = contextvars.copy_context()
+                        parent_futures.append(
+                            loop.run_in_executor(
+                                lane_a_pool,
+                                lambda i=parent_index, c=parent_ctx: c.run(
+                                    self._run_lane_a_parent, root_mid_cp, i
+                                ),
+                            )
+                        )
+                    parent_results = await asyncio.gather(
+                        *parent_futures, return_exceptions=True
+                    )
+                parent_mid_cps: list[MidCp] = []
+                parent_errors: list[str] = []
+                for parent_index, item in enumerate(parent_results):
+                    if isinstance(item, BaseException):
+                        parent_errors.append(
+                            f"parent {parent_index}: {type(item).__name__}: {item}"
+                        )
+                    else:
+                        parent_mid_cps.append(item)
+                instance_record.lane_a.mid_cps.extend(parent_mid_cps)
+                if parent_errors:
+                    instance_record.lane_a.error = "; ".join(parent_errors)
+                    instance_record.lane_a.status = "beam_parent_error"
+                    logger.warning(
+                        "[%s] beam group skipped: %s",
+                        self.task_id,
+                        instance_record.lane_a.error,
+                    )
+                else:
+                    with usage_context(
+                        phase="train", group_id=self._usage_group_id(1)
+                    ):
+                        beam_coro = self._run_fork_group(
+                            mid_cp=root_mid_cp,
+                            loop=loop,
+                            lane_b_pool=lane_b_pool,
+                            gt_pool=gt_pool,
+                            group_index=1,
+                            group_kind="beam",
+                            parent_mid_cps=parent_mid_cps,
+                        )
+                        group_tasks.append(
+                            asyncio.create_task(
+                                _await_group_then_callback(1, beam_coro)
+                            )
+                        )
+                    instance_record.lane_a.status = "beam_parents_ready"
+
             if group_tasks:
                 logger.info(
-                    "[%s] lane_a finished, awaiting %d fork-groups",
-                    self.task_id, len(group_tasks),
+                    "[%s] awaiting %d topology groups",
+                    self.task_id,
+                    len(group_tasks),
                 )
                 t_drain = time.perf_counter()
                 groups_or_excs = await asyncio.gather(
@@ -2183,133 +2661,35 @@ class TrajectorySearchParallelRunner:
                     time.perf_counter() - t_drain,
                     len(instance_record.groups),
                 )
-            if getattr(self, "skip_lane_c", False):
-                instance_record.completed = (
-                    instance_record.lane_a.error is None
-                    and all(
-                        all(b.error is None for b in g.branches)
-                        for g in instance_record.groups
-                    )
-                )
-                if not instance_record.completed and instance_record.error is None:
-                    instance_record.error = (
-                        instance_record.lane_a.error
-                        or "one or more lane_b branches errored"
-                    )
-                return instance_record
-            experience_update_attrs = {
-                "siblings": {
-                    "samples_attr": "rubric_samples",
-                    "update_attr": "experience_bank_update",
-                    "message_attr": "experience_bank_message",
-                },
-                "pc": {
-                    "samples_attr": "pc_rubric_samples",
-                    "update_attr": "pc_experience_bank_update",
-                    "message_attr": "pc_experience_bank_message",
-                },
-            }
-            experience_update_specs = [
-                {
-                    "scope": scope,
-                    "bank": self.experience_banks[scope],
-                    **experience_update_attrs[scope],
-                }
-                for scope in self.rubric_scopes
-                if not self.experience_banks[scope].is_frozen
-            ]
-            experience_update_payloads = await asyncio.gather(
-                *[
-                    spec["bank"].update_after_instance(
-                        instance=self.instance,
-                        rubric_payloads=[
-                            {
-                                **copy.deepcopy(sample),
-                                **build_terminal_update_evidence(
-                                    parent_patch=group.parent_branch.terminal_patch if group.parent_branch else "",
-                                    parent_evaluation=(
-                                        group.parent_branch.gt_payload
-                                        if group.parent_branch and group.parent_branch.gt_payload
-                                        else None
-                                    ),
-                                    continuations=[
-                                        {
-                                            "patch": branch.terminal_patch,
-                                            "evaluation": branch.gt_payload,
-                                        }
-                                        for branch in group.branches
-                                    ],
-                                ),
-                                "group_index": group.group_index,
-                                "generation_context": copy.deepcopy(sample.get("generation_context", {})),
-                            }
-                            for group in instance_record.groups
-                            for sample in getattr(group, spec["samples_attr"])
-                        ],
-                        model_name=self.rubric_model_name,
-                        temperature=cfg.rubric_temperature,
-                        top_p=cfg.rubric_top_p,
-                        max_tokens=cfg.rubric_max_tokens,
-                        model_kwargs=self.rubric_model_kwargs,
-                    )
-                    for spec in experience_update_specs
-                ]
-            )
-            experience_updates_by_scope = {
-                spec["scope"]: payload
-                for spec, payload in zip(experience_update_specs, experience_update_payloads)
-            }
-            for scope, payload in experience_updates_by_scope.items():
-                _atomic_write_json(
-                    self.run_dir / f"{scope}_rubric_bank.json",
-                    {
-                        "before": copy.deepcopy(payload["before"]),
-                        "after": copy.deepcopy(payload["after"]),
-                    },
-                )
-            experience_updates_by_group = {
-                scope: {
-                    int(update["group_index"]): update
-                    for update in payload["groups"]
-                }
-                for scope, payload in experience_updates_by_scope.items()
-            }
-            for group in instance_record.groups:
-                for spec in experience_update_specs:
-                    update = experience_updates_by_group[spec["scope"]].get(group.group_index)
-                    if update is None:
-                        continue
-                    setattr(
-                        group,
-                        spec["update_attr"],
-                        {
-                            "before": copy.deepcopy(update["before"]),
-                            "actions": copy.deepcopy(update["actions"]),
-                            "after": copy.deepcopy(update["after"]),
-                        },
-                    )
-                    setattr(group, spec["message_attr"], copy.deepcopy(update["messages"]))
+            expected_groups = 2 if cfg.topology == "depth2" else 1
             instance_record.completed = (
                 instance_record.lane_a.error is None
+                and len(instance_record.groups) == expected_groups
                 and all(
-                    all(b.error is None for b in g.branches)
+                    len(g.branches) == cfg.m
+                    and all(b.error is None for b in g.branches)
+                    and (
+                        self.skip_lane_c
+                        or set(g.judge_score_by_node)
+                        == {b.node_id for b in g.branches}
+                    )
                     for g in instance_record.groups
                 )
             )
             if not instance_record.completed and instance_record.error is None:
                 instance_record.error = (
                     instance_record.lane_a.error
-                    or "one or more lane_b branches errored"
+                    or "one or more groups were incomplete, errored, or lacked judge scores"
                 )
         except Exception as exc:
             instance_record.error = f"runner exception: {exc}\n{traceback.format_exc()}"
             instance_record.completed = False
         finally:
             instance_record.seconds = time.perf_counter() - started
-            # Lane A is the spine; not trained, not dumped as its own dir.
-            # Each group writes its own shared_parent_message.json (sliced from the
-            # MidCp snapshot). Lane A's terminal patch + per-mid_cp markers
-            # are summarized in top-level config.json.
+            # Lane-A parents are not exported as a separate GRPO group. In
+            # depth2 their assistant turns are instead prepended to each
+            # corresponding child response and are trainable there. Each group
+            # writes its own shared_parent_message.json from the root MidCp.
             for grp in instance_record.groups:
                 self._dump_group(grp)
             self._dump_instance_record(instance_record)
@@ -2338,30 +2718,25 @@ class TrajectorySearchParallelRunner:
         if group.summary_messages:
             _atomic_write_json(gdir / "summary_message.json", group.summary_messages)
         sibling_rubrics_dir = gdir / "sibling_rubrics"
-        pc_rubrics_dir = gdir / "pc_rubrics"
         sibling_rubrics_dir.mkdir(parents=True, exist_ok=True)
-        pc_rubrics_dir.mkdir(parents=True, exist_ok=True)
         if group.experience_bank_update:
             _atomic_write_json(sibling_rubrics_dir / "rubric_bank.json", group.experience_bank_update)
             _atomic_write_json(sibling_rubrics_dir / "rubric_bank_message.json", group.experience_bank_message)
-        if group.pc_experience_bank_update:
-            _atomic_write_json(pc_rubrics_dir / "rubric_bank.json", group.pc_experience_bank_update)
-            _atomic_write_json(pc_rubrics_dir / "rubric_bank_message.json", group.pc_experience_bank_message)
+        _atomic_write_json(
+            gdir / "judge_score_by_node.json", group.judge_score_by_node
+        )
+        _atomic_write_json(gdir / "lane_c_errors.json", group.lane_c_errors)
         return gdir
 
     def _dump_branch(self, group: ForkGroup, branch: LaneBBranch) -> None:
         gdir = self._group_dir(group)
-        bdir = (
-            gdir / "parent_branch"
-            if branch.is_parent_baseline
-            else gdir / "branches" / f"branch_{branch.branch_index:02d}"
-        )
+        bdir = gdir / "branches" / f"branch_{branch.branch_index:02d}"
         bdir.mkdir(parents=True, exist_ok=True)
         branch_model_name = branch.policy_model_name or self.policy_model_name
         branch_policy_source = getattr(
             branch,
             "policy_source",
-            "parent_baseline" if branch.is_parent_baseline else "student",
+            "student",
         )
         branch_step_cards = _build_step_cards(branch.events, branch.parent_asst_step)
         stamped, _ = _stamp_steps(branch.messages, start_step=0)
@@ -2396,9 +2771,12 @@ class TrajectorySearchParallelRunner:
             bdir / "node.json",
             {
                 "node_id": branch.node_id,
-                "parent_id": f"group_{group.group_index:03d}",
+                "parent_id": (
+                    branch.beam_parent_node_id
+                    or f"group_{group.group_index:03d}"
+                ),
                 "round_index": group.group_index + 1,
-                "depth": 1,
+                "depth": 2 if group.group_kind == "beam" else 1,
                 "session_id": branch.session_id or f"{branch.node_id}-session",
                 "status": branch.status or ("error" if branch.error else "finished"),
                 "step_start": branch.parent_asst_step,
@@ -2410,10 +2788,12 @@ class TrajectorySearchParallelRunner:
                 ),
                 "exit_status": "Submitted" if branch.terminated_early else "",
                 "policy_source": branch_policy_source,
-                "is_parent_baseline": branch.is_parent_baseline,
                 "policy_model_name": branch_model_name,
                 "branch_index": branch.branch_index,
                 "group_index": group.group_index,
+                "group_kind": group.group_kind,
+                "beam_parent_index": branch.beam_parent_index,
+                "beam_parent_node_id": branch.beam_parent_node_id,
                 "parent_image_tag": branch.parent_image_tag,
                 "workspace_meta": branch.workspace_meta,
                 "terminated_early": branch.terminated_early,
@@ -2432,9 +2812,6 @@ class TrajectorySearchParallelRunner:
         """Persist one fork-group under run_dir/groups/group_NNN/."""
         gdir = self._dump_group_scaffold(group)
         self._dump_rubric_samples(gdir / "sibling_rubrics", group.rubric_samples)
-        self._dump_rubric_samples(gdir / "pc_rubrics", group.pc_rubric_samples)
-        if group.parent_branch is not None:
-            self._dump_branch(group, group.parent_branch)
         for branch in group.branches:
             self._dump_branch(group, branch)
 
@@ -2519,6 +2896,7 @@ class TrajectorySearchParallelRunner:
                 "groups": [
                     {
                         "group_index": g.group_index,
+                        "group_kind": g.group_kind,
                         "mid_cp": {
                             "idx": g.mid_cp.idx,
                             "image_tag": g.mid_cp.image_tag,
@@ -2527,16 +2905,13 @@ class TrajectorySearchParallelRunner:
                         },
                         "num_branches": len(g.branches),
                         "num_sibling_rubric_samples": len(g.rubric_samples),
-                        "num_pc_rubric_samples": len(g.pc_rubric_samples),
-                        "parent_branch": {
-                            "branch_index": g.parent_branch.branch_index,
-                            "node_id": g.parent_branch.node_id,
-                            "status": g.parent_branch.status,
-                            "gt_score": g.parent_branch.gt_score,
-                            "n_step_cards": len(_build_step_cards(g.parent_branch.events, g.parent_branch.parent_asst_step)),
-                            "terminated_early": g.parent_branch.terminated_early,
-                            "error": g.parent_branch.error,
-                        } if g.parent_branch is not None else None,
+                        "judge_score_by_node": copy.deepcopy(
+                            g.judge_score_by_node
+                        ),
+                        "lane_c_errors": copy.deepcopy(g.lane_c_errors),
+                        "beam_parent_node_ids": [
+                            parent.node_id for parent in g.parent_mid_cps
+                        ],
                         "branches": [
                             {
                                 "branch_index": b.branch_index,

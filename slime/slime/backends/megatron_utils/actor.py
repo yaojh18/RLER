@@ -173,7 +173,33 @@ class MegatronTrainRayActor(TrainRayActor):
             self._switch_model("actor")
             self.sleep()
 
+        # The source-attempt training loop overlaps generation with weight
+        # broadcast. Its rollout engine topology is immutable when fault
+        # tolerance is disabled, so cache the handles after the initial
+        # connection rather than queueing a metadata query behind an active
+        # single-threaded RolloutManager.generate call. Legacy Slime runs keep
+        # the original per-update lookup below.
+        self.cache_rollout_engines = (
+            not self.args.use_fault_tolerance
+            and any(
+                (
+                    getattr(self.args, "train_instance_budget", None)
+                    is not None,
+                    getattr(self.args, "eval_instance_interval", None)
+                    is not None,
+                    getattr(
+                        self.args,
+                        "stop_after_validation_attempt",
+                        None,
+                    )
+                    is not None,
+                )
+            )
+        )
         self.rollout_engines = None
+        self.rollout_engine_lock = None
+        self.rollout_engine_gpu_counts = None
+        self.rollout_engine_gpu_offsets = None
 
         self.rollout_data_postprocess = None
         if self.args.rollout_data_postprocess_path is not None:
@@ -587,9 +613,29 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())
             dist.barrier(group=get_gloo_group())
 
-        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_updatable_engines_and_lock.remote()
-        )
+        if (
+            not self.cache_rollout_engines
+            or self.rollout_engines is None
+        ):
+            (
+                rollout_engines,
+                rollout_engine_lock,
+                num_new_engines,
+                engine_gpu_counts,
+                engine_gpu_offsets,
+            ) = ray.get(
+                self.rollout_manager.get_updatable_engines_and_lock.remote()
+            )
+            self.rollout_engines = rollout_engines
+            self.rollout_engine_lock = rollout_engine_lock
+            self.rollout_engine_gpu_counts = engine_gpu_counts
+            self.rollout_engine_gpu_offsets = engine_gpu_offsets
+        else:
+            rollout_engines = self.rollout_engines
+            rollout_engine_lock = self.rollout_engine_lock
+            engine_gpu_counts = self.rollout_engine_gpu_counts
+            engine_gpu_offsets = self.rollout_engine_gpu_offsets
+            num_new_engines = 0
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
 

@@ -384,6 +384,7 @@ class WeightedKeywordExperienceRetriever:
         model_name: str,
         top_p: float,
         model_kwargs: dict[str, Any] | None,
+        max_tokens: int | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         messages = [
             {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
@@ -403,7 +404,11 @@ class WeightedKeywordExperienceRetriever:
                         messages=messages,
                         temperature=float(self.summary_config.get("temperature", 0.01)),
                         top_p=top_p,
-                        max_tokens=int(self.summary_config.get("max_tokens", 4096)),
+                        max_tokens=int(
+                            max_tokens
+                            if max_tokens is not None
+                            else self.summary_config.get("max_tokens", 4096)
+                        ),
                         model_kwargs=freeform_thought_model_kwargs(model_kwargs),
                     )
             messages.append(assistant)
@@ -500,6 +505,7 @@ class WeightedKeywordExperienceRetriever:
         model_name: str,
         top_p: float,
         model_kwargs: dict[str, Any] | None,
+        max_tokens: int | None = None,
     ) -> tuple[list[str], list[dict[str, Any]]]:
         stage = _stage_query(context)
         summary, messages = await self.summarize(
@@ -508,6 +514,7 @@ class WeightedKeywordExperienceRetriever:
             model_name=model_name,
             top_p=top_p,
             model_kwargs=model_kwargs,
+            max_tokens=max_tokens,
         )
         return self.rank(
             context=context,

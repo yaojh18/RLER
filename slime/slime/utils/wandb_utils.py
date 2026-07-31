@@ -6,6 +6,199 @@ import wandb
 
 logger = logging.getLogger(__name__)
 
+# Keep W&B config focused on knobs that change optimization, sampling, or the
+# train/eval schedule. Static experiment identity (model/data/provider/SHA and
+# filesystem paths) belongs in the run name and the frozen local manifest.
+# Credentials and proxy settings must never be copied from the full Namespace.
+_WANDB_CONFIG_ALLOWLIST = (
+    # Duration, batching, and dataset traversal.
+    "num_epoch",
+    "num_rollout",
+    "train_instance_budget",
+    "eval_instance_interval",
+    "train_iters",
+    "rollout_batch_size",
+    "over_sampling_batch_size",
+    "global_batch_size",
+    "micro_batch_size",
+    "num_steps_per_rollout",
+    "update_weights_interval",
+    "use_dynamic_batch_size",
+    "max_tokens_per_gpu",
+    "n_samples_per_prompt",
+    "n_samples_per_eval_prompt",
+    "rollout_global_dataset",
+    "rollout_shuffle",
+    "seed",
+    "rollout_seed",
+    # Objective and policy update.
+    "advantage_estimator",
+    "rewards_normalization",
+    "grpo_std_normalization",
+    "loss_type",
+    "calculate_per_token_loss",
+    "eps_clip",
+    "eps_clip_high",
+    "eps_clip_c",
+    "grpo_kl_beta",
+    "grpo_entropy_term_weight",
+    "entropy_coef",
+    "use_kl_loss",
+    "kl_coef",
+    "kl_loss_coef",
+    "kl_loss_type",
+    "use_unbiased_kl",
+    "use_tis",
+    "tis_clip",
+    "tis_clip_low",
+    "rl_importance_sampling_truncation_coef",
+    "use_rollout_logprobs",
+    "dynamic_sampling_filter_path",
+    # Optimizer and learning-rate schedule.
+    "optimizer",
+    "lr",
+    "min_lr",
+    "lr_decay_style",
+    "lr_warmup_fraction",
+    "lr_warmup_iters",
+    "weight_decay",
+    "adam_beta1",
+    "adam_beta2",
+    "adam_eps",
+    "clip_grad",
+    # Policy and validation sampling.
+    "rollout_temperature",
+    "rollout_top_p",
+    "rollout_top_k",
+    "rollout_max_context_len",
+    "rollout_max_response_len",
+    "eval_temperature",
+    "eval_top_p",
+    "eval_top_k",
+    "eval_max_context_len",
+    "eval_max_response_len",
+    # Validation/checkpoint cadence.
+    "eval_interval",
+    "save_interval",
+)
+
+# The SWE-agent wrappers intentionally consume their method-specific CLI
+# arguments before forwarding into Slime.  These environment variables are
+# therefore the authoritative values used by the collectors, and must be
+# merged back into W&B config rather than reporting Slime's unrelated generic
+# eval defaults.
+_WANDB_DYNAMIC_ENV_CONFIG = {
+    "SWE_AGENT_MODEL_CONTEXT_LENGTH": ("model_context_length", int),
+    "SWE_AGENT_VALIDATION_INSTANCE_WORKERS": (
+        "validation_instance_workers",
+        int,
+    ),
+    "SWE_AGENT_VALIDATION_STEP_LIMIT": ("validation_step_limit", int),
+    "SWE_AGENT_VALIDATION_COMPLETION_MAX_TOKENS": (
+        "validation_completion_max_tokens",
+        int,
+    ),
+    "SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT": (
+        "validation_gt_eval_timeout",
+        int,
+    ),
+    "SWE_AGENT_VALIDATION_TEMPERATURE": (
+        "validation_temperature",
+        float,
+    ),
+    "SWE_AGENT_VALIDATION_TOP_P": ("validation_top_p", float),
+    "SWE_AGENT_NAIVE_M": ("naive_m", int),
+    "SWE_AGENT_NAIVE_STEP_LIMIT": ("naive_step_limit", int),
+    "SWE_AGENT_NAIVE_INSTANCE_WORKERS": (
+        "naive_instance_workers",
+        int,
+    ),
+    "SWE_AGENT_NAIVE_MAX_PENDING": ("naive_max_pending", int),
+    "SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS": (
+        "naive_completion_max_tokens",
+        int,
+    ),
+    "SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT": (
+        "naive_gt_eval_timeout",
+        int,
+    ),
+    "SWE_AGENT_NAIVE_POLICY_TEMPERATURE": (
+        "naive_policy_temperature",
+        float,
+    ),
+    "SWE_AGENT_NAIVE_POLICY_TOP_P": ("naive_policy_top_p", float),
+    "SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY": (
+        "naive_fallback_patch_penalty",
+        float,
+    ),
+    "SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY": (
+        "naive_no_action_patch_penalty",
+        float,
+    ),
+    "SWE_AGENT_NAIVE_REWARD_KIND": ("naive_reward_kind", str),
+    "SWE_AGENT_NAIVE_JOINT_ALPHA": ("naive_joint_alpha", float),
+    "SWE_AGENT_NAIVE_ALL_PASS_REWARD": (
+        "naive_all_pass_reward",
+        float,
+    ),
+    "SWE_AGENT_LANES_TOPOLOGY": ("lanes_topology", str),
+    "SWE_AGENT_LANES_M": ("lanes_m", int),
+    "SWE_AGENT_LANES_BEAM_PARENTS": ("lanes_beam_parents", int),
+    "SWE_AGENT_LANES_STEPS_PER_ROUND": (
+        "lanes_steps_per_round",
+        int,
+    ),
+    "SWE_AGENT_LANES_STEP_LIMIT": ("lanes_step_limit", int),
+    "SWE_AGENT_LANES_INSTANCE_WORKERS": (
+        "lanes_instance_workers",
+        int,
+    ),
+    "SWE_AGENT_LANES_MAX_PENDING": ("lanes_max_pending", int),
+    "SWE_AGENT_LANES_COMPLETION_MAX_TOKENS": (
+        "lanes_completion_max_tokens",
+        int,
+    ),
+    "SWE_AGENT_LANES_RUBRIC_MAX_TOKENS": (
+        "lanes_rubric_max_tokens",
+        int,
+    ),
+    "SWE_AGENT_LANES_JUDGE_MAX_TOKENS": (
+        "lanes_judge_max_tokens",
+        int,
+    ),
+    "SWE_AGENT_LANES_POLICY_TEMPERATURE": (
+        "lanes_policy_temperature",
+        float,
+    ),
+    "SWE_AGENT_LANES_POLICY_TOP_P": ("lanes_policy_top_p", float),
+    "SWE_AGENT_LANES_LANE_B_TEMPERATURE": (
+        "lanes_lane_b_temperature",
+        float,
+    ),
+    "SWE_AGENT_LANES_LANE_B_TOP_P": (
+        "lanes_lane_b_top_p",
+        float,
+    ),
+    "SWE_AGENT_LANES_FALLBACK_PATCH_PENALTY": (
+        "lanes_fallback_patch_penalty",
+        float,
+    ),
+    "SWE_AGENT_LANES_NO_ACTION_PATCH_PENALTY": (
+        "lanes_no_action_patch_penalty",
+        float,
+    ),
+    "SWE_AGENT_LANES_REWARD_KIND": ("lanes_reward_kind", str),
+    "SWE_AGENT_LANES_JOINT_ALPHA": ("lanes_joint_alpha", float),
+    "SWE_AGENT_LANES_ALL_PASS_REWARD": (
+        "lanes_all_pass_reward",
+        float,
+    ),
+    "SWE_AGENT_LANES_TERMINAL_ROLLOUT": (
+        "lanes_terminal_rollout",
+        lambda value: value.strip().lower() in {"1", "true", "yes", "on"},
+    ),
+}
+
 
 def _is_offline_mode(args) -> bool:
     """Detect whether W&B should run in offline mode.
@@ -57,6 +250,13 @@ def init_wandb_primary(args):
         "name": run_name,
         "config": _compute_config_for_logging(args),
     }
+    # A Slurm requeue restarts the Python driver.  Let the frozen launcher
+    # provide one stable run id so optimizer, validation, heartbeat, and usage
+    # curves continue in the same W&B run instead of silently fragmenting.
+    external_run_id = str(os.environ.get("WANDB_RUN_ID") or "").strip()
+    if external_run_id:
+        init_kwargs["id"] = external_run_id
+        init_kwargs["resume"] = "allow"
 
     # Configure settings based on offline/online mode
     if offline:
@@ -82,12 +282,6 @@ def init_wandb_primary(args):
 def _compute_config_for_logging(args):
     output = _args_to_config_dict(args)
 
-    whitelist_env_vars = [
-        "SLURM_JOB_ID",
-        # We may insert more default values here, and may also allow users to configure a whitelist
-    ]
-    output["env_vars"] = {k: v for k, v in os.environ.items() if k in whitelist_env_vars}
-
     if getattr(args, "use_critic", False):
         critic_args = _get_role_args_for_logging(args, role="critic")
         output.update(_prefix_config_keys(_args_to_config_dict(critic_args), "critic"))
@@ -96,7 +290,39 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    values = vars(args)
+    output = {
+        key: deepcopy(values[key])
+        for key in _WANDB_CONFIG_ALLOWLIST
+        if key in values and values[key] is not None
+    }
+    for env_name, (config_name, converter) in (
+        _WANDB_DYNAMIC_ENV_CONFIG.items()
+    ):
+        raw_value = os.environ.get(env_name)
+        if raw_value is None or not raw_value.strip():
+            continue
+        try:
+            output[config_name] = converter(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid dynamic W&B config {env_name}={raw_value!r}"
+            ) from exc
+    if any(
+        os.environ.get(name)
+        for name in (
+            "SWE_AGENT_NAIVE_POLICY_TEMPERATURE",
+            "SWE_AGENT_LANES_POLICY_TEMPERATURE",
+        )
+    ):
+        # These generic SGLang defaults do not control SWE-agent requests;
+        # the method-specific collector values above do.
+        for key in ("rollout_temperature", "rollout_top_p", "rollout_top_k"):
+            output.pop(key, None)
+    if os.environ.get("SWE_AGENT_VALIDATION_TEMPERATURE"):
+        for key in ("eval_temperature", "eval_top_p", "eval_top_k"):
+            output.pop(key, None)
+    return output
 
 
 def _prefix_config_keys(config, prefix):
@@ -174,3 +400,29 @@ def _init_wandb_common():
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
     wandb.define_metric("perf/*", step_metric="rollout/step")
+    wandb.define_metric("swe_agent/*", step_metric="rollout/step")
+    # Long hosted-judge waits need a progress axis independent of optimizer
+    # updates and completed rollout batches.
+    wandb.define_metric("heartbeat/event_step")
+    wandb.define_metric("heartbeat/*", step_metric="heartbeat/event_step")
+    # Request-level model usage has its own monotonically increasing event
+    # axis. It intentionally does not share rollout/step: filtered and invalid
+    # groups still consume Qwen/GLM tokens even when they produce no rollout or
+    # optimizer update.
+    wandb.define_metric("usage/event_step")
+    wandb.define_metric("usage/*", step_metric="usage/event_step")
+    # W&B only accepts a wildcard as a suffix.  Register cumulative series
+    # explicitly so each run summary retains the experiment-wide maximum
+    # without relying on the invalid ``usage/*_cumulative`` middle glob.
+    for metric_name in (
+        "total_tokens_cumulative",
+        "train_tokens_cumulative",
+        "validation_tokens_cumulative",
+        "qwen_tokens_cumulative",
+        "glm_tokens_cumulative",
+    ):
+        wandb.define_metric(
+            f"usage/{metric_name}",
+            step_metric="usage/event_step",
+            summary="max",
+        )

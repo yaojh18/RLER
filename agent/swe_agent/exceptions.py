@@ -20,3 +20,7 @@ class UserInterruption(InterruptAgentFlow):
 
 class FormatError(InterruptAgentFlow):
     """Raised when the LM's output is not in the expected format."""
+
+
+class PolicyVersionMismatch(RuntimeError):
+    """A policy request crossed an asynchronous SGLang weight transition."""

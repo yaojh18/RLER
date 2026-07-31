@@ -41,7 +41,7 @@ class ModelRouteConfig:
 _MODEL_ROUTE_CONFIGS: Dict[str, ModelRouteConfig] = {}
 
 
-# Per-event-loop concurrency control for LiteLLM async calls to avoid event loop binding issues
+# Per-event-loop concurrency control for LiteLLM async calls.
 _LITELLM_SEMAPHORES = weakref.WeakKeyDictionary()
 
 
@@ -53,7 +53,19 @@ def _get_litellm_semaphore() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     sem = _LITELLM_SEMAPHORES.get(loop)
     if sem is None:
-        max_concurrent = int(os.environ.get("LITELLM_MAX_CONCURRENT_CALLS", "256"))
+        raw_max_concurrent = os.environ.get("LITELLM_MAX_CONCURRENT_CALLS", "256")
+        try:
+            max_concurrent = int(raw_max_concurrent)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "LITELLM_MAX_CONCURRENT_CALLS must be a positive integer, "
+                f"got {raw_max_concurrent!r}"
+            ) from exc
+        if max_concurrent <= 0:
+            raise ValueError(
+                "LITELLM_MAX_CONCURRENT_CALLS must be a positive integer, "
+                f"got {raw_max_concurrent!r}"
+            )
         sem = asyncio.Semaphore(max_concurrent)
         _LITELLM_SEMAPHORES[loop] = sem
     return sem
@@ -272,63 +284,257 @@ async def run_litellm_completion_async(
     user_prompt: Optional[str] = None,
     system_prompt: Optional[str] = None,
     messages: Optional[List[Dict[str, str]]] = None,
+    usage_model_role: Optional[str] = None,
     **chat_kwargs,
 ) -> ChatCompletion:
+    """Run one hosted logical call and account only its final success.
+
+    Retry attempts and failed/fallback requests are deliberately omitted from
+    usage accounting.  With no fallback configured, LiteLLM retains ownership
+    of its established retry behavior.  The early-prediction launcher may
+    configure a fallback route, in which case this wrapper surfaces retries so
+    a capacity error can switch providers immediately.
+    """
+    from swe_agent.usage import (
+        current_usage_context,
+        infer_model_family,
+        new_logical_call_id,
+        record_model_usage,
+    )
+
     msgs = _build_messages(system_prompt=system_prompt, user_prompt=user_prompt, messages=messages)
-    chat_kwargs["num_retries"] = chat_kwargs.get("num_retries", 4)
-    chat_kwargs["timeout"] = chat_kwargs.get("timeout", _default_litellm_timeout_seconds())
-    try:
-        async with _get_litellm_semaphore():
-            completion_call = asyncio.to_thread(litellm.completion, messages=msgs, model=model_name, **chat_kwargs)
-            outer_timeout = _litellm_outer_timeout_seconds(chat_kwargs.get("timeout"))
-            if outer_timeout > 0:
-                response = await asyncio.wait_for(completion_call, timeout=outer_timeout)
-            else:
-                response = await completion_call
-    except Exception as exc:
-        if isinstance(exc, litellm.JSONSchemaValidationError):
-            raw_content = exc.raw_response if isinstance(exc.raw_response, str) else str(exc.raw_response)
-            return ChatCompletion(
-                content=raw_content,
-                finish_reason="stop",
-                model_name=model_name,
-                cost=0.0,
-                metadata={
-                    "timestamp": time.time(),
-                    "validation_error": str(exc),
-                },
+    raw_completion_cap = os.environ.get(
+        "RLER_HOSTED_MAX_COMPLETION_TOKENS",
+        os.environ.get("RLER_MAX_COMPLETION_TOKENS"),
+    )
+    completion_cap = (
+        int(raw_completion_cap)
+        if raw_completion_cap is not None
+        else None
+    )
+    raw_requested_max_tokens = chat_kwargs.get(
+        "max_tokens",
+        chat_kwargs.get("max_completion_tokens", completion_cap),
+    )
+    requested_max_tokens = (
+        int(raw_requested_max_tokens)
+        if raw_requested_max_tokens is not None
+        else None
+    )
+    if completion_cap is not None and requested_max_tokens is not None:
+        requested_max_tokens = min(requested_max_tokens, completion_cap)
+    if requested_max_tokens is not None:
+        if "max_completion_tokens" in chat_kwargs and "max_tokens" not in chat_kwargs:
+            chat_kwargs["max_completion_tokens"] = requested_max_tokens
+        else:
+            chat_kwargs["max_tokens"] = requested_max_tokens
+    raw_context_cap = os.environ.get("RLER_HOSTED_MODEL_CONTEXT_LENGTH")
+    context_cap = int(raw_context_cap) if raw_context_cap is not None else 0
+    known_prompt_tokens: int | None = None
+    if context_cap > 0:
+        try:
+            known_prompt_tokens = int(
+                litellm.token_counter(model=model_name, messages=msgs)
             )
-        # ContextWindow / token-count overflow must NOT be silently swallowed: doing so
-        # causes the agent loop to inject a format_error template and retry with a
-        # still-longer prompt, growing the conversation past the cap (we observed
-        # 250k -> 263k+ via +152-tok-per-iter loops).
-        # sglang/litellm reports overflow under TWO exception classes depending on
-        # version/path:
-        #   1) litellm.ContextWindowExceededError
-        #   2) litellm.BadRequestError with message "Requested token count exceeds ..."
-        #      or "longer than the model's context length"
-        # Re-raise both so the calling rollout terminates this branch cleanly.
-        _exc_msg = str(exc)
-        _is_overflow = (
-            isinstance(exc, getattr(litellm, "ContextWindowExceededError", ()))
-            or "ContextWindowExceededError" in type(exc).__name__
-            or "Requested token count exceeds" in _exc_msg
-            or "longer than the model's context length" in _exc_msg
-            or "maximum context length" in _exc_msg
+        except Exception as exc:
+            LOGGER.warning(
+                "Could not preflight hosted-model context for %s: %s",
+                model_name,
+                exc,
+            )
+        else:
+            if known_prompt_tokens >= context_cap:
+                raise litellm.exceptions.ContextWindowExceededError(
+                    message=(
+                        "ContextWindowExceeded (pre-flight: "
+                        f"prompt_tokens={known_prompt_tokens} >= "
+                        f"context={context_cap})"
+                    ),
+                    model=model_name,
+                    llm_provider="litellm",
+                )
+            available_completion_tokens = context_cap - known_prompt_tokens
+            if (
+                requested_max_tokens is not None
+                and requested_max_tokens > available_completion_tokens
+            ):
+                LOGGER.warning(
+                    "Clipping hosted-model max completion for %s from %d to "
+                    "%d so prompt_tokens=%d stays within context=%d",
+                    model_name,
+                    requested_max_tokens,
+                    available_completion_tokens,
+                    known_prompt_tokens,
+                    context_cap,
+                )
+                requested_max_tokens = available_completion_tokens
+                if (
+                    "max_completion_tokens" in chat_kwargs
+                    and "max_tokens" not in chat_kwargs
+                ):
+                    chat_kwargs["max_completion_tokens"] = requested_max_tokens
+                else:
+                    chat_kwargs["max_tokens"] = requested_max_tokens
+    rate_limit_fallback_model = str(
+        os.environ.get("RLER_LITELLM_RATE_LIMIT_FALLBACK_MODEL") or ""
+    ).strip()
+    if rate_limit_fallback_model == model_name:
+        rate_limit_fallback_model = ""
+    if rate_limit_fallback_model:
+        configured_retries = max(
+            0,
+            int(
+                chat_kwargs.pop(
+                    "num_retries",
+                    os.environ.get("RLER_LITELLM_EXPLICIT_RETRIES", "4"),
+                )
+            ),
         )
-        if _is_overflow:
-            print(f"Error in run_litellm_completion_async (FATAL, raising): {exc}")
-            raise
+        # Only the explicit early-prediction fallback path owns physical
+        # attempts.  This makes a GLM 429/529 switch to Ultra immediately.
+        chat_kwargs["num_retries"] = 0
+    else:
+        # Preserve the original generic helper contract: LiteLLM owns retries
+        # and receives the caller's value (or the historical default of four).
+        configured_retries = 0
+        chat_kwargs["num_retries"] = chat_kwargs.get("num_retries", 4)
+    active_model_name = model_name
+    fallback_used = False
+    chat_kwargs["timeout"] = chat_kwargs.get("timeout", _default_litellm_timeout_seconds())
+    context = current_usage_context()
+    logical_call_id = context.logical_call_id or new_logical_call_id()
+    base_attempt_index = int(context.attempt_index or 0)
+    response = None
+    last_exception: Exception | None = None
+    response_latency_ms = 0.0
+    response_request_started_at: float | None = None
+
+    max_physical_attempts = (
+        configured_retries + 1 + int(bool(rate_limit_fallback_model))
+    )
+    for retry_index in range(max_physical_attempts):
+        started: float | None = None
+        request_started_at: float | None = None
+        try:
+            async with _get_litellm_semaphore():
+                started = time.monotonic()
+                request_started_at = time.time()
+                completion_call = asyncio.to_thread(
+                    litellm.completion,
+                    messages=msgs,
+                    model=active_model_name,
+                    **chat_kwargs,
+                )
+                outer_timeout = _litellm_outer_timeout_seconds(
+                    chat_kwargs.get("timeout")
+                )
+                if outer_timeout > 0:
+                    response = await asyncio.wait_for(
+                        completion_call,
+                        timeout=outer_timeout,
+                    )
+                else:
+                    response = await completion_call
+        except Exception as exc:
+            if started is None:
+                raise
+            last_exception = exc
+
+            rate_limit_type = getattr(litellm, "RateLimitError", None)
+            is_rate_limit = (
+                isinstance(rate_limit_type, type)
+                and isinstance(exc, rate_limit_type)
+            )
+            status_code = getattr(exc, "status_code", None)
+            is_capacity_error = is_rate_limit or status_code in {429, 529}
+            if (
+                is_capacity_error
+                and rate_limit_fallback_model
+                and active_model_name == model_name
+            ):
+                active_model_name = rate_limit_fallback_model
+                fallback_used = True
+                LOGGER.warning(
+                    "Hosted primary model %s rate-limited; immediately "
+                    "falling back to %s",
+                    model_name,
+                    active_model_name,
+                )
+                continue
+            if is_capacity_error:
+                # Do not stall the whole rollout pipeline when both hosted
+                # routes reject this call, or when no fallback was configured.
+                # The enclosing judge group fails closed and the collector
+                # moves on to another source attempt.
+                break
+
+            # Preserve the established correction flow. It is a retry result,
+            # so it is intentionally absent from approximate usage accounting.
+            if isinstance(exc, litellm.JSONSchemaValidationError):
+                raw_content = exc.raw_response if isinstance(exc.raw_response, str) else str(exc.raw_response)
+                return ChatCompletion(
+                    content=raw_content,
+                    finish_reason="stop",
+                    model_name=active_model_name,
+                    cost=0.0,
+                    metadata={
+                        "timestamp": time.time(),
+                        "validation_error": str(exc),
+                    },
+                )
+
+            _exc_msg = str(exc)
+            _is_overflow = (
+                isinstance(exc, getattr(litellm, "ContextWindowExceededError", ()))
+                or "ContextWindowExceededError" in type(exc).__name__
+                or "Requested token count exceeds" in _exc_msg
+                or "longer than the model's context length" in _exc_msg
+                or "maximum context length" in _exc_msg
+            )
+            non_retryable_types = tuple(
+                error_type
+                for error_type in (
+                    asyncio.TimeoutError,
+                    getattr(litellm, "AuthenticationError", None),
+                    getattr(litellm, "PermissionDeniedError", None),
+                    getattr(litellm, "BadRequestError", None),
+                    getattr(litellm, "NotFoundError", None),
+                    getattr(litellm, "UnsupportedParamsError", None),
+                )
+                if isinstance(error_type, type)
+            )
+            if _is_overflow:
+                print(f"Error in run_litellm_completion_async (FATAL, raising): {exc}")
+                raise
+            if (
+                active_model_name == model_name
+                and retry_index < configured_retries
+                and not isinstance(exc, non_retryable_types)
+            ):
+                continue
+            break
+        else:
+            response_latency_ms = (time.monotonic() - started) * 1000
+            response_request_started_at = request_started_at
+            break
+
+    if response is None:
+        exc = last_exception or RuntimeError("LiteLLM returned no response")
         print(f"Error in run_litellm_completion_async: {exc}")
         return ChatCompletion(
             content="",
-            model_name=model_name,
+            model_name=active_model_name,
             metadata={
                 "timestamp": time.time(),
                 "error": f"{type(exc).__name__}: {exc}",
                 "timeout": chat_kwargs.get("timeout") if isinstance(exc, asyncio.TimeoutError) else None,
+                "primary_model": model_name,
+                "rate_limit_fallback_model": (
+                    rate_limit_fallback_model if fallback_used else None
+                ),
             },
         )
+
     choice = response.choices[0]
     message = choice.message
     inline_content = message.content or ""
@@ -345,17 +551,41 @@ async def run_litellm_completion_async(
         _, content_no_thinking = _split_inline_thinking_content(inline_content)
     content = inline_content
     if reasoning_content:
-        content = f"<think>{reasoning_content}</think>\n{content_no_thinking}" if content_no_thinking else f"<think>{reasoning_content}</think>"
+        content = (
+            f"<think>{reasoning_content}</think>\n{content_no_thinking}"
+            if content_no_thinking
+            else f"<think>{reasoning_content}</think>"
+        )
     usage = {}
     if getattr(response, "usage", None) is not None:
         usage = response.usage.model_dump() if hasattr(response.usage, "model_dump") else dict(response.usage)
+
+    event = record_model_usage(
+        usage=usage,
+        known_input_tokens=known_prompt_tokens,
+        status="success",
+        model_family=infer_model_family(active_model_name),
+        model_role=usage_model_role or "litellm",
+        logical_call_id=logical_call_id,
+        attempt_index=base_attempt_index,
+        latency_ms=response_latency_ms,
+        request_started_at=response_request_started_at,
+    )
     return ChatCompletion(
         content=content,
         finish_reason=choice.finish_reason,
-        model_name=model_name,
+        model_name=active_model_name,
         cost=0.0,
         usage=usage,
-        metadata={"timestamp": time.time(), "content_no_thinking": content_no_thinking},
+        metadata={
+            "timestamp": time.time(),
+            "content_no_thinking": content_no_thinking,
+            "usage_event_ids": [event["event_id"]] if event is not None else [],
+            "primary_model": model_name,
+            "rate_limit_fallback_model": (
+                rate_limit_fallback_model if fallback_used else None
+            ),
+        },
     )
 
 
@@ -429,7 +659,15 @@ async def run_generate_with_route_async(
         if "longer than" in msg or "context length" in msg or "Requested token count exceeds" in msg:
             raise
         print(f"Error in run_generate_with_route_async: {exc}")
-        return ChatCompletion(content="", model_name=route_name, metadata={"timestamp": time.time(), "error": msg})
+        return ChatCompletion(
+            content="",
+            model_name=route_name,
+            metadata={
+                "timestamp": time.time(),
+                "error": msg,
+                "usage_event_ids": [],
+            },
+        )
 
     # sglang /generate response shape:
     #   {
@@ -452,10 +690,21 @@ async def run_generate_with_route_async(
         finish_reason = finish_info.get("type", "stop") or "stop"
     else:
         finish_reason = str(finish_info) or "stop"
+    prompt_tokens = meta.get("prompt_tokens")
+    completion_tokens = meta.get("completion_tokens")
     usage = {
-        "prompt_tokens": int(meta.get("prompt_tokens", 0) or 0),
-        "completion_tokens": int(meta.get("completion_tokens", 0) or 0),
+        # Raw token ids are authoritative when older SGLang versions omit
+        # usage fields.
+        "prompt_tokens": len(input_ids)
+        if prompt_tokens is None
+        else int(prompt_tokens),
+        "completion_tokens": len(output_ids)
+        if completion_tokens is None
+        else int(completion_tokens),
     }
+    for key in ("cached_tokens", "cached_input_tokens", "prompt_tokens_details"):
+        if key in meta:
+            usage[key] = meta[key]
     usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
     output_logprobs: List[float] = []
     raw_lp = meta.get("output_token_logprobs") or []
@@ -479,6 +728,7 @@ async def run_generate_with_route_async(
         metadata={
             "timestamp": time.time(),
             "content_no_thinking": content_no_thinking,
+            "usage_event_ids": [],
         },
         output_token_ids=output_ids,
         output_logprobs=output_logprobs,
@@ -580,12 +830,69 @@ async def route_completion_message(
     kwargs = copy.deepcopy(model_kwargs or {})
     api_base = kwargs.pop("api_base", None)
     api_key = kwargs.pop("api_key", "EMPTY")
+    completion_backend = str(
+        kwargs.pop("completion_backend", "auto") or "auto"
+    ).strip().lower()
+    if completion_backend not in {"auto", "sglang_generate", "litellm"}:
+        raise ValueError(
+            "model_kwargs.completion_backend must be one of "
+            "'auto', 'sglang_generate', or 'litellm'"
+        )
     enable_json_schema_validation = bool(kwargs.pop("enable_json_schema_validation", True))
     extra_body = kwargs.get("extra_body", {}) if isinstance(kwargs.get("extra_body"), dict) else {}
     if api_base is None:
         api_base, api_key, effective_model = _route_service_base(route_name, model_name, api_key)
     else:
         effective_model = model_name
+
+    # An explicit hosted-chat transport prevents OpenAI-compatible provider
+    # endpoints from being mistaken for a local SGLang server.  Keep a narrow
+    # NVIDIA-host fallback so the canonical experiment endpoint is safe even
+    # when an older caller omits the new marker.
+    hosted_nvidia_chat = False
+    if api_base:
+        from urllib.parse import urlparse
+
+        hostname = (urlparse(str(api_base)).hostname or "").lower()
+        hosted_nvidia_chat = hostname in {
+            "inference-api.nvidia.com",
+            "integrate.api.nvidia.com",
+        }
+    use_litellm = completion_backend == "litellm" or (
+        completion_backend == "auto" and hosted_nvidia_chat
+    )
+    if use_litellm:
+        # The NVIDIA gateway's Azure GLM-5.2 deployment rejects the
+        # OpenAI-compatible ``chat_template_kwargs`` extension with HTTP 400.
+        # That extension is only a tokenizer hint; the deployment controls its
+        # own reasoning template.  Strip it narrowly for this exact transport
+        # while leaving the canonical NVIDIA route and every other extra-body
+        # field unchanged.
+        if effective_model.lower().startswith("openai/azure/"):
+            hosted_extra_body = kwargs.get("extra_body")
+            if isinstance(hosted_extra_body, dict):
+                hosted_extra_body = copy.deepcopy(hosted_extra_body)
+                hosted_extra_body.pop("chat_template_kwargs", None)
+                if hosted_extra_body:
+                    kwargs["extra_body"] = hosted_extra_body
+                else:
+                    kwargs.pop("extra_body", None)
+        completion = await run_litellm_completion_async(
+            model_name=effective_model,
+            messages=_strip_chat_only_message_fields(messages),
+            usage_model_role=route_name,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            response_format=response_format,
+            api_base=api_base,
+            api_key=api_key,
+            **kwargs,
+        )
+        error = completion.metadata.get("error")
+        if error is not None:
+            raise RuntimeError(f"{route_name} hosted chat completion failed: {error}")
+        return _completion_to_assistant_message(completion)
 
     if api_base:
         from swe_agent.tokenization import get_stop_token_ids, tokenize_messages_with_template
@@ -662,6 +969,7 @@ async def run_chat_with_route_completion_async(
             user_prompt=user_prompt,
             system_prompt=system_prompt,
             messages=messages,
+            usage_model_role=route_name,
             **routed_kwargs,
         )
     try:

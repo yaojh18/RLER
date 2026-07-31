@@ -38,6 +38,7 @@ from typing import Any
 
 from agent_rl import RolloutSessionSpec
 from swe_agent.backend import SWEAgentRolloutBackend
+from swe_agent.exceptions import PolicyVersionMismatch
 
 from swe_agent.parallel_utils import (
     TurnTokenInfo,
@@ -73,6 +74,8 @@ class NaiveSearchConfig:
     policy_top_p: float = 0.95
 
     gt_eval_workers: int = 8
+    gt_eval_timeout: int = 600
+    evaluate_gt: bool = True
     rollout_pool_size: int | None = None  # default = m
 
     # Same fallback-patch penalty recipe as v0/lanes.
@@ -82,7 +85,8 @@ class NaiveSearchConfig:
 
     reward_kind: str = "joint"
     joint_alpha: float = 1.0
-    all_pass_reward: float = 2.0
+    # Keep a fully solved rollout on the same unit scale as judge rewards.
+    all_pass_reward: float = 1.0
 
 
 @dataclass
@@ -146,6 +150,8 @@ class NaiveSearchRunner:
         backend: SWEAgentRolloutBackend,
         run_dir: Path,
         policy_model_name: str,
+        policy_version: str | None = None,
+        enforce_policy_version: bool = False,
         config: NaiveSearchConfig,
         harness_namespace: str | None,
         policy_base_url: str,
@@ -162,6 +168,8 @@ class NaiveSearchRunner:
         self.backend = backend
         self.run_dir = Path(run_dir)
         self.policy_model_name = policy_model_name
+        self.policy_version = policy_version or policy_model_name
+        self.enforce_policy_version = bool(enforce_policy_version)
         self.config = config
         self.harness_namespace = harness_namespace
         self.policy_base_url = policy_base_url.rstrip("/")
@@ -196,7 +204,14 @@ class NaiveSearchRunner:
             task_id=self.task_id,
             sample_index=rollout_index,
             policy_ref=self.policy_model_name,
-            policy_version=self.policy_model_name,
+            # Training uses slime's original stale-window semantics: the
+            # dispatch version is retained in the exported record/sample, but
+            # an in-flight trajectory is not aborted when the next update is
+            # committed. Validation opts into the strict request-level guard
+            # so unfinished policy work can be discarded on an update.
+            policy_version=(
+                self.policy_version if self.enforce_policy_version else None
+            ),
             dataset_name="swebench",
             ground_truth=self.instance.get("patch"),
             raw_user_query=self.task,
@@ -364,6 +379,19 @@ class NaiveSearchRunner:
                 rollout.total_tokens.get("prompt", 0),
                 rollout.total_tokens.get("completion", 0),
             )
+        except PolicyVersionMismatch as exc:
+            # The next policy update invalidates only unfinished validation
+            # trajectories. Normal session cleanup remains unchanged from the
+            # TTS path.
+            rollout.error = f"{type(exc).__name__}: {exc}"
+            rollout.status = "error"
+            logger.warning(
+                "[%s] naive r=%d STALE_POLICY dt=%.1fs %s",
+                self.task_id,
+                rollout_index,
+                time.perf_counter() - rollout.started_at,
+                rollout.error,
+            )
         except Exception as exc:
             rollout.error = f"{type(exc).__name__}: {exc}"
             rollout.status = "error"
@@ -409,12 +437,18 @@ class NaiveSearchRunner:
             return
         try:
             rollout_run_dir = self._rollout_run_dir(rollout.rollout_index)
+            # Unlike the search runners, the naive runner does not write its
+            # per-rollout artifacts until every GT evaluation has finished.
+            # The shared Singularity evaluator needs its work directory to
+            # exist before it can create a temporary evaluation directory.
+            rollout_run_dir.mkdir(parents=True, exist_ok=True)
             eval_key = str(rollout_run_dir)
             payload = evaluate_swebench_instance_patches(
                 instance=self.instance,
                 patches_by_key={eval_key: patch},
                 model_name=self.policy_model_name,
                 max_workers=1,
+                timeout=self.config.gt_eval_timeout,
                 namespace=self.harness_namespace,
                 work_dir=rollout_run_dir,
                 reward_config=reward_config,
@@ -465,10 +499,12 @@ class NaiveSearchRunner:
             max_workers=cfg.rollout_pool_size or cfg.m,
             thread_name_prefix=f"naive-{self.task_id[:12]}",
         )
-        gt_pool = ThreadPoolExecutor(
-            max_workers=cfg.gt_eval_workers,
-            thread_name_prefix=f"naive-gt-{self.task_id[:12]}",
-        )
+        gt_pool = None
+        if cfg.evaluate_gt:
+            gt_pool = ThreadPoolExecutor(
+                max_workers=cfg.gt_eval_workers,
+                thread_name_prefix=f"naive-gt-{self.task_id[:12]}",
+            )
         try:
             # Launch all M rollouts in parallel.
             rollout_futures: list[asyncio.Future] = []
@@ -499,24 +535,27 @@ class NaiveSearchRunner:
                     rollouts.append(item)
             record.rollouts = rollouts
 
-            # GT-score in parallel (CPU + docker, independent across rollouts).
-            gt_futures: list[asyncio.Future] = []
-            for r in rollouts:
-                if r.error is not None:
-                    r.gt_score = None
-                    if r.evaluation_payload is None:
-                        r.evaluation_payload = make_evaluation_payload(
-                            "error", error=r.error,
+            if cfg.evaluate_gt:
+                # GT-score in parallel (CPU + docker, independent across
+                # rollouts). Validation can defer this phase so policy
+                # generation is not held behind evaluator processes.
+                gt_futures: list[asyncio.Future] = []
+                for r in rollouts:
+                    if r.error is not None:
+                        r.gt_score = None
+                        if r.evaluation_payload is None:
+                            r.evaluation_payload = make_evaluation_payload(
+                                "error", error=r.error,
+                            )
+                        continue
+                    ctx = contextvars.copy_context()
+                    gt_futures.append(
+                        loop.run_in_executor(
+                            gt_pool, lambda x=r, c=ctx: c.run(self._evaluate_gt, x)
                         )
-                    continue
-                ctx = contextvars.copy_context()
-                gt_futures.append(
-                    loop.run_in_executor(
-                        gt_pool, lambda x=r, c=ctx: c.run(self._evaluate_gt, x)
                     )
-                )
-            if gt_futures:
-                await asyncio.gather(*gt_futures, return_exceptions=True)
+                if gt_futures:
+                    await asyncio.gather(*gt_futures, return_exceptions=True)
 
             record.completed = all(r.error is None for r in record.rollouts)
             if not record.completed and record.error is None:
@@ -528,6 +567,8 @@ class NaiveSearchRunner:
             record.seconds = time.perf_counter() - started
             self._dump_record(record)
             for pool in (rollout_pool, gt_pool):
+                if pool is None:
+                    continue
                 try:
                     pool.shutdown(wait=False, cancel_futures=True)
                 except Exception:
@@ -570,6 +611,8 @@ class NaiveSearchRunner:
             )
             evaluation_payload = r.evaluation_payload
             if evaluation_payload is None:
+                if not self.config.evaluate_gt:
+                    continue
                 raise RuntimeError(f"missing evaluation payload for rollout {r.node_id}")
             (rdir / "evaluation.json").write_text(
                 json.dumps(

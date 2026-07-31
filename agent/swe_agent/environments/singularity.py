@@ -24,6 +24,33 @@ _BIND_ENV_VARS = (
     "SINGULARITY_BINDPATH",
 )
 
+_RUNTIME_GUARD_ENV = "RLER_SINGULARITY_RUNTIME_GUARD"
+_MEMORY_LIMIT_ENV = "RLER_SINGULARITY_MEMORY_LIMIT_GB"
+
+
+def _runtime_guard_enabled() -> bool:
+    value = os.getenv(_RUNTIME_GUARD_ENV, "").strip().lower()
+    if not value:
+        return False
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{_RUNTIME_GUARD_ENV} must be a boolean, got {value!r}")
+
+
+def _runtime_memory_limit_kib() -> int | None:
+    value = os.getenv(_MEMORY_LIMIT_ENV, "").strip()
+    if not value:
+        return None
+    try:
+        gib = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{_MEMORY_LIMIT_ENV} must be a positive integer, got {value!r}") from exc
+    if gib <= 0:
+        raise ValueError(f"{_MEMORY_LIMIT_ENV} must be a positive integer, got {value!r}")
+    return gib * 1024 * 1024
+
 
 def _runtime_environment() -> dict[str, str]:
     environment = os.environ.copy()
@@ -172,6 +199,9 @@ class SingularityEnvironment:
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         """Execute a command in a Singularity container and return the result as a dict."""
         command = action.get("command", "")
+        memory_limit_kib = _runtime_memory_limit_kib()
+        if memory_limit_kib is not None:
+            command = f"ulimit -v {memory_limit_kib}\n{command}"
         cmd = [self.config.executable, *self.config.global_args, "exec", *self.config.exec_args]
 
         work_dir = cwd or self.config.cwd
@@ -185,17 +215,35 @@ class SingularityEnvironment:
             cmd.extend(["--env", f"{key}={value}"])
 
         cmd.extend(["--writable", str(self.sandbox_dir), "bash", "-c", command])
+        effective_timeout = timeout or self.config.timeout
+        runtime_guard = _runtime_guard_enabled()
+        if runtime_guard:
+            # GNU timeout owns a process group by default, so TERM/KILL reaches
+            # Apptainer and command children instead of only the direct parent.
+            cmd = [
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=5s",
+                f"{effective_timeout}s",
+                *cmd,
+            ]
         try:
             result = subprocess.run(
                 cmd,
                 text=True,
                 env=_runtime_environment(),
-                timeout=timeout or self.config.timeout,
+                timeout=effective_timeout + 10 if runtime_guard else effective_timeout,
                 encoding="utf-8",
                 errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
+            if runtime_guard and result.returncode in {124, 137}:
+                raise subprocess.TimeoutExpired(
+                    cmd,
+                    effective_timeout,
+                    output=result.stdout,
+                )
             output = {"output": result.stdout, "returncode": result.returncode, "exception_info": ""}
         except Exception as e:
             raw_output = getattr(e, "output", None)

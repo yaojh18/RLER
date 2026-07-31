@@ -33,9 +33,11 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--naive-output-root", default="")
     p.add_argument("--naive-m", type=int, default=8)
     p.add_argument("--naive-step-limit", type=int, default=120)
-    p.add_argument("--naive-completion-max-tokens", type=int, default=16384)
+    p.add_argument("--naive-completion-max-tokens", type=int, default=20480)
+    p.add_argument("--model-context-length", type=int, default=128000)
     p.add_argument("--naive-seed", type=int, default=0)
     p.add_argument("--naive-gt-eval-workers", type=int, default=8)
+    p.add_argument("--naive-gt-eval-timeout", type=int, default=600)
     p.add_argument("--naive-rollout-pool-size", type=int, default=0)
     p.add_argument("--naive-policy-temperature", type=float, default=1.0,
                    help="Sampling temperature for the M independent rollouts.")
@@ -44,11 +46,27 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--naive-no-action-patch-penalty", type=float, default=-0.1)
     p.add_argument(
         "--naive-reward-kind",
-        choices=("hard", "soft", "delta", "joint", "f2p_only"),
-        default="delta",
+        choices=("hard", "soft", "joint", "f2p_only"),
+        default="joint",
     )
     p.add_argument("--naive-joint-alpha", type=float, default=1.0)
-    p.add_argument("--naive-all-pass-reward", type=float, default=2.0)
+    p.add_argument("--naive-all-pass-reward", type=float, default=1.0)
+    p.add_argument("--validation-instance-workers", type=int, default=8)
+    p.add_argument(
+        "--validation-process-workers",
+        type=int,
+        default=int(os.environ.get("VALIDATION_PROCESS_WORKERS", "8")),
+    )
+    p.add_argument("--validation-step-limit", type=int, default=120)
+    p.add_argument("--validation-completion-max-tokens", type=int, default=20480)
+    p.add_argument("--validation-gt-eval-timeout", type=int, default=1800)
+    p.add_argument(
+        "--validation-temperature",
+        type=float,
+        default=0.2,
+        help="Low-temperature sampling used only by terminal validation.",
+    )
+    p.add_argument("--validation-top-p", type=float, default=0.95)
     return p.parse_known_args(argv)
 
 
@@ -70,7 +88,16 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_NAIVE_M"] = str(ns.naive_m)
     os.environ["SWE_AGENT_NAIVE_STEP_LIMIT"] = str(ns.naive_step_limit)
     os.environ["SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS"] = str(ns.naive_completion_max_tokens)
+    os.environ["SWE_AGENT_MODEL_CONTEXT_LENGTH"] = str(ns.model_context_length)
+    os.environ["RLER_POLICY_MODEL_CONTEXT_LENGTH"] = str(
+        ns.model_context_length
+    )
+    os.environ.setdefault("RLER_HOSTED_MODEL_CONTEXT_LENGTH", "128000")
+    os.environ.setdefault("RLER_HOSTED_MAX_COMPLETION_TOKENS", "20480")
     os.environ["SWE_AGENT_NAIVE_GT_EVAL_WORKERS"] = str(ns.naive_gt_eval_workers)
+    os.environ["SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT"] = str(
+        ns.naive_gt_eval_timeout
+    )
     if ns.naive_rollout_pool_size:
         os.environ["SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE"] = str(ns.naive_rollout_pool_size)
     if ns.naive_seed:
@@ -82,6 +109,21 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_NAIVE_REWARD_KIND"] = ns.naive_reward_kind
     os.environ["SWE_AGENT_NAIVE_JOINT_ALPHA"] = str(ns.naive_joint_alpha)
     os.environ["SWE_AGENT_NAIVE_ALL_PASS_REWARD"] = str(ns.naive_all_pass_reward)
+    os.environ["SWE_AGENT_VALIDATION_INSTANCE_WORKERS"] = str(ns.validation_instance_workers)
+    os.environ["SWE_AGENT_VALIDATION_PROCESS_WORKERS"] = str(
+        ns.validation_process_workers
+    )
+    os.environ["SWE_AGENT_VALIDATION_STEP_LIMIT"] = str(ns.validation_step_limit)
+    os.environ["SWE_AGENT_VALIDATION_COMPLETION_MAX_TOKENS"] = str(
+        ns.validation_completion_max_tokens
+    )
+    os.environ["SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT"] = str(
+        ns.validation_gt_eval_timeout
+    )
+    os.environ["SWE_AGENT_VALIDATION_TEMPERATURE"] = str(
+        ns.validation_temperature
+    )
+    os.environ["SWE_AGENT_VALIDATION_TOP_P"] = str(ns.validation_top_p)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,6 +131,17 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     naive_args, forwarded = _parse_naive_args(argv)
     _export_naive_env(naive_args)
+    if not any(
+        arg == "--dynamic-sampling-filter-path"
+        or arg.startswith("--dynamic-sampling-filter-path=")
+        for arg in forwarded
+    ):
+        forwarded.extend(
+            [
+                "--dynamic-sampling-filter-path",
+                "slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std",
+            ]
+        )
     from train_agent.run.grpo import main as grpo_main
     return grpo_main(
         [

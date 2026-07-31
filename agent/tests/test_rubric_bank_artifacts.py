@@ -91,6 +91,62 @@ def test_singularity_defaults_hide_host_bind_paths(monkeypatch):
     assert "SINGULARITY_BINDPATH" not in environment
 
 
+def test_singularity_runtime_guard_is_opt_in(monkeypatch):
+    from swe_agent.environments.singularity import (
+        _runtime_guard_enabled,
+        _runtime_memory_limit_kib,
+    )
+
+    monkeypatch.delenv("RLER_SINGULARITY_RUNTIME_GUARD", raising=False)
+    monkeypatch.delenv("RLER_SINGULARITY_MEMORY_LIMIT_GB", raising=False)
+    assert _runtime_guard_enabled() is False
+    assert _runtime_memory_limit_kib() is None
+
+    monkeypatch.setenv("RLER_SINGULARITY_RUNTIME_GUARD", "1")
+    monkeypatch.setenv("RLER_SINGULARITY_MEMORY_LIMIT_GB", "192")
+    assert _runtime_guard_enabled() is True
+    assert _runtime_memory_limit_kib() == 192 * 1024 * 1024
+
+
+def test_singularity_runtime_guard_wraps_action(monkeypatch, tmp_path):
+    import subprocess
+
+    from swe_agent.environments.singularity import SingularityEnvironment
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "ok")
+
+    environment = SingularityEnvironment.__new__(SingularityEnvironment)
+    environment.config = SimpleNamespace(
+        executable="apptainer",
+        global_args=[],
+        exec_args=[],
+        cwd="/testbed",
+        timeout=60,
+        forward_env=[],
+        env={},
+    )
+    environment.sandbox_dir = tmp_path
+    environment._owns_sandbox = False
+    monkeypatch.setenv("RLER_SINGULARITY_RUNTIME_GUARD", "1")
+    monkeypatch.setenv("RLER_SINGULARITY_MEMORY_LIMIT_GB", "192")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert environment.execute({"command": "echo ok"})["output"] == "ok"
+    assert captured["cmd"][:4] == [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=5s",
+        "60s",
+    ]
+    assert captured["cmd"][-1].startswith("ulimit -v 201326592\n")
+    assert captured["timeout"] == 70
+
+
 def test_partially_initialized_singularity_environment_can_cleanup():
     from swe_agent.environments.singularity import SingularityEnvironment
 
@@ -223,6 +279,85 @@ def test_route_completion_message_requires_reasoning_for_structured_sglang(monke
     assert message["token_ids"] == [5, 6]
 
 
+def test_route_completion_message_uses_litellm_for_hosted_nvidia(monkeypatch):
+    captured = {}
+
+    async def fail_generate(**kwargs):
+        raise AssertionError("hosted NVIDIA must not use SGLang /generate")
+
+    async def fake_litellm(**kwargs):
+        captured.update(kwargs)
+        return ChatCompletion(
+            content='{"score": 0.75}',
+            model_name=kwargs["model_name"],
+            usage={"prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16},
+        )
+
+    monkeypatch.setattr(run_utils, "run_generate_with_route_async", fail_generate)
+    monkeypatch.setattr(run_utils, "run_litellm_completion_async", fake_litellm)
+
+    message = asyncio.run(
+        run_utils.route_completion_message(
+            route_name="rubric_judge",
+            model_name="nvidia/zai-org/glm-5.2",
+            messages=[{"role": "user", "content": "judge"}],
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=128,
+            model_kwargs={
+                "api_base": "https://inference-api.nvidia.com/v1",
+                "api_key": "secret",
+                "custom_llm_provider": "openai",
+            },
+        )
+    )
+
+    assert captured["api_base"] == "https://inference-api.nvidia.com/v1"
+    assert captured["api_key"] == "secret"
+    assert captured["custom_llm_provider"] == "openai"
+    assert captured["usage_model_role"] == "rubric_judge"
+    assert captured["messages"] == [{"role": "user", "content": "judge"}]
+    assert message["content"] == '{"score": 0.75}'
+
+
+def test_route_completion_message_strips_unsupported_azure_chat_template_kwargs(
+    monkeypatch,
+):
+    captured = {}
+
+    async def fake_litellm(**kwargs):
+        captured.update(kwargs)
+        return ChatCompletion(
+            content='{"score": 0.75}',
+            model_name=kwargs["model_name"],
+        )
+
+    monkeypatch.setattr(run_utils, "run_litellm_completion_async", fake_litellm)
+
+    asyncio.run(
+        run_utils.route_completion_message(
+            route_name="rubric_judge",
+            model_name="openai/azure/zai-org/glm-5.2",
+            messages=[{"role": "user", "content": "judge"}],
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=20480,
+            model_kwargs={
+                "api_base": "https://inference-api.nvidia.com/v1",
+                "api_key": "secret",
+                "completion_backend": "litellm",
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": True},
+                    "provider_supported_field": "keep-me",
+                },
+            },
+        )
+    )
+
+    assert captured["model_name"] == "openai/azure/zai-org/glm-5.2"
+    assert captured["extra_body"] == {"provider_supported_field": "keep-me"}
+
+
 def test_text_action_parser_turns_non_string_content_into_format_error():
     try:
         parse_regex_actions(
@@ -265,13 +400,28 @@ def test_litellm_textbased_gemini_uses_timeout_non_streaming_client():
     assert kwargs["client"].__class__.__name__ == "HTTPHandler"
 
 
-def test_route_litellm_completion_uses_mswea_timeout(monkeypatch):
+def test_route_litellm_completion_preserves_outer_mswea_timeout(
+    monkeypatch,
+):
     captured = {}
 
     def slow_completion(**kwargs):
         captured["timeout"] = kwargs.get("timeout")
         time.sleep(0.2)
-        return SimpleNamespace(choices=[])
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="late success"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(
+                model_dump=lambda: {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                }
+            ),
+        )
 
     monkeypatch.delenv("LITELLM_DEFAULT_TIMEOUT", raising=False)
     monkeypatch.setenv("MSWEA_LITELLM_TIMEOUT", "0.05")
@@ -286,9 +436,12 @@ def test_route_litellm_completion_uses_mswea_timeout(monkeypatch):
     )
 
     assert captured["timeout"] == 0.05
+    # Preserve the pre-training helper's fail-fast outer watchdog. A timeout is
+    # not retried here, and its unknown provider cost is intentionally omitted
+    # from approximate training usage.
     assert completion.content == ""
-    assert completion.metadata["timeout"] == 0.05
     assert "TimeoutError" in completion.metadata["error"]
+    assert completion.metadata["timeout"] == 0.05
 
 
 def test_progress_reward_returns_zero_for_tie_only_labels():

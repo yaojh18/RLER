@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 from collections import defaultdict
@@ -10,6 +11,10 @@ from pathlib import Path
 import torch
 from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
 from slime.backends.megatron_utils.loss import policy_loss_function
+from slime.rollout.data_source import (
+    ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
+    ROLLOUT_COLLECTOR_STATE_METADATA_KEY,
+)
 
 
 def _apply_deferred_experience_update_rewards(samples) -> None:
@@ -219,6 +224,154 @@ def compute_rubric_loss(args, batch, logits, sum_of_sample_mean):
     return loss, metrics
 
 
+def _requires_exact_collector_resume(args) -> bool:
+    return any(
+        (
+            args.train_instance_budget is not None,
+            args.eval_instance_interval is not None,
+            bool(args.require_train_instance_budget_exhaustion),
+            args.stop_after_validation_attempt is not None,
+        )
+    )
+
+
+def _dataset_state_has_exact_collector_position(
+    path: Path,
+    checkpoint_id: int,
+) -> bool:
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if not isinstance(state, dict):
+        return False
+    if int(state.get("checkpoint_schema_version", -1)) < (
+        ROLLOUT_CHECKPOINT_SCHEMA_VERSION
+    ):
+        return False
+    if int(state.get("checkpoint_rollout_id", -1)) != int(
+        checkpoint_id
+    ):
+        return False
+    metadata = state.get("metadata")
+    return (
+        isinstance(metadata, dict)
+        and isinstance(
+            metadata.get(ROLLOUT_COLLECTOR_STATE_METADATA_KEY),
+            dict,
+        )
+    )
+
+
+def _complete_checkpoint_ids(
+    checkpoint_root: Path,
+    *,
+    require_collector_state: bool = False,
+) -> list[int]:
+    """Return model checkpoints that have a paired rollout cursor.
+
+    Megatron writes its model checkpoint before the rollout data source writes
+    the source-instance cursor.  A Slurm timeout can therefore leave the
+    tracker pointing at a model-only checkpoint.  Such a checkpoint is not a
+    valid recovery point for online RL and must never be selected silently.
+    """
+
+    complete: list[int] = []
+    rollout_root = checkpoint_root / "rollout"
+    for checkpoint_dir in checkpoint_root.glob("iter_*"):
+        match = re.fullmatch(r"iter_(\d+)", checkpoint_dir.name)
+        if match is None or not checkpoint_dir.is_dir():
+            continue
+        checkpoint_id = int(match.group(1))
+        dataset_state = (
+            rollout_root
+            / f"global_dataset_state_dict_{checkpoint_id}.pt"
+        )
+        if not dataset_state.is_file():
+            continue
+        if require_collector_state and not (
+            _dataset_state_has_exact_collector_position(
+                dataset_state,
+                checkpoint_id,
+            )
+        ):
+            continue
+        complete.append(checkpoint_id)
+    return sorted(set(complete))
+
+
+def _configure_auto_resume(args, parser: argparse.ArgumentParser) -> int | None:
+    """Resume from the newest complete checkpoint under ``--save-dir``.
+
+    Returns the selected rollout id, or ``None`` for a fresh run.  When the
+    Megatron tracker is ahead of the newest paired data cursor, it is moved
+    back atomically to that last complete recovery point.  The newer
+    model-only directory is retained for diagnosis.
+    """
+
+    if not args.auto_resume:
+        return None
+    tracker = args.save_dir / "latest_checkpointed_iteration.txt"
+    if not tracker.exists():
+        return None
+    if not tracker.is_file():
+        parser.error(
+            f"--auto-resume checkpoint tracker is not a file: {tracker}"
+        )
+    tracker_text = ""
+    try:
+        tracker_text = tracker.read_text(encoding="utf-8").strip()
+        tracked_checkpoint_id = int(tracker_text)
+    except (OSError, ValueError):
+        # A fresh converted checkpoint may use the literal "release".
+        # SAVE_DIR should normally be empty, so only accept that marker when
+        # no online-training checkpoint/cursor exists beside it.
+        if (
+            tracker_text == "release"
+            and not _complete_checkpoint_ids(args.save_dir)
+        ):
+            return None
+        parser.error(
+            "--auto-resume found a non-numeric online checkpoint tracker: "
+            f"{tracker}"
+        )
+    complete_ids = [
+        checkpoint_id
+        for checkpoint_id in _complete_checkpoint_ids(
+            args.save_dir,
+            require_collector_state=(
+                _requires_exact_collector_resume(args)
+            ),
+        )
+        if checkpoint_id <= tracked_checkpoint_id
+    ]
+    if not complete_ids:
+        parser.error(
+            "--auto-resume found a numeric Megatron tracker but no model/data "
+            f"checkpoint pair at or before {tracked_checkpoint_id}: "
+            f"{args.save_dir}"
+        )
+    resume_rollout_id = complete_ids[-1]
+    if resume_rollout_id != tracked_checkpoint_id:
+        temporary = tracker.with_name(
+            f".{tracker.name}.{os.getpid()}.resume.tmp"
+        )
+        try:
+            temporary.write_text(
+                f"{resume_rollout_id}\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, tracker)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    args.load_dir = args.save_dir
+    args.resume = True
+    return resume_rollout_id
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run online slime GRPO for SWE-agent policy or rubric data.")
     parser.add_argument("--target", choices=["policy", "rubric"], required=True)
@@ -226,14 +379,96 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hf-checkpoint", type=Path, required=True)
     parser.add_argument("--load-dir", type=Path, required=True)
     parser.add_argument("--save-dir", type=Path, required=True)
+    resume_mode = parser.add_mutually_exclusive_group()
+    resume_mode.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume an interrupted online-training run from --load-dir. "
+            "Optimizer/RNG state and start_rollout_id are restored from the "
+            "Megatron checkpoint, and the matching global-dataset cursor must "
+            "exist under --load-dir/rollout."
+        ),
+    )
+    resume_mode.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help=(
+            "On a Slurm restart, automatically load the newest complete "
+            "model/global-dataset checkpoint pair from --save-dir. Start "
+            "fresh when no online checkpoint exists."
+        ),
+    )
     parser.add_argument("--ref-load-dir", type=Path)
     parser.add_argument("--config-path", type=Path)
     parser.add_argument("--rler-root", type=Path, default=Path("/workspace/rler"),
                         help="Root dir of the RLER repo as seen by the runtime (used to build PYTHONPATH and cd into slime). "
                              "Override when not running in the original docker layout (e.g. inside pyxis with --container-mounts to a Lustre path).")
     parser.add_argument("--rollout-function-path", default="train_agent.collect_grpo_rollout.generate_rollout")
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        help="Run the SWE terminal validation protocol every N rollout steps.",
+    )
+    parser.add_argument(
+        "--eval-instance-interval",
+        type=int,
+        help=(
+            "Run validation after every N attempted source instances. "
+            "Invalid and dynamically filtered instances count, and this "
+            "cadence supersedes update-based --eval-interval scheduling."
+        ),
+    )
+    parser.add_argument(
+        "--stop-after-validation-attempt",
+        type=int,
+        help=(
+            "End an intermediate Slurm chunk after this exact attempt-based "
+            "validation boundary. A partial optimizer batch is refilled and "
+            "trained before the chunk checkpoints and exits."
+        ),
+    )
+    eval_source = parser.add_mutually_exclusive_group()
+    eval_source.add_argument(
+        "--eval-prompt-data",
+        nargs="+",
+        help="Evaluation dataset name/path pairs, e.g. fold0_val /path/val.jsonl.",
+    )
+    eval_source.add_argument(
+        "--eval-config",
+        type=Path,
+        help="Slime evaluation YAML/JSON config; overrides legacy name/path pairs.",
+    )
+    parser.add_argument(
+        "--n-samples-per-eval-prompt",
+        type=int,
+        default=1,
+        help="Must remain 1 for the fixed SWE validation protocol.",
+    )
+    parser.add_argument(
+        "--usage-ledger",
+        type=Path,
+        help="Append-only request-token ledger. Defaults to SAVE_DIR/usage.jsonl.",
+    )
     parser.add_argument("--num-rollout", type=int)
     parser.add_argument("--num-epoch", type=int)
+    parser.add_argument(
+        "--train-instance-budget",
+        type=int,
+        help=(
+            "Stop normally after this many attempted source instances. "
+            "This is independent of the number of optimizer updates."
+        ),
+    )
+    parser.add_argument(
+        "--require-train-instance-budget-exhaustion",
+        action="store_true",
+        help=(
+            "For a final invocation, fail before final validation/checkpoint "
+            "unless the source cursor exactly exhausts "
+            "--train-instance-budget. Intermediate chunk stops are exempt."
+        ),
+    )
     parser.add_argument("--rollout-batch-size", type=int, default=2)
     parser.add_argument("--over-sampling-batch-size", type=int,
                         help="If set, slime pulls this many prompts per rollout cycle "
@@ -268,6 +503,48 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tokens-per-gpu", type=int)
     parser.add_argument("--log-probs-chunk-size", type=int)
     parser.add_argument("--rollout-max-context-len", type=int)
+    parser.add_argument(
+        "--sglang-context-length",
+        type=int,
+        help=(
+            "Optional SGLang served-context override. Keep this aligned with "
+            "--rollout-max-context-len and the agent model context cap."
+        ),
+    )
+    parser.add_argument(
+        "--sglang-mem-fraction-static",
+        type=float,
+        help=(
+            "Optional SGLang static-memory fraction override. When omitted, "
+            "the sourced GRPO config value is preserved."
+        ),
+    )
+    parser.add_argument(
+        "--sglang-disable-custom-all-reduce",
+        action="store_true",
+        help=(
+            "Disable SGLang's custom all-reduce fast path. This is a rollout "
+            "runtime compatibility override and does not change actor training."
+        ),
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        help=(
+            "Optional checkpoint interval override. Replaces, rather than "
+            "duplicates, the value from GRPO_COMMON_ARGS."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-retain-latest",
+        type=int,
+        default=0,
+        help=(
+            "Retain only the latest N complete model/dataset checkpoint "
+            "pairs under --save-dir. Default 0 leaves legacy runs "
+            "non-destructive; formal runs opt in explicitly."
+        ),
+    )
     parser.add_argument("--model-config-name", type=str, default="qwen3.5-9B",
                         help="Basename (no .sh) of a preset under "
                              "$RLER/slime/train_agent/configs/ to source for MODEL_ARGS. "
@@ -362,6 +639,138 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.config_path is None:
         args.config_path = args.rler_root / "slime/train_agent/configs/grpo.sh"
+    eval_enabled = (
+        args.eval_interval is not None
+        or args.eval_instance_interval is not None
+    )
+    if eval_enabled:
+        if args.eval_interval is not None and args.eval_interval <= 0:
+            parser.error("--eval-interval must be positive")
+        if (
+            args.eval_instance_interval is not None
+            and args.eval_instance_interval <= 0
+        ):
+            parser.error("--eval-instance-interval must be positive")
+        if args.eval_prompt_data is None and args.eval_config is None:
+            parser.error(
+                "validation scheduling requires --eval-prompt-data or "
+                "--eval-config"
+            )
+        if args.n_samples_per_eval_prompt != 1:
+            parser.error(
+                "SWE validation requires --n-samples-per-eval-prompt 1"
+            )
+        if args.eval_prompt_data is not None and len(args.eval_prompt_data) % 2:
+            parser.error(
+                "--eval-prompt-data requires dataset name/path pairs"
+            )
+    elif args.eval_prompt_data is not None or args.eval_config is not None:
+        parser.error(
+            "--eval-prompt-data/--eval-config requires --eval-interval or "
+            "--eval-instance-interval"
+        )
+    if (
+        args.sglang_mem_fraction_static is not None
+        and not 0.0 < args.sglang_mem_fraction_static <= 1.0
+    ):
+        parser.error("--sglang-mem-fraction-static must be in (0, 1]")
+    if (
+        args.sglang_context_length is not None
+        and args.sglang_context_length <= 0
+    ):
+        parser.error("--sglang-context-length must be positive")
+    if args.save_interval is not None and args.save_interval <= 0:
+        parser.error("--save-interval must be positive")
+    if (
+        args.checkpoint_retain_latest is not None
+        and args.checkpoint_retain_latest < 0
+    ):
+        parser.error("--checkpoint-retain-latest must be non-negative")
+    if (
+        args.train_instance_budget is not None
+        and args.train_instance_budget <= 0
+    ):
+        parser.error("--train-instance-budget must be positive")
+    if (
+        args.require_train_instance_budget_exhaustion
+        and args.train_instance_budget is None
+    ):
+        parser.error(
+            "--require-train-instance-budget-exhaustion requires "
+            "--train-instance-budget"
+        )
+    if args.stop_after_validation_attempt is not None:
+        if args.stop_after_validation_attempt <= 0:
+            parser.error(
+                "--stop-after-validation-attempt must be positive"
+            )
+        if args.eval_instance_interval is None:
+            parser.error(
+                "--stop-after-validation-attempt requires "
+                "--eval-instance-interval"
+            )
+        if (
+            args.stop_after_validation_attempt
+            % args.eval_instance_interval
+        ):
+            parser.error(
+                "--stop-after-validation-attempt must be an exact "
+                "--eval-instance-interval boundary"
+            )
+        if (
+            args.train_instance_budget is not None
+            and args.stop_after_validation_attempt
+            >= args.train_instance_budget
+        ):
+            parser.error(
+                "--stop-after-validation-attempt is for an intermediate "
+                "boundary and must be below --train-instance-budget"
+            )
+    original_load_dir = args.load_dir
+    resume_rollout_id = _configure_auto_resume(args, parser)
+    if args.resume:
+        tracker = args.load_dir / "latest_checkpointed_iteration.txt"
+        if not tracker.is_file():
+            parser.error(
+                f"--resume requires a Megatron checkpoint tracker: {tracker}"
+            )
+        try:
+            resume_rollout_id = int(tracker.read_text().strip())
+        except (OSError, ValueError):
+            parser.error(
+                f"--resume requires a numeric rollout id in {tracker}"
+            )
+        if resume_rollout_id < 0:
+            parser.error(
+                f"--resume requires a non-negative rollout id in {tracker}"
+            )
+        checkpoint_dir = args.load_dir / f"iter_{resume_rollout_id:07d}"
+        if not checkpoint_dir.is_dir():
+            parser.error(
+                f"--resume checkpoint directory does not exist: {checkpoint_dir}"
+            )
+        dataset_state = (
+            args.load_dir
+            / "rollout"
+            / f"global_dataset_state_dict_{resume_rollout_id}.pt"
+        )
+        if not dataset_state.is_file():
+            parser.error(
+                "--resume requires the dataset state paired with checkpoint "
+                f"{resume_rollout_id}: {dataset_state}"
+            )
+        if (
+            _requires_exact_collector_resume(args)
+            and not _dataset_state_has_exact_collector_position(
+                dataset_state,
+                resume_rollout_id,
+            )
+        ):
+            parser.error(
+                "--resume checkpoint does not contain the exact collector "
+                "buffer/pending/counter state required to restore the "
+                f"training position: {dataset_state}"
+            )
 
     total_gpus = args.actor_num_gpus + args.rollout_num_gpus
     actor_num_nodes = args.actor_num_nodes or args.num_nodes
@@ -371,11 +780,38 @@ def main(argv: list[str] | None = None) -> int:
             f"by --actor-num-nodes ({actor_num_nodes})"
         )
     actor_gpus_per_node = args.actor_num_gpus // actor_num_nodes
-    ref_load_dir = args.ref_load_dir or args.load_dir
+    # Auto-resume changes the actor load directory to SAVE_DIR, but the
+    # frozen reference policy must remain the original base checkpoint.
+    ref_load_dir = args.ref_load_dir or original_load_dir
     wandb_dir = args.wandb_dir or (args.save_dir / "wandb")
     global_batch_size = shlex.quote(str(args.global_batch_size or args.rollout_batch_size))
     num_rollout_args = shlex.join(["--num-rollout", str(args.num_rollout)]) if args.num_rollout is not None else ""
     num_epoch_args = shlex.join(["--num-epoch", str(args.num_epoch)]) if args.num_epoch is not None else ""
+    train_instance_budget_arg = (
+        shlex.join(
+            [
+                "--train-instance-budget",
+                str(args.train_instance_budget),
+            ]
+        )
+        if args.train_instance_budget is not None
+        else ""
+    )
+    require_budget_exhaustion_arg = (
+        "--require-train-instance-budget-exhaustion"
+        if args.require_train_instance_budget_exhaustion
+        else ""
+    )
+    stop_after_validation_arg = (
+        shlex.join(
+            [
+                "--stop-after-validation-attempt",
+                str(args.stop_after_validation_attempt),
+            ]
+        )
+        if args.stop_after_validation_attempt is not None
+        else ""
+    )
     oversample_arg = (
         shlex.join(["--over-sampling-batch-size", str(args.over_sampling_batch_size)])
         if args.over_sampling_batch_size is not None else ""
@@ -399,6 +835,39 @@ def main(argv: list[str] | None = None) -> int:
         shlex.join(["--save-debug-rollout-data", args.save_debug_rollout_data])
         if args.save_debug_rollout_data else ""
     )
+    eval_arg_parts: list[str] = []
+    if eval_enabled:
+        # Slime's generic argument validation still expects eval_interval
+        # whenever evaluation is configured. In instance-scheduled mode a
+        # value of 1 is only an enable flag; train_async suppresses the
+        # update-based schedule completely.
+        framework_eval_interval = (
+            args.eval_interval
+            if args.eval_interval is not None
+            else 1
+        )
+        eval_arg_parts.extend(
+            [
+                "--eval-interval",
+                str(framework_eval_interval),
+                "--n-samples-per-eval-prompt",
+                "1",
+            ]
+        )
+        if args.eval_instance_interval is not None:
+            eval_arg_parts.extend(
+                [
+                    "--eval-instance-interval",
+                    str(args.eval_instance_interval),
+                ]
+            )
+        if args.eval_config is not None:
+            eval_arg_parts.extend(["--eval-config", str(args.eval_config)])
+        else:
+            eval_arg_parts.append("--eval-prompt-data")
+            eval_arg_parts.extend(str(value) for value in args.eval_prompt_data or [])
+    eval_args = shlex.join(eval_arg_parts) if eval_arg_parts else ""
+    usage_ledger = args.usage_ledger or (args.save_dir / "usage.jsonl")
     override_lines = []
     if args.context_parallel_size is not None:
         override_lines.append(f"GRPO_PARALLEL_ARGS+=(--context-parallel-size {args.context_parallel_size})")
@@ -423,9 +892,99 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_tokens_per_gpu is not None:
         override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
     if args.log_probs_chunk_size is not None:
-        override_lines.append(f"GRPO_COMMON_ARGS+=(--log-probs-chunk-size {args.log_probs_chunk_size})")
+        override_lines.append(
+            f"""
+GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE=()
+GRPO_COMMON_ARGS_SKIP_NEXT=0
+for arg in "${{GRPO_COMMON_ARGS[@]}}"; do
+  if [ "$GRPO_COMMON_ARGS_SKIP_NEXT" = 1 ]; then
+    GRPO_COMMON_ARGS_SKIP_NEXT=0
+    continue
+  fi
+  case "$arg" in
+    --log-probs-chunk-size)
+      GRPO_COMMON_ARGS_SKIP_NEXT=1
+      continue
+      ;;
+    --log-probs-chunk-size=*)
+      continue
+      ;;
+  esac
+  GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE+=("$arg")
+done
+GRPO_COMMON_ARGS=(
+  "${{GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE[@]}}"
+  --log-probs-chunk-size {args.log_probs_chunk_size}
+)
+unset GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE GRPO_COMMON_ARGS_SKIP_NEXT
+""".strip()
+        )
     if args.rollout_max_context_len is not None:
         override_lines.append(f"GRPO_SGLANG_ARGS+=(--rollout-max-context-len {args.rollout_max_context_len})")
+    if args.sglang_context_length is not None:
+        override_lines.append(
+            f"GRPO_SGLANG_ARGS+=(--sglang-context-length {args.sglang_context_length})"
+        )
+    if args.sglang_mem_fraction_static is not None:
+        override_lines.append(
+            f"""
+GRPO_SGLANG_ARGS_MEM_OVERRIDE=()
+GRPO_SGLANG_ARGS_SKIP_NEXT=0
+for arg in "${{GRPO_SGLANG_ARGS[@]}}"; do
+  if [ "$GRPO_SGLANG_ARGS_SKIP_NEXT" = 1 ]; then
+    GRPO_SGLANG_ARGS_SKIP_NEXT=0
+    continue
+  fi
+  case "$arg" in
+    --sglang-mem-fraction-static)
+      GRPO_SGLANG_ARGS_SKIP_NEXT=1
+      continue
+      ;;
+    --sglang-mem-fraction-static=*)
+      continue
+      ;;
+  esac
+  GRPO_SGLANG_ARGS_MEM_OVERRIDE+=("$arg")
+done
+GRPO_SGLANG_ARGS=(
+  "${{GRPO_SGLANG_ARGS_MEM_OVERRIDE[@]}}"
+  --sglang-mem-fraction-static {args.sglang_mem_fraction_static}
+)
+unset GRPO_SGLANG_ARGS_MEM_OVERRIDE GRPO_SGLANG_ARGS_SKIP_NEXT
+""".strip()
+        )
+    if args.sglang_disable_custom_all_reduce:
+        override_lines.append(
+            "GRPO_SGLANG_ARGS+=(--sglang-disable-custom-all-reduce)"
+        )
+    if args.save_interval is not None:
+        override_lines.append(
+            f"""
+GRPO_COMMON_ARGS_SAVE_OVERRIDE=()
+GRPO_COMMON_ARGS_SKIP_NEXT=0
+for arg in "${{GRPO_COMMON_ARGS[@]}}"; do
+  if [ "$GRPO_COMMON_ARGS_SKIP_NEXT" = 1 ]; then
+    GRPO_COMMON_ARGS_SKIP_NEXT=0
+    continue
+  fi
+  case "$arg" in
+    --save-interval)
+      GRPO_COMMON_ARGS_SKIP_NEXT=1
+      continue
+      ;;
+    --save-interval=*)
+      continue
+      ;;
+  esac
+  GRPO_COMMON_ARGS_SAVE_OVERRIDE+=("$arg")
+done
+GRPO_COMMON_ARGS=(
+  "${{GRPO_COMMON_ARGS_SAVE_OVERRIDE[@]}}"
+  --save-interval {args.save_interval}
+)
+unset GRPO_COMMON_ARGS_SAVE_OVERRIDE GRPO_COMMON_ARGS_SKIP_NEXT
+""".strip()
+        )
     if args.num_epoch is not None and args.num_rollout is None:
         override_lines.append(
             """
@@ -444,6 +1003,34 @@ for arg in "${GRPO_COMMON_ARGS[@]}"; do
 done
 GRPO_COMMON_ARGS=("${GRPO_COMMON_ARGS_STRIPPED[@]}")
 unset GRPO_COMMON_ARGS_STRIPPED GRPO_STRIP_NEXT
+""".strip()
+        )
+    if args.resume:
+        override_lines.append(
+            """
+GRPO_COMMON_ARGS_RESUME=()
+GRPO_COMMON_ARGS_SKIP_NEXT=0
+for arg in "${GRPO_COMMON_ARGS[@]}"; do
+  if [ "$GRPO_COMMON_ARGS_SKIP_NEXT" = 1 ]; then
+    GRPO_COMMON_ARGS_SKIP_NEXT=0
+    continue
+  fi
+  case "$arg" in
+    --no-load-optim|--no-load-optim=*|--no-load-rng|--no-load-rng=*|--finetune|--finetune=*)
+      continue
+      ;;
+    --start-rollout-id)
+      GRPO_COMMON_ARGS_SKIP_NEXT=1
+      continue
+      ;;
+    --start-rollout-id=*)
+      continue
+      ;;
+  esac
+  GRPO_COMMON_ARGS_RESUME+=("$arg")
+done
+GRPO_COMMON_ARGS=("${GRPO_COMMON_ARGS_RESUME[@]}")
+unset GRPO_COMMON_ARGS_RESUME GRPO_COMMON_ARGS_SKIP_NEXT
 """.strip()
         )
     config_overrides = "\n".join(override_lines)
@@ -488,6 +1075,26 @@ unset GRPO_COMMON_ARGS_STRIPPED GRPO_STRIP_NEXT
         ray_stop_line = "pkill -9 sglang >/dev/null 2>&1 || true\nray stop --force >/dev/null 2>&1 || true"
         ray_trap_line = "trap 'ray stop --force >/dev/null 2>&1 || true' EXIT"
 
+    if args.resume:
+        checkpoint_seed_fixup = (
+            "# Explicit resume: preserve the checkpoint's recorded rollout id "
+            "and load optimizer/RNG state.\n"
+            f"echo 'Resuming optimizer, RNG, and dataset state after rollout "
+            f"{resume_rollout_id}.'"
+        )
+    else:
+        checkpoint_seed_fixup = f"""
+for CHECKPOINT_DIR in {shlex.quote(str(args.load_dir))} {shlex.quote(str(ref_load_dir))}; do
+  TRACKER="${{CHECKPOINT_DIR}}/latest_checkpointed_iteration.txt"
+  if [ -f "${{TRACKER}}" ] && [ "$(tr -d '[:space:]' < "${{TRACKER}}")" = "0" ] && [ -d "${{CHECKPOINT_DIR}}/iter_0000000" ]; then
+    if [ ! -e "${{CHECKPOINT_DIR}}/iter_0000001" ]; then
+      cp -al "${{CHECKPOINT_DIR}}/iter_0000000" "${{CHECKPOINT_DIR}}/iter_0000001" 2>/dev/null || cp -a "${{CHECKPOINT_DIR}}/iter_0000000" "${{CHECKPOINT_DIR}}/iter_0000001"
+    fi
+    printf '1\\n' > "${{TRACKER}}"
+  fi
+done
+""".strip()
+
     rler_root = str(args.rler_root)
     # Preserve any PYTHONPATH set by the launcher (e.g. for jsonlines / docker
     # / other agent runtime deps installed into a Lustre-side site dir).
@@ -512,6 +1119,9 @@ export SWE_AGENT_GRPO_MAX_ROUNDS={"" if args.search_max_rounds is None else args
 export SWE_AGENT_GRPO_STEP_LIMIT={"" if args.search_step_limit is None else args.search_step_limit}
 export SWE_AGENT_GRPO_INSTANCE_WORKERS={args.rollout_instance_workers}
 export SWE_AGENT_PYTHON="${{SWE_AGENT_PYTHON:-{rler_root}/agent/.venv/bin/python}}"
+export RLER_USAGE_LEDGER_PATH={shlex.quote(str(usage_ledger))}
+export RLER_USAGE_RESUME={"1" if args.resume else "0"}
+export RLER_CHECKPOINT_RETAIN_LATEST={args.checkpoint_retain_latest}
 {ray_trap_line}
 {ray_stop_line}
 cd {rler_root}/slime
@@ -524,15 +1134,7 @@ else
   GRPO_TARGET_ARGS=("${{GRPO_POLICY_ARGS[@]}}")
 fi
 GLOBAL_BATCH_SIZE={global_batch_size}
-for CHECKPOINT_DIR in {shlex.quote(str(args.load_dir))} {shlex.quote(str(ref_load_dir))}; do
-  TRACKER="${{CHECKPOINT_DIR}}/latest_checkpointed_iteration.txt"
-  if [ -f "${{TRACKER}}" ] && [ "$(tr -d '[:space:]' < "${{TRACKER}}")" = "0" ] && [ -d "${{CHECKPOINT_DIR}}/iter_0000000" ]; then
-    if [ ! -e "${{CHECKPOINT_DIR}}/iter_0000001" ]; then
-      cp -al "${{CHECKPOINT_DIR}}/iter_0000000" "${{CHECKPOINT_DIR}}/iter_0000001" 2>/dev/null || cp -a "${{CHECKPOINT_DIR}}/iter_0000000" "${{CHECKPOINT_DIR}}/iter_0000001"
-    fi
-    printf '1\\n' > "${{TRACKER}}"
-  fi
-done
+{checkpoint_seed_fixup}
 RAY_TMPDIR="/tmp/ray-swe-{args.target}-grpo-$$"
 mkdir -p "${{RAY_TMPDIR}}"
 {ray_start_line}
@@ -553,8 +1155,12 @@ python3 train_async.py \\
   --sglang-served-model-name {shlex.quote(args.student_model)} \\
   "${{GRPO_COMMON_ARGS[@]}}" \\
   --rollout-function-path {shlex.quote(args.rollout_function_path)} \\
+  {eval_args} \\
   {num_rollout_args} \\
   {num_epoch_args} \\
+  {train_instance_budget_arg} \\
+  {require_budget_exhaustion_arg} \\
+  {stop_after_validation_arg} \\
   "${{GRPO_TARGET_ARGS[@]}}" \\
   "${{GRPO_PARALLEL_ARGS[@]}}" \\
   "${{GRPO_RECOMPUTE_ARGS[@]}}" \\

@@ -81,6 +81,11 @@ def build_rollout_samples(
     truncated = 0
     for group_index, group in enumerate(groups):
         for export_sample in group.samples:
+            if export_sample.group_id != group.group_id:
+                raise ValueError(
+                    f"Sample {export_sample.sample_id} declares group "
+                    f"{export_sample.group_id!r}, expected {group.group_id!r}."
+                )
             if (
                 export_sample.token_ids is None
                 or export_sample.loss_mask is None
@@ -106,22 +111,38 @@ def build_rollout_samples(
                     f"({len(rollout_logprobs)}) != response_length ({response_length})"
                 )
             messages = build_training_messages(export_sample.prompt, export_sample.turns)
-            was_truncated = max_sample_tokens is not None and len(token_ids) > max_sample_tokens
+            was_truncated = (
+                max_sample_tokens is not None
+                and len(token_ids) > max_sample_tokens
+            )
             if was_truncated:
                 if max_sample_tokens <= 0:
-                    raise ValueError(f"max_sample_tokens must be positive, got {max_sample_tokens}")
+                    raise ValueError(
+                        "max_sample_tokens must be positive, got "
+                        f"{max_sample_tokens}"
+                    )
                 response_start = len(token_ids) - response_length
-                retained_response_length = max(0, max_sample_tokens - response_start)
+                retained_response_length = max(
+                    0,
+                    max_sample_tokens - response_start,
+                )
                 token_ids = token_ids[:max_sample_tokens]
                 full_loss_mask = full_loss_mask[:max_sample_tokens]
-                rollout_logprobs = rollout_logprobs[:retained_response_length]
+                rollout_logprobs = rollout_logprobs[
+                    :retained_response_length
+                ]
                 response_length = retained_response_length
                 if response_length <= 0:
-                    raise ValueError(f"Sample {export_sample.sample_id} has no response tokens after truncation.")
+                    raise ValueError(
+                        f"Sample {export_sample.sample_id} has no response "
+                        "tokens after truncation."
+                    )
                 truncated += 1
                 export_sample.metadata = {
                     **(export_sample.metadata or {}),
-                    "right_truncated_tokens": len(export_sample.token_ids) - max_sample_tokens,
+                    "right_truncated_tokens": (
+                        len(export_sample.token_ids) - max_sample_tokens
+                    ),
                 }
             sample = Sample(
                 group_index=group_index_offset + group_index,
@@ -130,7 +151,11 @@ def build_rollout_samples(
                 response_length=response_length,
                 reward=float(export_sample.reward),
                 loss_mask=full_loss_mask[-response_length:],
-                status=Sample.Status.TRUNCATED if was_truncated else Sample.Status.COMPLETED,
+                status=(
+                    Sample.Status.TRUNCATED
+                    if was_truncated
+                    else Sample.Status.COMPLETED
+                ),
             )
             # Propagate ExportSample.metadata onto Sample.metadata so
             # downstream metric aggregation in the rollout-fn metrics dict
@@ -138,8 +163,15 @@ def build_rollout_samples(
             # fields that lane_to_grpo_bundle._build_branch_sample stashes
             # there: n_continuation_steps, n_parent_steps, n_full_trace_steps,
             # raw_gt_score, raw_rubric_score, and terminated_early.
-            if export_sample.metadata:
-                sample.metadata = dict(export_sample.metadata)
+            sample.metadata = {
+                **(export_sample.metadata or {}),
+                # These IDs are the durable join keys between the accepted
+                # Slime rollout dump and the search artifacts that produced
+                # it.  Always overwrite same-named free-form metadata with
+                # the typed ExportSample/ExportGroup fields.
+                "export_sample_id": str(export_sample.sample_id),
+                "export_group_id": str(group.group_id),
+            }
             # Propagate sglang-stored rollout-time logprobs onto the
             # slime Sample so TIS (off-policy IS correction) can compute
             # exp(actor_logprob - rollout_logprob). naive bundle emits a

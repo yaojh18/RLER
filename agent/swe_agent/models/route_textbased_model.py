@@ -17,13 +17,14 @@ from typing import Any
 from agent_rl.model_service import run_async
 from agent_rl.run_utils import run_generate_with_route_async
 
-from swe_agent.exceptions import FormatError, LimitsExceeded
+from swe_agent.exceptions import FormatError, LimitsExceeded, PolicyVersionMismatch
 from swe_agent.models import GLOBAL_MODEL_STATS
 from swe_agent.models.litellm_model import LitellmModel, _build_assistant_message, logger
 from swe_agent.models.litellm_textbased_model import LitellmTextbasedModel, LitellmTextbasedModelConfig
 from swe_agent.models.utils.actions_text import parse_regex_actions
 from swe_agent.models.utils.retry import retry
 from swe_agent.tokenization import get_stop_token_ids, tokenize_messages_with_template
+from swe_agent.usage import current_usage_context, new_logical_call_id, record_model_usage
 
 
 class RouteTextbasedModelConfig(LitellmTextbasedModelConfig):
@@ -166,8 +167,23 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         if stop:
             sampling_params["stop"] = stop
 
-        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions, model_name=self.config.model_name):
+        accounting_context = current_usage_context()
+        logical_call_id = accounting_context.logical_call_id or new_logical_call_id()
+        from swe_agent.policy_version import assert_policy_version
+
+        for attempt in retry(
+            logger=logger,
+            abort_exceptions=[
+                *self.abort_exceptions,
+                PolicyVersionMismatch,
+            ],
+            model_name=self.config.model_name,
+        ):
             with attempt:
+                assert_policy_version(
+                    self.policy_version,
+                    stage="request_start",
+                )
                 try:
                     completion = run_async(
                         run_generate_with_route_async(
@@ -202,6 +218,10 @@ class RouteTextbasedModel(LitellmTextbasedModel):
                             llm_provider="sglang",
                         ) from exc
                     raise
+                assert_policy_version(
+                    self.policy_version,
+                    stage="request_complete",
+                )
         content = completion.content or ""
         assistant_message = _build_assistant_message(
             content=content,
@@ -215,6 +235,54 @@ class RouteTextbasedModel(LitellmTextbasedModel):
             finish_reason=completion.finish_reason,
         )
         GLOBAL_MODEL_STATS.add(completion.cost)
+
+        def record_accepted_completion_usage() -> None:
+            """Count only requests that become part of the usable trajectory.
+
+            Transport retries and responses rejected by the action parser are
+            deliberately omitted: they are recovery overhead, not required
+            training inference.
+            """
+
+            event = record_model_usage(
+                usage=completion.usage,
+                known_input_tokens=len(completion.input_token_ids or input_ids),
+                known_output_tokens=len(completion.output_token_ids or []),
+                status="success",
+                model_family=accounting_context.model_family or "qwen",
+                model_role=accounting_context.model_role or self.config.route_name,
+                logical_call_id=logical_call_id,
+            )
+            if event is not None:
+                completion.metadata["usage_event_ids"] = [event["event_id"]]
+
+        # A completion that consumed the entire per-call output budget is not a
+        # valid executable action.  In particular, a fenced shell command may
+        # be syntactically complete while its reasoning or trailing content was
+        # cut off.  Preserve the exact assistant tokens for training/accounting,
+        # but stop the policy immediately and let the runner collect the current
+        # git diff as the terminal fallback patch.
+        if str(completion.finish_reason or "").strip().lower() in {
+            "length",
+            "max_tokens",
+            "max_new_tokens",
+        }:
+            record_accepted_completion_usage()
+            exc = LimitsExceeded(
+                {
+                    "role": "exit",
+                    "content": (
+                        "CompletionLengthExceeded "
+                        f"(max_new_tokens={int(max_tokens)})"
+                    ),
+                    "extra": {
+                        "exit_status": "CompletionLengthExceeded",
+                        "submission": "",
+                    },
+                }
+            )
+            setattr(exc, "assistant_message", assistant_message)
+            raise exc
         try:
             assistant_message["extra"]["actions"] = parse_regex_actions(
                 content,
@@ -225,6 +293,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
             assistant_message["extra"]["format_error"] = True
             setattr(exc, "assistant_message", assistant_message)
             raise
+        record_accepted_completion_usage()
         return assistant_message
 
     def get_state(self) -> dict[str, Any]:

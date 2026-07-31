@@ -588,6 +588,49 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If both `--num-epoch` and `--num-rollout` are set, `--num-epoch` will be ignored."
                 ),
             )
+            parser.add_argument(
+                "--train-instance-budget",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of source prompt groups that training may "
+                    "consume. Dynamic-filtered and invalid groups count toward "
+                    "this budget, so dataset-defined epochs do not silently "
+                    "expand while the collector refills an optimizer batch."
+                ),
+            )
+            parser.add_argument(
+                "--require-train-instance-budget-exhaustion",
+                action="store_true",
+                help=(
+                    "Fail a final training invocation before final validation "
+                    "or checkpointing unless the source cursor exactly equals "
+                    "--train-instance-budget. Intermediate validation-boundary "
+                    "chunk stops are exempt."
+                ),
+            )
+            parser.add_argument(
+                "--eval-instance-interval",
+                type=int,
+                default=None,
+                help=(
+                    "Schedule asynchronous validation after every N consumed "
+                    "training prompt groups. Invalid and dynamically filtered "
+                    "groups count toward this cadence."
+                ),
+            )
+            parser.add_argument(
+                "--stop-after-validation-attempt",
+                type=int,
+                default=None,
+                help=(
+                    "End an intermediate training chunk after this exact "
+                    "attempt-scheduled validation boundary. If the collector "
+                    "preserved part of an optimizer batch at the boundary, "
+                    "the chunk first refills, trains, and checkpoints that "
+                    "one normal batch. Final-cursor validation is suppressed."
+                ),
+            )
 
             parser.add_argument(
                 "--disable-rollout-global-dataset",
@@ -1973,6 +2016,46 @@ def slime_validate_args(args):
         assert args.num_rollout is not None, (
             "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
         )
+    if args.train_instance_budget is not None:
+        assert args.rollout_global_dataset, (
+            "train_instance_budget requires the global rollout dataset"
+        )
+        assert args.train_instance_budget > 0, (
+            "train_instance_budget must be positive"
+        )
+    if args.require_train_instance_budget_exhaustion:
+        assert args.train_instance_budget is not None, (
+            "require_train_instance_budget_exhaustion requires "
+            "train_instance_budget"
+        )
+    if args.eval_instance_interval is not None:
+        assert args.rollout_global_dataset, (
+            "eval_instance_interval requires the global rollout dataset"
+        )
+        assert args.eval_instance_interval > 0, (
+            "eval_instance_interval must be positive"
+        )
+        assert args.eval_interval is not None, (
+            "eval_instance_interval requires eval_interval and an evaluation "
+            "dataset"
+        )
+    if args.stop_after_validation_attempt is not None:
+        stop_attempt = int(args.stop_after_validation_attempt)
+        assert stop_attempt > 0, (
+            "stop_after_validation_attempt must be positive"
+        )
+        assert args.eval_instance_interval is not None, (
+            "stop_after_validation_attempt requires eval_instance_interval"
+        )
+        assert stop_attempt % int(args.eval_instance_interval) == 0, (
+            "stop_after_validation_attempt must be an exact "
+            "eval_instance_interval boundary"
+        )
+        if args.train_instance_budget is not None:
+            assert stop_attempt < int(args.train_instance_budget), (
+                "stop_after_validation_attempt is for an intermediate "
+                "boundary and must be below train_instance_budget"
+            )
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"

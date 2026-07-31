@@ -226,13 +226,10 @@ eval_output/
 agent/evaluation/sqa_eval/test.jsonl
 agent/evaluation/sqa_eval/test_asta_format.jsonl
 agent/evaluation/deep_research_bench_eval/data/
-agent/outputs
+agent/outputs*
 agent/logs
-agent/search_outputs
-agent/aggregate_outputs
+agent/search_outputs*
+agent/aggregate_outputs*
 .vscode/*
 !.vscode/settings.json
 .agents
-
-outputs/
-search_outputs/
