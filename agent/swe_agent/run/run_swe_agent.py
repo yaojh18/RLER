@@ -550,7 +550,11 @@ def make_evaluation_payload(
     if status == "empty":
         reward = EMPTY_REWARD
     elif status == "error":
-        reward = ERROR_REWARD
+        # A model-produced patch can make the benchmark command fail or time
+        # out.  That is an unresolved policy outcome, not missing training
+        # data.  Only failures explicitly classified as evaluator
+        # infrastructure errors are discarded by callers.
+        reward = ERROR_REWARD if infrastructure_error else 0.0
     elif reward_config.kind == "hard":
         reward = 1.0 if all_pass else 0.0
     elif reward_config.kind == "soft":

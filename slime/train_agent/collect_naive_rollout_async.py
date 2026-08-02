@@ -69,6 +69,7 @@ from train_agent.collector_checkpoint import (
 )
 from train_agent.serving.sglang_chat_service import start_slime_policy_route_warmup
 from swe_agent.exceptions import PolicyVersionMismatch
+from swe_agent.parallel_utils import normalize_terminal_patch_text
 from swe_agent.policy_version import (
     checkpoint_policy_stale_lag,
     committed_policy_version,
@@ -217,9 +218,9 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         environment_overrides = {
             "image": image_name if environment_class == "docker" else get_swebench_singularity_image_name(instance),
             "environment_class": environment_class,
+            "cwd": instance.get("swebench_workdir") or "/testbed",
         }
         if instance.get("expected_output_json"):
-            environment_overrides["cwd"] = "/testbed"
             environment_overrides["dataset_name"] = "r2egym"
         overrides = {
             "agent": {"step_limit": task["step_limit"]},
@@ -507,8 +508,9 @@ def _naive_validation_gt_task(task: dict[str, Any]) -> dict[str, Any]:
                 f"{task['subset']}/{task['split']}"
             )
         instance = instances[0]
-        raw_patch = str(descriptor.get("terminal_patch") or "").rstrip()
-        patch = raw_patch + "\n" if raw_patch else ""
+        patch = normalize_terminal_patch_text(
+            descriptor.get("terminal_patch")
+        )
         reward_config = EvaluationRewardConfig(
             kind="hard",
             all_pass_reward=1.0,
@@ -1320,12 +1322,6 @@ def _naive_values_from_env() -> dict[str, Any]:
         v = os.environ.get(name, "")
         return float(v) if v else default
 
-    def _bool(name, default):
-        v = os.environ.get(name, "")
-        if not v:
-            return default
-        return v.strip().lower() in ("1", "true", "yes", "on")
-
     return {
         "m": _int("SWE_AGENT_NAIVE_M", 8),
         "step_limit": _int("SWE_AGENT_NAIVE_STEP_LIMIT", 120),
@@ -1345,12 +1341,6 @@ def _naive_values_from_env() -> dict[str, Any]:
         "joint_alpha": _float("SWE_AGENT_NAIVE_JOINT_ALPHA", 1.0),
         "all_pass_reward": _float("SWE_AGENT_NAIVE_ALL_PASS_REWARD", 1.0),
     }
-
-
-def _hash_to_index(s: str, n: int) -> int:
-    import hashlib
-    h = hashlib.sha256(s.encode("utf-8")).hexdigest()
-    return int(h, 16) % n
 
 
 def _pick_least_loaded_endpoints(
@@ -1386,13 +1376,12 @@ def _release_endpoints(endpoints_picked: list[tuple[str, int]]) -> None:
         _ENDPOINT_INFLIGHT[ep] = max(0, cur - 1)
 
 
-def _dispatch_policy_version(rollout_id: int) -> str | None:
+def _dispatch_policy_version() -> str | None:
     """Return the committed weight epoch, pausing dispatch during an update."""
     try:
-        version = committed_policy_version()
+        return committed_policy_version()
     except PolicyVersionMismatch:
         return None
-    return version or f"legacy-rollout-{int(rollout_id)}"
 
 
 def _policy_endpoints_for_model(args, model_name: str) -> list[tuple[str, int]]:
@@ -1430,7 +1419,7 @@ def _replay_checkpoint_pending_tasks(
         raise RuntimeError(
             "cannot replay naive pending tasks before node workers exist"
         )
-    policy_version = _dispatch_policy_version(rollout_id)
+    policy_version = _dispatch_policy_version()
     if policy_version is None:
         raise RuntimeError(
             "cannot replay naive pending tasks during a policy transition"
@@ -1646,7 +1635,7 @@ def _validation_sample(
         or "PolicyVersionMismatch" in str(rollout_error or "")
     )
     completed = (
-        status in {"resolved", "unresolved", "empty"}
+        status in {"resolved", "unresolved", "empty", "error"}
         and not infrastructure_error
         and not rollout_error
     )
@@ -1768,10 +1757,7 @@ def _persisted_validation_entry(
             evaluation.get("infrastructure_error")
             or metainfo.get("infrastructure_error")
         )
-        if (
-            status not in {"resolved", "unresolved", "empty"}
-            or infrastructure_error
-        ):
+        if status not in {"resolved", "unresolved", "empty", "error"} or infrastructure_error:
             continue
 
         resolved = status == "resolved"
@@ -1840,9 +1826,10 @@ def generate_validation_rollout(
         getattr(args, "eval_policy_version", "") or ""
     ).strip()
     if not policy_version:
-        policy_version = (
-            _dispatch_policy_version(rollout_id)
-            or f"legacy-rollout-{int(rollout_id)}"
+        policy_version = str(_dispatch_policy_version() or "")
+    if not policy_version:
+        raise RuntimeError(
+            "validation requires an explicitly coordinated policy version"
         )
     eval_key = (
         int(rollout_id),
@@ -2313,7 +2300,7 @@ def _submit_until_full(
     while len(_PENDING) < max_pending:
         if _SOURCE_BUDGET_EXHAUSTED or _SOURCE_VALIDATION_ERROR is not None:
             break
-        policy_version = _dispatch_policy_version(rollout_id)
+        policy_version = _dispatch_policy_version()
         if policy_version is None:
             break
         try:

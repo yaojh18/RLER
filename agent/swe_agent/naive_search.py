@@ -43,7 +43,9 @@ from swe_agent.exceptions import PolicyVersionMismatch
 from swe_agent.parallel_utils import (
     TurnTokenInfo,
     _ensure_litellm_prefix,
+    exact_rollout_token_error,
     extract_terminal_patch_from_session,
+    normalize_terminal_patch_text,
 )
 from swe_agent.run.run_swe_agent import (
     EvaluationRewardConfig,
@@ -355,6 +357,7 @@ class NaiveSearchRunner:
                 snapshot_after.get("metadata", {}).get("events", [])[base_event_count:]
             )
             rollout.messages = all_messages
+            rollout.error = exact_rollout_token_error(all_messages)
             rollout.step_cards = _build_step_cards(segment_events, 0)
             rollout.n_action_steps = sum(
                 1 for c in rollout.step_cards if c.get("commands")
@@ -365,6 +368,13 @@ class NaiveSearchRunner:
                 "completion": sum(t.completion_tokens for t in rollout.turns),
             }
             rollout.status = result.get("status", "")
+            if result.get("exit_status") in {
+                "CompletionLengthExceeded",
+                "ContextWindowExceeded",
+            }:
+                rollout.status = "policy_overlength"
+            if rollout.error is not None:
+                rollout.status = "error"
             rollout.terminated_early = result.get("exit_status") == "Submitted"
             rollout.terminal_patch, rollout.terminal_patch_from_fallback = (
                 extract_terminal_patch_from_session(result, session)
@@ -408,8 +418,7 @@ class NaiveSearchRunner:
     def _evaluate_gt(self, rollout: NaiveRollout) -> None:
         """Evaluate one terminal patch with the shared reward definition."""
         t_gt = time.perf_counter()
-        raw = (rollout.terminal_patch or "").rstrip()
-        patch = (raw + "\n") if raw else ""
+        patch = normalize_terminal_patch_text(rollout.terminal_patch)
         reward_config = EvaluationRewardConfig(
             kind=self.config.reward_kind,
             joint_alpha=self.config.joint_alpha,

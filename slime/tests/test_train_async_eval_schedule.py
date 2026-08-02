@@ -15,6 +15,9 @@ TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY = (
     "__slime_train_instance_budget_exhausted__"
 )
 TRAIN_VALIDATION_BOUNDARY_KEY = "__slime_train_validation_boundary__"
+ROLLOUT_COLLECTOR_STATE_METADATA_KEY = (
+    "__rler_rollout_collector_state_v1__"
+)
 
 
 def _module(name: str, **attrs):
@@ -408,6 +411,9 @@ def test_rollout_manager_resume_uses_persisted_validation_rollout_id():
         {"load", "_schedule_train_validation"},
         policy_version_state_path=lambda: object(),
         logger=SimpleNamespace(info=lambda *_args: None),
+        ROLLOUT_COLLECTOR_STATE_METADATA_KEY=(
+            ROLLOUT_COLLECTOR_STATE_METADATA_KEY
+        ),
     )
 
     class Manager:
@@ -424,6 +430,8 @@ def test_rollout_manager_resume_uses_persisted_validation_rollout_id():
             self._train_validation_refs = {}
             self._train_validation_rollout_ids = {}
             self._train_validation_policy_versions = {}
+            self._collector_checkpoint_hook = lambda _name: None
+            self._requires_collector_checkpoint_state = lambda: False
 
         def get_train_instance_progress(self):
             return self.data_source.training_progress()
@@ -442,7 +450,7 @@ def test_rollout_manager_checkpoint_embeds_and_restores_collector_state():
     methods = _load_rollout_manager_methods(
         {"save", "load"},
         ROLLOUT_COLLECTOR_STATE_METADATA_KEY=(
-            "__rler_rollout_collector_state_v1__"
+            ROLLOUT_COLLECTOR_STATE_METADATA_KEY
         ),
     )
 
@@ -493,7 +501,12 @@ def test_rollout_manager_checkpoint_embeds_and_restores_collector_state():
 
 
 def test_rollout_manager_allows_fresh_negative_cursor_but_rejects_old_online_state():
-    methods = _load_rollout_manager_methods({"load"})
+    methods = _load_rollout_manager_methods(
+        {"load"},
+        ROLLOUT_COLLECTOR_STATE_METADATA_KEY=(
+            ROLLOUT_COLLECTOR_STATE_METADATA_KEY
+        ),
+    )
 
     class DataSource:
         metadata = {}
@@ -536,6 +549,9 @@ def test_rollout_manager_resume_requires_persisted_validation_mapping():
         {"load", "_schedule_train_validation"},
         policy_version_state_path=lambda: None,
         logger=SimpleNamespace(info=lambda *_args: None),
+        ROLLOUT_COLLECTOR_STATE_METADATA_KEY=(
+            ROLLOUT_COLLECTOR_STATE_METADATA_KEY
+        ),
     )
 
     class Manager:
@@ -550,6 +566,8 @@ def test_rollout_manager_resume_requires_persisted_validation_mapping():
             self._train_validation_refs = {}
             self._train_validation_rollout_ids = {}
             self._train_validation_policy_versions = {}
+            self._collector_checkpoint_hook = lambda _name: None
+            self._requires_collector_checkpoint_state = lambda: False
 
         def get_train_instance_progress(self):
             return self.data_source.training_progress()
@@ -760,7 +778,7 @@ def test_unrelated_checkpoint_retention_does_not_select_control_loop(
     assert not module._uses_instance_attempt_control(args)
 
 
-def test_legacy_train_matches_upstream_event_trace_and_epoch_semantics(
+def test_upstream_train_preserves_event_trace_and_epoch_semantics(
     monkeypatch,
 ):
     module = _load_train_async(monkeypatch)
@@ -1099,9 +1117,6 @@ def test_attempt_boundary_retries_same_update_and_budget_stops_normally(
             self.generate_1_calls = 0
             self.generate = RemoteMethod(self._generate)
             self.eval = RemoteMethod(self._eval)
-            self.acknowledge_train_validation = RemoteMethod(
-                self._acknowledge
-            )
             self.drain_train_validations = RemoteMethod(
                 self._drain_train_validations
             )
@@ -1414,9 +1429,6 @@ def test_exact_final_boundary_is_not_validated_twice(monkeypatch):
             self.after_boundary = False
             self.generate = RemoteMethod(self._generate)
             self.eval = RemoteMethod(self._eval)
-            self.acknowledge_train_validation = RemoteMethod(
-                self._acknowledge
-            )
             self.drain_train_validations = RemoteMethod(
                 self._drain_train_validations
             )
@@ -1528,7 +1540,6 @@ def test_intermediate_chunk_partial_refill_is_checkpointed_or_fails_closed(
             self.generate_calls = 0
             self.generate = RemoteMethod(self._generate)
             self.eval = RemoteMethod(self._eval)
-            self.acknowledge_train_validation = RemoteMethod(self._ack)
             self.drain_train_validations = RemoteMethod(
                 self._drain_train_validations
             )
@@ -1779,7 +1790,6 @@ def test_budget_after_resume_persists_ack_with_existing_checkpoint(
                 }
             )
             self.eval = RemoteMethod(self._eval)
-            self.acknowledge_train_validation = RemoteMethod(self._ack)
             self.drain_train_validations = RemoteMethod(
                 self._drain_train_validations
             )

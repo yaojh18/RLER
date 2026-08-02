@@ -90,29 +90,6 @@ def _uses_instance_attempt_eval(args) -> bool:
     return getattr(args, "eval_instance_interval", None) is not None
 
 
-def _uses_instance_attempt_control(args) -> bool:
-    """Whether training needs the source-attempt control loop.
-
-    Keep this gate deliberately limited to the four source-attempt contract
-    flags.  With all four at their defaults, ``train`` must execute the
-    upstream async loop byte-for-byte in event semantics.
-    """
-    return any(
-        (
-            getattr(args, "train_instance_budget", None) is not None,
-            getattr(args, "eval_instance_interval", None) is not None,
-            bool(
-                getattr(
-                    args,
-                    "require_train_instance_budget_exhaustion",
-                    False,
-                )
-            ),
-            getattr(args, "stop_after_validation_attempt", None) is not None,
-        )
-    )
-
-
 def _should_run_eval(rollout_id, args):
     """Run update-scheduled eval only when no instance cadence is active."""
     if _uses_instance_attempt_eval(args):
@@ -122,25 +99,6 @@ def _should_run_eval(rollout_id, args):
         args.eval_interval,
         num_rollout=args.num_rollout,
     )
-
-
-def _should_save_checkpoint(rollout_id, args, num_rollout_per_epoch):
-    return should_run_periodic_action(
-        rollout_id,
-        args.save_interval,
-        num_rollout_per_epoch,
-        args.num_rollout,
-    )
-
-
-def _control_signal(rollout_data):
-    if not isinstance(rollout_data, dict):
-        return None
-    if rollout_data.get(TRAIN_VALIDATION_BOUNDARY_KEY):
-        return "validation"
-    if rollout_data.get(TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY):
-        return "budget"
-    return None
 
 
 def _signal_attempt(rollout_data) -> int:
@@ -619,7 +577,7 @@ def _refresh_existing_checkpoint_dataset_state(
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
-def _train_legacy(args):
+def _train_upstream(args):
     assert not args.colocate, "Colocation is not supported for async training."
     configure_logger()
     # allocate the GPUs
@@ -739,7 +697,14 @@ def _train_instance_attempt_control(args):
             ready_rollout_data = ray.get(rollout_data_future)
             rollout_data_future = None
 
-        signal = _control_signal(ready_rollout_data)
+        signal = None
+        if isinstance(ready_rollout_data, dict):
+            if ready_rollout_data.get(TRAIN_VALIDATION_BOUNDARY_KEY):
+                signal = "validation"
+            elif ready_rollout_data.get(
+                TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY
+            ):
+                signal = "budget"
         if signal == "validation":
             attempted = _signal_attempt(ready_rollout_data)
             boundary = int(
@@ -878,10 +843,11 @@ def _train_instance_attempt_control(args):
         rollout_data_curr_ref = ready_rollout_data
         ready_rollout_data = _NO_ROLLOUT_DATA
 
-        should_save_checkpoint = _should_save_checkpoint(
+        should_save_checkpoint = should_run_periodic_action(
             rollout_id,
-            args,
+            args.save_interval,
             num_rollout_per_epoch,
+            args.num_rollout,
         )
         required_final_budget_incomplete = False
         if (
@@ -1121,9 +1087,26 @@ def _train_instance_attempt_control(args):
     finish_tracking(args)
 
 
+def _uses_instance_attempt_control(args) -> bool:
+    return any(
+        (
+            getattr(args, "train_instance_budget", None) is not None,
+            getattr(args, "eval_instance_interval", None) is not None,
+            bool(
+                getattr(
+                    args,
+                    "require_train_instance_budget_exhaustion",
+                    False,
+                )
+            ),
+            getattr(args, "stop_after_validation_attempt", None) is not None,
+        )
+    )
+
+
 def train(args):
     if not _uses_instance_attempt_control(args):
-        return _train_legacy(args)
+        return _train_upstream(args)
     return _train_instance_attempt_control(args)
 
 

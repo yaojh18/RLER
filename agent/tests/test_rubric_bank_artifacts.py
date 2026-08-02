@@ -1,6 +1,5 @@
 import asyncio
 import json
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -405,9 +404,10 @@ def test_route_litellm_completion_preserves_outer_mswea_timeout(
 ):
     captured = {}
 
-    def slow_completion(**kwargs):
+    async def slow_to_thread(function, **kwargs):
+        assert function is run_utils.litellm.completion
         captured["timeout"] = kwargs.get("timeout")
-        time.sleep(0.2)
+        await asyncio.sleep(0.2)
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -426,7 +426,7 @@ def test_route_litellm_completion_preserves_outer_mswea_timeout(
     monkeypatch.delenv("LITELLM_DEFAULT_TIMEOUT", raising=False)
     monkeypatch.setenv("MSWEA_LITELLM_TIMEOUT", "0.05")
     monkeypatch.setenv("LITELLM_OUTER_TIMEOUT_GRACE", "0")
-    monkeypatch.setattr(run_utils.litellm, "completion", slow_completion)
+    monkeypatch.setattr(run_utils.asyncio, "to_thread", slow_to_thread)
 
     completion = asyncio.run(
         run_utils.run_litellm_completion_async(

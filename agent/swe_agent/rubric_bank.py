@@ -775,6 +775,7 @@ class ExperienceRubricBank:
         top_p: float,
         model_kwargs: dict[str, Any] | None = None,
         summary_max_tokens: int | None = None,
+        retrieval_format_correction_rounds: int = 2,
         instance_id: str = "",
         round_index: int = 0,
     ) -> RubricBankGenerationContext:
@@ -802,6 +803,9 @@ class ExperienceRubricBank:
             top_p=top_p,
             model_kwargs=model_kwargs,
             max_tokens=summary_max_tokens,
+            max_format_correction_rounds=(
+                retrieval_format_correction_rounds
+            ),
         )
         by_id = {
             experience.experience_id: experience

@@ -4,11 +4,8 @@ Both root and beam groups contain exactly ``m`` samples.  In a beam sample the
 common prompt is still the root system/user prefix; the corresponding Lane-A
 parent and Lane-B child are one trainable response.
 
-The token-level prefix invariant + per-turn loss-mask placement is COPIED
-verbatim from pds_to_grpo_bundle.py — that logic is the core fix for the
-v0 7.6B-loss bug and is independent of the search topology. We re-implement
-locally (rather than import) so the v1 path has zero runtime dependency on
-v0's bundle module, but the semantics are byte-equal.
+The token-level prefix invariant and per-turn loss-mask placement match the
+established PDS exporter and are independent of search topology.
 
 Rubric-training bundles (rubric_groups) are NOT generated. True rubric-
 model training is a separate design — see docs/rubric_rl.md. The lanes
@@ -18,9 +15,15 @@ yield no training data (empty buffer), fail-loud by design.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
-from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle, has_exact_rollout_tokens
+from swe_agent.contracts import (
+    ExportGroup,
+    ExportSample,
+    GRPOExportBundle,
+    has_exact_rollout_tokens,
+)
 from swe_agent.trajectory_search_parallel import (
     ForkGroup,
     InstanceRecord,
@@ -63,33 +66,33 @@ def _build_branch_sample(
     at 2k assistant turns, so both the judged parent and judged child stay in
     the trainable sequence.
     """
-    # Reward = pure rubric (task 4). Earlier we blended alpha*gt +
-    # (1-alpha)*rubric; that biased the policy toward whichever signal had
-    # higher variance in a given group. With rubric-only, every group's
-    # advantage is driven by the judge — which is the signal we actually
-    # want the policy to optimize. A missing rubric or invalid branch makes
-    # the complete sibling group unusable.
-    #
-    # gt_only_reward (paired with ParallelSearchConfig.disable_rubric): use
-    # the centrally computed branch.gt_score as the reward. Same scale as
-    # the naive baseline; each ForkGroup's M branches
-    # are GRPO-normalized against each other conditioned on the shared
-    # MidCp state.
-    import math as _math
+    # Formal submissions use binary SWE-bench reward. Unfinished trajectories
+    # use the final oracle-equivalent hosted-judge score.
     if branch.error is not None:
         return None
-    if gt_only_reward:
+    if gt_only_reward or branch.terminated_early:
         gt = branch.gt_score
-        if gt is None or not _math.isfinite(float(gt)):
+        if gt is None or not math.isfinite(float(gt)):
             return None
         reward = float(gt)
+        reward_source = (
+            "gt_only"
+            if gt_only_reward
+            else "terminal_swebench_binary"
+        )
     else:
         rubric = _branch_overall_rubric_score(
             branch.node_id, group.judge_score_by_node
         )
-        if rubric is None or not _math.isfinite(rubric):
+        if rubric is None or not math.isfinite(rubric):
             return None
-        reward = float(rubric) * float(branch.reward_penalty)
+        # The oracle joint aggregation is signed when a negative-direction
+        # rubric fires, while this training recipe requires the judge signal
+        # to stay on the same non-negative scale as terminal binary reward.
+        # Preserve the signed value in raw_rubric_score for auditability, but
+        # clip only the reward consumed by GRPO.
+        reward = max(0.0, float(rubric))
+        reward_source = "hosted_judge"
 
     # Every training group shares the root system/user prompt.  For a beam
     # sample, prepend the corresponding Lane-A parent continuation to the
@@ -140,7 +143,7 @@ def _build_branch_sample(
     ):
         return None
     branch_assistants_with_tokens = branch_assistant_messages
-    # Cap trainable assistant turns to first steps_per_round (task 3).
+    # Cap trainable assistant turns to the judged window.
     # Anything past that cap is dropped from token_ids entirely — we slice
     # `last` to the last in-window assistant turn, so full_token_ids =
     # last_prompt + last_out naturally truncates the sequence.
@@ -178,7 +181,7 @@ def _build_branch_sample(
             # producing prefix-stable renderings and PG ratio will explode.
             if len(a_prompt) > len(last_prompt):
                 raise AssertionError(
-                    f"v1 sample {branch.node_id}: a_i.prompt len "
+                    f"lane sample {branch.node_id}: a_i.prompt len "
                     f"({len(a_prompt)}) exceeds last.prompt len "
                     f"({len(last_prompt)}) — invariant violated."
                 )
@@ -189,7 +192,7 @@ def _build_branch_sample(
                     -1,
                 )
                 raise AssertionError(
-                    f"v1 sample {branch.node_id}: a_i.prompt is NOT a prefix "
+                    f"lane sample {branch.node_id}: a_i.prompt is NOT a prefix "
                     f"of last.prompt. first_divergence_idx={div}, "
                     f"len(a_i)={len(a_prompt)}, len(last)={len(last_prompt)}. "
                     f"Custom chat template must be broken — fix tokenization.py."
@@ -203,20 +206,20 @@ def _build_branch_sample(
                 or end > len(full_token_ids)
             ):
                 raise AssertionError(
-                    f"v1 sample {branch.node_id}: invalid assistant response "
+                    f"lane sample {branch.node_id}: invalid assistant response "
                     f"span start={start} end={end} "
                     f"parent_prefix_len={parent_prefix_len} "
                     f"full_token_count={len(full_token_ids)}."
                 )
             if full_token_ids[start:end] != out_tok:
                 raise AssertionError(
-                    f"v1 sample {branch.node_id}: assistant output tokens are "
+                    f"lane sample {branch.node_id}: assistant output tokens are "
                     f"misaligned at span [{start}, {end})."
                 )
             lp = list(asst["logprobs"])
             if len(lp) != len(out_tok):
                 raise AssertionError(
-                    f"v1 sample {branch.node_id}: assistant logprobs len "
+                    f"lane sample {branch.node_id}: assistant logprobs len "
                     f"({len(lp)}) != output tokens len ({len(out_tok)})."
                 )
             response_span = [
@@ -282,7 +285,7 @@ def _build_branch_sample(
             "raw_rubric_score": _branch_overall_rubric_score(
                 branch.node_id, group.judge_score_by_node
             ),
-            "reward_penalty": float(branch.reward_penalty),
+            "reward_source": reward_source,
             "policy_overlength_reason": branch.overlength_reason,
             "group_kind": group.group_kind,
             "beam_parent_index": branch.beam_parent_index,
@@ -345,9 +348,8 @@ def fork_group_to_export_group(
     An invalid branch invalidates the complete sibling group so GRPO never
     computes an advantage from a partial group.
 
-    steps_per_round (task 3): cap each branch's trainable window to its
-    first steps_per_round assistant turns past the shared parent. Tokens
-    after the cap are dropped from token_ids entirely.
+    ``steps_per_round`` caps each judged segment; tokens after the cap are
+    omitted from the training sequence.
     """
     if expected_group_size is not None and len(group.branches) != expected_group_size:
         return None
@@ -385,11 +387,13 @@ def instance_record_to_bundle(
     steps_per_round: int | None = None,
     gt_only_reward: bool = False,
 ) -> GRPOExportBundle:
-    """Convert one v1 InstanceRecord into a GRPOExportBundle.
+    """Convert one lane InstanceRecord into a GRPOExportBundle.
 
     ``depth1`` exports the root M=8 group. ``depth2`` exports that same group
-    plus a second M=8 beam group. Lane-A parent tokens are included in each
-    corresponding beam response and reward is the final judge score.
+    plus a second M=8 beam group when at least one sampled parent remains
+    unfinished. Lane-A parent tokens are included in each corresponding beam
+    response. Unfinished traces use the hosted judge score; formal submissions
+    use their binary SWE-bench terminal result.
 
     rubric_groups: always empty — true rubric-model training is a
     separate piece of work (see docs/rubric_rl.md)."""
@@ -420,12 +424,20 @@ def instance_record_to_bundle(
         rubric_groups=[],
         metadata={
             "config": record.config,
-            "reward_recipe": "gt_only" if gt_only_reward else "rubric_only",
+            "reward_recipe": (
+                "gt_only"
+                if gt_only_reward
+                else "terminal_swebench_binary_else_nonnegative_hosted_judge"
+            ),
             "steps_per_round_cap": cap,
             "completed": record.completed,
             "error": record.error,
             "seconds": record.seconds,
             "num_groups": len(record.groups),
+            "skipped_group_reasons": {
+                str(index): reason
+                for index, reason in record.skipped_group_reasons.items()
+            },
             "num_mid_cps": len(record.lane_a.mid_cps),
             "scheme": "lane_v1",
         },

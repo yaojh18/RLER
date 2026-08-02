@@ -114,9 +114,6 @@ class DataSource(abc.ABC):
         Save the state of the data source
         """
 
-    def commit_staged_save(self, rollout_id):
-        """Publish a previously staged data-source checkpoint."""
-
     @abc.abstractmethod
     def load(self, rollout_id=None):
         """
@@ -306,20 +303,6 @@ class RolloutDataSource(DataSource):
         path = self._checkpoint_path(rollout_id, staged=staged)
         self._atomic_torch_save(state_dict, path)
         return str(path)
-
-    def commit_staged_save(self, rollout_id):
-        if not self.args.rollout_global_dataset:
-            return None
-        staged_path = self._checkpoint_path(rollout_id, staged=True)
-        final_path = self._checkpoint_path(rollout_id)
-        if not staged_path.is_file():
-            raise FileNotFoundError(
-                "staged rollout data-source checkpoint does not exist: "
-                f"{staged_path}"
-            )
-        final_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staged_path, final_path)
-        return str(final_path)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:

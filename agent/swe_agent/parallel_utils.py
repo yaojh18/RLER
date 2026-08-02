@@ -1,24 +1,21 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
-import logging
-import math
 import os
-import re
 import tempfile
-import copy
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-import openai
-from agent_rl.run_utils import extract_json_from_response
-from swe_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
-from swe_agent.prompt import SWE_TRAJECTORY_RUBRIC_GENERATION_PROMPT
+from swe_agent.contracts import (
+    ExportGroup,
+    ExportSample,
+    GRPOExportBundle,
+    has_exact_rollout_tokens,
+)
 from swe_agent.rubric_bank import build_terminal_update_evidence
 
 INVALID_SAMPLE_REWARD = -1.0
@@ -171,12 +168,48 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         raise
 
 
-def extract_terminal_patch_from_session(result: dict[str, Any], session: Any) -> tuple[str, bool]:
-    def normalize_patch_text(patch: str) -> str:
-        patch = (patch or "").rstrip()
-        return patch + "\n" if patch else ""
+_CONTAINER_CWD_WARNING = (
+    "WARNING: Error changing the container working directory. Using '/root' "
+    "instead: chdir /workspace: no such file or directory"
+)
 
-    patch = normalize_patch_text(str(result.get("submission") or ""))
+
+def normalize_terminal_patch_text(patch: Any) -> str:
+    """Normalize a patch while preserving all meaningful diff bytes."""
+    text = "" if patch is None else str(patch)
+    lines = text.splitlines(keepends=True)
+    while lines and lines[0].rstrip("\r\n") == _CONTAINER_CWD_WARNING:
+        lines.pop(0)
+    text = "".join(lines)
+    if not text.strip():
+        return ""
+    return text if text.endswith("\n") else text + "\n"
+
+
+def exact_rollout_token_error(messages: list[dict[str, Any]]) -> str | None:
+    """Return why a policy trajectory cannot be exported, if applicable."""
+    assistants = [
+        message for message in messages if message.get("role") == "assistant"
+    ]
+    if not assistants:
+        return "invalid_policy_completion:no_assistant_turns"
+    for assistant_index, message in enumerate(assistants):
+        if has_exact_rollout_tokens(message):
+            continue
+        finish_reason = str(message.get("finish_reason") or "unknown")
+        return (
+            "invalid_policy_completion:"
+            f"assistant_index={assistant_index}:finish_reason={finish_reason}:"
+            f"prompt_tokens={len(message.get('prompt_token_ids') or [])}:"
+            f"output_tokens={len(message.get('token_ids') or [])}:"
+            f"logprobs={len(message.get('logprobs') or [])}"
+        )
+    return None
+
+
+def extract_terminal_patch_from_session(result: dict[str, Any], session: Any) -> tuple[str, bool]:
+
+    patch = normalize_terminal_patch_text(result.get("submission"))
     if patch:
         return patch, False
     try:
@@ -190,7 +223,7 @@ def extract_terminal_patch_from_session(result: dict[str, Any], session: Any) ->
             },
             timeout=30,
         )
-        return normalize_patch_text(str(diff.get("output") or "")), True
+        return normalize_terminal_patch_text(diff.get("output")), True
     except Exception:
         return "", True
 

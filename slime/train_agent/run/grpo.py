@@ -224,17 +224,6 @@ def compute_rubric_loss(args, batch, logits, sum_of_sample_mean):
     return loss, metrics
 
 
-def _requires_exact_collector_resume(args) -> bool:
-    return any(
-        (
-            args.train_instance_budget is not None,
-            args.eval_instance_interval is not None,
-            bool(args.require_train_instance_budget_exhaustion),
-            args.stop_after_validation_attempt is not None,
-        )
-    )
-
-
 def _dataset_state_has_exact_collector_position(
     path: Path,
     checkpoint_id: int,
@@ -245,7 +234,7 @@ def _dataset_state_has_exact_collector_position(
         return False
     if not isinstance(state, dict):
         return False
-    if int(state.get("checkpoint_schema_version", -1)) < (
+    if int(state.get("checkpoint_schema_version", -1)) != (
         ROLLOUT_CHECKPOINT_SCHEMA_VERSION
     ):
         return False
@@ -259,6 +248,17 @@ def _dataset_state_has_exact_collector_position(
         and isinstance(
             metadata.get(ROLLOUT_COLLECTOR_STATE_METADATA_KEY),
             dict,
+        )
+    )
+
+
+def _requires_exact_collector_resume(args) -> bool:
+    return any(
+        (
+            args.train_instance_budget is not None,
+            args.eval_instance_interval is not None,
+            bool(args.require_train_instance_budget_exhaustion),
+            args.stop_after_validation_attempt is not None,
         )
     )
 
@@ -339,9 +339,7 @@ def _configure_auto_resume(args, parser: argparse.ArgumentParser) -> int | None:
         checkpoint_id
         for checkpoint_id in _complete_checkpoint_ids(
             args.save_dir,
-            require_collector_state=(
-                _requires_exact_collector_resume(args)
-            ),
+            require_collector_state=_requires_exact_collector_resume(args),
         )
         if checkpoint_id <= tracked_checkpoint_id
     ]
@@ -370,6 +368,39 @@ def _configure_auto_resume(args, parser: argparse.ArgumentParser) -> int | None:
     args.load_dir = args.save_dir
     args.resume = True
     return resume_rollout_id
+
+
+def _bash_replace_array_option(
+    array_name: str,
+    flag: str,
+    value: object,
+) -> str:
+    """Render Bash that replaces one value option in an argument array."""
+    return f"""
+GRPO_OVERRIDE_ARGS=()
+GRPO_OVERRIDE_SKIP_NEXT=0
+for arg in "${{{array_name}[@]}}"; do
+  if [ "$GRPO_OVERRIDE_SKIP_NEXT" = 1 ]; then
+    GRPO_OVERRIDE_SKIP_NEXT=0
+    continue
+  fi
+  case "$arg" in
+    {flag})
+      GRPO_OVERRIDE_SKIP_NEXT=1
+      continue
+      ;;
+    {flag}=*)
+      continue
+      ;;
+  esac
+  GRPO_OVERRIDE_ARGS+=("$arg")
+done
+{array_name}=(
+  "${{GRPO_OVERRIDE_ARGS[@]}}"
+  {flag} {shlex.quote(str(value))}
+)
+unset GRPO_OVERRIDE_ARGS GRPO_OVERRIDE_SKIP_NEXT
+""".strip()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -503,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tokens-per-gpu", type=int)
     parser.add_argument("--log-probs-chunk-size", type=int)
     parser.add_argument("--rollout-max-context-len", type=int)
+    parser.add_argument("--rollout-max-response-len", type=int)
     parser.add_argument(
         "--sglang-context-length",
         type=int,
@@ -679,6 +711,11 @@ def main(argv: list[str] | None = None) -> int:
         and args.sglang_context_length <= 0
     ):
         parser.error("--sglang-context-length must be positive")
+    if (
+        args.rollout_max_response_len is not None
+        and args.rollout_max_response_len <= 0
+    ):
+        parser.error("--rollout-max-response-len must be positive")
     if args.save_interval is not None and args.save_interval <= 0:
         parser.error("--save-interval must be positive")
     if (
@@ -893,65 +930,29 @@ def main(argv: list[str] | None = None) -> int:
         override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
     if args.log_probs_chunk_size is not None:
         override_lines.append(
-            f"""
-GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE=()
-GRPO_COMMON_ARGS_SKIP_NEXT=0
-for arg in "${{GRPO_COMMON_ARGS[@]}}"; do
-  if [ "$GRPO_COMMON_ARGS_SKIP_NEXT" = 1 ]; then
-    GRPO_COMMON_ARGS_SKIP_NEXT=0
-    continue
-  fi
-  case "$arg" in
-    --log-probs-chunk-size)
-      GRPO_COMMON_ARGS_SKIP_NEXT=1
-      continue
-      ;;
-    --log-probs-chunk-size=*)
-      continue
-      ;;
-  esac
-  GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE+=("$arg")
-done
-GRPO_COMMON_ARGS=(
-  "${{GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE[@]}}"
-  --log-probs-chunk-size {args.log_probs_chunk_size}
-)
-unset GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE GRPO_COMMON_ARGS_SKIP_NEXT
-""".strip()
+            _bash_replace_array_option(
+                "GRPO_COMMON_ARGS",
+                "--log-probs-chunk-size",
+                args.log_probs_chunk_size,
+            )
         )
     if args.rollout_max_context_len is not None:
         override_lines.append(f"GRPO_SGLANG_ARGS+=(--rollout-max-context-len {args.rollout_max_context_len})")
+    if args.rollout_max_response_len is not None:
+        override_lines.append(
+            f"GRPO_SGLANG_ARGS+=(--rollout-max-response-len {args.rollout_max_response_len})"
+        )
     if args.sglang_context_length is not None:
         override_lines.append(
             f"GRPO_SGLANG_ARGS+=(--sglang-context-length {args.sglang_context_length})"
         )
     if args.sglang_mem_fraction_static is not None:
         override_lines.append(
-            f"""
-GRPO_SGLANG_ARGS_MEM_OVERRIDE=()
-GRPO_SGLANG_ARGS_SKIP_NEXT=0
-for arg in "${{GRPO_SGLANG_ARGS[@]}}"; do
-  if [ "$GRPO_SGLANG_ARGS_SKIP_NEXT" = 1 ]; then
-    GRPO_SGLANG_ARGS_SKIP_NEXT=0
-    continue
-  fi
-  case "$arg" in
-    --sglang-mem-fraction-static)
-      GRPO_SGLANG_ARGS_SKIP_NEXT=1
-      continue
-      ;;
-    --sglang-mem-fraction-static=*)
-      continue
-      ;;
-  esac
-  GRPO_SGLANG_ARGS_MEM_OVERRIDE+=("$arg")
-done
-GRPO_SGLANG_ARGS=(
-  "${{GRPO_SGLANG_ARGS_MEM_OVERRIDE[@]}}"
-  --sglang-mem-fraction-static {args.sglang_mem_fraction_static}
-)
-unset GRPO_SGLANG_ARGS_MEM_OVERRIDE GRPO_SGLANG_ARGS_SKIP_NEXT
-""".strip()
+            _bash_replace_array_option(
+                "GRPO_SGLANG_ARGS",
+                "--sglang-mem-fraction-static",
+                args.sglang_mem_fraction_static,
+            )
         )
     if args.sglang_disable_custom_all_reduce:
         override_lines.append(
@@ -959,31 +960,11 @@ unset GRPO_SGLANG_ARGS_MEM_OVERRIDE GRPO_SGLANG_ARGS_SKIP_NEXT
         )
     if args.save_interval is not None:
         override_lines.append(
-            f"""
-GRPO_COMMON_ARGS_SAVE_OVERRIDE=()
-GRPO_COMMON_ARGS_SKIP_NEXT=0
-for arg in "${{GRPO_COMMON_ARGS[@]}}"; do
-  if [ "$GRPO_COMMON_ARGS_SKIP_NEXT" = 1 ]; then
-    GRPO_COMMON_ARGS_SKIP_NEXT=0
-    continue
-  fi
-  case "$arg" in
-    --save-interval)
-      GRPO_COMMON_ARGS_SKIP_NEXT=1
-      continue
-      ;;
-    --save-interval=*)
-      continue
-      ;;
-  esac
-  GRPO_COMMON_ARGS_SAVE_OVERRIDE+=("$arg")
-done
-GRPO_COMMON_ARGS=(
-  "${{GRPO_COMMON_ARGS_SAVE_OVERRIDE[@]}}"
-  --save-interval {args.save_interval}
-)
-unset GRPO_COMMON_ARGS_SAVE_OVERRIDE GRPO_COMMON_ARGS_SKIP_NEXT
-""".strip()
+            _bash_replace_array_option(
+                "GRPO_COMMON_ARGS",
+                "--save-interval",
+                args.save_interval,
+            )
         )
     if args.num_epoch is not None and args.num_rollout is None:
         override_lines.append(

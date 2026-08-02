@@ -128,7 +128,7 @@ def test_empty_and_error_rewards_are_fixed():
     )
 
     assert make_evaluation_payload("empty", reward_config=reward_config)["reward"] == -0.2
-    assert make_evaluation_payload("error", reward_config=reward_config)["reward"] == -0.5
+    assert make_evaluation_payload("error", reward_config=reward_config)["reward"] == 0.0
 
 
 def test_infrastructure_error_is_explicit():
@@ -142,23 +142,23 @@ def test_infrastructure_error_is_explicit():
     assert payload["metainfo"]["infrastructure_error"] is True
 
 
-def test_evaluator_reported_error_has_fixed_reward_not_infrastructure_error():
+def test_evaluator_reported_error_is_zero_reward_not_infrastructure_error():
     payload = _benchmark_result_payload(
         {"error": "patch broke test script", "evaluation_output": "failed"}
     )
 
     assert payload["status"] == "error"
-    assert payload["reward"] == -0.5
+    assert payload["reward"] == 0.0
     assert payload["metainfo"]["infrastructure_error"] is False
 
 
-def test_evaluator_timeout_has_fixed_reward_not_infrastructure_error():
+def test_evaluator_timeout_is_zero_reward_not_infrastructure_error():
     payload = _evaluator_exception_payload(
         RuntimeError("evaluation command timed out after 600 seconds")
     )
 
     assert payload["status"] == "error"
-    assert payload["reward"] == -0.5
+    assert payload["reward"] == 0.0
     assert payload["metainfo"]["infrastructure_error"] is False
 
 

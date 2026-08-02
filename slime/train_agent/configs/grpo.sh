@@ -1,6 +1,3 @@
-# Two-node launchers intentionally override these for validation. Before a
-# formal run, use: num_rollout=3000, actor_gpus=64, rollout_gpus=64,
-# TP/PP/CP=4/2/4, and rollout_num_gpus_per_engine=4.
 GRPO_COMMON_ARGS=(
   --save-interval 10
   --no-load-optim
@@ -20,6 +17,9 @@ GRPO_COMMON_ARGS=(
   --eps-clip 3e-4
   --eps-clip-high 4e-4
   --entropy-coef 0
+  --kl-loss-coef 0.0
+  --kl-loss-type low_var_kl
+  --kl-coef 0.0
   --log-probs-chunk-size 256
   --micro-batch-size 1
 )

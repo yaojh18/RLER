@@ -48,13 +48,11 @@ def test_checkpoint_policy_stale_lag_tracks_true_weight_age():
         )
         == 1
     )
-    assert (
+    with pytest.raises(PolicyVersionMismatch, match="invalid coordinated"):
         checkpoint_policy_stale_lag(
             "legacy-rollout-2",
             consumer_rollout_id=3,
         )
-        is None
-    )
 
 
 def test_policy_version_transition_is_fail_closed(monkeypatch, tmp_path):

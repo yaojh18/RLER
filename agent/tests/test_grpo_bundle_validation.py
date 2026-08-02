@@ -16,6 +16,11 @@ from swe_agent.naive_search import (
     NaiveSearchRunner,
 )
 from swe_agent.naive_to_grpo_bundle import naive_record_to_bundle
+from swe_agent.parallel_utils import (
+    exact_rollout_token_error,
+    extract_terminal_patch_from_session,
+    normalize_terminal_patch_text,
+)
 from swe_agent.rubric_bank import RubricGenerationSample, RubricRecord
 
 from swe_agent.trajectory_search_parallel import (
@@ -45,6 +50,45 @@ def _messages(*, valid: bool = True) -> list[dict]:
         {"role": "user", "content": "problem"},
         assistant,
     ]
+
+
+def test_terminal_patch_normalization_preserves_diff_and_strips_only_cwd_warning():
+    warning = (
+        "WARNING: Error changing the container working directory. Using '/root' "
+        "instead: chdir /workspace: no such file or directory"
+    )
+    patch = "diff --git a/a b/a\n@@ -1 +1 @@\n-a\n+b\n "
+
+    assert normalize_terminal_patch_text(patch) == patch + "\n"
+    assert normalize_terminal_patch_text(warning) == ""
+    assert normalize_terminal_patch_text(f"{warning}\n{patch}\n") == patch + "\n"
+
+    env = SimpleNamespace(
+        execute=lambda *_args, **_kwargs: {"output": warning, "returncode": 0}
+    )
+    extracted, is_fallback = extract_terminal_patch_from_session(
+        {"submission": ""}, SimpleNamespace(agent=SimpleNamespace(env=env))
+    )
+    assert extracted == ""
+    assert is_fallback is True
+
+
+def test_zero_token_abort_is_a_policy_branch_error():
+    messages = _messages()
+    messages[-1] = {
+        "role": "assistant",
+        "content": "",
+        "finish_reason": "abort",
+        "prompt_token_ids": [1, 2],
+        "token_ids": [],
+        "logprobs": [],
+    }
+
+    error = exact_rollout_token_error(messages)
+
+    assert error is not None
+    assert "invalid_policy_completion" in error
+    assert "finish_reason=abort" in error
 
 
 def _load_smoke_verifier():
@@ -292,7 +336,106 @@ def test_judge_reward_uses_real_node_id():
     assert exported.samples[0].metadata["child_assistant_spans"] == [[0, 1]]
 
 
-def test_policy_overlength_multiplies_hosted_judge_reward():
+def test_formal_submission_binary_gt_overrides_hosted_judge_reward():
+    mid_cp = MidCp(
+        idx=0,
+        asst_step=0,
+        image_tag="root-image",
+        snapshot={"agent": {"state": {"messages": _messages()[:2]}}},
+    )
+    branch = LaneBBranch(
+        group_index=0,
+        branch_index=0,
+        node_id="submitted-node",
+        parent_image_tag="root-image",
+        messages=_messages()[2:],
+        terminated_early=True,
+        gt_score=1.0,
+    )
+    group = ForkGroup(
+        group_index=0,
+        mid_cp=mid_cp,
+        branches=[branch],
+        judge_score_by_node={"submitted-node": 0.15},
+    )
+
+    exported = fork_group_to_export_group(
+        instance_id="instance",
+        group=group,
+        steps_per_round=1,
+    )
+
+    assert exported is not None
+    assert exported.samples[0].reward == 1.0
+    assert (
+        exported.samples[0].metadata["reward_source"]
+        == "terminal_swebench_binary"
+    )
+    assert exported.samples[0].metadata["raw_rubric_score"] == 0.15
+
+
+def test_empty_formal_submission_has_binary_zero_reward():
+    runner = object.__new__(TrajectorySearchParallelRunner)
+    runner.config = ParallelSearchConfig()
+    runner.task_id = "instance"
+    branch = LaneBBranch(
+        group_index=0,
+        branch_index=0,
+        node_id="empty-submission",
+        parent_image_tag="root-image",
+        terminated_early=True,
+        terminal_patch="",
+    )
+
+    runner._evaluate_gt(branch)
+
+    assert branch.gt_score == 0.0
+    assert branch.gt_payload["status"] == "unresolved"
+
+
+def test_thinking_output_tokens_remain_trainable_in_exact_lane_bundle():
+    mid_cp = MidCp(
+        idx=0,
+        asst_step=0,
+        image_tag="root-image",
+        snapshot={"agent": {"state": {"messages": _messages()[:2]}}},
+    )
+    branch = LaneBBranch(
+        group_index=0,
+        branch_index=0,
+        node_id="thinking-node",
+        parent_image_tag="root-image",
+        messages=[
+            {
+                "role": "assistant",
+                "content": "<think>reasoning</think>action",
+                "prompt_token_ids": [1, 2],
+                "token_ids": [10, 11, 12, 13],
+                "logprobs": [-0.1, -0.2, -0.3, -0.4],
+            }
+        ],
+    )
+    group = ForkGroup(
+        group_index=0,
+        mid_cp=mid_cp,
+        branches=[branch],
+        judge_score_by_node={"thinking-node": 0.5},
+    )
+
+    exported = fork_group_to_export_group(
+        instance_id="instance",
+        group=group,
+        steps_per_round=1,
+    )
+
+    assert exported is not None
+    sample = exported.samples[0]
+    assert sample.token_ids == [1, 2, 10, 11, 12, 13]
+    assert sample.loss_mask[-sample.response_length :] == [1, 1, 1, 1]
+    assert sample.rollout_logprobs == [-0.1, -0.2, -0.3, -0.4]
+
+
+def test_policy_overlength_uses_unscaled_hosted_judge_reward():
     mid_cp = MidCp(
         idx=0,
         asst_step=0,
@@ -305,8 +448,6 @@ def test_policy_overlength_multiplies_hosted_judge_reward():
         node_id="overflow-node",
         parent_image_tag="root-image",
         messages=_messages()[2:],
-        terminal_patch_from_fallback=True,
-        reward_penalty=0.5,
         overlength_reason="ContextWindowExceeded",
     )
     group = ForkGroup(
@@ -324,13 +465,47 @@ def test_policy_overlength_multiplies_hosted_judge_reward():
 
     assert exported is not None
     sample = exported.samples[0]
-    assert sample.reward == pytest.approx(0.4)
+    assert sample.reward == pytest.approx(0.8)
     assert sample.metadata["raw_rubric_score"] == pytest.approx(0.8)
-    assert sample.metadata["reward_penalty"] == pytest.approx(0.5)
+    assert "reward_penalty" not in sample.metadata
     assert (
         sample.metadata["policy_overlength_reason"]
         == "ContextWindowExceeded"
     )
+
+
+def test_negative_hosted_judge_reward_is_clipped_to_zero():
+    mid_cp = MidCp(
+        idx=0,
+        asst_step=0,
+        image_tag="root-image",
+        snapshot={"agent": {"state": {"messages": _messages()[:2]}}},
+    )
+    branch = LaneBBranch(
+        group_index=0,
+        branch_index=0,
+        node_id="negative-judge-node",
+        parent_image_tag="root-image",
+        messages=_messages()[2:],
+    )
+    group = ForkGroup(
+        group_index=0,
+        mid_cp=mid_cp,
+        branches=[branch],
+        judge_score_by_node={"negative-judge-node": -0.35},
+    )
+
+    exported = fork_group_to_export_group(
+        instance_id="instance",
+        group=group,
+        steps_per_round=1,
+    )
+
+    assert exported is not None
+    sample = exported.samples[0]
+    assert sample.reward == 0.0
+    assert sample.metadata["raw_rubric_score"] == pytest.approx(-0.35)
+    assert sample.metadata["reward_source"] == "hosted_judge"
 
 
 def test_beam_parent_assistant_tokens_are_trainable_from_root_prompt():
@@ -438,6 +613,75 @@ def test_beam_parent_assistant_tokens_are_trainable_from_root_prompt():
                 expected_child_turns=1,
                 label="beam sample",
             )
+
+
+def test_beam_overlength_before_first_child_turn_trains_parent_only():
+    root_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "problem"},
+    ]
+    parent_messages = root_messages + [
+        {
+            "role": "assistant",
+            "content": "parent work",
+            "prompt_token_ids": [1, 2],
+            "token_ids": [3, 30],
+            "logprobs": [-0.1, -0.11],
+        },
+        {"role": "tool", "content": "observation"},
+    ]
+    root = MidCp(
+        idx=0,
+        asst_step=0,
+        image_tag="root-image",
+        snapshot={"agent": {"state": {"messages": root_messages}}},
+    )
+    parent = MidCp(
+        idx=1,
+        asst_step=1,
+        image_tag="parent-image",
+        node_id="parent-real-id",
+        snapshot={"agent": {"state": {"messages": parent_messages}}},
+    )
+    child = LaneBBranch(
+        group_index=1,
+        branch_index=0,
+        node_id="child-overlength-id",
+        parent_image_tag="parent-image",
+        parent_asst_step=1,
+        beam_parent_index=0,
+        beam_parent_node_id="parent-real-id",
+        messages=[],
+        status="policy_overlength",
+        overlength_reason="ContextWindowExceeded",
+    )
+    group = ForkGroup(
+        group_index=1,
+        mid_cp=root,
+        group_kind="beam",
+        parent_mid_cps=[parent],
+        branches=[child],
+        judge_score_by_node={"child-overlength-id": 0.4},
+    )
+
+    exported = fork_group_to_export_group(
+        instance_id="instance",
+        group=group,
+        steps_per_round=1,
+    )
+
+    assert exported is not None
+    sample = exported.samples[0]
+    assert sample.turns == [
+        {"role": "assistant", "content": "parent work"},
+        {"role": "tool", "content": "observation"},
+    ]
+    assert sample.reward == pytest.approx(0.4)
+    assert sample.metadata["parent_assistant_spans"] == [[0, 2]]
+    assert sample.metadata["child_assistant_spans"] == []
+    assert sample.metadata["policy_overlength_reason"] == (
+        "ContextWindowExceeded"
+    )
 
 
 def test_assistant_output_overflow_is_fail_closed():
@@ -566,6 +810,36 @@ def test_depth2_config_is_two_parents_and_two_size_eight_groups():
     assert cfg.rubric_max_tokens == 20480
     assert cfg.judge_max_tokens == 20480
     assert cfg.psu_max_tokens == 20480
+
+
+def test_depth2_uses_only_nonterminal_sampled_parents_without_resampling():
+    first = MidCp(
+        idx=1,
+        asst_step=20,
+        image_tag="first",
+        terminated_early=False,
+    )
+    second = MidCp(
+        idx=2,
+        asst_step=8,
+        image_tag="",
+        terminated_early=True,
+    )
+
+    assert first.can_continue
+    assert not second.can_continue
+    first.terminated_early = True
+    assert not first.can_continue
+    first.terminated_early = False
+    second.terminated_early = False
+    assert first.can_continue
+    assert second.can_continue
+
+    first.continuation_unavailable_reason = (
+        "policy_overlength:CompletionLengthExceeded"
+    )
+    assert not first.can_continue
+    assert second.can_continue
 
 
 @pytest.mark.parametrize(

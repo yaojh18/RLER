@@ -9,7 +9,6 @@ rebound to the resumed policy and current routes before redispatch.
 from __future__ import annotations
 
 import copy
-import re
 from typing import Any
 
 from slime.utils.types import Sample
@@ -29,36 +28,21 @@ _RUNTIME_TASK_KEYS = {
     "usage_ledger",
 }
 
-_USAGE_TASK_INDEX = re.compile(r"(?:^|/)t(?P<index>\d+)(?::g\d+)?$")
-
-
 def checkpoint_task_source_group_index(task: dict[str, Any]) -> int:
-    """Recover the stable source-attempt cursor for a pending task.
+    """Return the explicitly checkpointed source-attempt cursor."""
 
-    New checkpoints persist this field directly.  Schema-v1 checkpoints made
-    before the field was added still encode the same cursor in their usage
-    group prefix, so they remain exactly resumable.
-    """
-
-    explicit = task.get("source_group_index")
-    if explicit is not None:
-        source_group_index = int(explicit)
-        if source_group_index < 0:
-            raise ValueError(
-                "checkpoint pending task source_group_index must be "
-                f"non-negative, got {source_group_index}"
-            )
-        return source_group_index
-
-    for key in ("usage_group_prefix", "usage_group_id"):
-        value = str(task.get(key) or "")
-        match = _USAGE_TASK_INDEX.search(value)
-        if match is not None:
-            return int(match.group("index"))
-    raise RuntimeError(
-        "checkpoint pending task is missing its stable source-group cursor: "
-        f"instance={task.get('instance_id')!r}"
-    )
+    if "source_group_index" not in task:
+        raise RuntimeError(
+            "checkpoint pending task is missing source_group_index: "
+            f"instance={task.get('instance_id')!r}"
+        )
+    source_group_index = int(task["source_group_index"])
+    if source_group_index < 0:
+        raise ValueError(
+            "checkpoint pending task source_group_index must be "
+            f"non-negative, got {source_group_index}"
+        )
+    return source_group_index
 
 
 def serialize_sample(sample: Sample) -> dict[str, Any]:

@@ -817,7 +817,9 @@ class RolloutManager:
                 allow_target_during_update=True
             )
         if policy_version is None:
-            policy_version = f"legacy-rollout-{int(rollout_id)}"
+            raise RuntimeError(
+                "source-attempt validation requires policy-version coordination"
+            )
         policy_version = str(policy_version)
         mark_scheduled(
             attempted_instances,
@@ -1132,20 +1134,6 @@ class RolloutManager:
             }
         return progress_fn()
 
-    def acknowledge_train_validation(self, attempted_instances):
-        acknowledge_fn = getattr(
-            self.data_source,
-            "acknowledge_validation",
-            None,
-        )
-        if acknowledge_fn is None:
-            raise RuntimeError(
-                "the configured rollout data source cannot acknowledge "
-                "source-instance validation boundaries"
-            )
-        acknowledge_fn(int(attempted_instances))
-        return self.get_train_instance_progress()
-
     def _collector_checkpoint_hook(self, name: str):
         module_name = getattr(self.generate_rollout, "__module__", "")
         if not module_name:
@@ -1211,40 +1199,19 @@ class RolloutManager:
             return self.data_source.save(rollout_id, staged=True)
         return self.data_source.save(rollout_id)
 
-    def commit_save(self, rollout_id):
-        commit = getattr(self.data_source, "commit_staged_save", None)
-        if not callable(commit):
-            raise RuntimeError(
-                "the rollout data source cannot commit staged checkpoints"
-            )
-        return commit(int(rollout_id))
-
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
-        hook_resolver = getattr(
-            self,
-            "_collector_checkpoint_hook",
-            None,
-        )
-        load_hook = (
-            hook_resolver("load_checkpoint_state_dict")
-            if callable(hook_resolver)
-            else None
+        load_hook = self._collector_checkpoint_hook(
+            "load_checkpoint_state_dict"
         )
         metadata = getattr(self.data_source, "metadata", None)
         collector_state = (
-            metadata.get("__rler_rollout_collector_state_v1__")
+            metadata.get(ROLLOUT_COLLECTOR_STATE_METADATA_KEY)
             if isinstance(metadata, dict)
             else None
         )
-        requires_state = getattr(
-            self,
-            "_requires_collector_checkpoint_state",
-            None,
-        )
         exact_restore_required = (
-            callable(requires_state)
-            and requires_state()
+            self._requires_collector_checkpoint_state()
             and rollout_id is not None
             and int(rollout_id) >= 0
         )

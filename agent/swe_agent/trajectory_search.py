@@ -674,6 +674,7 @@ async def _score_round(
     max_tokens: int,
     model_kwargs: dict[str, Any] | None = None,
     judge_prompt: str = SWE_TRAJECTORY_RUBRIC_JUDGE_PROMPT,
+    max_format_correction_rounds: int = MAX_FORMAT_CORRECTION_ROUNDS,
 ) -> tuple[list[list[dict[str, Any]]], list[dict[str, str]]]:
     if not continuations or not rubrics:
         return [[] for _ in continuations], []
@@ -713,7 +714,7 @@ async def _score_round(
                 ]
                 messages = [{"role": "user", "content": "".join(prompt_parts)}]
                 try:
-                    for _ in range(MAX_FORMAT_CORRECTION_ROUNDS):
+                    for _ in range(max(1, int(max_format_correction_rounds))):
                         async for attempt in retry(
                             logger=logger,
                             abort_exceptions=LitellmModel.abort_exceptions,

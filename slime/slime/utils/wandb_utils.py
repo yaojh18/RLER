@@ -6,6 +6,8 @@ import wandb
 
 logger = logging.getLogger(__name__)
 
+_WANDB_METRIC_ALLOWLIST_ENV = "SLIME_WANDB_METRIC_ALLOWLIST"
+
 # Keep W&B config focused on knobs that change optimization, sampling, or the
 # train/eval schedule. Static experiment identity (model/data/provider/SHA and
 # filesystem paths) belongs in the run name and the frozen local manifest.
@@ -287,6 +289,26 @@ def _compute_config_for_logging(args):
         output.update(_prefix_config_keys(_args_to_config_dict(critic_args), "critic"))
 
     return output
+
+
+def filter_metrics_for_logging(metrics, *, step_key: str):
+    """Apply an optional exact-name allowlist to W&B history metrics.
+
+    Training and local logs retain the complete metric dictionary.  The
+    allowlist only limits W&B history/dashboard cardinality, and is opt-in so
+    other Slime workloads keep their existing telemetry unchanged.
+    """
+
+    raw_allowlist = os.environ.get(_WANDB_METRIC_ALLOWLIST_ENV, "")
+    if not raw_allowlist.strip():
+        return metrics
+    allowed = {
+        name.strip()
+        for name in raw_allowlist.split(",")
+        if name.strip()
+    }
+    allowed.add(step_key)
+    return {key: value for key, value in metrics.items() if key in allowed}
 
 
 def _args_to_config_dict(args):

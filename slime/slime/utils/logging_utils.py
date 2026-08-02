@@ -44,7 +44,12 @@ def finish_tracking(args):
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     if args.use_wandb:
-        wandb.log(metrics)
+        wandb.log(
+            wandb_utils.filter_metrics_for_logging(
+                metrics,
+                step_key=step_key,
+            )
+        )
 
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}

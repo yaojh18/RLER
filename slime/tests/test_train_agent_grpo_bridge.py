@@ -131,9 +131,7 @@ def test_grpo_forwards_fixed_validation_usage_and_smoke_overrides(
     assert script.count("--log-probs-chunk-size 32") == 1
     assert script.count("--sglang-mem-fraction-static 0.75") == 1
     assert script.count("--sglang-disable-custom-all-reduce") == 1
-    assert "GRPO_COMMON_ARGS_SAVE_OVERRIDE" in script
-    assert "GRPO_COMMON_ARGS_LOG_PROBS_OVERRIDE" in script
-    assert "GRPO_SGLANG_ARGS_MEM_OVERRIDE" in script
+    assert script.count("GRPO_OVERRIDE_ARGS") >= 3
 
 
 @pytest.mark.parametrize(

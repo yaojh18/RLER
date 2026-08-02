@@ -268,7 +268,7 @@ def test_validation_rollout_mapping_round_trips_checkpoint(
     }
 
 
-def test_staged_checkpoint_is_invisible_until_atomic_commit(tmp_path):
+def test_staged_checkpoint_is_not_published_by_data_source(tmp_path):
     source = _source(
         sample_group_index=251,
         sample_offset=1,
@@ -296,12 +296,8 @@ def test_staged_checkpoint_is_invisible_until_atomic_commit(tmp_path):
     assert not final_path.exists()
     assert not list(rollout_root.glob(".*.tmp"))
 
-    source.commit_staged_save(3)
-    assert final_path.is_file()
-    assert not staged_path.exists()
-
     state = __import__("torch").load(
-        final_path,
+        staged_path,
         weights_only=False,
     )
     assert (
@@ -377,4 +373,3 @@ def test_rollout_checkpoint_load_rejects_wrong_schema(tmp_path):
         match="unsupported rollout data-source checkpoint schema",
     ):
         restored.load(4)
-

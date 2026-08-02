@@ -1,6 +1,6 @@
-"""GRPO async entry point backed by v1 lane-based trajectory search.
+"""GRPO async entry point backed by lane-based trajectory search.
 
-Mirror of grpo_async_pds.py — pulls v1-specific args out, sets matching
+Mirror of grpo_async_pds.py — pulls lane-specific args out, sets matching
 SWE_AGENT_LANES_* env vars, then forwards the rest to train_agent.run.grpo.main
 with --rollout-function-path pointing at the v1 collect module.
 
@@ -11,7 +11,7 @@ Usage:
         --policy-ports 30000,30001,30002,30003,30004,30005 \\
         --rubric-ports 30006,30007 \\
         --lanes-instance-workers 8 \\
-        --lanes-m 8 --lanes-max-mid-cps 6 ...
+        --lanes-m 8 --lanes-topology depth2 --lanes-beam-parents 2 ...
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def _parse_lanes_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument(
         "--rubric-ports",
         default="",
-        help="Deprecated: Lane C is hosted GLM and cannot use local policy ports.",
+        help="Deprecated: Lane C is hosted and cannot use local policy ports.",
     )
     p.add_argument("--api-host", default="http://127.0.0.1")
     p.add_argument("--lanes-instance-workers", type=int, default=8)
@@ -36,17 +36,14 @@ def _parse_lanes_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--lanes-wait-timeout", type=int, default=10800)
     p.add_argument("--lanes-output-root", default="")
     p.add_argument("--lanes-m", type=int, default=8)
-    p.add_argument("--lanes-max-mid-cps", type=int, default=6)
     p.add_argument("--lanes-steps-per-round", type=int, default=20)
     p.add_argument("--lanes-step-limit", type=int, default=120)
     p.add_argument("--lanes-completion-max-tokens", type=int, default=20480)
     p.add_argument("--model-context-length", type=int, default=128000)
     p.add_argument("--lanes-rubric-max-tokens", type=int, default=20480)
     p.add_argument("--lanes-judge-max-tokens", type=int, default=20480)
-    p.add_argument("--lanes-seed", type=int, default=0)
     p.add_argument("--lanes-gt-eval-workers", type=int, default=8)
     p.add_argument("--lanes-lane-b-pool-size", type=int, default=0)
-    p.add_argument("--lanes-policy-alpha", type=float, default=1.0)
     p.add_argument("--lanes-policy-temperature", type=float, default=1.0,
                    help="Lane A sampling temperature (the linear spine).")
     p.add_argument("--lanes-policy-top-p", type=float, default=0.95)
@@ -91,8 +88,18 @@ def _parse_lanes_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
         help="Low-temperature sampling used only by terminal validation.",
     )
     p.add_argument("--validation-top-p", type=float, default=0.95)
-    p.add_argument("--lanes-rubric-model", default="nvidia/zai-org/glm-5.2")
-    p.add_argument("--lanes-judge-model", default="nvidia/zai-org/glm-5.2")
+    default_lane_c_model = os.environ.get(
+        "SWE_AGENT_LANES_RUBRIC_MODEL",
+        "openai/azure/openai/gpt-5.6-luna",
+    )
+    p.add_argument("--lanes-rubric-model", default=default_lane_c_model)
+    p.add_argument(
+        "--lanes-judge-model",
+        default=os.environ.get(
+            "SWE_AGENT_LANES_JUDGE_MODEL",
+            default_lane_c_model,
+        ),
+    )
     p.add_argument(
         "--lanes-rubric-api-base",
         default="https://inference-api.nvidia.com/v1",
@@ -111,7 +118,7 @@ def _export_lanes_env(ns: argparse.Namespace) -> None:
     if ns.rubric_ports:
         raise ValueError(
             "--rubric-ports is not supported: all Lane C calls must use "
-            "hosted NVIDIA GLM-5.2"
+            "one hosted NVIDIA-gateway model"
         )
     if ns.api_host:
         os.environ["SWE_AGENT_LANES_API_HOST"] = ns.api_host
@@ -124,7 +131,6 @@ def _export_lanes_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_LANES_WAIT_TIMEOUT"] = str(ns.lanes_wait_timeout)
 
     os.environ["SWE_AGENT_LANES_M"] = str(ns.lanes_m)
-    os.environ["SWE_AGENT_LANES_MAX_MID_CPS"] = str(ns.lanes_max_mid_cps)
     os.environ["SWE_AGENT_LANES_STEPS_PER_ROUND"] = str(ns.lanes_steps_per_round)
     os.environ["SWE_AGENT_LANES_STEP_LIMIT"] = str(ns.lanes_step_limit)
     os.environ["SWE_AGENT_LANES_COMPLETION_MAX_TOKENS"] = str(ns.lanes_completion_max_tokens)
@@ -140,11 +146,6 @@ def _export_lanes_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_LANES_GT_EVAL_WORKERS"] = str(ns.lanes_gt_eval_workers)
     if ns.lanes_lane_b_pool_size:
         os.environ["SWE_AGENT_LANES_LANE_B_POOL_SIZE"] = str(ns.lanes_lane_b_pool_size)
-    if ns.lanes_seed:
-        os.environ["SWE_AGENT_LANES_SEED"] = str(ns.lanes_seed)
-    # lanes_policy_alpha removed (task 4): reward is now pure rubric in
-    # lane_to_grpo_bundle._build_branch_sample. The flag is silently
-    # ignored upstream when passed by older sbatches.
     os.environ["SWE_AGENT_LANES_POLICY_TEMPERATURE"] = str(ns.lanes_policy_temperature)
     os.environ["SWE_AGENT_LANES_POLICY_TOP_P"] = str(ns.lanes_policy_top_p)
     os.environ["SWE_AGENT_LANES_LANE_B_TEMPERATURE"] = str(ns.lanes_lane_b_temperature)

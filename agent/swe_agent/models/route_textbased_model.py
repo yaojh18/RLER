@@ -259,9 +259,9 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         # A completion that consumed the entire per-call output budget is not a
         # valid executable action.  In particular, a fenced shell command may
         # be syntactically complete while its reasoning or trailing content was
-        # cut off.  Preserve the exact assistant tokens for training/accounting,
-        # but stop the policy immediately and let the runner collect the current
-        # git diff as the terminal fallback patch.
+        # cut off. Preserve the exact assistant tokens for training/accounting
+        # and expose a structured non-submission; each runner then applies its
+        # own reward semantics.
         if str(completion.finish_reason or "").strip().lower() in {
             "length",
             "max_tokens",

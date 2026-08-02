@@ -385,12 +385,13 @@ class WeightedKeywordExperienceRetriever:
         top_p: float,
         model_kwargs: dict[str, Any] | None,
         max_tokens: int | None = None,
+        max_format_correction_rounds: int = 2,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         messages = [
             {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
             {"role": "user", "content": _summary_prompt(context_markdown, stage)},
         ]
-        for _ in range(2):
+        for _ in range(max(1, int(max_format_correction_rounds))):
             async for attempt in retry(
                 logger=logger,
                 abort_exceptions=LitellmModel.abort_exceptions,
@@ -422,7 +423,13 @@ class WeightedKeywordExperienceRetriever:
             messages.append(
                 {
                     "role": "user",
-                    "content": "Append one valid final JSON object using the requested retrieval-feature schema.",
+                    "content": (
+                        "The previous response was not valid parseable JSON. "
+                        "Do not repeat it. Escape every double quote inside a "
+                        "string value (or omit the quoted code example), then "
+                        "append one valid final JSON object using the requested "
+                        "retrieval-feature schema."
+                    ),
                 }
             )
         return {}, messages
@@ -506,6 +513,7 @@ class WeightedKeywordExperienceRetriever:
         top_p: float,
         model_kwargs: dict[str, Any] | None,
         max_tokens: int | None = None,
+        max_format_correction_rounds: int = 2,
     ) -> tuple[list[str], list[dict[str, Any]]]:
         stage = _stage_query(context)
         summary, messages = await self.summarize(
@@ -515,6 +523,7 @@ class WeightedKeywordExperienceRetriever:
             top_p=top_p,
             model_kwargs=model_kwargs,
             max_tokens=max_tokens,
+            max_format_correction_rounds=max_format_correction_rounds,
         )
         return self.rank(
             context=context,

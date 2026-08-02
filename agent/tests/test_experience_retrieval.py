@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+import swe_agent.experience_retrieval as experience_retrieval
 from swe_agent.experience_retrieval import WeightedKeywordExperienceRetriever
 from swe_agent.rubric_bank import ExperienceRubricBank, _retrieval_summary_context
 
@@ -167,6 +168,45 @@ def test_weighted_retriever_uses_only_configured_document_fields(tmp_path):
 
     assert retriever.document_fields == ("full", "keywords")
     assert set(retriever.bm25) == {"full", "keywords"}
+
+
+def test_summary_corrects_malformed_quoted_code_example(monkeypatch, tmp_path):
+    _write_checkpoint(tmp_path)
+    retriever = WeightedKeywordExperienceRetriever(tmp_path, scope="siblings")
+    responses = [
+        '{"retrieval_queries":["mf.clean([\\"\\", "\\"]) returns"]}',
+        '{"retrieval_queries":["MultiValueField required child"]}',
+    ]
+
+    async def fake_completion_message(**_kwargs):
+        content = responses.pop(0)
+        return {
+            "role": "assistant",
+            "content": content,
+            "content_no_thinking": content,
+        }
+
+    monkeypatch.setattr(
+        experience_retrieval,
+        "route_completion_message",
+        fake_completion_message,
+    )
+    summary, messages = asyncio.run(
+        retriever.summarize(
+            context_markdown="state",
+            stage="pre-patch",
+            model_name="glm",
+            top_p=0.95,
+            model_kwargs={},
+            max_format_correction_rounds=8,
+        )
+    )
+
+    assert summary["retrieval_queries"] == [
+        "MultiValueField required child"
+    ]
+    assert len([message for message in messages if message["role"] == "assistant"]) == 2
+    assert messages[-1]["role"] == "assistant"
 
 
 def test_retrieval_summary_context_accepts_current_raw_continuation_key():

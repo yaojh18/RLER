@@ -112,13 +112,13 @@ export TMPDIR=/tmp/rler-$SLURM_JOB_ID
 export SEARCH_SWE_SLIME_API_KEY=EMPTY
 export SWE_AGENT_NAIVE_SKIP_NODE_IPS="$HEAD_IP"
 export RAY_ADDRESS="$HEAD_IP:$RAY_PORT"
-export WANDB_API_KEY="${WANDB_API_KEY:-$(config_value "WanDB TOKEN")}"
+export WANDB_API_KEY="$(config_value "WanDB personal TOKEN")"
 export HF_TOKEN="${HF_TOKEN:-$(config_value "HF TOKEN")}"
-export WANDB_ENTITY="${WANDB_ENTITY:-nemo-llm-service}"
+export WANDB_ENTITY="jihany2-university-of-washington"
 export WANDB_PROJECT="${WANDB_PROJECT:-rler-train-smoke}"
 export WANDB_MODE=online
 
-[ -n "$WANDB_API_KEY" ] || { echo "ERROR: missing WanDB TOKEN in /workspace/exp/config.md"; exit 1; }
+[ -n "$WANDB_API_KEY" ] || { echo "ERROR: missing WanDB personal TOKEN in /workspace/exp/config.md"; exit 1; }
 mkdir -p "$APPTAINER_CACHEDIR" "$XDG_CONFIG_HOME" "$TMPDIR" "$RUN_DIR/rollout_dumps" "$RUN_DIR/train_dumps" "$RUN_DIR/naive_out"
 
 echo "[$(date)] node=$HOST ip=$NODE_IP head=$HEAD_NODE head_ip=$HEAD_IP"

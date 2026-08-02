@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Async rollout function backed by TrajectorySearchParallelRunner (v1).
+"""Async rollout function backed by TrajectorySearchParallelRunner.
 
 Drop-in for collect_grpo_rollout_async.generate_rollout — same signature,
-same return type. Uses the v1 lane-based search to produce per-instance
+same return type. Uses lane-based search to produce per-instance
 GRPOExportBundle.policy_groups (one ExportGroup per fork-group = per
 mid_cp). Atomic mode only — no streaming queue.
 
-Selects target='policy' (rubric_groups not generated in v1 first pass).
+Selects target='policy'; Lane C is reward-only and is never trained.
 
 ENV CONTRACT (set by slime/train_agent/run/grpo_async_lanes.py to match
 the SLURM script's tunables):
   SWE_AGENT_LANES_M                  int    forks per mid_cp (default 8)
-  SWE_AGENT_LANES_MAX_MID_CPS        int    mid_cps cap per instance (default 6)
   SWE_AGENT_LANES_STEPS_PER_ROUND    int    asst turns between mid_cps (default 20)
   SWE_AGENT_LANES_STEP_LIMIT         int    hard cap per Lane B branch (default 120)
   SWE_AGENT_LANES_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
@@ -45,7 +44,7 @@ from typing import Any
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.data_source import (
     TrainingInstanceBudgetExhausted,
     TrainingValidationBoundaryReached,
@@ -69,11 +68,9 @@ from train_agent.collector_checkpoint import (
     serialize_validation_error,
 )
 from train_agent.collect_naive_rollout_async import (
-    CollectorInfrastructureError,
     _emit_heartbeat,
     _ensure_usage_tracking,
     _group_outcome_metrics,
-    _is_fatal_ray_infrastructure_error,
     _raise_fatal_ray_infrastructure_error,
     _record_usage_disposition,
     _restore_usage_tracking_checkpoint,
@@ -170,9 +167,9 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         environment_overrides = {
             "image": image_name if environment_class == "docker" else get_swebench_singularity_image_name(instance),
             "environment_class": environment_class,
+            "cwd": instance.get("swebench_workdir") or "/testbed",
         }
         if instance.get("expected_output_json"):
-            environment_overrides["cwd"] = "/testbed"
             environment_overrides["dataset_name"] = "r2egym"
         overrides = {
             "agent": {"step_limit": task["step_limit"]},
@@ -205,15 +202,10 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"unsupported lanes reward_kind={reward_kind!r}")
         cfg = ParallelSearchConfig(
             m=task["m"],
-            # Post chinsengi rubric-bank rebase the field names changed:
-            # max_mid_cps -> max_rounds, steps_per_round -> k, seed removed.
-            # Task dict still uses the old keys (env-set in slurm launcher)
-            # so remap here instead of churning every launcher.
-            max_rounds=task["max_mid_cps"],
             k=task["steps_per_round"],
             step_limit=task["step_limit"],
             gt_eval_workers=task.get("gt_eval_workers", 8),
-            lane_b_pool_size=task.get("lane_b_pool_size") or (task["m"] * task["max_mid_cps"]),
+            lane_b_pool_size=task.get("lane_b_pool_size"),
             keep_images=False,
             policy_temperature=task.get("policy_temperature", 1.0),
             policy_top_p=task.get("policy_top_p", 0.95),
@@ -383,8 +375,7 @@ _DISPATCH_COUNTER = 0
 # Rolling estimate of groups produced per completed instance. Updated in
 # _harvest_ready as bundles return; used by _submit_until_full to decide
 # whether the in-flight set already covers the over-sampling group target.
-# Initialized optimistically (every instance maxes out at max_mid_cps) so
-# the first dispatch round under-fills rather than over-fills; refines fast.
+# Initialized to one group per instance; the observed depth-2 yield refines it.
 _OBSERVED_GROUPS_TOTAL = 0
 _OBSERVED_INSTANCES = 0
 _DEFAULT_EST_GROUPS = 1.0
@@ -605,11 +596,6 @@ def _expected_usage_group_specs(task: dict[str, Any]) -> dict[str, str]:
     return specs
 
 
-def _expected_usage_group_ids(task: dict[str, Any]) -> list[str]:
-    """Return the exact request-ledger ids the runner can emit for a task."""
-    return list(_expected_usage_group_specs(task))
-
-
 def _increment_kind_counter(counter: dict[str, int], kind: str) -> None:
     counter[kind] = counter.get(kind, 0) + 1
 
@@ -626,20 +612,18 @@ def _mark_expected_stale(kind: str) -> None:
     _increment_kind_counter(_STALE_DROPPED_BY_KIND, kind)
 
 
-def _mark_expected_invalid(kind: str, reason: str) -> None:
-    global _INVALID_DROPPED_GROUPS
+def _mark_expected_drop(kind: str, reason: str, *, filtered: bool) -> None:
+    global _FILTER_DROPPED_GROUPS, _INVALID_DROPPED_GROUPS
+    if filtered:
+        _FILTER_DROPPED_GROUPS += 1
+        _increment_kind_counter(_FILTER_DROPPED_BY_KIND, kind)
+        key = str(reason or "unspecified")
+        _FILTER_DROP_REASONS[key] = _FILTER_DROP_REASONS.get(key, 0) + 1
+        return
     _INVALID_DROPPED_GROUPS += 1
     _increment_kind_counter(_INVALID_DROPPED_BY_KIND, kind)
     key = str(reason or "unspecified").split(" ", 1)[0]
     _INVALID_DROP_REASONS[key] = _INVALID_DROP_REASONS.get(key, 0) + 1
-
-
-def _mark_expected_filtered(kind: str, reason: str) -> None:
-    global _FILTER_DROPPED_GROUPS
-    _FILTER_DROPPED_GROUPS += 1
-    _increment_kind_counter(_FILTER_DROPPED_BY_KIND, kind)
-    key = str(reason or "unspecified")
-    _FILTER_DROP_REASONS[key] = _FILTER_DROP_REASONS.get(key, 0) + 1
 
 
 def _observe_reward_group(args, samples: list[Sample], *, kind: str) -> None:
@@ -668,25 +652,13 @@ def _observe_reward_group(args, samples: list[Sample], *, kind: str) -> None:
         )
 
 
-def _export_group_usage_id(task: dict[str, Any], group: Any) -> str:
-    metadata = getattr(group, "metadata", None) or {}
-    try:
-        group_index = int(metadata["group_index"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"lane ExportGroup for {task.get('instance_id')} is missing a "
-            "valid metadata.group_index"
-        ) from exc
-    return f"{task.get('usage_group_prefix', '')}:g{group_index}"
-
-
 def _record_task_disposition(
     task: dict[str, Any],
     *,
     disposition: str,
     reason: str,
 ) -> None:
-    for group_id in _expected_usage_group_ids(task):
+    for group_id in _expected_usage_group_specs(task):
         _record_usage_disposition(
             group_id,
             disposition=disposition,
@@ -839,10 +811,8 @@ def _lanes_values_from_env() -> dict[str, Any]:
 
     return {
         "m": _int("SWE_AGENT_LANES_M", 8),
-        "max_mid_cps": _int("SWE_AGENT_LANES_MAX_MID_CPS", 6),
         "steps_per_round": _int("SWE_AGENT_LANES_STEPS_PER_ROUND", 20),
         "step_limit": _int("SWE_AGENT_LANES_STEP_LIMIT", 120),
-        "seed": _int("SWE_AGENT_LANES_SEED"),
         "gt_eval_workers": _int("SWE_AGENT_LANES_GT_EVAL_WORKERS", 8),
         "lane_b_pool_size": _int("SWE_AGENT_LANES_LANE_B_POOL_SIZE"),
         "completion_max_tokens": _int("SWE_AGENT_LANES_COMPLETION_MAX_TOKENS", 20480),
@@ -880,37 +850,32 @@ _ENDPOINT_LOAD: dict[str, int] = {}
 _ENDPOINT_LOAD_LOCK = threading.Lock()
 
 
-def _urls_from_ports_env(name: str, host: str) -> list[str]:
-    ports = [int(p) for p in os.environ.get(name, "").split(",") if p]
-    return [f"{host.rstrip('/')}:{p}" for p in ports]
-
-
 def _hosted_lane_c_settings() -> tuple[str, str, str, str]:
-    """Return hosted GLM rubric/judge routing, never a local policy URL."""
+    """Return the single hosted Lane-C route, never a local policy URL."""
+    default_lane_c_model = "openai/azure/openai/gpt-5.6-luna"
     rubric_model = (
         os.environ.get("SWE_AGENT_LANES_RUBRIC_MODEL")
-        or "nvidia/zai-org/glm-5.2"
+        or default_lane_c_model
     ).strip()
     judge_model = (
         os.environ.get("SWE_AGENT_LANES_JUDGE_MODEL")
-        or "nvidia/zai-org/glm-5.2"
+        or default_lane_c_model
     ).strip()
     allowed_model_routes = {
-        # Primary NVIDIA deployment.
+        # GLM remains an explicit experiment route alongside Luna.
         "nvidia/zai-org/glm-5.2",
-        # Same GLM-5.2 model through the NVIDIA gateway's Azure deployment.
-        # The outer openai/ prefix makes LiteLLM use the gateway's standard
-        # OpenAI-compatible path while sending azure/zai-org/glm-5.2 as the
-        # provider-visible model id.
         "openai/azure/zai-org/glm-5.2",
+        # The outer openai/ selects LiteLLM's OpenAI-compatible adapter; the
+        # NVIDIA gateway receives azure/openai/gpt-5.6-luna as the model id.
+        "openai/azure/openai/gpt-5.6-luna",
     }
     if (
         rubric_model != judge_model
         or rubric_model not in allowed_model_routes
     ):
         raise ValueError(
-            "Current early-prediction experiments require GLM-5.2 for every "
-            "Lane C call through an approved NVIDIA-gateway deployment; "
+            "Current early-prediction experiments require one identical "
+            "approved NVIDIA-gateway model for every Lane C call; "
             f"got rubric={rubric_model!r}, judge={judge_model!r}"
         )
     api_base = (
@@ -944,7 +909,7 @@ def _hosted_lane_c_settings() -> tuple[str, str, str, str]:
     )
     if not api_key:
         raise ValueError(
-            "Lane C hosted GLM API key is missing; export "
+            "Lane C hosted-model API key is missing; export "
             "LITELLM_API_KEY or NVIDIA_API_KEY from exp/config.md"
         )
     return rubric_model, judge_model, api_base, api_key
@@ -952,7 +917,14 @@ def _hosted_lane_c_settings() -> tuple[str, str, str, str]:
 
 def _policy_urls_for_model(args, model_name: str) -> list[str]:
     api_host = os.environ.get("SWE_AGENT_LANES_API_HOST", "http://127.0.0.1")
-    explicit_urls = _urls_from_ports_env("SWE_AGENT_LANES_POLICY_PORTS", api_host)
+    explicit_urls = [
+        f"{api_host.rstrip('/')}:{int(port)}"
+        for port in os.environ.get(
+            "SWE_AGENT_LANES_POLICY_PORTS",
+            "",
+        ).split(",")
+        if port
+    ]
     if explicit_urls:
         return explicit_urls
 
@@ -982,12 +954,6 @@ def _pick_least_loaded_urls(candidates: list[str], n: int) -> list[str]:
     return picks
 
 
-def _release_endpoint(url: str) -> None:
-    with _ENDPOINT_LOAD_LOCK:
-        if url in _ENDPOINT_LOAD:
-            _ENDPOINT_LOAD[url] = max(0, _ENDPOINT_LOAD[url] - 1)
-
-
 def _release_endpoints(urls: list[str]) -> None:
     with _ENDPOINT_LOAD_LOCK:
         for url in urls:
@@ -995,13 +961,12 @@ def _release_endpoints(urls: list[str]) -> None:
                 _ENDPOINT_LOAD[url] = max(0, _ENDPOINT_LOAD[url] - 1)
 
 
-def _dispatch_policy_version(rollout_id: int) -> str | None:
+def _dispatch_policy_version() -> str | None:
     """Return the committed weight epoch, pausing dispatch during an update."""
     try:
-        version = committed_policy_version()
+        return committed_policy_version()
     except PolicyVersionMismatch:
         return None
-    return version or f"legacy-rollout-{int(rollout_id)}"
 
 
 def _replay_checkpoint_pending_tasks(
@@ -1019,7 +984,7 @@ def _replay_checkpoint_pending_tasks(
         raise RuntimeError(
             "cannot replay Lane pending tasks before node workers exist"
         )
-    policy_version = _dispatch_policy_version(rollout_id)
+    policy_version = _dispatch_policy_version()
     if policy_version is None:
         raise RuntimeError(
             "cannot replay Lane pending tasks during a policy transition"
@@ -1049,10 +1014,12 @@ def _replay_checkpoint_pending_tasks(
             task_index=source_group_index,
             dataset_name=str(task.get("dataset_name") or ""),
         )
-        policy_base_urls = _pick_least_loaded_urls(
-            policy_urls,
-            n=max(1, int(task.get("max_mid_cps") or 1)),
+        n_urls = (
+            1 + int(task.get("beam_parents", 2))
+            if task.get("topology") == "depth2"
+            else 1
         )
+        policy_base_urls = _pick_least_loaded_urls(policy_urls, n=n_urls)
         task.update(
             {
                 "rollout_id": int(rollout_id),
@@ -1115,11 +1082,8 @@ def _submit_until_full(
       - over_sampling_groups: stop dispatching once
         (buffer + pending * est_groups_per_instance) reaches this many groups
 
-    The second cap is what makes lanes a fair comparison to naive: each
-    instance yields ~max_mid_cps groups, so to land ROLLOUT_BATCH_SIZE
-    trainable groups in the buffer we only need ROLLOUT_BATCH_SIZE /
-    groups_per_instance live instances, not OVER_SAMPLING_BATCH_SIZE of
-    them. Dispatching more wastes rollout compute.
+    The second cap keeps depth-2's variable one-or-two group yield from
+    dispatching avoidable extra instances while preserving FIFO ordering.
     """
     global _TASK_INDEX, _DISPATCH_COUNTER
     global _SOURCE_BUDGET_EXHAUSTED, _SOURCE_BUDGET_ERROR
@@ -1143,10 +1107,13 @@ def _submit_until_full(
         _hosted_lane_c_settings()
     )
     policy_api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
-    # Per-instance URL count: pre-pick one URL per *potential* fork group so
-    # the runner can spread group-level branches across distinct sglang
-    # engines. lanes_values["max_mid_cps"] is the runner-side cap.
-    n_urls_per_instance = max(1, int(lanes_values.get("max_mid_cps") or 1))
+    # Root rollout uses one endpoint. Depth-2 reserves one additional endpoint
+    # per independent Lane-A parent for its possible continuation group.
+    n_urls_per_instance = (
+        1 + int(lanes_values["beam_parents"])
+        if lanes_values["topology"] == "depth2"
+        else 1
+    )
 
     while True:
         if len(_PENDING) >= max_pending:
@@ -1160,7 +1127,7 @@ def _submit_until_full(
             break
         if _SOURCE_BUDGET_EXHAUSTED or _SOURCE_VALIDATION_ERROR is not None:
             break
-        policy_version = _dispatch_policy_version(rollout_id)
+        policy_version = _dispatch_policy_version()
         if policy_version is None:
             break
         try:
@@ -1304,7 +1271,11 @@ def _harvest_ready(
             ):
                 return
             accounted_usage_ids.add(usage_group_id)
-            _mark_expected_invalid(expected_specs[usage_group_id], reason)
+            _mark_expected_drop(
+                expected_specs[usage_group_id],
+                reason,
+                filtered=False,
+            )
 
         def mark_filtered(usage_group_id: str, reason: str) -> None:
             if (
@@ -1313,17 +1284,16 @@ def _harvest_ready(
             ):
                 return
             accounted_usage_ids.add(usage_group_id)
-            _mark_expected_filtered(expected_specs[usage_group_id], reason)
-
-        def mark_valid(usage_group_id: str) -> None:
-            if usage_group_id in expected_specs:
-                accounted_usage_ids.add(usage_group_id)
+            _mark_expected_drop(
+                expected_specs[usage_group_id],
+                reason,
+                filtered=True,
+            )
 
         # Release this task's pinned endpoint(s) from the least-loaded
         # counter — must happen regardless of success/error so the
         # counter stays correct.
-        for ep in task.get("_pinned_endpoints", []):
-            _release_endpoint(ep)
+        _release_endpoints(list(task.get("_pinned_endpoints", [])))
         if policy_stale_lag is not None and policy_stale_lag < 0:
             raise RuntimeError(
                 "Lane collector observed policy weights from the future: "
@@ -1430,21 +1400,35 @@ def _harvest_ready(
         groups = (
             bundle.policy_groups if target == "policy" else bundle.rubric_groups
         )
+        bundle_metadata = getattr(bundle, "metadata", None) or {}
+        skipped_group_reasons = dict(
+            bundle_metadata.get("skipped_group_reasons") or {}
+        )
         # Refine the rolling groups-per-instance estimate from every
         # successfully harvested bundle.
         global _OBSERVED_GROUPS_TOTAL, _OBSERVED_INSTANCES
         _OBSERVED_GROUPS_TOTAL += len(groups)
         _OBSERVED_INSTANCES += 1
-        resolved_groups: list[tuple[Any, str]] = []
+        resolved_groups: list[tuple[Any, str, dict[str, Any]]] = []
         usage_id_counts: dict[str, int] = {}
         for group in groups:
-            usage_group_id = _export_group_usage_id(task, group)
-            resolved_groups.append((group, usage_group_id))
+            metadata = getattr(group, "metadata", None) or {}
+            try:
+                group_index = int(metadata["group_index"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "lane ExportGroup for "
+                    f"{task.get('instance_id')} is missing a valid "
+                    "metadata.group_index"
+                ) from exc
+            usage_group_id = (
+                f"{task.get('usage_group_prefix', '')}:g{group_index}"
+            )
+            resolved_groups.append((group, usage_group_id, metadata))
             usage_id_counts[usage_group_id] = (
                 usage_id_counts.get(usage_group_id, 0) + 1
             )
-        for group, usage_group_id in resolved_groups:
-            metadata = getattr(group, "metadata", None) or {}
+        for group, usage_group_id, metadata in resolved_groups:
             if usage_id_counts[usage_group_id] > 1:
                 raise RuntimeError(
                     "Lane runner returned duplicate GRPO groups for "
@@ -1507,7 +1491,7 @@ def _harvest_ready(
                         ),
                     )
                     continue
-            mark_valid(usage_group_id)
+            accounted_usage_ids.add(usage_group_id)
             _BUFFER.append(
                 _BufferedGroup(
                     samples=samples,
@@ -1517,6 +1501,34 @@ def _harvest_ready(
                 )
             )
             harvested += 1
+        for raw_group_index, raw_reason in skipped_group_reasons.items():
+            try:
+                skipped_group_index = int(raw_group_index)
+            except (TypeError, ValueError):
+                raise RuntimeError(
+                    "Lane runner returned an invalid skipped group index: "
+                    f"{raw_group_index!r}"
+                )
+            skipped_usage_id = (
+                f"{task.get('usage_group_prefix', '')}:g{skipped_group_index}"
+            )
+            if skipped_usage_id not in expected_usage_ids:
+                raise RuntimeError(
+                    "Lane runner returned an unexpected skipped group: "
+                    f"{skipped_usage_id}; expected={sorted(expected_usage_ids)}"
+                )
+            if skipped_usage_id in accounted_usage_ids:
+                raise RuntimeError(
+                    "Lane runner both exported and skipped the same group: "
+                    f"{skipped_usage_id}"
+                )
+            reason = f"topology_skip:{str(raw_reason or 'unspecified')}"
+            mark_filtered(skipped_usage_id, reason)
+            _record_usage_disposition(
+                skipped_usage_id,
+                disposition="filtered",
+                reason=reason,
+            )
         for missing_group_id in expected_usage_ids - accounted_usage_ids:
             mark_invalid(missing_group_id, "missing_group")
             _record_usage_disposition(

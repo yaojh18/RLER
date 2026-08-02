@@ -793,17 +793,6 @@ class UsageMetricsTracker:
         self._set_delta_baseline(cumulative)
         return output
 
-    def wandb_metrics(self) -> dict[str, float | int]:
-        """Compatibility API: commit one optimizer-update metric interval.
-
-        New non-update callers must use :meth:`peek` or :meth:`snapshot`;
-        keeping the historical method commit-like preserves existing external
-        consumers without allowing heartbeats to consume update deltas.
-        """
-
-        return self.commit_update()
-
-
 __all__ = [
     "UsageContext",
     "UsageLedger",

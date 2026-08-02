@@ -41,17 +41,19 @@ def checkpoint_policy_stale_lag(
     policy_version: str,
     *,
     consumer_rollout_id: int,
-) -> int | None:
+) -> int:
     """Return true checkpoint lag for coordinated policy labels.
 
-    ``None`` preserves the legacy, opt-in-free collector behavior. Before
-    optimizer update ``r``, checkpoint ``r - 1`` is current; therefore lag 0
-    and 1 are the accepted stale=1 window.
+    Before optimizer update ``r``, checkpoint ``r - 1`` is current; therefore
+    lag 0 and 1 are the accepted stale=1 window. Invalid labels fail closed so
+    a resumed collector cannot silently bypass the coordinated version check.
     """
 
     checkpoint_id = _checkpoint_id_for_policy_version(policy_version)
     if checkpoint_id is None:
-        return None
+        raise PolicyVersionMismatch(
+            f"invalid coordinated policy version: {policy_version!r}"
+        )
     return int(consumer_rollout_id) - 1 - checkpoint_id
 
 
@@ -87,12 +89,6 @@ def _read_state(path: Path) -> dict[str, Any]:
             f"policy version state is missing {missing}: {path}"
         )
     return payload
-
-
-def read_policy_version_state() -> dict[str, Any] | None:
-    """Read the configured state, or return ``None`` when coordination is off."""
-    path = policy_version_state_path()
-    return None if path is None else _read_state(path)
 
 
 def _atomic_write_state(path: Path, payload: dict[str, Any]) -> None:
@@ -208,9 +204,10 @@ def committed_policy_version(*, allow_target_during_update: bool = False) -> str
     training dispatch fails closed; validation scheduling may record the
     target version that will become visible after the transition.
     """
-    state = read_policy_version_state()
-    if state is None:
+    path = policy_version_state_path()
+    if path is None:
         return None
+    state = _read_state(path)
     if bool(state.get("updating")):
         if allow_target_during_update:
             return str(state["target_version"])

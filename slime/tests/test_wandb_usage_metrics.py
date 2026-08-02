@@ -105,6 +105,35 @@ def test_usage_metrics_have_an_independent_event_axis(monkeypatch):
     assert not any(args == ("usage/*_cumulative",) for args, _ in calls)
 
 
+def test_wandb_history_metric_allowlist_is_opt_in_and_keeps_step(monkeypatch):
+    metrics = {
+        "rollout/step": 3,
+        "swe_agent/reward_group_mean": 0.4,
+        "swe_agent/groups_attempted": 16,
+    }
+
+    monkeypatch.delenv(wandb_utils._WANDB_METRIC_ALLOWLIST_ENV, raising=False)
+    assert (
+        wandb_utils.filter_metrics_for_logging(
+            metrics,
+            step_key="rollout/step",
+        )
+        == metrics
+    )
+
+    monkeypatch.setenv(
+        wandb_utils._WANDB_METRIC_ALLOWLIST_ENV,
+        "swe_agent/reward_group_mean",
+    )
+    assert wandb_utils.filter_metrics_for_logging(
+        metrics,
+        step_key="rollout/step",
+    ) == {
+        "rollout/step": 3,
+        "swe_agent/reward_group_mean": 0.4,
+    }
+
+
 def test_primary_wandb_run_resumes_external_run_id(monkeypatch, tmp_path):
     captured = {}
     monkeypatch.setenv("WANDB_RUN_ID", "fold0-baseline-stable")

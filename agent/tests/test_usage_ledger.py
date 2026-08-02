@@ -26,10 +26,6 @@ def _reset_usage_ledger(monkeypatch):
     monkeypatch.delenv("RLER_USAGE_LEDGER_PATH", raising=False)
     monkeypatch.delenv("RLER_USAGE_RESUME", raising=False)
     monkeypatch.delenv("RLER_USAGE_ATTEMPT_NONCE", raising=False)
-    monkeypatch.delenv(
-        "RLER_LITELLM_RATE_LIMIT_FALLBACK_MODEL",
-        raising=False,
-    )
     yield
     configure_usage_ledger(None)
     configure_usage_resume_window(None)
@@ -175,7 +171,7 @@ def test_metrics_deduplicate_events_and_include_filtered_and_validation_tokens(t
         )
 
     tracker = UsageMetricsTracker(ledger_path)
-    metrics = tracker.wandb_metrics()
+    metrics = tracker.commit_update()
     assert metrics["usage/total_tokens_cumulative"] == 20
     assert metrics["usage/train_tokens_cumulative"] == 17
     assert metrics["usage/validation_tokens_cumulative"] == 3
@@ -205,7 +201,7 @@ def test_metrics_deduplicate_events_and_include_filtered_and_validation_tokens(t
     assert metrics["usage/glm_output_tokens_delta"] == 1
     assert metrics["usage/exact_usage_fraction"] == 1.0
 
-    unchanged = tracker.wandb_metrics()
+    unchanged = tracker.commit_update()
     assert unchanged["usage/qwen_input_tokens_delta"] == 0
     assert unchanged["usage/qwen_cached_input_tokens_delta"] == 0
     assert unchanged["usage/glm_cached_input_tokens_delta"] == 0
@@ -281,7 +277,7 @@ def test_metrics_apply_late_and_changed_group_dispositions_incrementally(tmp_pat
             model_role="policy",
         )
 
-    before_disposition = tracker.wandb_metrics()
+    before_disposition = tracker.commit_update()
     assert before_disposition["usage/total_tokens_cumulative"] == 12
     assert before_disposition["usage/dropped_tokens_cumulative"] == 0
 
@@ -291,7 +287,7 @@ def test_metrics_apply_late_and_changed_group_dispositions_incrementally(tmp_pat
         reason="zero_variance",
         phase="train",
     )
-    filtered = tracker.wandb_metrics()
+    filtered = tracker.commit_update()
     assert filtered["usage/dropped_tokens_cumulative"] == 12
     assert filtered["usage/zero_variance_dropped_tokens_cumulative"] == 12
     assert filtered["usage/qwen_input_tokens_delta"] == 0
@@ -310,7 +306,7 @@ def test_metrics_apply_late_and_changed_group_dispositions_incrementally(tmp_pat
             model_family="glm",
             model_role="rubric_judge",
         )
-    retried = tracker.wandb_metrics()
+    retried = tracker.commit_update()
     assert retried["usage/total_tokens_cumulative"] == 17
     assert retried["usage/dropped_tokens_cumulative"] == 17
     assert retried["usage/zero_variance_dropped_tokens_cumulative"] == 17
@@ -323,7 +319,7 @@ def test_metrics_apply_late_and_changed_group_dispositions_incrementally(tmp_pat
         reason="excess_group",
         phase="train",
     )
-    excess = tracker.wandb_metrics()
+    excess = tracker.commit_update()
     assert excess["usage/dropped_tokens_cumulative"] == 17
     assert excess["usage/zero_variance_dropped_tokens_cumulative"] == 0
 
@@ -332,7 +328,7 @@ def test_metrics_apply_late_and_changed_group_dispositions_incrementally(tmp_pat
         disposition="accepted",
         phase="train",
     )
-    accepted = tracker.wandb_metrics()
+    accepted = tracker.commit_update()
     assert accepted["usage/dropped_tokens_cumulative"] == 0
     assert accepted["usage/zero_variance_dropped_tokens_cumulative"] == 0
 
@@ -379,7 +375,7 @@ def test_restart_tracker_keeps_history_cumulative_but_bootstraps_deltas(
     # refresh. Only the explicit resume path suppresses historical deltas.
     monkeypatch.delenv("RLER_USAGE_RESUME")
     fresh = UsageMetricsTracker(ledger_path)
-    fresh_first = fresh.wandb_metrics()
+    fresh_first = fresh.commit_update()
     assert fresh_first["usage/qwen_input_tokens_delta"] == 14
     assert fresh_first["usage/qwen_output_tokens_delta"] == 3
 
@@ -483,7 +479,7 @@ def test_excess_and_partial_drop_dispositions_keep_all_cost_in_total(tmp_path):
                 reason=reason,
             )
 
-    metrics = UsageMetricsTracker(ledger_path).wandb_metrics()
+    metrics = UsageMetricsTracker(ledger_path).commit_update()
     assert metrics["usage/total_tokens_cumulative"] == 19
     assert metrics["usage/train_tokens_cumulative"] == 19
     assert metrics["usage/qwen_tokens_cumulative"] == 19
@@ -544,7 +540,7 @@ def test_usage_group_prefix_prevents_replay_from_reclassifying_history(
             disposition="accepted",
         )
 
-    metrics = UsageMetricsTracker(ledger_path).wandb_metrics()
+    metrics = UsageMetricsTracker(ledger_path).commit_update()
     assert metrics["usage/total_tokens_cumulative"] == 17
     assert metrics["usage/dropped_tokens_cumulative"] == 12
     assert metrics["usage/zero_variance_dropped_tokens_cumulative"] == 12
@@ -574,10 +570,10 @@ def test_metrics_process_each_request_only_once_across_refreshes(
             model_role="policy",
             event_id=event_id,
         )
-    tracker.wandb_metrics()
+    tracker.commit_update()
     assert processed_event_ids == ["request-1", "request-2"]
 
-    tracker.wandb_metrics()
+    tracker.commit_update()
     assert processed_event_ids == ["request-1", "request-2"]
 
     record_group_disposition(
@@ -585,7 +581,7 @@ def test_metrics_process_each_request_only_once_across_refreshes(
         disposition="invalid",
         reason="missing_group",
     )
-    tracker.wandb_metrics()
+    tracker.commit_update()
     assert processed_event_ids == ["request-1", "request-2"]
 
     record_model_usage(
@@ -595,7 +591,7 @@ def test_metrics_process_each_request_only_once_across_refreshes(
         model_role="rubric_generation",
         event_id="request-3",
     )
-    final = tracker.wandb_metrics()
+    final = tracker.commit_update()
     assert processed_event_ids == ["request-1", "request-2", "request-3"]
     assert final["usage/requests_cumulative"] == 3
     assert not hasattr(tracker, "_requests")
@@ -616,7 +612,7 @@ def test_missing_failure_usage_is_visible_in_coverage(tmp_path):
     [event] = _events(ledger_path)
     assert event["error_type"] == "RuntimeError"
     assert "secret-bearing" not in json.dumps(event)
-    metrics = UsageMetricsTracker(ledger_path).wandb_metrics()
+    metrics = UsageMetricsTracker(ledger_path).commit_update()
     assert metrics["usage/missing_usage_attempts_cumulative"] == 1
     assert metrics["usage/failed_requests_cumulative"] == 1
     assert metrics["usage/exact_usage_fraction"] == 0.0
@@ -633,7 +629,6 @@ def test_litellm_preserves_provider_retry_configuration_without_fallback(
 ):
     ledger_path = tmp_path / "usage.jsonl"
     configure_usage_ledger(ledger_path)
-    monkeypatch.setenv("RLER_LITELLM_RETRY_BASE_SECONDS", "0")
     monkeypatch.setattr(
         run_utils.litellm,
         "token_counter",
@@ -775,38 +770,17 @@ def test_litellm_rejects_prompt_that_already_fills_hosted_context(
     assert _events(ledger_path) == []
 
 
-def test_litellm_rate_limit_immediately_uses_configured_ultra_fallback(
+def test_litellm_glm_only_contract_uses_eight_provider_retries(
     tmp_path,
     monkeypatch,
 ):
     ledger_path = tmp_path / "usage.jsonl"
     configure_usage_ledger(ledger_path)
-    primary_model = "nvidia/zai-org/glm-5.2"
-    fallback_model = "nvidia/nvidia/nemotron-3-ultra"
-    monkeypatch.setenv(
-        "RLER_LITELLM_RATE_LIMIT_FALLBACK_MODEL",
-        fallback_model,
-    )
-    monkeypatch.setattr(
-        run_utils.litellm,
-        "token_counter",
-        lambda **_kwargs: 7,
-    )
-
-    class FakeRateLimitError(Exception):
-        pass
-
-    monkeypatch.setattr(
-        run_utils.litellm,
-        "RateLimitError",
-        FakeRateLimitError,
-    )
+    monkeypatch.setenv("RLER_LITELLM_EXPLICIT_RETRIES", "8")
     calls = []
 
     def completion(**kwargs):
         calls.append(kwargs)
-        if kwargs["model"] == primary_model:
-            raise FakeRateLimitError("primary capacity")
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -827,98 +801,19 @@ def test_litellm_rate_limit_immediately_uses_configured_ultra_fallback(
 
     monkeypatch.setattr(run_utils.litellm, "completion", completion)
     monkeypatch.setattr(run_utils.asyncio, "to_thread", inline_to_thread)
-
     result = asyncio.run(
         run_utils.run_litellm_completion_async(
-            model_name=primary_model,
-            messages=[{"role": "user", "content": "not persisted"}],
+            model_name="openai/azure/zai-org/glm-5.2",
+            messages=[{"role": "user", "content": "judge"}],
             usage_model_role="rubric_judge",
-            num_retries=4,
         )
     )
 
-    assert [call["model"] for call in calls] == [
-        primary_model,
-        fallback_model,
-    ]
     assert result.content == '{"score": 1}'
-    assert result.model_name == fallback_model
-    assert result.metadata["primary_model"] == primary_model
-    assert (
-        result.metadata["rate_limit_fallback_model"]
-        == fallback_model
-    )
-    events = _events(ledger_path)
-    assert [event["status"] for event in events] == ["success"]
-    assert [event["model_family"] for event in events] == ["other"]
-    assert UsageMetricsTracker(ledger_path).wandb_metrics()[
-        "usage/total_tokens_cumulative"
-    ] == 10
-
-
-def test_litellm_nvidia_529_immediately_uses_configured_ultra_fallback(
-    tmp_path,
-    monkeypatch,
-):
-    ledger_path = tmp_path / "usage.jsonl"
-    configure_usage_ledger(ledger_path)
-    primary_model = "openai/azure/zai-org/glm-5.2"
-    fallback_model = "nvidia/nvidia/nemotron-3-ultra"
-    monkeypatch.setenv(
-        "RLER_LITELLM_RATE_LIMIT_FALLBACK_MODEL",
-        fallback_model,
-    )
-    monkeypatch.setattr(
-        run_utils.litellm,
-        "token_counter",
-        lambda **_kwargs: 7,
-    )
-
-    class FakeOverloadedError(Exception):
-        status_code = 529
-
-    calls = []
-
-    def completion(**kwargs):
-        calls.append(kwargs)
-        if kwargs["model"] == primary_model:
-            raise FakeOverloadedError("temporarily overloaded")
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content='{"score": 1}'),
-                    finish_reason="stop",
-                )
-            ],
-            usage=SimpleNamespace(
-                model_dump=lambda: {
-                    "prompt_tokens": 7,
-                    "completion_tokens": 3,
-                }
-            ),
-        )
-
-    async def inline_to_thread(function, /, *args, **kwargs):
-        return function(*args, **kwargs)
-
-    monkeypatch.setattr(run_utils.litellm, "completion", completion)
-    monkeypatch.setattr(run_utils.asyncio, "to_thread", inline_to_thread)
-
-    result = asyncio.run(
-        run_utils.run_litellm_completion_async(
-            model_name=primary_model,
-            messages=[{"role": "user", "content": "not persisted"}],
-            usage_model_role="rubric_judge",
-            num_retries=4,
-        )
-    )
-
-    assert [call["model"] for call in calls] == [
-        primary_model,
-        fallback_model,
-    ]
-    assert result.model_name == fallback_model
-    assert len(_events(ledger_path)) == 1
+    assert len(calls) == 1
+    assert calls[0]["model"] == "openai/azure/zai-org/glm-5.2"
+    assert calls[0]["num_retries"] == 8
+    assert "custom_llm_provider" not in calls[0]
 
 
 def test_sglang_transport_returns_exact_usage_without_recording_retry_cost(

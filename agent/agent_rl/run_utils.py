@@ -289,11 +289,8 @@ async def run_litellm_completion_async(
 ) -> ChatCompletion:
     """Run one hosted logical call and account only its final success.
 
-    Retry attempts and failed/fallback requests are deliberately omitted from
-    usage accounting.  With no fallback configured, LiteLLM retains ownership
-    of its established retry behavior.  The early-prediction launcher may
-    configure a fallback route, in which case this wrapper surfaces retries so
-    a capacity error can switch providers immediately.
+    LiteLLM owns retry behavior. Failed attempts are deliberately omitted from
+    the experiment's approximate token accounting.
     """
     from swe_agent.usage import (
         current_usage_context,
@@ -375,165 +372,85 @@ async def run_litellm_completion_async(
                     chat_kwargs["max_completion_tokens"] = requested_max_tokens
                 else:
                     chat_kwargs["max_tokens"] = requested_max_tokens
-    rate_limit_fallback_model = str(
-        os.environ.get("RLER_LITELLM_RATE_LIMIT_FALLBACK_MODEL") or ""
-    ).strip()
-    if rate_limit_fallback_model == model_name:
-        rate_limit_fallback_model = ""
-    if rate_limit_fallback_model:
-        configured_retries = max(
-            0,
-            int(
-                chat_kwargs.pop(
-                    "num_retries",
-                    os.environ.get("RLER_LITELLM_EXPLICIT_RETRIES", "4"),
-                )
-            ),
-        )
-        # Only the explicit early-prediction fallback path owns physical
-        # attempts.  This makes a GLM 429/529 switch to Ultra immediately.
-        chat_kwargs["num_retries"] = 0
-    else:
-        # Preserve the original generic helper contract: LiteLLM owns retries
-        # and receives the caller's value (or the historical default of four).
-        configured_retries = 0
-        chat_kwargs["num_retries"] = chat_kwargs.get("num_retries", 4)
-    active_model_name = model_name
-    fallback_used = False
+    # Keep physical retries inside LiteLLM.  The experiment launcher raises
+    # this default to eight; failed/retry calls are not recorded by the
+    # approximate token ledger.
+    chat_kwargs["num_retries"] = max(
+        0,
+        int(
+            chat_kwargs.get(
+                "num_retries",
+                os.environ.get("RLER_LITELLM_EXPLICIT_RETRIES", "4"),
+            )
+        ),
+    )
     chat_kwargs["timeout"] = chat_kwargs.get("timeout", _default_litellm_timeout_seconds())
     context = current_usage_context()
     logical_call_id = context.logical_call_id or new_logical_call_id()
     base_attempt_index = int(context.attempt_index or 0)
-    response = None
-    last_exception: Exception | None = None
-    response_latency_ms = 0.0
-    response_request_started_at: float | None = None
-
-    max_physical_attempts = (
-        configured_retries + 1 + int(bool(rate_limit_fallback_model))
-    )
-    for retry_index in range(max_physical_attempts):
-        started: float | None = None
-        request_started_at: float | None = None
-        try:
-            async with _get_litellm_semaphore():
-                started = time.monotonic()
-                request_started_at = time.time()
-                completion_call = asyncio.to_thread(
-                    litellm.completion,
-                    messages=msgs,
-                    model=active_model_name,
-                    **chat_kwargs,
-                )
-                outer_timeout = _litellm_outer_timeout_seconds(
-                    chat_kwargs.get("timeout")
-                )
-                if outer_timeout > 0:
-                    response = await asyncio.wait_for(
-                        completion_call,
-                        timeout=outer_timeout,
-                    )
-                else:
-                    response = await completion_call
-        except Exception as exc:
-            if started is None:
-                raise
-            last_exception = exc
-
-            rate_limit_type = getattr(litellm, "RateLimitError", None)
-            is_rate_limit = (
-                isinstance(rate_limit_type, type)
-                and isinstance(exc, rate_limit_type)
+    started = time.monotonic()
+    request_started_at = time.time()
+    try:
+        async with _get_litellm_semaphore():
+            completion_call = asyncio.to_thread(
+                litellm.completion,
+                messages=msgs,
+                model=model_name,
+                **chat_kwargs,
             )
-            status_code = getattr(exc, "status_code", None)
-            is_capacity_error = is_rate_limit or status_code in {429, 529}
-            if (
-                is_capacity_error
-                and rate_limit_fallback_model
-                and active_model_name == model_name
-            ):
-                active_model_name = rate_limit_fallback_model
-                fallback_used = True
-                LOGGER.warning(
-                    "Hosted primary model %s rate-limited; immediately "
-                    "falling back to %s",
-                    model_name,
-                    active_model_name,
-                )
-                continue
-            if is_capacity_error:
-                # Do not stall the whole rollout pipeline when both hosted
-                # routes reject this call, or when no fallback was configured.
-                # The enclosing judge group fails closed and the collector
-                # moves on to another source attempt.
-                break
-
-            # Preserve the established correction flow. It is a retry result,
-            # so it is intentionally absent from approximate usage accounting.
-            if isinstance(exc, litellm.JSONSchemaValidationError):
-                raw_content = exc.raw_response if isinstance(exc.raw_response, str) else str(exc.raw_response)
-                return ChatCompletion(
-                    content=raw_content,
-                    finish_reason="stop",
-                    model_name=active_model_name,
-                    cost=0.0,
-                    metadata={
-                        "timestamp": time.time(),
-                        "validation_error": str(exc),
-                    },
-                )
-
-            _exc_msg = str(exc)
-            _is_overflow = (
-                isinstance(exc, getattr(litellm, "ContextWindowExceededError", ()))
-                or "ContextWindowExceededError" in type(exc).__name__
-                or "Requested token count exceeds" in _exc_msg
-                or "longer than the model's context length" in _exc_msg
-                or "maximum context length" in _exc_msg
+            outer_timeout = _litellm_outer_timeout_seconds(
+                chat_kwargs.get("timeout")
             )
-            non_retryable_types = tuple(
-                error_type
-                for error_type in (
-                    asyncio.TimeoutError,
-                    getattr(litellm, "AuthenticationError", None),
-                    getattr(litellm, "PermissionDeniedError", None),
-                    getattr(litellm, "BadRequestError", None),
-                    getattr(litellm, "NotFoundError", None),
-                    getattr(litellm, "UnsupportedParamsError", None),
+            if outer_timeout > 0:
+                response = await asyncio.wait_for(
+                    completion_call,
+                    timeout=outer_timeout,
                 )
-                if isinstance(error_type, type)
+            else:
+                response = await completion_call
+    except Exception as exc:
+        if isinstance(exc, litellm.JSONSchemaValidationError):
+            raw_content = (
+                exc.raw_response
+                if isinstance(exc.raw_response, str)
+                else str(exc.raw_response)
             )
-            if _is_overflow:
-                print(f"Error in run_litellm_completion_async (FATAL, raising): {exc}")
-                raise
-            if (
-                active_model_name == model_name
-                and retry_index < configured_retries
-                and not isinstance(exc, non_retryable_types)
-            ):
-                continue
-            break
-        else:
-            response_latency_ms = (time.monotonic() - started) * 1000
-            response_request_started_at = request_started_at
-            break
-
-    if response is None:
-        exc = last_exception or RuntimeError("LiteLLM returned no response")
+            return ChatCompletion(
+                content=raw_content,
+                finish_reason="stop",
+                model_name=model_name,
+                cost=0.0,
+                metadata={
+                    "timestamp": time.time(),
+                    "validation_error": str(exc),
+                },
+            )
+        message = str(exc)
+        is_overflow = (
+            isinstance(exc, getattr(litellm, "ContextWindowExceededError", ()))
+            or "ContextWindowExceededError" in type(exc).__name__
+            or "Requested token count exceeds" in message
+            or "longer than the model's context length" in message
+            or "maximum context length" in message
+        )
+        if is_overflow:
+            print(
+                "Error in run_litellm_completion_async "
+                f"(FATAL, raising): {exc}"
+            )
+            raise
         print(f"Error in run_litellm_completion_async: {exc}")
         return ChatCompletion(
             content="",
-            model_name=active_model_name,
+            model_name=model_name,
             metadata={
                 "timestamp": time.time(),
                 "error": f"{type(exc).__name__}: {exc}",
                 "timeout": chat_kwargs.get("timeout") if isinstance(exc, asyncio.TimeoutError) else None,
-                "primary_model": model_name,
-                "rate_limit_fallback_model": (
-                    rate_limit_fallback_model if fallback_used else None
-                ),
             },
         )
+
+    response_latency_ms = (time.monotonic() - started) * 1000
 
     choice = response.choices[0]
     message = choice.message
@@ -564,27 +481,23 @@ async def run_litellm_completion_async(
         usage=usage,
         known_input_tokens=known_prompt_tokens,
         status="success",
-        model_family=infer_model_family(active_model_name),
+        model_family=infer_model_family(model_name),
         model_role=usage_model_role or "litellm",
         logical_call_id=logical_call_id,
         attempt_index=base_attempt_index,
         latency_ms=response_latency_ms,
-        request_started_at=response_request_started_at,
+        request_started_at=request_started_at,
     )
     return ChatCompletion(
         content=content,
         finish_reason=choice.finish_reason,
-        model_name=active_model_name,
+        model_name=model_name,
         cost=0.0,
         usage=usage,
         metadata={
             "timestamp": time.time(),
             "content_no_thinking": content_no_thinking,
             "usage_event_ids": [event["event_id"]] if event is not None else [],
-            "primary_model": model_name,
-            "rate_limit_fallback_model": (
-                rate_limit_fallback_model if fallback_used else None
-            ),
         },
     )
 
