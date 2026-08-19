@@ -86,7 +86,6 @@ _MODEL_CLASS_MAPPING = {
     "requesty": "swe_agent.models.requesty_model.RequestyModel",
     "model_service_textbased": "swe_agent.models.model_service_textbased_model.ModelServiceTextbasedModel",
     "route_textbased": "swe_agent.models.route_textbased_model.RouteTextbasedModel",
-    "deterministic": "swe_agent.models.test_models.DeterministicModel",
 }
 
 
@@ -144,10 +143,6 @@ def get_model_class(model_name: str, model_class: str = "") -> type:
             from swe_agent.models.route_textbased_model import RouteTextbasedModel
 
             return RouteTextbasedModel
-        if full_path == "swe_agent.models.test_models.DeterministicModel":
-            from swe_agent.models.test_models import DeterministicModel
-
-            return DeterministicModel
         msg = f"Unknown model class: {model_class} (resolved to {full_path}, available: {_MODEL_CLASS_MAPPING})"
         raise ValueError(msg)
 

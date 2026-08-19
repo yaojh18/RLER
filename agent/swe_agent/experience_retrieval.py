@@ -22,23 +22,17 @@ from swe_agent.models.utils.retry import retry
 logger = logging.getLogger(__name__)
 TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:-]*|\d+")
 CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-PATH_RE = re.compile(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+")
-IDENT_RE = re.compile(
-    r"\b(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning)|"
-    r"[A-Za-z_][A-Za-z0-9_]{2,}(?=\s*\())\b"
-)
-QUOTED_RE = re.compile(r"[`'\"]([A-Za-z_][A-Za-z0-9_.:-]{2,})[`'\"]")
 RRF_K = 60.0
-QUERY_FIELDS = (
-    "problem",
-    "prior",
-    "continuations",
-    "stage",
-    "llm_contract",
-    "llm_state",
-    "symbols",
-)
-DOCUMENT_FIELDS = ("full", "routing", "lesson", "features", "keywords")
+QUERY_WEIGHTS = {
+    "prior": 0.6,
+    "stage": 0.69,
+    "llm_contract": 1.48,
+    "llm_state": 4.01,
+}
+DOCUMENT_WEIGHTS = {"full": 0.19, "keywords": 1.39}
+CANDIDATE_LIMIT = 6
+SUMMARY_TEMPERATURE = 0.01
+SUMMARY_MAX_TOKENS = 4096
 SUMMARY_SYSTEM_PROMPT = (
     "You extract compact, visible retrieval features for SWE rubric experiences. "
     "Reason freely and append the requested JSON object."
@@ -115,7 +109,6 @@ class BM25:
             term: math.log(1.0 + (total - frequency + 0.5) / (frequency + 0.5))
             for term, frequency in frequencies.items()
         }
-        self.unknown_idf = math.log(1.0 + (total + 0.5) / 0.5)
 
     def score(self, query: list[str]) -> list[float]:
         query_terms = set(query)
@@ -132,7 +125,7 @@ class BM25:
                 frequency = frequencies.get(term, 0)
                 if frequency:
                     score += (
-                        self.idf.get(term, self.unknown_idf)
+                        self.idf[term]
                         * frequency
                         * (self.k1 + 1.0)
                         / (frequency + normalization)
@@ -187,56 +180,6 @@ def _public_document(record: dict[str, Any]) -> str:
             "Metadata: " + _text_values(record.get("metadata") or {}),
         ]
     )
-
-
-def _routing_document(record: dict[str, Any]) -> str:
-    references = (record.get("metadata") or {}).get("reference_golden_rubrics") or []
-    return "\n".join(
-        [
-            f"Title: {record.get('title') or ''}",
-            f"Description: {record.get('description') or ''}",
-            f"Activation and abstention: {record.get('context') or ''}",
-            "Reference rubric titles and contracts: "
-            + "\n".join(
-                " | ".join(
-                    [
-                        str(item.get("title") or ""),
-                        str(item.get("description") or ""),
-                        _text_values(item.get("metadata") or {}),
-                    ]
-                )
-                for item in references
-                if isinstance(item, dict)
-            ),
-        ]
-    )
-
-
-def _lesson_document(record: dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            str(record.get("experience") or ""),
-            _text_values(
-                (record.get("metadata") or {}).get("reference_golden_rubrics")
-                or []
-            ),
-        ]
-    )
-
-
-def _feature_document(features: dict[str, list[str]]) -> str:
-    return "\n".join(
-        f"{field.replace('_', ' ').title()}: " + " | ".join(values)
-        for field, values in features.items()
-        if values
-    )
-
-
-def _feature_query(parts: dict[str, str]) -> str:
-    values = []
-    for pattern in (PATH_RE, IDENT_RE, QUOTED_RE):
-        values.extend(pattern.findall(parts["all"]))
-    return " ".join(_dedupe(values))
 
 
 def _stage_query(context: dict[str, Any]) -> str:
@@ -306,74 +249,53 @@ Use 2-8 concise items per relevant list and at most 10 retrieval queries.
 
 
 class WeightedKeywordExperienceRetriever:
-    def __init__(self, checkpoint: Path, *, scope: str) -> None:
-        self.checkpoint = Path(checkpoint)
-        self.scope = scope
-        config = json.loads(
-            (self.checkpoint / "retrieval/recall_config.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        if config.get("rerank") is not False:
-            raise ValueError("Frozen weighted retrieval must have rerank=false")
-        self.candidate_limit = int(config["candidate_limit"])
-        self.query_weights = {
-            field: float(config["query_weights"][field]) for field in QUERY_FIELDS
-        }
-        configured_document_weights = config["document_weights"]
-        unknown_document_fields = set(configured_document_weights) - set(DOCUMENT_FIELDS)
-        if unknown_document_fields:
-            raise ValueError(
-                f"Unknown frozen retrieval document fields: {sorted(unknown_document_fields)}"
-            )
-        self.document_fields = tuple(
-            field for field in DOCUMENT_FIELDS if field in configured_document_weights
-        )
-        if not self.document_fields:
-            raise ValueError("Frozen retrieval must configure at least one document field")
-        self.document_weights = {
-            field: float(configured_document_weights[field])
-            for field in self.document_fields
-        }
-        self.summary_config = config.get("query_summary") or {}
+    def __init__(
+        self,
+        checkpoint: Path,
+        *,
+        scope: str,
+    ) -> None:
+        checkpoint = Path(checkpoint)
         bank = json.loads(
-            (self.checkpoint / "bank" / scope / "experience_bank.json").read_text(
+            (checkpoint / "bank" / scope / "experience_bank.json").read_text(
                 encoding="utf-8"
             )
         )
         keyword_bank = json.loads(
-            (self.checkpoint / "retrieval/keyword_bank.json").read_text(
+            (checkpoint / "retrieval/keyword_bank.json").read_text(
                 encoding="utf-8"
             )
         )["bank"][scope]
-        card_features = json.loads(
-            (self.checkpoint / "retrieval/card_features.json").read_text(
-                encoding="utf-8"
-            )
-        )["features"][scope]
         self.records = bank["experiences"]
         self.ids = [record["experience_id"] for record in self.records]
-        if set(self.ids) != set(keyword_bank) or (
-            "features" in self.document_fields and set(self.ids) != set(card_features)
-        ):
+        self.instance_labels: dict[str, str | None] = {}
+        for record in self.records:
+            label = record.get("instance_label")
+            if label is not None and not isinstance(label, str):
+                raise ValueError(
+                    f"Non-scalar instance label for {scope}:{record['experience_id']}"
+                )
+            self.instance_labels[record["experience_id"]] = label or None
+        if set(self.ids) != set(keyword_bank):
             raise ValueError(f"Frozen retrieval coverage mismatch for {scope}")
-        self.by_id = {record["experience_id"]: record for record in self.records}
-        document_builders = {
-            "full": lambda: [_public_document(record) for record in self.records],
-            "routing": lambda: [_routing_document(record) for record in self.records],
-            "lesson": lambda: [_lesson_document(record) for record in self.records],
-            "features": lambda: [
-                _feature_document(card_features[experience_id])
-                for experience_id in self.ids
-            ],
-            "keywords": lambda: [
-                "\n".join(keyword_bank[experience_id].get("keywords") or [])
+        if any(
+            set(keyword_bank[experience_id])
+            != {"generated_keywords", "selected_keywords"}
+            for experience_id in self.ids
+        ):
+            raise ValueError(f"Invalid frozen keyword schema for {scope}")
+        documents = {
+            "full": [_public_document(record) for record in self.records],
+            "keywords": [
+                "\n".join(
+                    keyword_bank[experience_id].get("selected_keywords") or []
+                )
                 for experience_id in self.ids
             ],
         }
         self.bm25 = {
-            field: BM25([tokenize(text) for text in document_builders[field]()])
-            for field in self.document_fields
+            field: BM25([tokenize(text) for text in documents[field]])
+            for field in DOCUMENT_WEIGHTS
         }
 
     async def summarize(
@@ -384,7 +306,6 @@ class WeightedKeywordExperienceRetriever:
         model_name: str,
         top_p: float,
         model_kwargs: dict[str, Any] | None,
-        max_tokens: int | None = None,
         max_format_correction_rounds: int = 2,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         messages = [
@@ -403,13 +324,9 @@ class WeightedKeywordExperienceRetriever:
                         route_name="rubric_generation",
                         model_name=model_name,
                         messages=messages,
-                        temperature=float(self.summary_config.get("temperature", 0.01)),
+                        temperature=SUMMARY_TEMPERATURE,
                         top_p=top_p,
-                        max_tokens=int(
-                            max_tokens
-                            if max_tokens is not None
-                            else self.summary_config.get("max_tokens", 4096)
-                        ),
+                        max_tokens=SUMMARY_MAX_TOKENS,
                         model_kwargs=freeform_thought_model_kwargs(model_kwargs),
                     )
             messages.append(assistant)
@@ -441,24 +358,14 @@ class WeightedKeywordExperienceRetriever:
         summary: dict[str, Any],
         instance_id: str,
     ) -> list[str]:
-        problem = _text_values(context.get("question"))
         prior = "\n".join(
             [
                 _text_values(context.get("previous_state")),
                 _text_values(context.get("parent_trajectory")),
             ]
         )
-        continuations = _text_values(context.get("continuations"))
-        parts = {
-            "problem": problem,
-            "prior": prior,
-            "continuations": continuations,
-            "all": "\n".join((problem, prior, continuations)),
-        }
         query_fields = {
-            "problem": problem,
             "prior": prior,
-            "continuations": continuations,
             "stage": _stage_query(context),
             "llm_contract": _text_values(
                 [
@@ -475,18 +382,13 @@ class WeightedKeywordExperienceRetriever:
                     summary.get("abstention_risks") or [],
                 ]
             ),
-            "symbols": _feature_query(parts),
         }
         scores: Counter[str] = Counter()
-        for query_field in QUERY_FIELDS:
-            query_weight = self.query_weights[query_field]
-            if query_weight <= 0 or not query_fields[query_field].strip():
+        for query_field, query_weight in QUERY_WEIGHTS.items():
+            if not query_fields[query_field].strip():
                 continue
             query = tokenize(query_fields[query_field])
-            for document_field in self.document_fields:
-                document_weight = self.document_weights[document_field]
-                if document_weight <= 0:
-                    continue
+            for document_field, document_weight in DOCUMENT_WEIGHTS.items():
                 bm25_scores = self.bm25[document_field].score(query)
                 ranking = sorted(
                     range(len(self.ids)),
@@ -498,10 +400,15 @@ class WeightedKeywordExperienceRetriever:
                         * document_weight
                         * _rrf_contribution(rank)
                     )
+        eligible_ids = [
+            experience_id
+            for experience_id in self.ids
+            if not instance_id or self.instance_labels[experience_id] != instance_id
+        ]
         return sorted(
-            self.ids,
+            eligible_ids,
             key=lambda experience_id: (-scores[experience_id], experience_id),
-        )[: self.candidate_limit]
+        )[:CANDIDATE_LIMIT]
 
     async def retrieve(
         self,
@@ -512,7 +419,6 @@ class WeightedKeywordExperienceRetriever:
         model_name: str,
         top_p: float,
         model_kwargs: dict[str, Any] | None,
-        max_tokens: int | None = None,
         max_format_correction_rounds: int = 2,
     ) -> tuple[list[str], list[dict[str, Any]]]:
         stage = _stage_query(context)
@@ -522,7 +428,6 @@ class WeightedKeywordExperienceRetriever:
             model_name=model_name,
             top_p=top_p,
             model_kwargs=model_kwargs,
-            max_tokens=max_tokens,
             max_format_correction_rounds=max_format_correction_rounds,
         )
         return self.rank(

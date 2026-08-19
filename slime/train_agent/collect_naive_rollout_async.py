@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Async rollout function backed by NaiveSearchRunner (naive baseline).
+"""Async rollout function backed by NaiveSearchRunner.
 
 Drop-in for collect_lanes_rollout_async.generate_rollout — same signature,
 same return type. Each instance produces ONE ExportGroup of M=8 samples,
-one per independent linear rollout. No Lane A spine, no Lane B forks from
-intermediate states, no Lane C rubric/judge. GT reward only.
+one per independent linear rollout. No Lane A spine or Lane B forks from
+intermediate states.
 
 ENV CONTRACT (set by slime/train_agent/run/grpo_async_naive.py from the
 SLURM script's tunables):
@@ -19,13 +19,11 @@ SLURM script's tunables):
   SWE_AGENT_NAIVE_NO_ACTION_PATCH_PENALTY float default -0.1
   SWE_AGENT_NAIVE_OUTPUT_ROOT        str    where to write per-instance run dirs
   SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE  int    per-instance ThreadPoolExecutor cap (default = M)
-  SWE_AGENT_NAIVE_SEED               int    seed for sampling (optional)
   SWE_AGENT_NAIVE_REWARD_KIND        str    hard, soft, joint, or f2p_only;
                                             default joint
   SWE_AGENT_NAIVE_ALL_PASS_REWARD    float  resolved reward multiplier (default 1)
-Per-engine endpoints come from args.sglang_model_engines (populated at engine
-init in slime/ray/rollout.py). The legacy SWE_AGENT_NAIVE_POLICY_PORTS env
-var is no longer consulted.
+Per-engine endpoints come from args.sglang_model_engines, populated when the
+rollout engines are initialized in slime/ray/rollout.py.
 """
 
 from __future__ import annotations
@@ -37,6 +35,7 @@ import json
 import logging
 import os
 import random
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -73,6 +72,8 @@ from swe_agent.parallel_utils import normalize_terminal_patch_text
 from swe_agent.policy_version import (
     checkpoint_policy_stale_lag,
     committed_policy_version,
+    observed_policy_version,
+    policy_version_stale_lag,
 )
 from swe_agent.usage import (
     UsageMetricsTracker,
@@ -87,6 +88,15 @@ from swe_agent.usage import (
 
 
 logger = logging.getLogger("train_agent.collect_naive_rollout_async")
+
+
+def _observed_policy_version() -> str:
+    """Best-effort policy label for validation diagnostics."""
+
+    try:
+        return str(observed_policy_version() or "")
+    except PolicyVersionMismatch:
+        return ""
 
 
 class CollectorInfrastructureError(RuntimeError):
@@ -254,11 +264,11 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         cfg = NaiveSearchConfig(
             m=task["m"],
             step_limit=task["step_limit"],
-            seed=task.get("seed"),
             gt_eval_workers=task.get("gt_eval_workers", 8),
             gt_eval_timeout=task.get("gt_eval_timeout", 600),
             evaluate_gt=not bool(task.get("defer_gt_evaluation")),
             rollout_pool_size=task.get("rollout_pool_size") or task["m"],
+            rollout_max_attempts=task.get("rollout_max_attempts", 8),
             policy_temperature=task.get("policy_temperature", 1.0),
             policy_top_p=task.get("policy_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
@@ -268,25 +278,44 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             all_pass_reward=task.get("all_pass_reward", 1.0),
         )
         run_dir = (
-            output_root / instance_id
+            output_root
+            / instance_id
             / time.strftime("%Y%m%d-%H%M%S")
             / f"task-{task['index']:06d}"
         )
         run_dir.mkdir(parents=True, exist_ok=True)
 
+        observed_policy_start = _observed_policy_version()
         runner = NaiveSearchRunner(
             instance=instance,
             backend=backend,
             run_dir=run_dir,
             policy_model_name=model_name,
             policy_version=task.get("policy_version"),
-            enforce_policy_version=bool(task.get("validation")),
+            # Validation uses the same stale=1 rollout semantics as training.
+            # Record weight drift for diagnostics instead of aborting work.
+            enforce_policy_version=False,
             config=cfg,
             harness_namespace=get_swebench_harness_namespace(instance),
             policy_base_url=policy_base_url,
             policy_base_urls=policy_base_urls,
             api_key=api_key,
         )
+        branch_done_dir = task.get("_branch_done_dir")
+
+        def _mark_rollout_done(rollout_index: int) -> None:
+            if not branch_done_dir:
+                return
+            marker = Path(str(branch_done_dir)) / (
+                f"rollout-{int(rollout_index):02d}.ready"
+            )
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            temporary = marker.with_name(
+                f".{marker.name}.{os.getpid()}.tmp"
+            )
+            temporary.write_text("ready\n", encoding="utf-8")
+            os.replace(temporary, marker)
+
         with usage_context(
             phase=task.get("usage_phase", "train"),
             group_id=task.get("usage_group_id", ""),
@@ -296,12 +325,21 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                 task.get("suppress_usage_accounting")
             ),
         ):
-            record = asyncio.run(runner.run())
+            record = asyncio.run(
+                runner.run(on_rollout_done=_mark_rollout_done)
+            )
+        observed_policy_end = _observed_policy_version()
+        if not task.get("validation") and not record.completed:
+            raise RuntimeError(
+                record.error or "naive rollout group did not complete"
+            )
         if task.get("validation"):
             (run_dir / "validation_policy.json").write_text(
                 json.dumps(
                     {
                         "policy_version": task.get("policy_version"),
+                        "observed_policy_start": observed_policy_start,
+                        "observed_policy_end": observed_policy_end,
                         "rollout_id": int(task["rollout_id"]),
                     },
                     sort_keys=True,
@@ -345,14 +383,8 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                         rollout.total_tokens if rollout is not None else {}
                     ),
                     "policy_version": task.get("policy_version"),
-                    "stale_policy_aborted": bool(
-                        "PolicyVersionMismatch"
-                        in str(
-                            rollout.error
-                            if rollout is not None
-                            else record.error
-                        )
-                    ),
+                    "observed_policy_start": observed_policy_start,
+                    "observed_policy_end": observed_policy_end,
                 }
             else:
                 status = str((payload or {}).get("status") or "error")
@@ -375,14 +407,8 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                         rollout.total_tokens if rollout is not None else {}
                     ),
                     "policy_version": task.get("policy_version"),
-                    "stale_policy_aborted": bool(
-                        "PolicyVersionMismatch"
-                        in str(
-                            rollout.error
-                            if rollout is not None
-                            else record.error
-                        )
-                    ),
+                    "observed_policy_start": observed_policy_start,
+                    "observed_policy_end": observed_policy_end,
                 }
         result = {
             "index": task["index"],
@@ -469,7 +495,8 @@ def _naive_validation_gt_task(task: dict[str, Any]) -> dict[str, Any]:
         "rollout_status": str(descriptor.get("rollout_status") or "error"),
         "total_tokens": dict(descriptor.get("total_tokens") or {}),
         "policy_version": descriptor.get("policy_version"),
-        "stale_policy_aborted": bool(descriptor.get("stale_policy_aborted")),
+        "observed_policy_start": descriptor.get("observed_policy_start"),
+        "observed_policy_end": descriptor.get("observed_policy_end"),
     }
     if rollout_error:
         return {
@@ -641,15 +668,10 @@ _SOURCE_BUDGET_ERROR: TrainingInstanceBudgetExhausted | None = None
 _SOURCE_VALIDATION_ERROR: TrainingValidationBoundaryReached | None = None
 # A generate() call can pause after accepting fewer than rollout_batch_size
 # groups at an attempt-based validation boundary.  This state is deliberately
-# process-local: train_async ACKs the boundary in the same job and retries the
-# same rollout id, which may then refill the preserved groups.  No other
+# process-local: RolloutManager schedules validation and immediately continues
+# the same rollout id, which may then refill the preserved groups. No other
 # generate boundary is allowed to retain hidden work.
 _VALIDATION_PARTIAL_STATE: dict[str, Any] | None = None
-# Terminal validation is fail-closed, but a retry must not regenerate policy
-# trajectories that already completed successfully.  Live retry state stays in
-# the dedicated AsyncValidationManager and is keyed by the exact
-# rollout/source-attempt pair; driver restarts seed it from complete artifacts.
-_EVAL_PARTIAL_STATE: dict[str, Any] | None = None
 
 
 def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
@@ -661,7 +683,9 @@ def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
         "buffer": serialize_buffer(_BUFFER),
         "pending_tasks": (
             serialize_pending_tasks(_PENDING)
-            + copy.deepcopy(_REPLAY_PENDING_TASKS)
+            + serialize_pending_tasks(
+                dict(enumerate(_REPLAY_PENDING_TASKS))
+            )
         ),
         "task_index": int(_TASK_INDEX),
         "dispatch_counter": int(_DISPATCH_COUNTER),
@@ -712,7 +736,8 @@ def load_checkpoint_state_dict(
     global _REWARD_GROUP_VARIANCE_SUM, _ZERO_VARIANCE_GROUPS
     global _NODE_WORKERS, _NODE_WORKER_IPS
     global _NODE_WORKER_GENERATION, _PENDING
-    global _REPLAY_PENDING_TASKS, _DISPATCH_COUNTER
+    global _REPLAY_PENDING_TASKS
+    global _DISPATCH_COUNTER
     global _USAGE_TRACKER, _USAGE_TRACKER_PATH
     global _HEARTBEAT_EVENT_STEP, _HEARTBEAT_OUTPUT_ROOT
     global _SOURCE_BUDGET_EXHAUSTED, _SOURCE_BUDGET_ERROR
@@ -736,7 +761,11 @@ def load_checkpoint_state_dict(
             f"requested={rollout_id} "
             f"saved={state.get('checkpoint_rollout_id')}"
         )
-    if _BUFFER or _PENDING or _REPLAY_PENDING_TASKS:
+    if (
+        _BUFFER
+        or _PENDING
+        or _REPLAY_PENDING_TASKS
+    ):
         raise RuntimeError(
             "refusing to overlay a naive collector checkpoint on live state"
         )
@@ -1071,6 +1100,7 @@ class _NaiveNodeWorker:
         self.name = name
         self.max_workers = max_workers
         self.max_tasks_per_child = max_tasks_per_child
+        self._executor_rebuild_lock = threading.Lock()
         self._build_executor()
         import socket
         self.ip = socket.gethostbyname(socket.gethostname())
@@ -1107,35 +1137,83 @@ class _NaiveNodeWorker:
         instance_id: str,
     ):
         from concurrent.futures.process import BrokenProcessPool
+        executor = self._executor
         try:
-            future = self._executor.submit(function, argument)
+            future = executor.submit(function, argument)
             return future.result()
         except BrokenProcessPool:
-            logger.warning(
-                "[NaiveNodeWorker %s] BrokenProcessPool — rebuilding "
-                "executor and retrying instance=%s",
-                self.name, instance_id,
-            )
-            try:
-                self._executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-            self._build_executor()
-            future = self._executor.submit(function, argument)
+            # A broken pool fails every outstanding future.  Ray permits
+            # concurrent actor methods here, so every caller can observe the
+            # same failure at once.  Serialize the replacement and use object
+            # identity as the generation guard; otherwise N callers each
+            # create max_workers fresh processes and turn one child failure
+            # into a process/memory spike.
+            with self._executor_rebuild_lock:
+                if self._executor is executor:
+                    logger.warning(
+                        "[NaiveNodeWorker %s] BrokenProcessPool — rebuilding "
+                        "executor and retrying instance=%s",
+                        self.name,
+                        instance_id,
+                    )
+                    try:
+                        executor.shutdown(
+                            wait=False,
+                            cancel_futures=True,
+                        )
+                    except Exception:
+                        pass
+                    self._build_executor()
+                retry_executor = self._executor
+            future = retry_executor.submit(function, argument)
             return future.result()
+
+    def _submit_validation_once(
+        self,
+        function,
+        argument,
+        *,
+        instance_id: str,
+    ):
+        """Run one validation task and repair only for later validations."""
+        from concurrent.futures.process import BrokenProcessPool
+
+        executor = self._executor
+        try:
+            return executor.submit(function, argument).result()
+        except BrokenProcessPool:
+            # Validation is diagnostic: never replay the failed task. Repair
+            # the local pool so a later scheduled validation can run once.
+            with self._executor_rebuild_lock:
+                if self._executor is executor:
+                    logger.warning(
+                        "[NaiveNodeWorker %s] validation executor broke; "
+                        "rebuilding for later tasks without retrying %s",
+                        self.name,
+                        instance_id,
+                    )
+                    try:
+                        executor.shutdown(
+                            wait=False,
+                            cancel_futures=True,
+                        )
+                    except Exception:
+                        pass
+                    self._build_executor()
+            raise
 
     def submit_validation_policy_batch(
         self,
         tasks: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        return self._submit_with_rebuild(
+        return self._submit_validation_once(
             _naive_validation_policy_batch_task,
             tasks,
             instance_id=f"validation-batch[{len(tasks)}]",
         )
 
     def submit_validation_gt(self, task: dict[str, Any]) -> dict[str, Any]:
-        return self._submit_with_rebuild(
+        return self._submit_validation_once(
             _naive_validation_gt_task,
             task,
             instance_id=task.get("instance_id", "?"),
@@ -1204,11 +1282,23 @@ def _spawn_node_workers(per_node_concurrency: int) -> None:
         nodes.append(n)
     if not nodes:
         raise RuntimeError("No GPU-bearing Ray nodes found for Naive worker spawn")
-    actor_concurrency = per_node_concurrency + 4
+    tail_workers = max(
+        0,
+        int(
+            os.environ.get(
+                "SWE_AGENT_NAIVE_TAIL_WORKERS_PER_NODE",
+                str(per_node_concurrency),
+            )
+        ),
+    )
+    executor_workers = per_node_concurrency + tail_workers
+    actor_concurrency = executor_workers + 4
     logger.info(
         f"[naive-async] spawning {len(nodes)} node workers "
         f"(skipped={len(skip)}), "
         f"per-node concurrency={per_node_concurrency} "
+        f"tail_workers={tail_workers} "
+        f"executor_workers={executor_workers} "
         f"actor_concurrency={actor_concurrency}"
     )
     worker_role = "".join(
@@ -1233,7 +1323,7 @@ def _spawn_node_workers(per_node_concurrency: int) -> None:
                 f"naive-node-worker{role_suffix}-{node_name}"
                 f"-g{_NODE_WORKER_GENERATION}"
             ),
-        ).remote(name=node_name, max_workers=per_node_concurrency)
+        ).remote(name=node_name, max_workers=executor_workers)
         ip = ray.get(worker.get_ip.remote())
         _NODE_WORKERS.append(worker)
         _NODE_WORKER_IPS.append(ip)
@@ -1273,9 +1363,8 @@ def _node_workers_are_healthy() -> bool:
 def _ensure_validation_node_workers(
     *,
     instance_workers: int,
-    verify_existing: bool,
 ) -> None:
-    if verify_existing and _NODE_WORKERS and not _node_workers_are_healthy():
+    if _NODE_WORKERS and not _node_workers_are_healthy():
         _shutdown_node_workers()
     if _NODE_WORKERS:
         return
@@ -1325,12 +1414,14 @@ def _naive_values_from_env() -> dict[str, Any]:
     return {
         "m": _int("SWE_AGENT_NAIVE_M", 8),
         "step_limit": _int("SWE_AGENT_NAIVE_STEP_LIMIT", 120),
-        "seed": _int("SWE_AGENT_NAIVE_SEED"),
         "gt_eval_workers": _int("SWE_AGENT_NAIVE_GT_EVAL_WORKERS", 8),
         "gt_eval_timeout": _int(
             "SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT", 600
         ),
         "rollout_pool_size": _int("SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE"),
+        "rollout_max_attempts": _int(
+            "SWE_AGENT_NAIVE_ROLLOUT_MAX_ATTEMPTS", 8
+        ),
         "completion_max_tokens": _int("SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS", 20480),
         "context_length": _int("SWE_AGENT_MODEL_CONTEXT_LENGTH", 128000),
         "policy_temperature": _float("SWE_AGENT_NAIVE_POLICY_TEMPERATURE", 1.0),
@@ -1374,6 +1465,70 @@ def _release_endpoints(endpoints_picked: list[tuple[str, int]]) -> None:
     for ep in endpoints_picked:
         cur = _ENDPOINT_INFLIGHT.get(ep, 0)
         _ENDPOINT_INFLIGHT[ep] = max(0, cur - 1)
+
+
+def _branch_done_dir(
+    output_root: Path,
+    *,
+    rollout_id: int,
+    task_index: int,
+) -> Path:
+    return (
+        output_root
+        / f"rollout_{int(rollout_id):04d}"
+        / ".branch_done"
+        / f"task-{int(task_index):06d}"
+    )
+
+
+def _reset_branch_done_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for marker in path.glob("rollout-*.ready"):
+        marker.unlink(missing_ok=True)
+
+
+def _refresh_branch_slots() -> int:
+    """Release endpoint capacity once each policy branch is complete.
+
+    A worker process may still own terminal evaluator work; only the exact
+    completed policy branch is released. This lets completed capacity from
+    different instances refill the shared policy pool without waiting for any
+    evaluator or one eight-sibling bundle to finish.
+    """
+    released = 0
+    for task in _PENDING.values():
+        marker_value = task.get("_branch_done_dir")
+        if not marker_value:
+            continue
+        already_released = {
+            int(index)
+            for index in task.get("_released_branch_indices", [])
+        }
+        endpoints = [
+            tuple(endpoint)
+            for endpoint in task.get("_endpoints_picked", [])
+        ]
+        for marker in Path(str(marker_value)).glob("rollout-*.ready"):
+            try:
+                rollout_index = int(
+                    marker.name.removeprefix("rollout-")
+                    .removesuffix(".ready")
+                )
+            except ValueError:
+                continue
+            if rollout_index in already_released:
+                continue
+            if rollout_index < 0 or rollout_index >= len(endpoints):
+                raise RuntimeError(
+                    "naive branch marker index is outside its endpoint "
+                    f"reservation: index={rollout_index} "
+                    f"reservations={len(endpoints)}"
+                )
+            _release_endpoints([endpoints[rollout_index]])
+            already_released.add(rollout_index)
+            released += 1
+        task["_released_branch_indices"] = sorted(already_released)
+    return released
 
 
 def _dispatch_policy_version() -> str | None:
@@ -1426,6 +1581,7 @@ def _replay_checkpoint_pending_tasks(
         )
     endpoints = _policy_endpoints_for_model(args, model_name)
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
+    gt_eval_workers = _naive_values_from_env()["gt_eval_workers"]
     replay_tasks = _REPLAY_PENDING_TASKS
     _REPLAY_PENDING_TASKS = []
     for original in replay_tasks:
@@ -1457,6 +1613,12 @@ def _replay_checkpoint_pending_tasks(
                 endpoints,
             )
         )
+        marker_dir = _branch_done_dir(
+            output_root,
+            rollout_id=rollout_id,
+            task_index=int(task["index"]),
+        )
+        _reset_branch_done_dir(marker_dir)
         task.update(
             {
                 "rollout_id": int(rollout_id),
@@ -1467,7 +1629,12 @@ def _replay_checkpoint_pending_tasks(
                 "policy_base_url": policy_base_urls[0],
                 "policy_base_urls": policy_base_urls,
                 "_endpoints_picked": endpoints_picked,
+                "_branch_done_dir": str(marker_dir),
+                "_released_branch_indices": [],
                 "api_key": api_key,
+                # Capacity knobs follow the resumed job; experiment semantics
+                # and the drawn source instance remain checkpointed.
+                "gt_eval_workers": gt_eval_workers,
                 "usage_ledger": _ensure_usage_tracking(),
                 # The durable ledger prefix already contains one approximate
                 # cost for this pending source instance. Re-execution is a
@@ -1626,18 +1793,28 @@ def _validation_sample(
     metadata: dict[str, Any],
     index: int,
 ) -> tuple[Sample, bool, bool]:
+    has_validation_result = isinstance(result.get("validation"), dict)
     validation = dict(result.get("validation") or {})
     status = str(validation.get("status") or "error")
     infrastructure_error = bool(validation.get("infrastructure_error"))
     rollout_error = validation.get("rollout_error") or result.get("error")
-    stale_policy_aborted = bool(
-        validation.get("stale_policy_aborted")
-        or "PolicyVersionMismatch" in str(rollout_error or "")
+    scheduled_policy = str(validation.get("policy_version") or "")
+    observed_policy = str(
+        validation.get("observed_policy_end")
+        or validation.get("observed_policy_start")
+        or scheduled_policy
     )
+    try:
+        stale_policy_lag = policy_version_stale_lag(
+            scheduled_policy,
+            observed_policy,
+        )
+    except PolicyVersionMismatch:
+        stale_policy_lag = None
     completed = (
-        status in {"resolved", "unresolved", "empty", "error"}
+        has_validation_result
+        and status in {"resolved", "unresolved", "empty", "error"}
         and not infrastructure_error
-        and not rollout_error
     )
     resolved = completed and status == "resolved"
 
@@ -1679,135 +1856,16 @@ def _validation_sample(
         "validation_rollout_error": str(rollout_error or ""),
         "validation_total_tokens": dict(validation.get("total_tokens") or {}),
         "validation_policy_version": validation.get("policy_version"),
-        "validation_stale_policy_aborted": stale_policy_aborted,
+        "validation_observed_policy_start": validation.get(
+            "observed_policy_start"
+        ),
+        "validation_observed_policy_end": validation.get(
+            "observed_policy_end"
+        ),
+        "validation_policy_stale_lag": stale_policy_lag,
     }
     truncated = "trunc" in str(validation.get("rollout_status") or "").lower()
     return sample, completed, truncated
-
-
-def _persisted_validation_entry(
-    *,
-    output_root: Path,
-    rollout_id: int,
-    dataset_name: str,
-    metadata: dict[str, Any],
-    index: int,
-    policy_version: str,
-) -> tuple[str, Sample, bool, bool] | None:
-    """Restore one artifact-complete validation result after driver restart.
-
-    Validation is deliberately asynchronous, so a Slurm wall-time boundary
-    can arrive after most terminal rollouts have already completed.  Ray actor
-    memory does not survive that boundary.  Reuse the earliest complete result
-    for an instance so a later recovery attempt cannot silently replace the
-    policy snapshot that the validation cursor was meant to measure.
-    """
-
-    instance_root = (
-        output_root
-        / "validation"
-        / f"rollout_{rollout_id:04d}"
-        / dataset_name.replace("/", "__")
-        / str(metadata["instance_id"])
-    )
-    if not instance_root.is_dir():
-        return None
-
-    for evaluation_path in sorted(instance_root.rglob("evaluation.json")):
-        run_root = evaluation_path.parent
-        messages_path = run_root / "messages.json"
-        patch_path = run_root / "model_patch.json"
-        # NaiveSearchRunner stores rollout artifacts below
-        # <task-run>/<instance>/<rollout>, while the worker records the pinned
-        # policy once at <task-run>/validation_policy.json.
-        policy_path = run_root.parent.parent / "validation_policy.json"
-        if (
-            not messages_path.is_file()
-            or not patch_path.is_file()
-            or not policy_path.is_file()
-        ):
-            continue
-        try:
-            evaluation = json.loads(
-                evaluation_path.read_text(encoding="utf-8")
-            )
-            messages = json.loads(messages_path.read_text(encoding="utf-8"))
-            patch = json.loads(patch_path.read_text(encoding="utf-8"))
-            policy_metadata = json.loads(
-                policy_path.read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError):
-            continue
-        if (
-            not isinstance(evaluation, dict)
-            or not isinstance(messages, dict)
-            or not isinstance(patch, dict)
-            or not isinstance(policy_metadata, dict)
-        ):
-            continue
-        if str(policy_metadata.get("policy_version") or "") != str(
-            policy_version
-        ):
-            continue
-
-        status = str(evaluation.get("status") or "error")
-        metainfo = evaluation.get("metainfo")
-        metainfo = metainfo if isinstance(metainfo, dict) else {}
-        infrastructure_error = bool(
-            evaluation.get("infrastructure_error")
-            or metainfo.get("infrastructure_error")
-        )
-        if status not in {"resolved", "unresolved", "empty", "error"} or infrastructure_error:
-            continue
-
-        resolved = status == "resolved"
-        sample = Sample(
-            prompt=[],
-            tokens=[],
-            response="",
-            response_length=0,
-        )
-        sample.index = index
-        sample.group_index = None
-        sample.reward = 1.0 if resolved else 0.0
-        sample.status = Sample.Status.COMPLETED
-        sample.metadata = {
-            **metadata,
-            "validation_status": status,
-            "validation_completed": True,
-            "validation_resolved": resolved,
-            "validation_infrastructure_error": False,
-            "validation_rollout_error": "",
-            "validation_total_tokens": {},
-            "validation_persisted": True,
-            "validation_artifact": str(evaluation_path),
-            "validation_policy_version": str(policy_version),
-            "validation_stale_policy_aborted": False,
-        }
-        return dataset_name, sample, True, False
-    return None
-
-
-def _restore_persisted_validation_entries(
-    *,
-    rows: list[tuple[str, dict[str, Any]]],
-    output_root: Path,
-    rollout_id: int,
-    policy_version: str,
-) -> dict[int, tuple[str, Sample, bool, bool]]:
-    restored: dict[int, tuple[str, Sample, bool, bool]] = {}
-    for index, (dataset_name, metadata) in enumerate(rows):
-        entry = _persisted_validation_entry(
-            output_root=output_root,
-            rollout_id=rollout_id,
-            dataset_name=dataset_name,
-            metadata=metadata,
-            index=index,
-            policy_version=policy_version,
-        )
-        if entry is not None:
-            restored[index] = entry
-    return restored
 
 
 def generate_validation_rollout(
@@ -1818,7 +1876,7 @@ def generate_validation_rollout(
     model_name: str,
 ) -> RolloutFnEvalOutput:
     """One policy-only terminal rollout and binary GT evaluation per val ID."""
-    global _TASK_INDEX, _DISPATCH_COUNTER, _EVAL_PARTIAL_STATE
+    global _TASK_INDEX, _DISPATCH_COUNTER
     rows = _validation_rows_from_args(args)
     if not rows:
         raise ValueError("validation manifest is empty")
@@ -1831,65 +1889,6 @@ def generate_validation_rollout(
         raise RuntimeError(
             "validation requires an explicitly coordinated policy version"
         )
-    eval_key = (
-        int(rollout_id),
-        int(getattr(args, "eval_instance_attempt", -1) or -1),
-        policy_version,
-    )
-    row_signature = tuple(
-        (dataset_name, str(metadata["instance_id"]))
-        for dataset_name, metadata in rows
-    )
-    if (
-        _EVAL_PARTIAL_STATE is not None
-        and (
-            _EVAL_PARTIAL_STATE.get("key") != eval_key
-            or _EVAL_PARTIAL_STATE.get("row_signature") != row_signature
-        )
-    ):
-        logger.warning(
-            "[validation] discarding incomplete resume state for key=%s "
-            "before starting key=%s",
-            _EVAL_PARTIAL_STATE.get("key"),
-            eval_key,
-        )
-        _EVAL_PARTIAL_STATE = None
-    if _EVAL_PARTIAL_STATE is None:
-        restored = _restore_persisted_validation_entries(
-            rows=rows,
-            output_root=output_root,
-            rollout_id=rollout_id,
-            policy_version=policy_version,
-        )
-        _EVAL_PARTIAL_STATE = {
-            "key": eval_key,
-            "row_signature": row_signature,
-            "completed": restored,
-            "calls": 0,
-        }
-        if restored:
-            logger.warning(
-                "[validation] restored persisted artifacts key=%s "
-                "completed=%d missing=%d",
-                eval_key,
-                len(restored),
-                len(rows) - len(restored),
-            )
-    _EVAL_PARTIAL_STATE["calls"] += 1
-    completed_entries: dict[
-        int, tuple[str, Sample, bool, bool]
-    ] = _EVAL_PARTIAL_STATE["completed"]
-    missing_indices = [
-        index for index in range(len(rows)) if index not in completed_entries
-    ]
-    if _EVAL_PARTIAL_STATE["calls"] > 1:
-        logger.warning(
-            "[validation] missing-only resume key=%s completed=%d missing=%d",
-            eval_key,
-            len(completed_entries),
-            len(missing_indices),
-        )
-
     policy_records: list[
         tuple[
             int,
@@ -1900,12 +1899,7 @@ def generate_validation_rollout(
             dict[str, Any],
         ]
     ] = []
-    stale_before_dispatch = bool(
-        getattr(args, "eval_policy_stale_before_dispatch", False)
-    )
-    dispatch_indices = (
-        [] if stale_before_dispatch else list(missing_indices)
-    )
+    dispatch_indices = list(range(len(rows)))
     if dispatch_indices:
         policy_concurrency = max(
             1,
@@ -1930,7 +1924,6 @@ def generate_validation_rollout(
         )
         _ensure_validation_node_workers(
             instance_workers=process_workers,
-            verify_existing=_EVAL_PARTIAL_STATE["calls"] > 1,
         )
         endpoints = _policy_endpoints_for_model(args, model_name)
         api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
@@ -1977,7 +1970,10 @@ def generate_validation_rollout(
                 )
             ),
             "context_length": int(
-                os.environ.get("SWE_AGENT_MODEL_CONTEXT_LENGTH", "128000")
+                os.environ.get(
+                    "SWE_AGENT_VALIDATION_CONTEXT_LENGTH",
+                    "128000",
+                )
             ),
             "policy_temperature": float(
                 os.environ.get("SWE_AGENT_VALIDATION_TEMPERATURE", "1.0")
@@ -2098,36 +2094,6 @@ def generate_validation_rollout(
         )
 
     attempt_entries: dict[int, tuple[str, Sample, bool, bool]] = {}
-    if stale_before_dispatch:
-        for index in missing_indices:
-            dataset_name, metadata = rows[index]
-            sample, completed, truncated = _validation_sample(
-                result={
-                    "bundle": None,
-                    "error": (
-                        "PolicyVersionMismatch: validation checkpoint "
-                        "was stale before policy dispatch"
-                    ),
-                    "validation": {
-                        "status": "error",
-                        "infrastructure_error": False,
-                        "rollout_error": (
-                            "PolicyVersionMismatch: validation checkpoint "
-                            "was stale before policy dispatch"
-                        ),
-                        "policy_version": policy_version,
-                        "stale_policy_aborted": True,
-                    },
-                },
-                metadata=metadata,
-                index=index,
-            )
-            attempt_entries[index] = (
-                dataset_name,
-                sample,
-                completed,
-                truncated,
-            )
     final_results = list(direct_results)
     for index, dataset_name, metadata, usage_group_id, ref in gt_pending:
         try:
@@ -2155,20 +2121,9 @@ def generate_validation_rollout(
         )
         entry = (dataset_name, sample, completed, truncated)
         attempt_entries[index] = entry
-        if completed:
-            completed_entries[index] = entry
-
-    combined_entries = dict(completed_entries)
-    combined_entries.update(
-        {
-            index: entry
-            for index, entry in attempt_entries.items()
-            if index not in combined_entries
-        }
-    )
     by_dataset: dict[str, list[tuple[int, Sample, bool, bool]]] = {}
     for index, (dataset_name, sample, completed, truncated) in sorted(
-        combined_entries.items()
+        attempt_entries.items()
     ):
         by_dataset.setdefault(dataset_name, []).append(
             (index, sample, completed, truncated)
@@ -2177,7 +2132,7 @@ def generate_validation_rollout(
     data: dict[str, dict[str, Any]] = {}
     metrics: dict[str, Any] = {}
     total_attempted = total_completed = total_resolved = 0
-    total_stale_policy_aborted = 0
+    total_stale_1 = total_stale_gt1 = 0
     for dataset_name, entries in by_dataset.items():
         entries.sort(key=lambda item: item[0])
         samples = [item[1] for item in entries]
@@ -2192,15 +2147,18 @@ def generate_validation_rollout(
             float(sample.reward or 0.0) >= 0.5
             for sample in completed_samples
         )
-        stale_policy_aborted = sum(
-            bool(
+        stale_lags = [
+            int(
                 (sample.metadata or {}).get(
-                    "validation_stale_policy_aborted",
-                    False,
+                    "validation_policy_stale_lag",
+                    0,
                 )
+                or 0
             )
             for sample in samples
-        )
+        ]
+        stale_1 = sum(lag == 1 for lag in stale_lags)
+        stale_gt1 = sum(lag > 1 for lag in stale_lags)
         attempted = len(samples)
         errors = attempted - completed
         if completed_samples:
@@ -2225,13 +2183,15 @@ def generate_validation_rollout(
                 f"{prefix}/coverage": (
                     completed / attempted if attempted else 0.0
                 ),
-                f"{prefix}/stale_policy_aborted": stale_policy_aborted,
+                f"{prefix}/stale_1_instances": stale_1,
+                f"{prefix}/stale_gt1_instances": stale_gt1,
             }
         )
         total_attempted += attempted
         total_completed += completed
         total_resolved += resolved
-        total_stale_policy_aborted += stale_policy_aborted
+        total_stale_1 += stale_1
+        total_stale_gt1 += stale_gt1
     metrics.update(
         {
             "eval/attempted": total_attempted,
@@ -2246,15 +2206,13 @@ def generate_validation_rollout(
                 if total_attempted
                 else 0.0
             ),
-            "eval/stale_policy_aborted": total_stale_policy_aborted,
+            "eval/stale_1_instances": total_stale_1,
+            "eval/stale_gt1_instances": total_stale_gt1,
             "eval/incomplete": int(total_completed != total_attempted),
         }
     )
     metrics.update(_usage_metrics())
-    output = RolloutFnEvalOutput(data=data, metrics=metrics)
-    if total_completed == len(rows):
-        _EVAL_PARTIAL_STATE = None
-    return output
+    return RolloutFnEvalOutput(data=data, metrics=metrics)
 
 
 def _submit_until_full(
@@ -2293,15 +2251,52 @@ def _submit_until_full(
     endpoints = _policy_endpoints_for_model(args, model_name)
 
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
+    m_trials = int(naive_values.get("m", 8))
+    max_tail_pending = max(
+        0,
+        int(
+            os.environ.get(
+                "SWE_AGENT_NAIVE_MAX_TAIL_PENDING",
+                str(max_pending),
+            )
+        ),
+    )
+    num_rollout = getattr(args, "num_rollout", None)
+    if (
+        num_rollout is not None
+        and rollout_id + 1 >= int(num_rollout)
+    ):
+        # There is no N+1 optimizer batch to consume speculative tail work.
+        max_tail_pending = 0
+    max_total_pending = max_pending + max_tail_pending
+    max_active_branches = max_pending * m_trials
 
-    # Keep the CPU/SGLang pipeline full across optimizer batches.  The
-    # rollout-id stale guard, not an artificial batch-local drain, bounds how
-    # long completed or in-flight work may survive.
-    while len(_PENDING) < max_pending:
-        if _SOURCE_BUDGET_EXHAUSTED or _SOURCE_VALIDATION_ERROR is not None:
+    # Every complete sibling releases its own endpoint reservation.  Launching
+    # is still group-atomic, so the first free branch may enqueue at most M-1
+    # siblings behind it; SGLang absorbs that bounded queue while every branch
+    # in the new GRPO group starts under one committed policy version.
+    while len(_PENDING) < max_total_pending:
+        _refresh_branch_slots()
+        active_policy_branches = sum(
+            max(
+                0,
+                len(task.get("_endpoints_picked", []))
+                - len(task.get("_released_branch_indices", [])),
+            )
+            for task in _PENDING.values()
+        )
+        if active_policy_branches >= max_active_branches:
             break
         policy_version = _dispatch_policy_version()
         if policy_version is None:
+            break
+        projected_groups = len(_BUFFER) + len(_PENDING)
+        if projected_groups >= target_groups + max_tail_pending:
+            break
+        if (
+            _SOURCE_BUDGET_EXHAUSTED
+            or _SOURCE_VALIDATION_ERROR is not None
+        ):
             break
         try:
             prompt_groups = data_buffer.get_samples(1)
@@ -2317,55 +2312,61 @@ def _submit_until_full(
         if not prompt_groups:
             break
         (prompt_group,) = prompt_groups
-        # slime expands n_samples_per_prompt by duplicating the prompt; the
-        # naive runner itself creates the M=8 sibling group, so we just take
-        # the first duplicate. n_samples_per_prompt MUST equal SWE_AGENT_NAIVE_M.
+        # Slime duplicates one prompt M times; the runner owns the actual
+        # sibling rollout group, so only the first copy supplies metadata.
         metadata = prompt_group[0].metadata
         instance_id = metadata["instance_id"]
-        # Per-trial routing: pick M URLs by current per-engine load. The M
-        # trials of this instance get spread across distinct engines (cycling
-        # back to least-loaded if M > num_engines), so all engines stay busy
-        # even when max_pending < num_engines.
-        m_trials = int(naive_values.get("m", 8))
-        policy_base_urls, endpoints_picked = _pick_least_loaded_endpoints(
-            m_trials, endpoints,
-        )
-
+        source_group_index = int(prompt_group[0].group_index)
         usage_prefix = _usage_group_prefix(
             phase="train",
             rollout_id=rollout_id,
             instance_id=instance_id,
-            # The source cursor is checkpointed and therefore stable across
-            # Slurm requeues.  _TASK_INDEX is process-local and restarts at
-            # zero, so using it here makes replayed logical groups
-            # indistinguishable from new source attempts in the usage ledger.
-            task_index=int(prompt_group[0].group_index),
+            task_index=source_group_index,
         )
         task = {
             "index": _TASK_INDEX,
-            "rollout_id": rollout_id,
             "instance_id": instance_id,
             "subset": metadata["subset"],
             "split": metadata["split"],
-            "output_root": str(output_root / f"rollout_{rollout_id:04d}"),
+            "usage_phase": "train",
+            "source_group_index": source_group_index,
+            **naive_values,
+        }
+        _TASK_INDEX += 1
+
+        # Per-trial routing remains sticky.  Endpoint reservations now end per
+        # completed branch rather than at the slowest sibling in the bundle.
+        policy_base_urls, endpoints_picked = _pick_least_loaded_endpoints(
+            m_trials, endpoints,
+        )
+        marker_dir = _branch_done_dir(
+            output_root,
+            rollout_id=rollout_id,
+            task_index=int(task["index"]),
+        )
+        _reset_branch_done_dir(marker_dir)
+        task.update({
+            "rollout_id": int(rollout_id),
+            "output_root": str(
+                output_root / f"rollout_{int(rollout_id):04d}"
+            ),
             "model_name": model_name,
             # Legacy single-URL key (kept for any consumer that hasn't been
             # updated yet; worker prefers policy_base_urls when present).
             "policy_base_url": policy_base_urls[0],
             "policy_base_urls": policy_base_urls,
             "_endpoints_picked": endpoints_picked,
+            "_branch_done_dir": str(marker_dir),
+            "_released_branch_indices": [],
             "api_key": api_key,
             "usage_ledger": _ensure_usage_tracking(),
             "usage_phase": "train",
             "usage_group_prefix": usage_prefix,
             "usage_group_id": f"{usage_prefix}:g0",
-            "source_group_index": int(
-                prompt_group[0].group_index
-            ),
+            "source_group_index": source_group_index,
             "policy_version": policy_version,
-            **naive_values,
-        }
-        _TASK_INDEX += 1
+            "suppress_usage_accounting": False,
+        })
         worker = _NODE_WORKERS[_DISPATCH_COUNTER % len(_NODE_WORKERS)]
         _DISPATCH_COUNTER += 1
         ref = worker.submit_task.remote(task)
@@ -2403,6 +2404,7 @@ def _harvest_ready(
 
     if not _PENDING:
         return harvested
+    _refresh_branch_slots()
     pending_refs = list(_PENDING.keys())
     if block and harvested == 0:
         ready, _ = ray.wait(
@@ -2434,12 +2436,27 @@ def _harvest_ready(
             )
         )
         usage_group_id = str(task.get("usage_group_id") or "")
-        # The bundle is no longer in-flight on any engine — release the
-        # M endpoint slots we reserved at dispatch, regardless of outcome.
-        # Tuples come back from Ray as lists; coerce to tuple for dict key.
-        _release_endpoints([
-            tuple(ep) for ep in task.get("_endpoints_picked", [])
-        ])
+        # Branch markers may already have released a subset.  Completion or
+        # error releases only the remainder and removes the ephemeral markers.
+        released_indices = {
+            int(index)
+            for index in task.get("_released_branch_indices", [])
+        }
+        endpoints_picked = [
+            tuple(endpoint)
+            for endpoint in task.get("_endpoints_picked", [])
+        ]
+        _release_endpoints(
+            [
+                endpoint
+                for index, endpoint in enumerate(endpoints_picked)
+                if index not in released_indices
+            ]
+        )
+        marker_value = task.get("_branch_done_dir")
+        if marker_value:
+            for marker in Path(str(marker_value)).glob("rollout-*.ready"):
+                marker.unlink(missing_ok=True)
         if policy_stale_lag is not None and policy_stale_lag < 0:
             raise RuntimeError(
                 "naive collector observed policy weights from the future: "
@@ -2480,20 +2497,11 @@ def _harvest_ready(
                 collector="naive",
                 instance_id=task.get("instance_id"),
             )
-            _TOTAL_GROUPS_ATTEMPTED += 1
-            _FAILED_INSTANCES += 1
-            _mark_invalid_group("ray_task_error")
-            _record_usage_disposition(
-                usage_group_id,
-                disposition="invalid",
-                reason="ray_task_error",
-            )
-            logger.warning(
-                "[naive-async] instance %s failed: %s",
-                task.get("instance_id"), str(exc)[:200],
-            )
-            del ref
-            continue
+            raise CollectorInfrastructureError(
+                "naive Ray task failed after worker recovery for instance "
+                f"{task.get('instance_id')}: {type(exc).__name__}: "
+                f"{str(exc)[:1000]}"
+            ) from exc
         # A returned worker result is one attempted model group even when the
         # runner later reports an application/bundle error. A lost Ray node is
         # infrastructure recovery and is intentionally excluded.
@@ -2513,7 +2521,8 @@ def _harvest_ready(
             )
             logger.warning(
                 "[naive-async] instance %s failed: %s",
-                result.get("instance_id"), result["error"][:200],
+                result.get("instance_id"),
+                str(result["error"])[:200],
             )
             del result, ref
             continue
@@ -2585,11 +2594,7 @@ def _harvest_ready(
                     _record_usage_disposition(
                         usage_group_id,
                         disposition="filtered",
-                        reason=(
-                            "zero_variance"
-                            if reason.startswith("zero_std")
-                            else reason
-                        ),
+                        reason=reason,
                     )
                     continue
             _BUFFER.append(
@@ -2710,7 +2715,7 @@ def _validation_partial_resume_state(
     data_buffer,
     rollout_id: int,
 ) -> dict[str, Any] | None:
-    """Return metrics state for a same-rollout validation retry.
+    """Return metrics state after nonblocking validation scheduling.
 
     Ordinary buffers and pending tasks are intentionally allowed across
     generate calls; stale=1 is the lifecycle guard.
@@ -2720,7 +2725,7 @@ def _validation_partial_resume_state(
         return None
     if int(state["rollout_id"]) != int(rollout_id):
         raise RuntimeError(
-            "Naive validation partial must retry the same rollout id: "
+            "Naive source-boundary continuation changed rollout id: "
             f"preserved={state['rollout_id']} requested={rollout_id}"
         )
     boundary = int(state["boundary"])
@@ -2729,7 +2734,7 @@ def _validation_partial_resume_state(
     )
     if source_boundary != boundary:
         raise RuntimeError(
-            "Naive validation partial lost its source-boundary guard: "
+            "Naive source-boundary continuation lost its guard: "
             f"preserved={boundary} source={source_boundary}"
         )
     scheduled = int(
@@ -2742,18 +2747,17 @@ def _validation_partial_resume_state(
     )
     if scheduled < boundary:
         raise RuntimeError(
-            "Naive validation partial cannot resume before validation is "
+            "Naive source-boundary continuation cannot resume before "
+            "validation is "
             f"scheduled: scheduled={scheduled} boundary={boundary}"
         )
-    checkpoint_pending_count = (
-        len(_PENDING) + len(_REPLAY_PENDING_TASKS)
-    )
+    checkpoint_pending_count = len(_PENDING) + len(_REPLAY_PENDING_TASKS)
     if (
         int(state["group_count"]) != len(_BUFFER)
         or int(state["pending_count"]) != checkpoint_pending_count
     ):
         raise RuntimeError(
-            "Naive validation partial changed while paused: "
+            "Naive source-boundary state changed before continuation: "
             f"groups={state['group_count']}->{len(_BUFFER)} "
             f"pending={state['pending_count']}->{checkpoint_pending_count}"
         )
@@ -3015,19 +3019,9 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
 
     selected_groups = _pop_groups(min_ready_groups)
     _VALIDATION_PARTIAL_STATE = None
-    submitted += _submit_until_full(
-        args=args,
-        data_buffer=data_buffer,
-        rollout_id=rollout_id,
-        output_root=output_root,
-        model_name=model_name,
-        max_pending=max_pending,
-        target_groups=min_ready_groups,
-    )
-    # A test double, or a very fast local dispatcher, may synchronously place
-    # newly prefetched groups in the buffer.  Count carry only after that
-    # refill so every attempted group remains visible in the conservation
-    # equation.  Merely pending tasks have not produced an attempted group yet.
+    # Count any already-produced excess groups in the conservation equation.
+    # The next generate call runs after the new policy version is committed and
+    # is therefore the earliest safe point to dispatch its work.
     carried_out = len(_BUFFER)
     samples = [sample for group in selected_groups for sample in group.samples]
     for group_index, group in enumerate(selected_groups):

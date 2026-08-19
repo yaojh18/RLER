@@ -23,11 +23,11 @@ M=8 samples) plus per-rollout bookkeeping.
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import copy
 import json
 import logging
+import threading
 import time
 import traceback
 import uuid
@@ -54,6 +54,7 @@ from swe_agent.run.run_swe_agent import (
     make_evaluation_payload,
 )
 from swe_agent.trajectory_search import _build_step_cards
+from swe_agent.usage import usage_context
 
 
 logger = logging.getLogger("swe_agent.naive_search")
@@ -70,7 +71,6 @@ class NaiveSearchConfig:
 
     m: int = 8  # number of independent rollouts per instance
     step_limit: int = 120  # hard cap per rollout
-    seed: int | None = None
 
     policy_temperature: float = 1.0
     policy_top_p: float = 0.95
@@ -79,6 +79,7 @@ class NaiveSearchConfig:
     gt_eval_timeout: int = 600
     evaluate_gt: bool = True
     rollout_pool_size: int | None = None  # default = m
+    rollout_max_attempts: int = 8
 
     # Same fallback-patch penalty recipe as v0/lanes.
     fallback_patch_penalty: float = 0.5
@@ -89,7 +90,6 @@ class NaiveSearchConfig:
     joint_alpha: float = 1.0
     # Keep a fully solved rollout on the same unit scale as judge rewards.
     all_pass_reward: float = 1.0
-
 
 @dataclass
 class NaiveRollout:
@@ -137,13 +137,7 @@ class NaiveRecord:
 
 
 class NaiveSearchRunner:
-    """Run M independent fresh-session rollouts per instance and GT-score them.
-
-    Sibling to TrajectorySearchParallelRunner: same constructor shape so the
-    async collector can swap them. ``rubric_model_name`` / ``judge_model_name``
-    / ``rubric_base_url`` are accepted for signature parity but ignored — naive
-    baseline never calls rubric/judge.
-    """
+    """Run M independent fresh-session rollouts per instance and GT-score them."""
 
     def __init__(
         self,
@@ -161,10 +155,6 @@ class NaiveSearchRunner:
         # Per-trial URL list; trial ri uses policy_base_urls[ri % len(...)].
         # Falls back to policy_base_url for all trials if not provided.
         policy_base_urls: list[str] | None = None,
-        # Accepted for call-site parity with the lanes runner; unused here.
-        rubric_model_name: str | None = None,
-        judge_model_name: str | None = None,
-        rubric_base_url: str | None = None,
     ) -> None:
         self.instance = copy.deepcopy(instance)
         self.backend = backend
@@ -180,14 +170,10 @@ class NaiveSearchRunner:
         else:
             self.policy_base_urls = [self.policy_base_url]
         self.api_key = api_key
-
         self.task = instance["problem_statement"]
         self.task_id = instance["instance_id"]
+
         self.run_timestamp = time.strftime("%Y%m%d-%H%M%S")
-        self.base_image = str(self.backend.environment_config.get("image", ""))
-        self.docker_executable = str(
-            self.backend.environment_config.get("executable", "docker")
-        )
 
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._live_sessions: list[Any] = []
@@ -345,7 +331,9 @@ class NaiveSearchRunner:
                 base_turn_count = 0
                 base_event_count = 0
 
-            result = self._step_session(session, max_steps=self.config.step_limit)
+            result = self._step_session(
+                session, max_steps=self.config.step_limit
+            )
             snapshot_after = session.snapshot().model_dump(mode="json")
             # The training sample wants the FULL chat (sys+user+all asst+tool)
             # so we keep messages from index 0 — the lane-to-grpo path will
@@ -487,7 +475,7 @@ class NaiveSearchRunner:
 
     # -- main loop -----------------------------------------------------------
 
-    async def run(self) -> NaiveRecord:
+    async def run(self, on_rollout_done=None) -> NaiveRecord:
         record = NaiveRecord(
             instance_id=self.task_id,
             run_dir=str(self.run_dir),
@@ -503,68 +491,127 @@ class NaiveSearchRunner:
             self.task_id, cfg.m, cfg.step_limit, distinct_urls,
         )
 
-        loop = asyncio.get_running_loop()
         rollout_pool = ThreadPoolExecutor(
             max_workers=cfg.rollout_pool_size or cfg.m,
             thread_name_prefix=f"naive-{self.task_id[:12]}",
         )
-        gt_pool = None
-        if cfg.evaluate_gt:
-            gt_pool = ThreadPoolExecutor(
-                max_workers=cfg.gt_eval_workers,
-                thread_name_prefix=f"naive-gt-{self.task_id[:12]}",
-            )
+        gt_slots = threading.Semaphore(max(1, int(cfg.gt_eval_workers)))
         try:
-            # Launch all M rollouts in parallel.
-            rollout_futures: list[asyncio.Future] = []
-            for ri in range(cfg.m):
-                ctx = contextvars.copy_context()
-
-                def _wrapped(idx=ri, c=ctx):
-                    return c.run(self._run_one_rollout, idx)
-
-                rollout_futures.append(loop.run_in_executor(rollout_pool, _wrapped))
-            rollouts_or_excs = await asyncio.gather(
-                *rollout_futures, return_exceptions=True
-            )
-            rollouts: list[NaiveRollout] = []
-            for ri, item in enumerate(rollouts_or_excs):
-                if isinstance(item, BaseException):
-                    err_rollout = NaiveRollout(
-                        rollout_index=ri,
-                        node_id=f"naive-{self.task_id[:20]}-r{ri:02d}-err",
-                        error=f"executor: {type(item).__name__}: {item}",
-                        status="error",
-                    )
-                    err_rollout.evaluation_payload = make_evaluation_payload(
-                        "error", error=err_rollout.error,
-                    )
-                    rollouts.append(err_rollout)
-                else:
-                    rollouts.append(item)
-            record.rollouts = rollouts
-
-            if cfg.evaluate_gt:
-                # GT-score in parallel (CPU + docker, independent across
-                # rollouts). Validation can defer this phase so policy
-                # generation is not held behind evaluator processes.
-                gt_futures: list[asyncio.Future] = []
-                for r in rollouts:
-                    if r.error is not None:
-                        r.gt_score = None
-                        if r.evaluation_payload is None:
-                            r.evaluation_payload = make_evaluation_payload(
-                                "error", error=r.error,
-                            )
-                        continue
-                    ctx = contextvars.copy_context()
-                    gt_futures.append(
-                        loop.run_in_executor(
-                            gt_pool, lambda x=r, c=ctx: c.run(self._evaluate_gt, x)
+            def _run_valid_rollout(rollout_index: int) -> NaiveRollout:
+                last_rollout: NaiveRollout | None = None
+                attempts = max(1, int(cfg.rollout_max_attempts))
+                for attempt in range(1, attempts + 1):
+                    with usage_context(
+                        suppress_accounting=attempt > 1
+                    ):
+                        rollout = self._run_one_rollout(rollout_index)
+                    last_rollout = rollout
+                    if (
+                        rollout.error is not None
+                        and "PolicyVersionMismatch" in rollout.error
+                    ):
+                        return rollout
+                    if rollout.error is None:
+                        if on_rollout_done is not None:
+                            try:
+                                on_rollout_done(rollout_index)
+                            except Exception as exc:
+                                logger.warning(
+                                    "[%s] on_rollout_done r=%d raised: %s",
+                                    self.task_id,
+                                    rollout_index,
+                                    exc,
+                                )
+                        break
+                    if attempt < attempts:
+                        logger.warning(
+                            "[%s] naive r=%d retrying policy attempt=%d/%d "
+                            "rollout_error=%s",
+                            self.task_id,
+                            rollout_index,
+                            attempt + 1,
+                            attempts,
+                            rollout.error or "",
                         )
+                assert last_rollout is not None
+                if last_rollout.error is not None:
+                    last_rollout.error = (
+                        f"rollout_retry_exhausted after {attempts} attempts: "
+                        f"{last_rollout.error}"
                     )
-                if gt_futures:
-                    await asyncio.gather(*gt_futures, return_exceptions=True)
+                    last_rollout.status = "error"
+                    last_rollout.gt_score = None
+                    return last_rollout
+
+                if not cfg.evaluate_gt:
+                    return last_rollout
+
+                # Policy capacity is released before terminal evaluation. An
+                # evaluator infrastructure failure retries this same terminal
+                # patch rather than wasting another policy rollout or holding
+                # an inference slot idle.
+                for eval_attempt in range(1, attempts + 1):
+                    with gt_slots:
+                        self._evaluate_gt(last_rollout)
+                    if last_rollout.gt_score is not None:
+                        return last_rollout
+                    if eval_attempt < attempts:
+                        logger.warning(
+                            "[%s] naive r=%d retrying evaluator "
+                            "attempt=%d/%d",
+                            self.task_id,
+                            rollout_index,
+                            eval_attempt + 1,
+                            attempts,
+                        )
+                last_rollout.error = (
+                    "evaluator_retry_exhausted after "
+                    f"{attempts} attempts"
+                )
+                last_rollout.status = "error"
+                return last_rollout
+
+            rollout_futures = []
+            for rollout_index in range(cfg.m):
+                rollout_context = contextvars.copy_context()
+
+                def _wrapped(
+                    idx=rollout_index,
+                    context=rollout_context,
+                ):
+                    return context.run(_run_valid_rollout, idx)
+
+                rollout_futures.append(
+                    rollout_pool.submit(_wrapped)
+                )
+            rollouts_or_excs: list[NaiveRollout | Exception] = []
+            for future in rollout_futures:
+                try:
+                    rollouts_or_excs.append(future.result())
+                except Exception as exc:
+                    rollouts_or_excs.append(exc)
+            rollouts: list[NaiveRollout] = []
+            for rollout_index, item in enumerate(rollouts_or_excs):
+                if not isinstance(item, Exception):
+                    rollouts.append(item)
+                    continue
+                err_rollout = NaiveRollout(
+                    rollout_index=rollout_index,
+                    node_id=(
+                        f"naive-{self.task_id[:20]}-r{rollout_index:02d}-err"
+                    ),
+                    error=(
+                        "rollout_retry_exhausted: executor: "
+                        f"{type(item).__name__}: {item}"
+                    ),
+                    status="error",
+                )
+                err_rollout.evaluation_payload = make_evaluation_payload(
+                    "error",
+                    error=err_rollout.error,
+                )
+                rollouts.append(err_rollout)
+            record.rollouts = rollouts
 
             record.completed = all(r.error is None for r in record.rollouts)
             if not record.completed and record.error is None:
@@ -575,13 +622,10 @@ class NaiveSearchRunner:
         finally:
             record.seconds = time.perf_counter() - started
             self._dump_record(record)
-            for pool in (rollout_pool, gt_pool):
-                if pool is None:
-                    continue
-                try:
-                    pool.shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    pass
+            try:
+                rollout_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
             self._cleanup_all()
         return record
 
@@ -622,7 +666,20 @@ class NaiveSearchRunner:
             if evaluation_payload is None:
                 if not self.config.evaluate_gt:
                     continue
-                raise RuntimeError(f"missing evaluation payload for rollout {r.node_id}")
+                if r.error is None:
+                    raise RuntimeError(
+                        f"missing evaluation payload for rollout {r.node_id}"
+                    )
+                # A policy/session failure can exhaust its bounded rollout
+                # retries before terminal evaluation is reached.  Preserve
+                # that original failure as an infrastructure-error artifact;
+                # do not let persistence mask it with a second, unrelated
+                # "missing evaluation payload" exception.
+                evaluation_payload = make_evaluation_payload(
+                    "error",
+                    error=r.error,
+                    infrastructure_error=True,
+                )
             (rdir / "evaluation.json").write_text(
                 json.dumps(
                     evaluation_payload,

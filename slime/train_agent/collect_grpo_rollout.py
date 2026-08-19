@@ -14,7 +14,6 @@ from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.utils.types import Sample
 import swe_agent.run.search_swe_agent as search_module
 
-from train_agent.collect_sft_rollout import build_training_messages
 from train_agent.contracts import ExportGroup, ExportSample, GRPOExportBundle
 from train_agent.serving.sglang_chat_service import start_slime_policy_route_warmup
 
@@ -110,7 +109,21 @@ def build_rollout_samples(
                     f"Sample {export_sample.sample_id}: rollout_logprobs len "
                     f"({len(rollout_logprobs)}) != response_length ({response_length})"
                 )
-            messages = build_training_messages(export_sample.prompt, export_sample.turns)
+            messages: list[dict[str, Any]] = []
+            for message in export_sample.prompt + export_sample.turns:
+                role = str(message.get("role"))
+                if role not in {"system", "user", "assistant", "tool"}:
+                    continue
+                item = {
+                    "role": role,
+                    "content": str(message.get("content")),
+                    "step_loss_mask": 1 if role == "assistant" else 0,
+                }
+                if "content_no_thinking" in message:
+                    item["content_no_thinking"] = str(
+                        message.get("content_no_thinking")
+                    )
+                messages.append(item)
             was_truncated = (
                 max_sample_tokens is not None
                 and len(token_ids) > max_sample_tokens

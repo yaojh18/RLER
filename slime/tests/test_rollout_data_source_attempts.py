@@ -48,8 +48,6 @@ def _source(
         else last_validation_scheduled_attempt
     )
     source.last_validation_attempt = last_validation_attempt
-    source.validation_rollout_ids = {}
-    source.validation_policy_versions = {}
     source.metadata = {}
     return source
 
@@ -66,8 +64,6 @@ def test_validation_boundary_blocks_attempt_101_until_scheduled():
         "epoch": 0.4,
         "last_validation_attempt": 0,
         "last_validation_scheduled_attempt": 0,
-        "validation_rollout_ids": {},
-        "validation_policy_versions": {},
         "eval_instance_interval": 100,
     }
 
@@ -80,13 +76,12 @@ def test_validation_boundary_blocks_attempt_101_until_scheduled():
     assert exc_info.value.preserved_pending_count == 0
     assert source.sample_group_index == 100
 
-    source.mark_validation_scheduled(100, rollout_id=5)
+    source.mark_validation_scheduled(100)
     next_group = source.get_samples(1)
     assert next_group[0][0].group_index == 100
     assert source.sample_group_index == 101
     assert source.last_validation_attempt == 0
     assert source.last_validation_scheduled_attempt == 100
-    assert source.validation_rollout_ids == {100: 5}
 
     # Completion is tracked independently and may arrive while later source
     # attempts are already rolling out.
@@ -188,84 +183,6 @@ def test_validation_cannot_complete_before_it_is_scheduled():
     source.mark_validation_scheduled(100)
     source.acknowledge_validation(100)
     assert source.last_validation_attempt == 100
-
-
-def test_validation_attempt_cannot_be_remapped_to_new_policy_rollout():
-    source = _source(sample_group_index=100)
-
-    source.mark_validation_scheduled(100, rollout_id=5)
-    source.mark_validation_scheduled(100, rollout_id=5)
-    with pytest.raises(ValueError, match="cannot remap validation attempt"):
-        source.mark_validation_scheduled(100, rollout_id=7)
-
-    assert source.validation_rollout_ids == {100: 5}
-
-
-def test_validation_attempt_cannot_be_remapped_to_new_policy_version():
-    source = _source(sample_group_index=100)
-
-    source.mark_validation_scheduled(
-        100,
-        rollout_id=5,
-        policy_version="checkpoint-0000004",
-    )
-    source.mark_validation_scheduled(
-        100,
-        rollout_id=5,
-        policy_version="checkpoint-0000004",
-    )
-    with pytest.raises(
-        ValueError,
-        match="different policy version",
-    ):
-        source.mark_validation_scheduled(
-            100,
-            rollout_id=5,
-            policy_version="checkpoint-0000005",
-        )
-
-    assert source.validation_policy_versions == {
-        100: "checkpoint-0000004"
-    }
-
-
-def test_validation_rollout_mapping_round_trips_checkpoint(
-    tmp_path,
-):
-    source = _source(
-        sample_group_index=156,
-        sample_offset=156,
-        last_validation_attempt=100,
-        last_validation_scheduled_attempt=156,
-    )
-    source.validation_rollout_ids = {100: 5, 156: 7}
-    source.validation_policy_versions = {
-        100: "checkpoint-0000004",
-        156: "checkpoint-0000006",
-    }
-    source.args = SimpleNamespace(
-        rollout_global_dataset=True,
-        save=str(tmp_path),
-    )
-    source.save(7)
-
-    restored = _source()
-    restored.args = SimpleNamespace(
-        rollout_global_dataset=True,
-        load=str(tmp_path),
-        rollout_shuffle=False,
-    )
-    restored.load(7)
-
-    assert restored.sample_group_index == 156
-    assert restored.sample_offset == 156
-    assert restored.last_validation_attempt == 100
-    assert restored.last_validation_scheduled_attempt == 156
-    assert restored.validation_rollout_ids == {100: 5, 156: 7}
-    assert restored.validation_policy_versions == {
-        100: "checkpoint-0000004",
-        156: "checkpoint-0000006",
-    }
 
 
 def test_staged_checkpoint_is_not_published_by_data_source(tmp_path):

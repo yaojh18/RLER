@@ -94,6 +94,30 @@ def test_request_ledger_contains_counts_and_context_but_not_payload(tmp_path):
     assert "api_base" not in serialized
 
 
+def test_explicit_call_labels_override_outer_policy_context(tmp_path):
+    ledger_path = tmp_path / "usage.jsonl"
+    configure_usage_ledger(ledger_path)
+
+    with usage_context(
+        phase="train",
+        group_id="group-7",
+        model_family="qwen",
+        model_role="policy",
+    ):
+        record_model_usage(
+            usage={"prompt_tokens": 10, "completion_tokens": 3},
+            status="success",
+            model_family="other",
+            model_role="rubric_judge",
+        )
+
+    [event] = _events(ledger_path)
+    assert event["phase"] == "train"
+    assert event["group_id"] == "group-7"
+    assert event["model_family"] == "other"
+    assert event["model_role"] == "rubric_judge"
+
+
 def test_group_disposition_has_nonempty_host_identity(tmp_path):
     ledger_path = tmp_path / "usage.jsonl"
     configure_usage_ledger(ledger_path)

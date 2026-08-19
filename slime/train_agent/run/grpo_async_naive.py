@@ -9,7 +9,6 @@ Usage:
 
     python -m train_agent.run.grpo_async_naive --target policy \\
         --prompt-data ... --hf-checkpoint ... --load-dir ... --save-dir ... \\
-        --policy-ports 30000,30001,30002,30003,30004,30005 \\
         --naive-instance-workers 8 \\
         --naive-m 8 --naive-step-limit 120 ...
 """
@@ -24,8 +23,6 @@ import sys
 def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[str]]:
     """Pull naive-specific args out before forwarding the rest to grpo.main."""
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--policy-ports", default="")
-    p.add_argument("--api-host", default="http://127.0.0.1")
     p.add_argument("--naive-instance-workers", type=int, default=8)
     p.add_argument("--naive-max-pending", type=int, default=0)
     p.add_argument("--naive-min-ready-groups", type=int, default=0)
@@ -35,10 +32,10 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     p.add_argument("--naive-step-limit", type=int, default=120)
     p.add_argument("--naive-completion-max-tokens", type=int, default=20480)
     p.add_argument("--model-context-length", type=int, default=128000)
-    p.add_argument("--naive-seed", type=int, default=0)
     p.add_argument("--naive-gt-eval-workers", type=int, default=8)
     p.add_argument("--naive-gt-eval-timeout", type=int, default=600)
     p.add_argument("--naive-rollout-pool-size", type=int, default=0)
+    p.add_argument("--naive-rollout-max-attempts", type=int, default=8)
     p.add_argument("--naive-policy-temperature", type=float, default=1.0,
                    help="Sampling temperature for the M independent rollouts.")
     p.add_argument("--naive-policy-top-p", type=float, default=0.95)
@@ -59,6 +56,7 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     )
     p.add_argument("--validation-step-limit", type=int, default=120)
     p.add_argument("--validation-completion-max-tokens", type=int, default=20480)
+    p.add_argument("--validation-context-length", type=int, default=128000)
     p.add_argument("--validation-gt-eval-timeout", type=int, default=1800)
     p.add_argument(
         "--validation-temperature",
@@ -71,10 +69,6 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
 
 
 def _export_naive_env(ns: argparse.Namespace) -> None:
-    if ns.policy_ports:
-        os.environ["SWE_AGENT_NAIVE_POLICY_PORTS"] = ns.policy_ports
-    if ns.api_host:
-        os.environ["SWE_AGENT_NAIVE_API_HOST"] = ns.api_host
     if ns.naive_output_root:
         os.environ["SWE_AGENT_NAIVE_OUTPUT_ROOT"] = ns.naive_output_root
 
@@ -100,8 +94,9 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     )
     if ns.naive_rollout_pool_size:
         os.environ["SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE"] = str(ns.naive_rollout_pool_size)
-    if ns.naive_seed:
-        os.environ["SWE_AGENT_NAIVE_SEED"] = str(ns.naive_seed)
+    os.environ["SWE_AGENT_NAIVE_ROLLOUT_MAX_ATTEMPTS"] = str(
+        ns.naive_rollout_max_attempts
+    )
     os.environ["SWE_AGENT_NAIVE_POLICY_TEMPERATURE"] = str(ns.naive_policy_temperature)
     os.environ["SWE_AGENT_NAIVE_POLICY_TOP_P"] = str(ns.naive_policy_top_p)
     os.environ["SWE_AGENT_NAIVE_FALLBACK_PATCH_PENALTY"] = str(ns.naive_fallback_patch_penalty)
@@ -116,6 +111,9 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_VALIDATION_STEP_LIMIT"] = str(ns.validation_step_limit)
     os.environ["SWE_AGENT_VALIDATION_COMPLETION_MAX_TOKENS"] = str(
         ns.validation_completion_max_tokens
+    )
+    os.environ["SWE_AGENT_VALIDATION_CONTEXT_LENGTH"] = str(
+        ns.validation_context_length
     )
     os.environ["SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT"] = str(
         ns.validation_gt_eval_timeout

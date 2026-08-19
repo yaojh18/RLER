@@ -16,8 +16,10 @@ the SLURM script's tunables):
   SWE_AGENT_LANES_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
   SWE_AGENT_LANES_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
   SWE_AGENT_LANES_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 20480)
-  SWE_AGENT_LANES_RUBRIC_MAX_TOKENS   int    Lane-C rubric max tokens (default 20480)
   SWE_AGENT_LANES_JUDGE_MAX_TOKENS    int    Lane-C judge max tokens (default 20480)
+  SWE_AGENT_LANES_DIRECT_RUBRIC_BANK  str    frozen golden-rubric bank
+  SWE_AGENT_LANES_ENABLE_VARIANCE_DETECTOR bool default true
+  SWE_AGENT_LANES_COLLAPSE_REWARD_MARGIN float empty disables collapse override
   SWE_AGENT_LANES_POLICY_TEMPERATURE float  Lane A sampling temp (default 1.0)
   SWE_AGENT_LANES_POLICY_TOP_P       float  default 0.95
   SWE_AGENT_LANES_LANE_B_TEMPERATURE float  Lane B sampling temp (default 1.0)
@@ -32,12 +34,14 @@ from __future__ import annotations
 import asyncio
 import atexit
 import copy
+import json
 import logging
 import os
 import threading
 import time
 import traceback
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +92,23 @@ from swe_agent.usage import usage_ledger_offset
 
 logger = logging.getLogger("train_agent.collect_lanes_rollout_async")
 
+_DEFAULT_DIRECT_RUBRIC_BANK = (
+    Path(__file__).resolve().parents[2]
+    / "rubric"
+    / "qwen"
+    / "golden_reference_rubrics.json"
+)
+@lru_cache(maxsize=8)
+def _eligible_direct_instances(bank_path: str) -> frozenset[str]:
+    with Path(bank_path).open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("schema_version") != "direct_golden_rubric_bank.v1":
+        raise ValueError(f"invalid direct rubric bank: {bank_path}")
+    eligible = payload.get("eligible_instance_ids")
+    if not isinstance(eligible, list):
+        raise ValueError(f"direct rubric bank lacks eligibility: {bank_path}")
+    return frozenset(str(instance_id) for instance_id in eligible)
+
 
 # ---------------------------------------------------------------------------
 # Subprocess entry: run one instance end-to-end and return its bundle
@@ -120,8 +141,6 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             select_container_environment_class,
         )
         from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
-        from swe_agent.run.search_swe_agent import DEFAULT_FROZEN_EXPERIENCE_BANK
-        from swe_agent.rubric_bank import ExperienceRubricBank
         from swe_agent.trajectory_search_parallel import (
             ParallelSearchConfig,
             TrajectorySearchParallelRunner,
@@ -133,9 +152,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         split = task["split"]
         model_name = task["model_name"]
         policy_base_url = task["policy_base_url"]
-        # Per-fork-group endpoint pool. Fallback to single-URL list if the
-        # task dispatcher didn't supply one (old launcher / external caller).
-        policy_base_urls = task.get("policy_base_urls") or [policy_base_url]
+        policy_base_urls = task["policy_base_urls"]
         rubric_base_url = task["rubric_base_url"]
         policy_api_key = task["policy_api_key"]
         rubric_api_key = task["rubric_api_key"]
@@ -214,33 +231,39 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
             no_action_patch_penalty=task.get("no_action_patch_penalty", -0.1),
             disable_rubric=task.get("disable_rubric", False),
+            gt_on_submit=task.get("gt_on_submit", False),
             reward_kind=reward_kind,
             joint_alpha=task.get("joint_alpha", 1.0),
             all_pass_reward=task.get("all_pass_reward", 1.0),
             topology=task.get("topology", "depth1"),
+            requested_group_kinds=tuple(
+                task.get("requested_group_kinds") or ()
+            ),
             p=task.get("beam_parents", 2),
             terminal_rollout=task.get("terminal_rollout", False),
-            rubric_max_tokens=task.get("rubric_max_tokens", 20480),
             judge_max_tokens=task.get("judge_max_tokens", 20480),
+            judge_context_length=task.get("judge_context_length", 256000),
+            judge_temperature=task.get("judge_temperature", 0.02),
+            judge_top_p=task.get("judge_top_p", 1.0),
+            direct_rubric_bank_path=task.get("direct_rubric_bank", ""),
+            enable_variance_detector=task.get(
+                "enable_variance_detector", True
+            ),
+            collapse_reward_margin=task.get("collapse_reward_margin"),
         )
+        task_dir_name = f"task-{task['index']:06d}"
+        variance_resample_attempt = int(
+            task.get("variance_resample_attempt", 0)
+        )
+        if variance_resample_attempt:
+            task_dir_name += f"-v{variance_resample_attempt}"
         run_dir = (
             output_root / instance_id
             / time.strftime("%Y%m%d-%H%M%S")
-            / f"task-{task['index']:06d}"
+            / task_dir_name
         )
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        experience_bank = ExperienceRubricBank(
-            bank_path=Path(
-                task.get("experience_bank") or DEFAULT_FROZEN_EXPERIENCE_BANK
-            ),
-            scope="siblings",
-        )
-        if not experience_bank.is_frozen:
-            raise ValueError(
-                "Lane C requires the frozen siblings experience checkpoint "
-                f"directory, got {experience_bank.bank_path}"
-            )
         runner = TrajectorySearchParallelRunner(
             instance=instance,
             backend=backend,
@@ -248,7 +271,6 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             policy_model_name=model_name,
             policy_version=task.get("policy_version"),
             enforce_policy_version=False,
-            rubric_model_name=task.get("rubric_model_name") or model_name,
             judge_model_name=task.get("judge_model_name") or model_name,
             config=cfg,
             harness_namespace=get_swebench_harness_namespace(instance),
@@ -257,9 +279,21 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             policy_api_key=policy_api_key,
             rubric_api_key=rubric_api_key,
             policy_base_urls=policy_base_urls,
-            experience_banks={"siblings": experience_bank},
             usage_group_prefix=task.get("usage_group_prefix") or None,
         )
+        policy_done_marker = task.get("_policy_done_marker")
+
+        def _mark_policy_done() -> None:
+            if not policy_done_marker:
+                return
+            marker = Path(str(policy_done_marker))
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            temporary = marker.with_name(
+                f".{marker.name}.{os.getpid()}.tmp"
+            )
+            temporary.write_text("ready\n", encoding="utf-8")
+            os.replace(temporary, marker)
+
         with usage_context(
             phase=task.get("usage_phase", "train"),
             group_id=task.get("usage_group_prefix", ""),
@@ -267,7 +301,9 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                 task.get("suppress_usage_accounting")
             ),
         ):
-            record = asyncio.run(runner.run())
+            record = asyncio.run(
+                runner.run(on_policy_done=_mark_policy_done)
+            )
         # steps_per_round is read from record.config inside the converter;
         # task["steps_per_round"] is honored as an explicit override.
         bundle = instance_record_to_bundle(
@@ -358,6 +394,26 @@ _REWARD_GROUPS_OBSERVED_BY_KIND: dict[str, int] = {}
 _REWARD_GROUP_MEAN_SUM_BY_KIND: dict[str, float] = {}
 _REWARD_GROUP_VARIANCE_SUM_BY_KIND: dict[str, float] = {}
 _ZERO_VARIANCE_GROUPS_BY_KIND: dict[str, int] = {}
+_DIRECT_DIAGNOSTICS: dict[str, int] = {
+    key: 0
+    for key in (
+        "groups",
+        "predicted_zero_groups",
+        "explicit_abstain_groups",
+        "rollouts",
+        "collapse_rollouts",
+        "gt_pairs",
+        "gt_correct",
+        "variance_tp",
+        "variance_fp",
+        "variance_tn",
+        "variance_fn",
+        "stage1_tp",
+        "stage1_fp",
+        "stage1_tn",
+        "stage1_fn",
+    )
+}
 _SOURCE_BUDGET_EXHAUSTED = False
 _SOURCE_BUDGET_ERROR: TrainingInstanceBudgetExhausted | None = None
 _SOURCE_VALIDATION_ERROR: TrainingValidationBoundaryReached | None = None
@@ -370,6 +426,7 @@ _NODE_WORKERS: list[Any] = []          # list[ray.actor.ActorHandle]
 _NODE_WORKER_IPS: list[str] = []
 _PENDING: dict[Any, dict[str, Any]] = {}   # ObjectRef -> task dict
 _REPLAY_PENDING_TASKS: list[dict[str, Any]] = []
+_VARIANCE_RESAMPLE_TASKS: list[dict[str, Any]] = []
 _DISPATCH_COUNTER = 0
 
 # Rolling estimate of groups produced per completed instance. Updated in
@@ -379,6 +436,7 @@ _DISPATCH_COUNTER = 0
 _OBSERVED_GROUPS_TOTAL = 0
 _OBSERVED_INSTANCES = 0
 _DEFAULT_EST_GROUPS = 1.0
+_MAX_VARIANCE_GROUP_ATTEMPTS = 4
 
 
 def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
@@ -391,6 +449,7 @@ def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
         "pending_tasks": (
             serialize_pending_tasks(_PENDING)
             + copy.deepcopy(_REPLAY_PENDING_TASKS)
+            + copy.deepcopy(_VARIANCE_RESAMPLE_TASKS)
         ),
         "task_index": int(_TASK_INDEX),
         "dispatch_counter": int(_DISPATCH_COUNTER),
@@ -434,6 +493,7 @@ def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
             "zero_variance_groups_by_kind": dict(
                 _ZERO_VARIANCE_GROUPS_BY_KIND
             ),
+            "direct_diagnostics": dict(_DIRECT_DIAGNOSTICS),
             "observed_groups_total": int(_OBSERVED_GROUPS_TOTAL),
             "observed_instances": int(_OBSERVED_INSTANCES),
         },
@@ -467,10 +527,12 @@ def load_checkpoint_state_dict(
     global _REWARD_GROUP_MEAN_SUM_BY_KIND
     global _REWARD_GROUP_VARIANCE_SUM_BY_KIND
     global _ZERO_VARIANCE_GROUPS_BY_KIND
+    global _DIRECT_DIAGNOSTICS
     global _SOURCE_BUDGET_EXHAUSTED, _SOURCE_BUDGET_ERROR
     global _SOURCE_VALIDATION_ERROR, _VALIDATION_PARTIAL_STATE
     global _NODE_WORKERS, _NODE_WORKER_IPS, _PENDING
-    global _REPLAY_PENDING_TASKS, _DISPATCH_COUNTER
+    global _REPLAY_PENDING_TASKS, _VARIANCE_RESAMPLE_TASKS
+    global _DISPATCH_COUNTER
     global _OBSERVED_GROUPS_TOTAL, _OBSERVED_INSTANCES
 
     if int(state.get("schema_version", -1)) != (
@@ -491,7 +553,12 @@ def load_checkpoint_state_dict(
             f"requested={rollout_id} "
             f"saved={state.get('checkpoint_rollout_id')}"
         )
-    if _BUFFER or _PENDING or _REPLAY_PENDING_TASKS:
+    if (
+        _BUFFER
+        or _PENDING
+        or _REPLAY_PENDING_TASKS
+        or _VARIANCE_RESAMPLE_TASKS
+    ):
         raise RuntimeError(
             "refusing to overlay a Lane collector checkpoint on live state"
         )
@@ -504,6 +571,7 @@ def load_checkpoint_state_dict(
     _REPLAY_PENDING_TASKS = copy.deepcopy(
         list(state.get("pending_tasks") or [])
     )
+    _VARIANCE_RESAMPLE_TASKS = []
     _TASK_INDEX = int(state.get("task_index", 0))
     _DISPATCH_COUNTER = int(state.get("dispatch_counter", 0))
     counters = dict(state.get("counters") or {})
@@ -557,6 +625,12 @@ def load_checkpoint_state_dict(
     _ZERO_VARIANCE_GROUPS_BY_KIND = dict(
         counters.get("zero_variance_groups_by_kind") or {}
     )
+    _DIRECT_DIAGNOSTICS = {
+        key: int(value)
+        for key, value in dict(
+            counters.get("direct_diagnostics") or {}
+        ).items()
+    }
     _OBSERVED_GROUPS_TOTAL = int(
         counters.get("observed_groups_total", 0)
     )
@@ -590,8 +664,15 @@ def _expected_usage_group_specs(task: dict[str, Any]) -> dict[str, str]:
     prefix = str(task.get("usage_group_prefix") or "")
     if not prefix:
         return {}
-    specs = {f"{prefix}:g0": "root"}
-    if task.get("topology") == "depth2":
+    requested = set(task.get("requested_group_kinds") or ())
+    if not requested:
+        requested = {"root"}
+        if task.get("topology") == "depth2":
+            requested.add("beam")
+    specs: dict[str, str] = {}
+    if "root" in requested:
+        specs[f"{prefix}:g0"] = "root"
+    if "beam" in requested:
         specs[f"{prefix}:g1"] = "beam"
     return specs
 
@@ -651,6 +732,69 @@ def _observe_reward_group(args, samples: list[Sample], *, kind: str) -> None:
             _ZERO_VARIANCE_GROUPS_BY_KIND.get(kind, 0) + 1
         )
 
+    metadata = [sample.metadata or {} for sample in samples]
+    if not metadata or any(
+        item.get("raw_rubric_score") is None for item in metadata
+    ):
+        return
+    _DIRECT_DIAGNOSTICS["groups"] = (
+        _DIRECT_DIAGNOSTICS.get("groups", 0) + 1
+    )
+    predicted_zero = bool(metadata[0].get("predicted_zero_variance"))
+    explicit_abstain = bool(metadata[0].get("explicit_abstain"))
+    _DIRECT_DIAGNOSTICS["predicted_zero_groups"] = (
+        _DIRECT_DIAGNOSTICS.get("predicted_zero_groups", 0)
+        + int(predicted_zero)
+    )
+    _DIRECT_DIAGNOSTICS["explicit_abstain_groups"] = (
+        _DIRECT_DIAGNOSTICS.get("explicit_abstain_groups", 0)
+        + int(explicit_abstain)
+    )
+    _DIRECT_DIAGNOSTICS["rollouts"] = (
+        _DIRECT_DIAGNOSTICS.get("rollouts", 0) + len(metadata)
+    )
+    _DIRECT_DIAGNOSTICS["collapse_rollouts"] = (
+        _DIRECT_DIAGNOSTICS.get("collapse_rollouts", 0)
+        + sum(bool(item.get("collapse_reward_applied")) for item in metadata)
+    )
+
+    if any(item.get("raw_gt_score") is None for item in metadata):
+        return
+    gt_values = [float(item["raw_gt_score"]) for item in metadata]
+    judge_values = [float(item["raw_rubric_score"]) for item in metadata]
+    for left in range(len(samples)):
+        for right in range(left + 1, len(samples)):
+            gt_delta = gt_values[left] - gt_values[right]
+            if abs(gt_delta) <= 1e-12:
+                continue
+            judge_delta = judge_values[left] - judge_values[right]
+            _DIRECT_DIAGNOSTICS["gt_pairs"] = (
+                _DIRECT_DIAGNOSTICS.get("gt_pairs", 0) + 1
+            )
+            if (gt_delta > 0.0 and judge_delta > 1e-12) or (
+                gt_delta < 0.0 and judge_delta < -1e-12
+            ):
+                _DIRECT_DIAGNOSTICS["gt_correct"] = (
+                    _DIRECT_DIAGNOSTICS.get("gt_correct", 0) + 1
+                )
+
+    actual_variance = max(gt_values) - min(gt_values) > 1e-12
+    for prefix, predicts_variance in (
+        ("variance", not predicted_zero),
+        ("stage1", not explicit_abstain),
+    ):
+        outcome = (
+            "tp"
+            if actual_variance and predicts_variance
+            else "fn"
+            if actual_variance
+            else "fp"
+            if predicts_variance
+            else "tn"
+        )
+        key = f"{prefix}_{outcome}"
+        _DIRECT_DIAGNOSTICS[key] = _DIRECT_DIAGNOSTICS.get(key, 0) + 1
+
 
 def _record_task_disposition(
     task: dict[str, Any],
@@ -674,8 +818,6 @@ class _LanesNodeWorker:
 
     def __init__(self, name: str = "", max_workers: int = 8, max_tasks_per_child: int = 5):
         self.name = name
-        self.max_workers = max_workers
-        self.max_tasks_per_child = max_tasks_per_child
         from concurrent.futures import ProcessPoolExecutor
         # max_tasks_per_child recycles each subprocess after N tasks. Bounds
         # any cross-task RAM leak (52084 grew ~25 GB/task → OOM at step 42).
@@ -755,11 +897,22 @@ def _spawn_node_workers(per_node_concurrency: int) -> None:
         nodes.append(n)
     if not nodes:
         raise RuntimeError("No GPU-bearing Ray nodes found for Lanes worker spawn")
-    actor_concurrency = per_node_concurrency + 4
+    lane_c_overlap = max(
+        0,
+        int(
+            os.environ.get(
+                "SWE_AGENT_LANES_LANE_C_OVERLAP_WORKERS_PER_NODE",
+                str(per_node_concurrency),
+            )
+        ),
+    )
+    process_workers = per_node_concurrency + lane_c_overlap
+    actor_concurrency = process_workers + 4
     logger.info(
         f"[lanes-async] spawning {len(nodes)} node workers "
         f"(skipped={len(skip)}), "
-        f"per-node concurrency={per_node_concurrency} "
+        f"per-node policy concurrency={per_node_concurrency} "
+        f"lane-c overlap={lane_c_overlap} "
         f"actor_concurrency={actor_concurrency}"
     )
     for n in nodes:
@@ -772,7 +925,7 @@ def _spawn_node_workers(per_node_concurrency: int) -> None:
                 node_id=node_id, soft=False,
             ),
             name=f"lanes-node-worker-{node_name}",
-        ).remote(name=node_name, max_workers=per_node_concurrency)
+        ).remote(name=node_name, max_workers=process_workers)
         ip = ray.get(worker.get_ip.remote())
         _NODE_WORKERS.append(worker)
         _NODE_WORKER_IPS.append(ip)
@@ -799,7 +952,7 @@ def _lanes_values_from_env() -> dict[str, Any]:
         v = os.environ.get(name, "")
         return int(v) if v else default
 
-    def _float(name, default):
+    def _float(name, default=None):
         v = os.environ.get(name, "")
         return float(v) if v else default
 
@@ -817,8 +970,24 @@ def _lanes_values_from_env() -> dict[str, Any]:
         "lane_b_pool_size": _int("SWE_AGENT_LANES_LANE_B_POOL_SIZE"),
         "completion_max_tokens": _int("SWE_AGENT_LANES_COMPLETION_MAX_TOKENS", 20480),
         "context_length": _int("SWE_AGENT_MODEL_CONTEXT_LENGTH", 128000),
-        "rubric_max_tokens": _int("SWE_AGENT_LANES_RUBRIC_MAX_TOKENS", 20480),
         "judge_max_tokens": _int("SWE_AGENT_LANES_JUDGE_MAX_TOKENS", 20480),
+        "judge_context_length": _int(
+            "SWE_AGENT_LANES_JUDGE_CONTEXT_LENGTH", 256000
+        ),
+        "judge_temperature": _float(
+            "SWE_AGENT_LANES_JUDGE_TEMPERATURE", 0.02
+        ),
+        "judge_top_p": _float("SWE_AGENT_LANES_JUDGE_TOP_P", 1.0),
+        "direct_rubric_bank": os.environ.get(
+            "SWE_AGENT_LANES_DIRECT_RUBRIC_BANK",
+            str(_DEFAULT_DIRECT_RUBRIC_BANK),
+        ),
+        "enable_variance_detector": _bool(
+            "SWE_AGENT_LANES_ENABLE_VARIANCE_DETECTOR", True
+        ),
+        "collapse_reward_margin": _float(
+            "SWE_AGENT_LANES_COLLAPSE_REWARD_MARGIN"
+        ),
         "policy_temperature": _float("SWE_AGENT_LANES_POLICY_TEMPERATURE", 1.0),
         "policy_top_p": _float("SWE_AGENT_LANES_POLICY_TOP_P", 0.95),
         "lane_b_temperature": _float("SWE_AGENT_LANES_LANE_B_TEMPERATURE", 1.0),
@@ -828,6 +997,7 @@ def _lanes_values_from_env() -> dict[str, Any]:
         # GT-only training: skip rubric/judge in trajectory_search_parallel
         # and use branch.gt_score as the reward in the bundler.
         "disable_rubric": _bool("SWE_AGENT_LANES_DISABLE_RUBRIC", False),
+        "gt_on_submit": _bool("SWE_AGENT_LANES_GT_ON_SUBMIT", False),
         # Shared evaluator reward kind, identical to naive in GT-only mode.
         "reward_kind": (os.environ.get("SWE_AGENT_LANES_REWARD_KIND") or "joint").lower(),
         "joint_alpha": _float("SWE_AGENT_LANES_JOINT_ALPHA", 1.0),
@@ -836,8 +1006,9 @@ def _lanes_values_from_env() -> dict[str, Any]:
             os.environ.get("SWE_AGENT_LANES_TOPOLOGY") or "depth1"
         ).strip().lower(),
         "beam_parents": _int("SWE_AGENT_LANES_BEAM_PARENTS", 2),
-        # Training must stop at the judged prefix. Validation uses the
-        # policy-only naive evaluator path below and never enables Lane C.
+        # Rollout40 may continue for terminal GT diagnostics, but the bundler
+        # drops every assistant turn after the judged/trainable prefix.
+        # Validation uses the policy-only naive evaluator path below.
         "terminal_rollout": _bool("SWE_AGENT_LANES_TERMINAL_ROLLOUT", False),
     }
 
@@ -850,18 +1021,14 @@ _ENDPOINT_LOAD: dict[str, int] = {}
 _ENDPOINT_LOAD_LOCK = threading.Lock()
 
 
-def _hosted_lane_c_settings() -> tuple[str, str, str, str]:
-    """Return the single hosted Lane-C route, never a local policy URL."""
+def _hosted_lane_c_settings() -> tuple[str, str, str]:
+    """Return the hosted direct-judge route and its credentials."""
     default_lane_c_model = "openai/azure/openai/gpt-5.6-luna"
-    rubric_model = (
-        os.environ.get("SWE_AGENT_LANES_RUBRIC_MODEL")
-        or default_lane_c_model
-    ).strip()
     judge_model = (
         os.environ.get("SWE_AGENT_LANES_JUDGE_MODEL")
         or default_lane_c_model
     ).strip()
-    allowed_model_routes = {
+    allowed_judge_routes = {
         # GLM remains an explicit experiment route alongside Luna.
         "nvidia/zai-org/glm-5.2",
         "openai/azure/zai-org/glm-5.2",
@@ -869,14 +1036,10 @@ def _hosted_lane_c_settings() -> tuple[str, str, str, str]:
         # NVIDIA gateway receives azure/openai/gpt-5.6-luna as the model id.
         "openai/azure/openai/gpt-5.6-luna",
     }
-    if (
-        rubric_model != judge_model
-        or rubric_model not in allowed_model_routes
-    ):
+    if judge_model not in allowed_judge_routes:
         raise ValueError(
-            "Current early-prediction experiments require one identical "
-            "approved NVIDIA-gateway model for every Lane C call; "
-            f"got rubric={rubric_model!r}, judge={judge_model!r}"
+            "Direct Lane C requires an approved hosted judge route; "
+            f"got judge={judge_model!r}"
         )
     api_base = (
         os.environ.get("SWE_AGENT_LANES_RUBRIC_API_BASE")
@@ -912,7 +1075,7 @@ def _hosted_lane_c_settings() -> tuple[str, str, str, str]:
             "Lane C hosted-model API key is missing; export "
             "LITELLM_API_KEY or NVIDIA_API_KEY from exp/config.md"
         )
-    return rubric_model, judge_model, api_base, api_key
+    return judge_model, api_base, api_key
 
 
 def _policy_urls_for_model(args, model_name: str) -> list[str]:
@@ -961,6 +1124,34 @@ def _release_endpoints(urls: list[str]) -> None:
                 _ENDPOINT_LOAD[url] = max(0, _ENDPOINT_LOAD[url] - 1)
 
 
+def _policy_done_marker_path(
+    output_root: Path,
+    *,
+    rollout_id: int,
+    task_index: int,
+) -> Path:
+    return (
+        output_root
+        / f"rollout_{int(rollout_id):04d}"
+        / ".policy_done"
+        / f"task-{int(task_index):06d}.ready"
+    )
+
+
+def _refresh_policy_slots() -> int:
+    released = 0
+    for task in _PENDING.values():
+        if task.get("_policy_slot_released"):
+            continue
+        marker_value = task.get("_policy_done_marker")
+        if not marker_value or not Path(str(marker_value)).is_file():
+            continue
+        _release_endpoints(list(task.get("_pinned_endpoints", [])))
+        task["_policy_slot_released"] = True
+        released += 1
+    return released
+
+
 def _dispatch_policy_version() -> str | None:
     """Return the committed weight epoch, pausing dispatch during an update."""
     try:
@@ -990,7 +1181,7 @@ def _replay_checkpoint_pending_tasks(
             "cannot replay Lane pending tasks during a policy transition"
         )
     policy_urls = _policy_urls_for_model(args, model_name)
-    rubric_model, judge_model, rubric_base_url, rubric_api_key = (
+    judge_model, rubric_base_url, rubric_api_key = (
         _hosted_lane_c_settings()
     )
     policy_api_key = os.environ.get(
@@ -1007,19 +1198,33 @@ def _replay_checkpoint_pending_tasks(
             reason="checkpoint_replay",
         )
         source_group_index = checkpoint_task_source_group_index(task)
-        usage_prefix = _usage_group_prefix(
+        base_usage_prefix = _usage_group_prefix(
             phase=str(task.get("usage_phase") or "train"),
             rollout_id=int(rollout_id),
             instance_id=str(task["instance_id"]),
             task_index=source_group_index,
             dataset_name=str(task.get("dataset_name") or ""),
         )
-        n_urls = (
-            1 + int(task.get("beam_parents", 2))
-            if task.get("topology") == "depth2"
-            else 1
+        variance_resample_attempt = int(
+            task.get("variance_resample_attempt", 0)
         )
+        usage_prefix = (
+            f"{base_usage_prefix}:vr{variance_resample_attempt}"
+            if variance_resample_attempt
+            else base_usage_prefix
+        )
+        requested = set(task.get("requested_group_kinds") or ())
+        needs_beam = task.get("topology") == "depth2" and (
+            not requested or "beam" in requested
+        )
+        n_urls = 1 + int(task.get("beam_parents", 2)) if needs_beam else 1
         policy_base_urls = _pick_least_loaded_urls(policy_urls, n=n_urls)
+        policy_done_marker = _policy_done_marker_path(
+            output_root,
+            rollout_id=rollout_id,
+            task_index=int(task["index"]),
+        )
+        policy_done_marker.unlink(missing_ok=True)
         task.update(
             {
                 "rollout_id": int(rollout_id),
@@ -1027,18 +1232,15 @@ def _replay_checkpoint_pending_tasks(
                     output_root / f"rollout_{int(rollout_id):04d}"
                 ),
                 "model_name": model_name,
-                "rubric_model_name": rubric_model,
                 "judge_model_name": judge_model,
                 "policy_base_url": policy_base_urls[0],
                 "policy_base_urls": policy_base_urls,
                 "_pinned_endpoints": list(policy_base_urls),
+                "_policy_done_marker": str(policy_done_marker),
+                "_policy_slot_released": False,
                 "rubric_base_url": rubric_base_url,
                 "policy_api_key": policy_api_key,
                 "rubric_api_key": rubric_api_key,
-                "experience_bank": os.environ.get(
-                    "SWE_AGENT_LANES_EXPERIENCE_BANK",
-                    str(task.get("experience_bank") or ""),
-                ),
                 "usage_ledger": _ensure_usage_tracking(),
                 # The durable prefix already contains one approximate cost
                 # for this pending source instance. Do not charge its
@@ -1047,6 +1249,7 @@ def _replay_checkpoint_pending_tasks(
                 "policy_version": policy_version,
                 "source_group_index": source_group_index,
                 "usage_group_prefix": usage_prefix,
+                "base_usage_group_prefix": base_usage_prefix,
             }
         )
         task.pop("usage_group_id", None)
@@ -1078,12 +1281,12 @@ def _submit_until_full(
     est_groups_per_instance: float,
 ) -> int:
     """Dispatch instance tasks subject to two caps:
-      - max_pending: hard concurrency cap on in-flight Ray Futures
+      - max_pending: hard cap on instances still using local policy capacity
       - over_sampling_groups: stop dispatching once
-        (buffer + pending * est_groups_per_instance) reaches this many groups
+        (buffer + active policy instances * estimate) reaches this many groups
 
-    The second cap keeps depth-2's variable one-or-two group yield from
-    dispatching avoidable extra instances while preserving FIFO ordering.
+    Hosted Lane C futures have a separate bounded overlap allowance. They do
+    not consume local policy endpoints or block the next instance's Lane A/B.
     """
     global _TASK_INDEX, _DISPATCH_COUNTER
     global _SOURCE_BUDGET_EXHAUSTED, _SOURCE_BUDGET_ERROR
@@ -1103,97 +1306,151 @@ def _submit_until_full(
         if scheduled >= boundary:
             _SOURCE_VALIDATION_ERROR = None
     policy_urls = _policy_urls_for_model(args, model_name)
-    rubric_model, judge_model, rubric_base_url, rubric_api_key = (
+    judge_model, rubric_base_url, rubric_api_key = (
         _hosted_lane_c_settings()
     )
     policy_api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
-    # Root rollout uses one endpoint. Depth-2 reserves one additional endpoint
-    # per independent Lane-A parent for its possible continuation group.
-    n_urls_per_instance = (
-        1 + int(lanes_values["beam_parents"])
-        if lanes_values["topology"] == "depth2"
-        else 1
+    max_total_pending = max_pending + max(
+        0,
+        int(
+            os.environ.get(
+                "SWE_AGENT_LANES_MAX_LANE_C_PENDING",
+                str(max_pending),
+            )
+        ),
     )
 
     while True:
-        if len(_PENDING) >= max_pending:
+        _refresh_policy_slots()
+        active_policy_pending = sum(
+            1
+            for task in _PENDING.values()
+            if not task.get("_policy_slot_released")
+        )
+        if (
+            active_policy_pending >= max_pending
+            or len(_PENDING) >= max_total_pending
+        ):
             break
         # Stop dispatching once buffer + in-flight estimates cover the
         # over-sampling target. This preserves the pre-change FIFO collector
         # semantics; depth2 root and beam groups are not reweighted after
         # invalid/zero-variance filtering.
-        est_pending_groups = len(_PENDING) * est_groups_per_instance
+        est_pending_groups = (
+            active_policy_pending * est_groups_per_instance
+        )
         if len(_BUFFER) + est_pending_groups >= over_sampling_groups:
             break
-        if _SOURCE_BUDGET_EXHAUSTED or _SOURCE_VALIDATION_ERROR is not None:
+        if (
+            not _VARIANCE_RESAMPLE_TASKS
+            and (
+                _SOURCE_BUDGET_EXHAUSTED
+                or _SOURCE_VALIDATION_ERROR is not None
+            )
+        ):
             break
         policy_version = _dispatch_policy_version()
         if policy_version is None:
             break
-        try:
-            prompt_groups = data_buffer.get_samples(1)
-        except TrainingValidationBoundaryReached as exc:
-            _SOURCE_VALIDATION_ERROR = exc
-            logger.info("[lanes-async] %s", exc)
-            break
-        except TrainingInstanceBudgetExhausted as exc:
-            _SOURCE_BUDGET_EXHAUSTED = True
-            _SOURCE_BUDGET_ERROR = exc
-            logger.info("[lanes-async] %s", exc)
-            break
-        if not prompt_groups:
-            break
-        (prompt_group,) = prompt_groups
-        # slime expands n_samples_per_prompt by duplicating the prompt; the
-        # runner itself creates the M=8 sibling group, so we just take the
-        # first duplicate. n_samples_per_prompt MUST equal SWE_AGENT_LANES_M.
-        metadata = prompt_group[0].metadata
-        instance_id = metadata["instance_id"]
-        # Per-fork-group endpoint pool. Pick N URLs by least-loaded with
-        # pre-increment, so an instance whose runner
-        # eventually spawns N fork groups gets N distinct (or repeated, when
-        # ports < N) endpoints. The runner round-robins groups across this
-        # pool. All picks are released together in _harvest_ready.
-        policy_base_urls = _pick_least_loaded_urls(policy_urls, n=n_urls_per_instance)
-        policy_base_url = policy_base_urls[0]
-        usage_prefix = _usage_group_prefix(
-            phase="train",
-            rollout_id=rollout_id,
-            instance_id=instance_id,
-            # Use the checkpointed source-attempt cursor for ledger identity.
-            # _TASK_INDEX is process-local and resets after a requeue.
-            task_index=int(prompt_group[0].group_index),
+        if _VARIANCE_RESAMPLE_TASKS:
+            task = copy.deepcopy(_VARIANCE_RESAMPLE_TASKS.pop(0))
+            instance_id = str(task["instance_id"])
+            base_usage_prefix = str(task["base_usage_group_prefix"])
+            variance_resample_attempt = int(
+                task["variance_resample_attempt"]
+            )
+        else:
+            try:
+                prompt_groups = data_buffer.get_samples(1)
+            except TrainingValidationBoundaryReached as exc:
+                _SOURCE_VALIDATION_ERROR = exc
+                logger.info("[lanes-async] %s", exc)
+                break
+            except TrainingInstanceBudgetExhausted as exc:
+                _SOURCE_BUDGET_EXHAUSTED = True
+                _SOURCE_BUDGET_ERROR = exc
+                logger.info("[lanes-async] %s", exc)
+                break
+            if not prompt_groups:
+                break
+            (prompt_group,) = prompt_groups
+            # Slime duplicates one prompt M times; the runner owns the real
+            # sibling group, so only the first copy supplies source metadata.
+            metadata = prompt_group[0].metadata
+            instance_id = metadata["instance_id"]
+            if (
+                not lanes_values["disable_rubric"]
+                and instance_id
+                not in _eligible_direct_instances(
+                    str(lanes_values["direct_rubric_bank"])
+                )
+            ):
+                logger.info(
+                    "[lanes-async] statically skipping ineligible "
+                    "direct-rubric instance %s",
+                    instance_id,
+                )
+                continue
+            source_group_index = int(prompt_group[0].group_index)
+            base_usage_prefix = _usage_group_prefix(
+                phase="train",
+                rollout_id=rollout_id,
+                instance_id=instance_id,
+                task_index=source_group_index,
+            )
+            variance_resample_attempt = 0
+            task = {
+                "index": _TASK_INDEX,
+                "instance_id": instance_id,
+                "subset": metadata["subset"],
+                "split": metadata["split"],
+                "usage_phase": "train",
+                "source_group_index": source_group_index,
+                "base_usage_group_prefix": base_usage_prefix,
+                "variance_resample_attempt": 0,
+                **lanes_values,
+            }
+            _TASK_INDEX += 1
+
+        usage_prefix = (
+            f"{base_usage_prefix}:vr{variance_resample_attempt}"
+            if variance_resample_attempt
+            else base_usage_prefix
         )
-        task = {
-            "index": _TASK_INDEX,
-            "rollout_id": rollout_id,
-            "instance_id": instance_id,
-            "subset": metadata["subset"],
-            "split": metadata["split"],
-            "output_root": str(output_root / f"rollout_{rollout_id:04d}"),
-            "model_name": model_name,
-            "rubric_model_name": rubric_model,
-            "judge_model_name": judge_model,
-            "policy_base_url": policy_base_url,
-            "policy_base_urls": policy_base_urls,
-            "rubric_base_url": rubric_base_url,
-            "policy_api_key": policy_api_key,
-            "rubric_api_key": rubric_api_key,
-            "experience_bank": os.environ.get(
-                "SWE_AGENT_LANES_EXPERIENCE_BANK", ""
-            ),
-            "usage_ledger": _ensure_usage_tracking(),
-            "usage_phase": "train",
-            "usage_group_prefix": usage_prefix,
-            "source_group_index": int(
-                prompt_group[0].group_index
-            ),
-            "policy_version": policy_version,
-            **lanes_values,
-        }
+        requested = set(task.get("requested_group_kinds") or ())
+        needs_beam = task.get("topology") == "depth2" and (
+            not requested or "beam" in requested
+        )
+        n_urls = 1 + int(task.get("beam_parents", 2)) if needs_beam else 1
+        policy_base_urls = _pick_least_loaded_urls(policy_urls, n=n_urls)
+        task.update(
+            {
+                "rollout_id": rollout_id,
+                "output_root": str(
+                    output_root / f"rollout_{rollout_id:04d}"
+                ),
+                "model_name": model_name,
+                "judge_model_name": judge_model,
+                "policy_base_url": policy_base_urls[0],
+                "policy_base_urls": policy_base_urls,
+                "rubric_base_url": rubric_base_url,
+                "policy_api_key": policy_api_key,
+                "rubric_api_key": rubric_api_key,
+                "usage_ledger": _ensure_usage_tracking(),
+                "usage_group_prefix": usage_prefix,
+                "policy_version": policy_version,
+            }
+        )
+        policy_done_marker = _policy_done_marker_path(
+            output_root,
+            rollout_id=rollout_id,
+            task_index=int(task["index"]),
+        )
+        policy_done_marker.unlink(missing_ok=True)
         # Stash for release on completion (every picked URL, even repeats).
         task["_pinned_endpoints"] = list(policy_base_urls)
-        _TASK_INDEX += 1
+        task["_policy_done_marker"] = str(policy_done_marker)
+        task["_policy_slot_released"] = False
         worker = _NODE_WORKERS[_DISPATCH_COUNTER % len(_NODE_WORKERS)]
         _DISPATCH_COUNTER += 1
         ref = worker.submit_task.remote(task)
@@ -1211,9 +1468,10 @@ def _harvest_ready(
 ) -> int:
     """Reap Ray Futures whose subprocess fully returned. For each completed
     bundle, expand its policy_groups into Samples and append to _BUFFER."""
-    global _FAILED_INSTANCES, _TRUNCATED_OVERSIZED
+    global _FAILED_INSTANCES, _TRUNCATED_OVERSIZED, _TASK_INDEX
     global _FILTER_DROPPED_GROUPS, _FILTER_DROP_REASONS
     global _FILTER_DROPPED_BY_KIND
+    global _VARIANCE_RESAMPLE_TASKS
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path)
         if getattr(args, "dynamic_sampling_filter_path", None) else None
@@ -1230,6 +1488,7 @@ def _harvest_ready(
 
     if not _PENDING:
         return harvested
+    _refresh_policy_slots()
     pending_refs = list(_PENDING.keys())
     if block and harvested == 0:
         ready, _ = ray.wait(
@@ -1290,10 +1549,22 @@ def _harvest_ready(
                 filtered=True,
             )
 
-        # Release this task's pinned endpoint(s) from the least-loaded
-        # counter — must happen regardless of success/error so the
-        # counter stays correct.
-        _release_endpoints(list(task.get("_pinned_endpoints", [])))
+        # A normal task released its policy endpoints at the Lane-B boundary.
+        # Error paths may return before creating that marker, so release here
+        # as the final fallback and never decrement twice.
+        if not task.get("_policy_slot_released"):
+            _release_endpoints(list(task.get("_pinned_endpoints", [])))
+            task["_policy_slot_released"] = True
+        marker_value = task.get("_policy_done_marker")
+        if marker_value:
+            try:
+                Path(str(marker_value)).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "[lanes-async] could not remove policy marker %s: %s",
+                    marker_value,
+                    exc,
+                )
         if policy_stale_lag is not None and policy_stale_lag < 0:
             raise RuntimeError(
                 "Lane collector observed policy weights from the future: "
@@ -1484,12 +1755,47 @@ def _harvest_ready(
                     _record_usage_disposition(
                         usage_group_id,
                         disposition="filtered",
-                        reason=(
-                            "zero_variance"
-                            if reason.startswith("zero_std")
-                            else reason
-                        ),
+                        reason=reason,
                     )
+                    variance_resample_attempt = int(
+                        task.get("variance_resample_attempt", 0)
+                    )
+                    if (
+                        not task.get("disable_rubric", False)
+                        and (
+                            reason == "direct_predicted_zero_variance"
+                            or reason.startswith("zero_std")
+                        )
+                        and variance_resample_attempt
+                        < _MAX_VARIANCE_GROUP_ATTEMPTS - 1
+                    ):
+                        retry_task = copy.deepcopy(task)
+                        retry_task["index"] = _TASK_INDEX
+                        _TASK_INDEX += 1
+                        retry_task["variance_resample_attempt"] = (
+                            variance_resample_attempt + 1
+                        )
+                        retry_task["requested_group_kinds"] = [group_kind]
+                        for runtime_key in (
+                            "_pinned_endpoints",
+                            "_policy_done_marker",
+                            "_policy_slot_released",
+                            "policy_base_url",
+                            "policy_base_urls",
+                            "policy_api_key",
+                            "rubric_api_key",
+                            "usage_ledger",
+                        ):
+                            retry_task.pop(runtime_key, None)
+                        _VARIANCE_RESAMPLE_TASKS.append(retry_task)
+                        logger.info(
+                            "[lanes-async] resampling zero-variance %s "
+                            "kind=%s group_attempt=%d/%d",
+                            task.get("instance_id"),
+                            group_kind,
+                            variance_resample_attempt + 2,
+                            _MAX_VARIANCE_GROUP_ATTEMPTS,
+                        )
                     continue
             accounted_usage_ids.add(usage_group_id)
             _BUFFER.append(
@@ -1695,7 +2001,9 @@ def _validation_partial_resume_state(
         )
     current_kinds = _buffer_kind_counts()
     checkpoint_pending_count = (
-        len(_PENDING) + len(_REPLAY_PENDING_TASKS)
+        len(_PENDING)
+        + len(_REPLAY_PENDING_TASKS)
+        + len(_VARIANCE_RESAMPLE_TASKS)
     )
     if (
         int(state["group_count"]) != len(_BUFFER)
@@ -1776,6 +2084,11 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         zero_variance_at_start = dict(
             resume_state["zero_variance_at_start"]
         )
+        direct_diagnostics_at_start = dict(
+            resume_state.get(
+                "direct_diagnostics_at_start", _DIRECT_DIAGNOSTICS
+            )
+        )
         stale_at_start = int(resume_state["stale_at_start"])
         stale_by_kind_at_start = dict(
             resume_state["stale_by_kind_at_start"]
@@ -1799,6 +2112,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             _REWARD_GROUP_VARIANCE_SUM_BY_KIND
         )
         zero_variance_at_start = dict(_ZERO_VARIANCE_GROUPS_BY_KIND)
+        direct_diagnostics_at_start = dict(_DIRECT_DIAGNOSTICS)
 
     if (
         _SOURCE_VALIDATION_ERROR is not None
@@ -1815,12 +2129,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         _SOURCE_VALIDATION_ERROR = None
 
     lanes_values = _lanes_values_from_env()
-    if lanes_values["terminal_rollout"]:
-        raise ValueError(
-            "Lane training must use terminal_rollout=false; terminal policy "
-            "rollouts are reserved for evaluation=True"
-        )
-
     if not _WARMUP_DONE:
         router_ip, router_port = (getattr(args, "sglang_model_routers", None) or {}).get(
             model_name, (args.sglang_router_ip, args.sglang_router_port),
@@ -1901,7 +2209,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     ) -> None:
         global _VALIDATION_PARTIAL_STATE
         preserved_count = len(_BUFFER)
-        preserved_pending = len(_PENDING)
+        preserved_pending = len(_PENDING) + len(_VARIANCE_RESAMPLE_TASKS)
         preserved_kinds = _buffer_kind_counts()
         exc.preserved_partial = (
             preserved_count > 0 or preserved_pending > 0
@@ -1928,6 +2236,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "reward_mean_sum_at_start": reward_mean_sum_at_start,
             "reward_variance_sum_at_start": reward_variance_sum_at_start,
             "zero_variance_at_start": zero_variance_at_start,
+            "direct_diagnostics_at_start": direct_diagnostics_at_start,
             "carried_in": carried_in,
             "carried_in_by_kind": carried_in_by_kind,
             "submitted": submitted,
@@ -2018,7 +2327,11 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 submitted=submitted,
                 output_root=output_root,
             )
-        if not _PENDING and not _target_ready():
+        if (
+            not _PENDING
+            and not _VARIANCE_RESAMPLE_TASKS
+            and not _target_ready()
+        ):
             if _SOURCE_BUDGET_EXHAUSTED:
                 _VALIDATION_PARTIAL_STATE = None
                 _discard_excess_buffer(reason="source_budget_partial_update")
@@ -2274,6 +2587,69 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             ),
         }
     )
+
+    direct_delta = {
+        key: int(_DIRECT_DIAGNOSTICS.get(key, 0))
+        - int(direct_diagnostics_at_start.get(key, 0))
+        for key in _DIRECT_DIAGNOSTICS
+    }
+
+    def _ratio(numerator: int, denominator: int) -> float:
+        return float(numerator / denominator) if denominator else 0.0
+
+    variance_total = sum(
+        direct_delta.get(f"variance_{outcome}", 0)
+        for outcome in ("tp", "fp", "tn", "fn")
+    )
+    stage1_total = sum(
+        direct_delta.get(f"stage1_{outcome}", 0)
+        for outcome in ("tp", "fp", "tn", "fn")
+    )
+    direct_metrics: dict[str, float | int] = {
+        "swe_agent/direct_judge_groups": direct_delta.get("groups", 0),
+        "swe_agent/direct_predicted_zero_variance_rate": _ratio(
+            direct_delta.get("predicted_zero_groups", 0),
+            direct_delta.get("groups", 0),
+        ),
+        "swe_agent/direct_explicit_abstain_rate": _ratio(
+            direct_delta.get("explicit_abstain_groups", 0),
+            direct_delta.get("groups", 0),
+        ),
+        "swe_agent/direct_collapse_reward_rate": _ratio(
+            direct_delta.get("collapse_rollouts", 0),
+            direct_delta.get("rollouts", 0),
+        ),
+        "swe_agent/direct_collapse_reward_rollouts": direct_delta.get(
+            "collapse_rollouts", 0
+        ),
+        "swe_agent/direct_gt_pair_count": direct_delta.get("gt_pairs", 0),
+        "swe_agent/direct_gt_pairwise_accuracy": _ratio(
+            direct_delta.get("gt_correct", 0),
+            direct_delta.get("gt_pairs", 0),
+        ),
+        "swe_agent/direct_variance_detector_count": variance_total,
+        "swe_agent/direct_variance_detector_accuracy": _ratio(
+            direct_delta.get("variance_tp", 0)
+            + direct_delta.get("variance_tn", 0),
+            variance_total,
+        ),
+        "swe_agent/direct_variance_detector_recall": _ratio(
+            direct_delta.get("variance_tp", 0),
+            direct_delta.get("variance_tp", 0)
+            + direct_delta.get("variance_fn", 0),
+        ),
+        "swe_agent/direct_stage1_detector_count": stage1_total,
+        "swe_agent/direct_stage1_detector_accuracy": _ratio(
+            direct_delta.get("stage1_tp", 0)
+            + direct_delta.get("stage1_tn", 0),
+            stage1_total,
+        ),
+        "swe_agent/direct_stage1_detector_recall": _ratio(
+            direct_delta.get("stage1_tp", 0),
+            direct_delta.get("stage1_tp", 0)
+            + direct_delta.get("stage1_fn", 0),
+        ),
+    }
     source_progress_fn = getattr(data_buffer, "training_progress", None)
     source_progress = (
         source_progress_fn() if source_progress_fn is not None else {}
@@ -2296,7 +2672,9 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "swe_agent/target": target,
             "swe_agent/samples": len(samples),
             "swe_agent/groups": len(selected_groups),
-            "swe_agent/pending_instances": len(_PENDING),
+            "swe_agent/pending_instances": (
+                len(_PENDING) + len(_VARIANCE_RESAMPLE_TASKS)
+            ),
             "swe_agent/buffer_groups": len(_BUFFER),
             "swe_agent/submitted_instances": submitted,
             "swe_agent/failed_instances_total": _FAILED_INSTANCES,
@@ -2363,6 +2741,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             **overall_outcome_metrics,
             **kind_outcome_metrics,
             **reward_metrics,
+            **direct_metrics,
             "swe_agent/wait_seconds": time.perf_counter() - wait_started,
             "swe_agent/seconds": time.perf_counter() - started,
             "swe_agent/source": "lanes",

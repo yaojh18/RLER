@@ -95,7 +95,6 @@ class SearchConfig:
     write_artifacts: bool = True
     strategy: Literal["best", "probability", "random"] = "best"
     rubric_bank_strategy: Literal["score", "experience", "both"] = "score"
-    update_experience_bank: bool = False
     score_tie_break: bool = True
     stop_on_first_round_no_variance: bool = False
 
@@ -1414,6 +1413,15 @@ class TrajectorySearchRunner:
                 raise ValueError(
                     "Experience rubric search requires frozen siblings and pc banks"
                 )
+            if any(
+                bank.retriever is None
+                or not bank.retriever.exclude_self_instance
+                for bank in (siblings_experience_bank, pc_experience_bank)
+            ):
+                raise ValueError(
+                    "Inference trajectory search requires instance-excluding "
+                    "frozen experience banks"
+                )
             self.experience_bank = siblings_experience_bank
             self.pc_experience_bank = pc_experience_bank
         else:
@@ -1436,6 +1444,16 @@ class TrajectorySearchRunner:
         self.peaceful_exit_triggered = False
         self.image_repository = f"rler-search/{self.task_id.replace('__', '-').lower()}"
         self.artifact_writer = ArtifactWriter(write_artifacts=self.search_config.write_artifacts)
+        self._async_terminal_enabled = not self.search_config.calculate_gt_reward
+        self._async_terminal_executor = (
+            ThreadPoolExecutor(
+                max_workers=max(1, self.search_config.gt_reward_workers),
+                thread_name_prefix="search-terminal",
+            )
+            if self._async_terminal_enabled
+            else None
+        )
+        self._async_terminal_futures: dict[str, Future] = {}
         self._manifest_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="search-manifest")
         self._manifest_futures: list[Future] = []
         self._node_judge_cache: dict[str, dict[str, Any]] = {}
@@ -1456,7 +1474,8 @@ class TrajectorySearchRunner:
                 evaluate_patches_fn=evaluate_swebench_instance_patches,
                 collector=self.grpo_collector,
                 write_artifacts=self.search_config.write_artifacts,
-                max_workers=max(1, self.search_config.gt_reward_workers),
+                max_workers=1,
+                patch_workers=max(1, self.search_config.gt_reward_workers),
             )
             if self.search_config.calculate_gt_reward
             else None
@@ -1466,7 +1485,6 @@ class TrajectorySearchRunner:
         if self.resume and not self.search_config.write_artifacts:
             raise RuntimeError("resume requires write_artifacts=True")
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        rubric_update_records: list[dict[str, Any]] = []
         try:
             if self.resume and self.manifest_path.exists():
                 self._load_manifest()
@@ -1487,25 +1505,19 @@ class TrajectorySearchRunner:
                 if not parent_ids:
                     break
                 self.current_round += 1
-                round_rubric_records = self._run_round(parent_ids, self.current_round)
-                if any(bank is not None for bank in self.experience_banks.values()):
-                    rubric_update_records.extend(round_rubric_records)
+                self._run_round(parent_ids, self.current_round)
                 self._save_manifest()
             self.artifact_writer.wait()
-            patch_eval_payloads = []
             if self.patch_eval_manager is not None:
-                patch_eval_payloads = self.patch_eval_manager.wait()
-            if self.search_config.update_experience_bank and not self.peaceful_exit_triggered:
-                self._update_experience_banks(rubric_update_records, patch_eval_payloads)
-            elif self.search_config.update_experience_bank and any(
-                bank is not None for bank in self.experience_banks.values()
-            ):
-                logger.warning(
-                    "Skipping experience bank update for %s because peaceful_exit was triggered.",
-                    self.task_id,
-                )
+                self.patch_eval_manager.wait()
+            self._wait_async_terminal_evaluations()
             self._finalize_outputs()
         finally:
+            if self._async_terminal_executor is not None:
+                self._async_terminal_executor.shutdown(
+                    wait=True,
+                    cancel_futures=False,
+                )
             if self.patch_eval_manager is not None:
                 self.patch_eval_manager.close()
             self.artifact_writer.close()
@@ -1516,6 +1528,19 @@ class TrajectorySearchRunner:
                 self._manifest_futures.pop(0).result()
             self._manifest_executor.shutdown(wait=True, cancel_futures=False)
 
+    def _wait_async_terminal_evaluations(self) -> None:
+        for node_id, future in list(self._async_terminal_futures.items()):
+            try:
+                future.result()
+            except Exception:
+                logger.exception(
+                    "Asynchronous terminal evaluation failed for %s; "
+                    "trajectory search will keep the recorded error.",
+                    node_id,
+                )
+            finally:
+                self._async_terminal_futures.pop(node_id, None)
+
     def _round_parent_ids(self) -> list[str]:
         first_parent = self.nodes[self.frontier_ids[0]]
         parent_limit = min(self.search_config.beam_size, self.search_config.m)
@@ -1525,103 +1550,6 @@ class TrajectorySearchRunner:
             if self.nodes[node_id].depth == first_parent.depth
             and self.nodes[node_id].status == "frontier"
         ][:parent_limit]
-
-
-    def _update_experience_banks(
-        self,
-        rubric_update_records: list[dict[str, Any]],
-        patch_eval_payloads: list[dict[str, Any]] | None = None,
-    ) -> None:
-        terminal_evidence_by_rubric = {}
-        for payload in patch_eval_payloads or []:
-            for item in payload.get("rubric_update_payloads") or []:
-                key = (item.get("scope"), item.get("rubric_list_id"))
-                terminal_evidence_by_rubric[key] = {
-                    "terminal_patch": str(item.get("terminal_patch") or ""),
-                    "passed_tests": str(item.get("passed_tests") or ""),
-                }
-        experience_update_specs = [
-            {"scope": scope, "bank": self.experience_banks[scope]}
-            for scope in self.rubric_scopes
-        ]
-        experience_update_jobs = []
-        for spec in experience_update_specs:
-            if spec["bank"] is None:
-                continue
-            rubric_payloads = [
-                {
-                    **copy.deepcopy(record["rubric_payload"]),
-                    **terminal_evidence_by_rubric.get(
-                        (
-                            spec["scope"],
-                            record["rubric_payload"].get("rubric_list_id"),
-                        ),
-                        {},
-                    ),
-                    "round_index": int(record["round_index"]),
-                    "generation_context": copy.deepcopy(record.get("generation_context", {})),
-                }
-                for record in rubric_update_records
-                if record.get("scope") == spec["scope"] and isinstance(record.get("rubric_payload"), dict)
-            ]
-            experience_update_jobs.append(
-                (
-                    spec["scope"],
-                    spec["bank"].update_after_instance(
-                        instance=self.instance,
-                        rubric_payloads=rubric_payloads,
-                        model_name=self.rubric_model_name,
-                        temperature=self.search_config.rubric_temperature,
-                        top_p=self.search_config.rubric_top_p,
-                        max_tokens=self.search_config.rubric_max_tokens,
-                        model_kwargs=self.rubric_model_kwargs,
-                    ),
-                )
-            )
-        if experience_update_jobs:
-            async def _run_experience_updates() -> list[dict[str, Any]]:
-                return list(await asyncio.gather(*(job for _, job in experience_update_jobs)))
-            update_payloads = asyncio.run(_run_experience_updates())
-            if self.search_config.write_artifacts:
-                scoped_updates = {
-                    scope: payload
-                    for (scope, _), payload in zip(experience_update_jobs, update_payloads)
-                }
-                records_by_scope_round: dict[tuple[str, int], list[dict[str, Any]]] = {}
-                for record in rubric_update_records:
-                    if not isinstance(record.get("rubric_payload"), dict):
-                        continue
-                    key = (str(record.get("scope")), int(record["round_index"]))
-                    records_by_scope_round.setdefault(key, []).append(record)
-                for scope, payload in scoped_updates.items():
-                    _atomic_write_json(
-                        self.run_dir / f"{scope}_rubric_bank.json",
-                        {
-                            "before": copy.deepcopy(payload.get("before", [])),
-                            "after": copy.deepcopy(payload.get("after", [])),
-                        },
-                    )
-                    for update in payload.get("groups", []):
-                        round_index = int(update["round_index"])
-                        for record in records_by_scope_round.get((scope, round_index), []):
-                            rubric_payload = record["rubric_payload"]
-                            rubric_list_id = rubric_payload.get("rubric_list_id")
-                            if not rubric_list_id:
-                                continue
-                            update_dir = self.rubrics_dir / scope / str(rubric_list_id)
-                            _atomic_write_json(
-                                update_dir / "rubric_bank.json",
-                                {
-                                    "before": copy.deepcopy(update.get("before", [])),
-                                    "after": copy.deepcopy(update.get("after", [])),
-                                    "actions": copy.deepcopy(update.get("actions", [])),
-                                },
-                            )
-                            _atomic_write_json(
-                                update_dir / "rubric_bank_message.json",
-                                copy.deepcopy(update.get("messages", [])),
-                            )
-
 
     def _save_manifest(self) -> None:
         if not self.search_config.write_artifacts:
@@ -1751,6 +1679,141 @@ class TrajectorySearchRunner:
         if env is not None:
             setattr(env, "container_id", None)
             setattr(env, "_owns_container", False)
+
+    def _complete_terminal_branch(
+        self,
+        branch: dict[str, Any],
+    ) -> tuple[Any, str, str | None]:
+        session = branch["session"]
+        terminal_result = copy.deepcopy(branch["result"])
+        terminal_snapshot = copy.deepcopy(branch["snapshot_after"])
+        terminal_error = None
+        if terminal_result.get("status") != "finished":
+            completed_steps = max(int(branch["step_end"]) + 1, 0)
+            remaining_steps = max(
+                self.search_config.step_limit - completed_steps,
+                0,
+            )
+            session.agent.model.config.model_kwargs["temperature"] = (
+                self.search_config.judge_temperature
+            )
+            session.agent.model.config.model_kwargs["top_p"] = (
+                self.search_config.judge_top_p
+            )
+            if remaining_steps > 0:
+                try:
+                    terminal_result = session.run_until_pause(
+                        max_steps=remaining_steps
+                    ).model_dump(mode="json")
+                except Exception as exc:
+                    terminal_result = {
+                        "status": "error",
+                        "exit_status": type(exc).__name__,
+                    }
+                    terminal_error = f"{type(exc).__name__}: {exc}"
+            terminal_snapshot = session.snapshot().model_dump(mode="json")
+
+        terminal_messages = build_messages(
+            terminal_snapshot["agent"]["state"].get("messages", []),
+            model_name=branch["policy_model_name"],
+            preserve_token_fields=True,
+        )
+        patch = _normalize_terminal_patch_text(
+            terminal_result.get("submission", "")
+        )
+        if not patch:
+            try:
+                diff = session.agent.env.execute(
+                    {"command": "git add -N . >/dev/null 2>&1; git diff"},
+                    timeout=30,
+                )
+                patch = _normalize_terminal_patch_text(diff.get("output") or "")
+            except Exception:
+                patch = ""
+        return terminal_messages, patch, terminal_error
+
+    def _run_async_terminal_evaluation(
+        self,
+        *,
+        branch: dict[str, Any],
+        round_index: int,
+        tied_node_ids: list[str],
+    ) -> None:
+        node_id = branch["node_id"]
+        node_dir = self.nodes_dir / node_id
+        status_path = node_dir / "async_terminal.json"
+        status = {
+            "status": "running",
+            "round_index": round_index,
+            "selected_node_id": node_id,
+            "tied_node_ids": tied_node_ids,
+            "score": float(branch["score"]),
+            "started_at": time.time(),
+        }
+        _atomic_write_json(status_path, status)
+        try:
+            terminal_messages, patch, terminal_error = (
+                self._complete_terminal_branch(branch)
+            )
+            terminal_patch = {
+                self.task_id: {
+                    "model_name_or_path": branch["policy_model_name"],
+                    "instance_id": self.task_id,
+                    "model_patch": patch,
+                    "terminal_error": terminal_error,
+                }
+            }
+            _atomic_write_json(
+                node_dir / "terminal_messages.json",
+                terminal_messages,
+            )
+            _atomic_write_json(node_dir / "terminal_patch.json", terminal_patch)
+
+            if patch.strip():
+                evaluation = evaluate_swebench_instance_patches(
+                    instance=self.instance,
+                    patches_by_key={node_id: patch},
+                    model_name=branch["policy_model_name"],
+                    max_workers=1,
+                    namespace=self.harness_namespace,
+                    work_dir=self.run_dir,
+                )[node_id]
+            else:
+                evaluation = make_evaluation_payload("empty")
+            _atomic_write_json(node_dir / "terminal_evalution.json", evaluation)
+            status.update(
+                {
+                    "status": "completed",
+                    "finished_at": time.time(),
+                    "evaluation_status": evaluation.get("status"),
+                    "reward": evaluation.get("reward"),
+                }
+            )
+            if evaluation.get("status") == "error":
+                status["evaluation_error"] = str(
+                    (evaluation.get("metainfo") or {}).get("output")
+                    or evaluation.get("error")
+                    or "unknown error"
+                )
+        except Exception as exc:
+            status.update(
+                {
+                    "status": "error",
+                    "finished_at": time.time(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            _atomic_write_json(
+                node_dir / "terminal_evalution.json",
+                make_evaluation_payload("error", error=exc),
+            )
+        finally:
+            try:
+                self._dispose_session(branch["session"])
+            except Exception as exc:
+                logger.exception("Failed to dispose terminal session for %s", node_id)
+                status["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+            _atomic_write_json(status_path, status)
 
     def _checkpoint_environment(self, session: Any, image_tag: str) -> tuple[str, str]:
         env = session.agent.env
@@ -2415,7 +2478,7 @@ class TrajectorySearchRunner:
             payload["parent_node_ids"] = list(parent_ids)
         return payload
 
-    def _run_round(self, parent_ids: list[str], round_index: int) -> list[dict[str, Any]]:
+    def _run_round(self, parent_ids: list[str], round_index: int) -> None:
         parent_contexts = []
         for parent_id in parent_ids:
             if parent_id not in self._node_snapshot_cache:
@@ -2599,7 +2662,10 @@ class TrajectorySearchRunner:
                 pass
             return rec, None
 
-        with ThreadPoolExecutor(max_workers=max(1, len(sample_plan)), thread_name_prefix="search-branch") as _branch_pool:
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(sample_plan)),
+            thread_name_prefix="search-branch",
+        ) as _branch_pool:
             ordered_results = list(_branch_pool.map(_run_one_branch, enumerate(sample_plan)))
         for rec, err_text in ordered_results:
             branch_records.append(rec)
@@ -2658,6 +2724,24 @@ class TrajectorySearchRunner:
             retention_limit=self.search_config.p,
             strategy=self.search_config.strategy,
         )
+        async_terminal_branch: dict[str, Any] | None = None
+        async_terminal_tied_node_ids: list[str] = []
+        if self._async_terminal_enabled and chosen_branches:
+            top_score = max(branch["score"] for branch in chosen_branches)
+            tied_branches = [
+                branch
+                for branch in chosen_branches
+                if math.isclose(
+                    branch["score"],
+                    top_score,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ]
+            async_terminal_branch = random.choice(tied_branches)
+            async_terminal_tied_node_ids = [
+                branch["node_id"] for branch in tied_branches
+            ]
         top_child_ids = [branch["node_id"] for branch in chosen_branches]
         regressed = primary_parent_id != "root" and pc_scores is not None and not top_child_ids
         candidate_frontier_ids = list(top_child_ids)
@@ -2675,20 +2759,11 @@ class TrajectorySearchRunner:
 
         round_rubric_path = self.rubrics_dir / f"round_{round_index:03d}.json"
         rubric_sample_payloads = []
-        rubric_update_records = []
         rubric_artifact_bundles: list[RubricArtifactBundle] = []
         for sample in judged["rubric_samples"]:
             rubric_dir = self.rubrics_dir / "siblings" / sample["rubric_list_id"]
             rubric_payload = self._rubric_artifact_payload(sample, parent_ids)
             rubric_sample_payloads.append(rubric_payload)
-            rubric_update_records.append(
-                {
-                    "scope": "siblings",
-                    "round_index": round_index,
-                    "rubric_payload": rubric_payload,
-                    "generation_context": copy.deepcopy(sample["generation_context"]),
-                }
-            )
             rubric_artifact_bundles.append(
                 RubricArtifactBundle(
                     rubric_dir=rubric_dir,
@@ -2711,14 +2786,6 @@ class TrajectorySearchRunner:
             rubric_dir = self.rubrics_dir / "pc" / sample["rubric_list_id"]
             rubric_payload = self._rubric_artifact_payload(sample, parent_ids)
             pc_rubric_sample_payloads.append(rubric_payload)
-            rubric_update_records.append(
-                {
-                    "scope": "pc",
-                    "round_index": round_index,
-                    "rubric_payload": rubric_payload,
-                    "generation_context": copy.deepcopy(sample["generation_context"]),
-                }
-            )
             rubric_artifact_bundles.append(
                 RubricArtifactBundle(
                     rubric_dir=rubric_dir,
@@ -2744,6 +2811,13 @@ class TrajectorySearchRunner:
             "persistent_state_error": judged.get("summary_error"),
             "rubric_samples": rubric_sample_payloads,
         }
+        if async_terminal_branch is not None:
+            round_payload["async_terminal_eval"] = {
+                "status": "submitted",
+                "selected_node_id": async_terminal_branch["node_id"],
+                "tied_node_ids": async_terminal_tied_node_ids,
+                "score": float(async_terminal_branch["score"]),
+            }
         if len(parent_ids) > 1:
             round_payload["parent_ids"] = list(parent_ids)
         if self.rubric_bank is not None:
@@ -2774,6 +2848,29 @@ class TrajectorySearchRunner:
             image_tag, image_id = self._checkpoint_environment(branch["session"], image_tag)
             branch["image_tag"] = image_tag
             branch["image_id"] = image_id
+
+        terminal_artifacts_by_node_id: dict[
+            str,
+            tuple[Any, str, str | None],
+        ] = {}
+        if self.search_config.calculate_gt_reward and valid_branch_records:
+            terminal_workers = min(
+                len(valid_branch_records),
+                max(1, self.search_config.gt_reward_workers),
+            )
+            with ThreadPoolExecutor(
+                max_workers=terminal_workers,
+                thread_name_prefix="search-gt-terminal",
+            ) as executor:
+                terminal_futures = {
+                    branch["node_id"]: executor.submit(
+                        self._complete_terminal_branch,
+                        branch,
+                    )
+                    for branch in valid_branch_records
+                }
+                for node_id, future in terminal_futures.items():
+                    terminal_artifacts_by_node_id[node_id] = future.result()
 
         artifact_bundles: list[NodeArtifactBundle] = []
         for branch in branch_records:
@@ -2828,49 +2925,14 @@ class TrajectorySearchRunner:
             terminal_patch = None
             if self.search_config.calculate_gt_reward:
                 judge_payload["ground_truth_reward"] = None
-                terminal_result = branch["result"]
-                terminal_snapshot = branch["snapshot_after"]
-                terminal_error = None
-                if branch["result"]["status"] != "finished":
-                    completed_steps = max(branch["step_end"] + 1, 0)
-                    remaining_steps = max(self.search_config.step_limit - completed_steps, 0)
-                    branch["session"].agent.model.config.model_kwargs["temperature"] = self.search_config.judge_temperature
-                    branch["session"].agent.model.config.model_kwargs["top_p"] = self.search_config.judge_top_p
-                    if remaining_steps > 0:
-                        try:
-                            terminal_result = branch["session"].run_until_pause(max_steps=remaining_steps).model_dump(mode="json")
-                        except Exception as exc:
-                            terminal_result = {
-                                "status": "error",
-                                "exit_status": type(exc).__name__,
-                            }
-                            terminal_error = f"{type(exc).__name__}: {exc}"
-                        terminal_snapshot = branch["session"].snapshot().model_dump(mode="json")
-                terminal_messages = build_messages(
-                    terminal_snapshot["agent"]["state"].get("messages", []),
-                    model_name=branch["policy_model_name"],
-                    preserve_token_fields=True,
+                terminal_messages, terminal_patch_text, terminal_error = (
+                    terminal_artifacts_by_node_id[branch["node_id"]]
                 )
-                _patch = _normalize_terminal_patch_text(terminal_result.get("submission", ""))
-                if not _patch:
-                    # Agent didn't explicitly submit (ran out of step budget mid-edit).
-                    # Fall back to the actual git diff inside the active container so we
-                    # don't lose real intermediate work. Run from the agent's current
-                    # working directory rather than hardcoding /testbed; ReBench images
-                    # do not mount the repo there.
-                    try:
-                        _diff = branch["session"].agent.env.execute(
-                            {"command": "git add -N . >/dev/null 2>&1; git diff"},
-                            timeout=30,
-                        )
-                        _patch = _normalize_terminal_patch_text(_diff.get("output") or "")
-                    except Exception:
-                        _patch = ""
                 terminal_patch = {
                     self.task_id: {
                         "model_name_or_path": branch["policy_model_name"],
                         "instance_id": self.task_id,
-                        "model_patch": _patch,
+                        "model_patch": terminal_patch_text,
                         "terminal_error": terminal_error,
                     }
                 }
@@ -2920,7 +2982,8 @@ class TrajectorySearchRunner:
             for parent_id in parent_ids
         ]
         for branch in valid_branch_records:
-            self._dispose_session(branch["session"])
+            if branch is not async_terminal_branch:
+                self._dispose_session(branch["session"])
 
         if self.patch_eval_manager is not None:
             self.artifact_writer.submit_round(
@@ -2953,8 +3016,19 @@ class TrajectorySearchRunner:
                 rubric_artifact_bundles,
                 extra_json_writes=gt_extra_json_writes + non_gt_extra_json_writes,
             )
+        if async_terminal_branch is not None:
+            assert self._async_terminal_executor is not None
+            node_id = async_terminal_branch["node_id"]
+            self._async_terminal_futures[node_id] = (
+                self._async_terminal_executor.submit(
+                    self._run_async_terminal_evaluation,
+                    branch=async_terminal_branch,
+                    round_index=round_index,
+                    tied_node_ids=async_terminal_tied_node_ids,
+                )
+            )
         self._sweep_checkpoint_images()
-        return rubric_update_records
+        return None
 
         try:
             logging.getLogger("swe_agent.trajectory_search").info(
@@ -2964,55 +3038,102 @@ class TrajectorySearchRunner:
         except Exception:
             pass
 
+    def _latest_async_terminal_node_id(self) -> str | None:
+        candidates: list[tuple[int, str]] = []
+        for node_id, node in self.nodes.items():
+            status_path = self.nodes_dir / node_id / "async_terminal.json"
+            if not status_path.is_file():
+                continue
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError):
+                continue
+            if (
+                status.get("status") not in {"completed", "error"}
+                or status.get("selected_node_id") != node_id
+            ):
+                continue
+            candidates.append(
+                (int(status.get("round_index", node.round_index)), node_id)
+            )
+        return max(candidates)[1] if candidates else None
+
     def _finalize_outputs(self) -> None:
         def _cached_overall_score(node_id: str) -> float:
             reward = (self._node_judge_cache.get(node_id) or {}).get("overall_score")
             return float(reward) if reward is not None else float("-inf")
 
-        if self.finished_node_ids:
-            final_node_id = max(
-                (node_id for node_id in self.finished_node_ids if node_id in self.nodes),
-                key=_cached_overall_score,
-            )
-        elif self.frontier_ids:
-            final_node_id = max(
-                (node_id for node_id in self.frontier_ids if node_id in self.nodes),
-                key=_cached_overall_score,
-            )
-        elif self.best_node_id is not None:
-            final_node_id = self.best_node_id
-        else:
-            return
+        final_node_id = (
+            self._latest_async_terminal_node_id()
+            if self._async_terminal_enabled
+            else None
+        )
+        if final_node_id is None:
+            if self.finished_node_ids:
+                final_node_id = max(
+                    (
+                        node_id
+                        for node_id in self.finished_node_ids
+                        if node_id in self.nodes
+                    ),
+                    key=_cached_overall_score,
+                )
+            elif self.frontier_ids:
+                final_node_id = max(
+                    (
+                        node_id
+                        for node_id in self.frontier_ids
+                        if node_id in self.nodes
+                    ),
+                    key=_cached_overall_score,
+                )
+            elif self.best_node_id is not None:
+                final_node_id = self.best_node_id
+            else:
+                return
 
         final_node = self.nodes[final_node_id]
-        if final_node_id not in self._node_snapshot_cache:
-            raise RuntimeError(f"Node {final_node_id} does not have a cached restorable snapshot")
-        snapshot = copy.deepcopy(self._node_snapshot_cache[final_node_id])
-        final_policy_model_name = final_node.policy_model_name or self.policy_model_name
-        final_messages = build_messages(
-            snapshot["agent"]["state"].get("messages", []),
-            model_name=final_policy_model_name,
-            preserve_token_fields=True,
+        final_policy_model_name = (
+            final_node.policy_model_name or self.policy_model_name
         )
         final_patch = final_node.submission or ""
-        if self.search_config.calculate_gt_reward:
-            terminal_patch_path = self.nodes_dir / final_node_id / "terminal_patch.json"
-            terminal_messages_path = self.nodes_dir / final_node_id / "terminal_messages.json"
-            if terminal_patch_path.is_file():
-                terminal_patch_payload = json.loads(terminal_patch_path.read_text(encoding="utf-8"))
-                task_payload = terminal_patch_payload.get(self.task_id, {})
-                if isinstance(task_payload, dict):
-                    final_patch = str(task_payload.get("model_patch") or "")
-                    final_policy_model_name = str(
-                        task_payload.get("model_name_or_path") or final_policy_model_name
-                    )
-            if terminal_messages_path.is_file():
-                terminal_messages = json.loads(terminal_messages_path.read_text(encoding="utf-8"))
-                if (
-                    isinstance(terminal_messages, dict)
-                    and isinstance(terminal_messages.get("messages"), list)
-                ) or isinstance(terminal_messages, list):
-                    final_messages = terminal_messages
+        terminal_node_dir = self.nodes_dir / final_node_id
+        terminal_patch_path = terminal_node_dir / "terminal_patch.json"
+        terminal_messages_path = terminal_node_dir / "terminal_messages.json"
+        terminal_evaluation_path = terminal_node_dir / "terminal_evalution.json"
+        final_messages = None
+        if terminal_patch_path.is_file():
+            terminal_patch_payload = json.loads(
+                terminal_patch_path.read_text(encoding="utf-8")
+            )
+            task_payload = terminal_patch_payload.get(self.task_id, {})
+            if isinstance(task_payload, dict):
+                final_patch = str(task_payload.get("model_patch") or "")
+                final_policy_model_name = str(
+                    task_payload.get("model_name_or_path")
+                    or final_policy_model_name
+                )
+        if terminal_messages_path.is_file():
+            terminal_messages = json.loads(
+                terminal_messages_path.read_text(encoding="utf-8")
+            )
+            if (
+                isinstance(terminal_messages, dict)
+                and isinstance(terminal_messages.get("messages"), list)
+            ) or isinstance(terminal_messages, list):
+                final_messages = terminal_messages
+        if final_messages is None:
+            if final_node_id not in self._node_snapshot_cache:
+                raise RuntimeError(
+                    f"Node {final_node_id} does not have terminal messages or "
+                    "a cached restorable snapshot"
+                )
+            snapshot = copy.deepcopy(self._node_snapshot_cache[final_node_id])
+            final_messages = build_messages(
+                snapshot["agent"]["state"].get("messages", []),
+                model_name=final_policy_model_name,
+                preserve_token_fields=True,
+            )
         final_node.submission = final_patch
         if self.search_config.write_artifacts:
             _atomic_write_json(
@@ -3031,7 +3152,31 @@ class TrajectorySearchRunner:
             )
         if self.search_config.evaluate_final_patch:
             patch_text = final_patch
-            if not patch_text.strip():
+            if terminal_evaluation_path.is_file():
+                evaluation = json.loads(
+                    terminal_evaluation_path.read_text(encoding="utf-8")
+                )
+                if self.search_config.write_artifacts:
+                    _atomic_write_json(self.run_dir / "evaluation.json", evaluation)
+            elif self._async_terminal_enabled:
+                status_path = terminal_node_dir / "async_terminal.json"
+                status = (
+                    json.loads(status_path.read_text(encoding="utf-8"))
+                    if status_path.is_file()
+                    else {}
+                )
+                error = status.get("error") or (
+                    f"Missing asynchronous terminal evaluation for {final_node_id}"
+                )
+                if self.search_config.write_artifacts:
+                    _atomic_write_json(
+                        self.run_dir / "evaluation.json",
+                        make_evaluation_payload(
+                            "error",
+                            error=RuntimeError(str(error)),
+                        ),
+                    )
+            elif not patch_text.strip():
                 if self.search_config.write_artifacts:
                     _atomic_write_json(
                         self.run_dir / "evaluation.json",

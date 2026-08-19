@@ -1077,8 +1077,7 @@ done
 """.strip()
 
     rler_root = str(args.rler_root)
-    # Preserve any PYTHONPATH set by the launcher (e.g. for jsonlines / docker
-    # / other agent runtime deps installed into a Lustre-side site dir).
+    # Preserve runtime dependencies installed into a Lustre-side site dir.
     extra_pp = os.environ.get("EXTRA_PYTHONPATH", "")
     pythonpath = f"{rler_root}/slime:{rler_root}:{rler_root}/agent:/root/Megatron-LM"
     if extra_pp:

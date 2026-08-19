@@ -38,11 +38,6 @@ from swe_agent.run.benchmarks.deepswe_eval import (
     is_deepswe_dataset_name,
     is_deepswe_instance,
 )
-from swe_agent.run.benchmarks.rebench_eval import (
-    evaluate_rebench_instance as evaluate_rebench_prediction,
-    is_rebench_dataset_name,
-    is_rebench_instance,
-)
 from swe_agent.run.benchmarks.r2egym_eval import (
     evaluate_r2egym_instances,
     is_r2egym_dataset_name,
@@ -90,7 +85,6 @@ SUPPORTED_REWARD_KINDS = {"hard", "soft", "joint", "f2p_only"}
 DEFAULT_VLLM_PORT = 30000
 DEFAULT_ENV_TIMEOUT = 300
 DEFAULT_PULL_TIMEOUT = 600
-DEFAULT_EVAL_TIMEOUT = 900
 SWE_AGENT_TEXTBASED_CONFIG = AGENT_ROOT / "swe_agent" / "config" / "benchmarks" / "swebench_backticks.yaml"
 SLIME_SERVICE_NAME = "slime"
 VLLM_SERVICE_NAME = "vllm"
@@ -693,7 +687,6 @@ def run_harness_evaluation(
             instance["instance_id"]: instance
             for instance in load_swebench_instances_by_id(subset, split, instance_ids)
         }
-    rebench = is_rebench_dataset_name(dataset_name)
     r2egym = is_r2egym_dataset_name(dataset_name)
     swebench_pro = is_swebench_pro_dataset_name(dataset_name)
     deepswe = is_deepswe_dataset_name(dataset_name)
@@ -714,7 +707,7 @@ def run_harness_evaluation(
                 timeout=timeout,
                 work_dir=run_dir.resolve(),
             )[str(run_dir)]
-            return run_dir, _r2egym_result_payload(result)
+            return run_dir, _benchmark_result_payload(result)
         if swebench_pro or is_swebench_pro_instance(instance):
             result = evaluate_swebench_pro_instances(
                 instance=instance,
@@ -735,9 +728,6 @@ def run_harness_evaluation(
             return run_dir, _benchmark_result_payload(result)
         if not patch:
             return run_dir, make_evaluation_payload("empty")
-        if rebench:
-            result = evaluate_rebench_prediction(instance=instance, patch_text=patch, timeout=timeout, work_dir=run_dir.resolve())
-            return run_dir, _rebench_result_payload(result)
         evaluations = evaluate_swebench_instance_patches(
             instance=instance,
             patches_by_key={str(run_dir): patch},
@@ -760,55 +750,6 @@ def run_harness_evaluation(
                     result_dir, payload = run_dir, _evaluator_exception_payload(exc)
                     _append_error_to_log(log_path, exc)
                 _json_dump(result_dir / "evaluation.json", payload)
-
-
-def _rebench_result_payload(
-    result: dict[str, Any], reward_config: EvaluationRewardConfig | None = None
-) -> dict[str, Any]:
-    if result.get("error"):
-        return make_evaluation_payload(
-            "error",
-            output=result.get("evaluation_output") or "",
-            error=str(result["error"]),
-            reward_config=reward_config,
-        )
-    expected = {str(test) for test in result.get("passed_expected", []) if str(test)}
-    passed_actual = {str(test) for test in result.get("passed_actual", []) if str(test)}
-    failed_actual = {str(test) for test in result.get("failed_actual", []) if str(test)}
-    passed_tests = sorted(passed_actual)
-    failed_tests = sorted((expected - passed_actual) | failed_actual)
-    resolved = bool(result.get("resolved"))
-    return make_evaluation_payload(
-        status="resolved" if resolved else "unresolved",
-        passed_tests=passed_tests,
-        failed_tests=failed_tests,
-        output=result.get("evaluation_output") or "",
-        pass_to_pass_expected=result.get("pass_to_pass_expected", []),
-        fail_to_pass_expected=result.get("fail_to_pass_expected", []),
-        reward_config=reward_config,
-    )
-
-
-def _r2egym_result_payload(
-    result: dict[str, Any], reward_config: EvaluationRewardConfig | None = None
-) -> dict[str, Any]:
-    if result.get("error"):
-        return make_evaluation_payload(
-            "error",
-            output=result.get("evaluation_output") or "",
-            error=str(result["error"]),
-            reward_config=reward_config,
-        )
-    resolved = bool(result.get("resolved"))
-    return make_evaluation_payload(
-        status="resolved" if resolved else "unresolved",
-        passed_tests=result.get("passed_actual", []),
-        failed_tests=result.get("failed_actual", []),
-        output=result.get("evaluation_output") or "",
-        pass_to_pass_expected=result.get("pass_to_pass_expected", []),
-        fail_to_pass_expected=result.get("fail_to_pass_expected", []),
-        reward_config=reward_config,
-    )
 
 
 def _benchmark_result_payload(
@@ -875,35 +816,6 @@ def evaluate_swebench_instance_patches(
     reward_config: EvaluationRewardConfig | None = None,
 ) -> dict[str, dict[str, Any]]:
     eval_work_dir = Path(work_dir or Path.cwd()).resolve()
-    if is_rebench_instance(instance):
-        evaluations: dict[str, dict[str, Any]] = {}
-        unique_patches: dict[str, dict[str, Any]] = {}
-        for key, patch in patches_by_key.items():
-            patch_text = patch or ""
-            if not patch_text.strip():
-                evaluations[key] = make_evaluation_payload("empty", reward_config=reward_config)
-                continue
-            unique_patches.setdefault(patch_text, {"patch": patch_text, "keys": []})["keys"].append(key)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(unique_patches) or 1))) as executor:
-            future_map = {
-                executor.submit(
-                    evaluate_rebench_prediction,
-                    instance=instance,
-                    patch_text=entry["patch"],
-                    timeout=timeout,
-                    work_dir=eval_work_dir,
-                ): entry["keys"]
-                for entry in unique_patches.values()
-            }
-            for future, keys in future_map.items():
-                try:
-                    payload = _rebench_result_payload(future.result(), reward_config)
-                except Exception as exc:
-                    payload = _evaluator_exception_payload(exc, reward_config)
-                for key in keys:
-                    evaluations[key] = payload
-        return evaluations
-
     if is_r2egym_instance(instance):
         evaluations: dict[str, dict[str, Any]] = {}
         try:
@@ -921,7 +833,7 @@ def evaluate_swebench_instance_patches(
             }
         for key, result in results.items():
             try:
-                evaluations[key] = _r2egym_result_payload(result, reward_config)
+                evaluations[key] = _benchmark_result_payload(result, reward_config)
             except Exception as exc:
                 evaluations[key] = _evaluator_exception_payload(exc, reward_config)
         return evaluations
@@ -1095,6 +1007,7 @@ def run_swe_instance_multi(
     eval_timeout: int,
     workers: int = 1,
     pass_n: int = 1,
+    skip_evaluation: bool = False,
     redo_existing: bool = True,
     timestamp: str | None = None,
     run_log_path: Path | None = None,
@@ -1175,9 +1088,15 @@ def run_swe_instance_multi(
                         temp_output_dir=temp_output_dir,
                     )
                     pass_run_dirs.append(run_dir)
-                evaluation_futures.append(
-                    (pass_index + 1, evaluation_executor.submit(evaluate_pass, pass_run_dirs))
-                )
+                if not skip_evaluation:
+                    evaluation_futures.append(
+                        (
+                            pass_index + 1,
+                            evaluation_executor.submit(
+                                evaluate_pass, pass_run_dirs
+                            ),
+                        )
+                    )
         finally:
             for pass_number, future in evaluation_futures:
                 try:
@@ -1291,7 +1210,7 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
     vllm_handle = None
     sglang_server: tuple[str, subprocess.Popen[str]] | None = None
     if args.backend == "vllm":
-        from dr_agent.utils import launch_vllm_server_handle
+        from agent_rl.vllm_server import launch_vllm_server_handle
 
         gpu_ids = choose_gpus(args.gpu_id)
         if not gpu_ids:
@@ -1335,6 +1254,9 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
                 litellm_model_kwargs["api_base"] = _litellm_api_base(args.litellm_api_base)
             if args.litellm_api_key:
                 litellm_model_kwargs["api_key"] = args.litellm_api_key
+        elif args.backend == "sglang":
+            litellm_model_kwargs["api_base"] = args.sglang_api_base
+            litellm_model_kwargs["api_key"] = args.sglang_api_key
         config = build_swebench_config(
             config_spec=[str(SWE_AGENT_TEXTBASED_CONFIG)],
             model=model_name,
@@ -1350,10 +1272,11 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
                     "pull_timeout": 600,
                 },
                 "model": {
+                    **({"context_length": args.max_model_len} if args.backend == "sglang" else {}),
                     "model_kwargs": {
                         "temperature": args.temperature,
                         "top_p": args.top_p,
-                        "max_tokens": DEFAULT_COMPLETION_MAX_TOKENS,
+                        "max_tokens": args.completion_max_tokens,
                         **litellm_model_kwargs,
                         **_litellm_model_kwargs(model_name),
                     },
@@ -1377,6 +1300,7 @@ def run_swe_agent_backend(args: argparse.Namespace, instance_ids: Sequence[str] 
                 eval_timeout=args.eval_timeout,
                 workers=args.workers,
                 pass_n=args.pass_n,
+                skip_evaluation=args.skip_evaluation,
                 redo_existing=True,
                 timestamp=args._run_timestamp,
                 run_log_path=args._run_log_path,
@@ -1398,6 +1322,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subset", default=DEFAULT_SUBSET)
     parser.add_argument("--split", default=DEFAULT_SPLIT)
     parser.add_argument("--evaluation-only", default=None)
+    parser.add_argument(
+        "--skip-evaluation",
+        action="store_true",
+        help="Materialize rollout artifacts without running the evaluator.",
+    )
     parser.add_argument("--timestamp", default=None, help="Override the run timestamp used in output/log directories.")
     parser.add_argument("--run-log-path", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -1416,6 +1345,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-id", default="auto:2")
     parser.add_argument("--vllm-port", type=int, default=8011)
     parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN)
+    parser.add_argument("--completion-max-tokens", type=int, default=DEFAULT_COMPLETION_MAX_TOKENS)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--allow-long-max-model-len", action="store_true")
     parser.add_argument("--vllm-model", default=DEFAULT_SERVE_MODEL)

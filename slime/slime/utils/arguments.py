@@ -914,6 +914,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
             )
+            parser.add_argument(
+                "--policy-loss-type",
+                choices=["ppo", "dppo"],
+                default="ppo",
+                help="Policy-gradient surrogate. DPPO uses rollout log-probs and an asymmetric binary trust region.",
+            )
+            parser.add_argument(
+                "--dppo-divergence-type",
+                choices=["tv", "kl"],
+                default="tv",
+                help="Sampled-token Bernoulli divergence used by the DPPO trust region.",
+            )
+            parser.add_argument(
+                "--dppo-divergence-threshold",
+                type=float,
+                default=0.1,
+                help="DPPO trust-region radius.",
+            )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
             parser.add_argument(
                 "--kl-coef",
@@ -1876,6 +1894,14 @@ def slime_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+    if args.policy_loss_type == "dppo":
+        assert args.loss_type == "policy_loss", "DPPO requires --loss-type policy_loss."
+        assert args.advantage_estimator == "grpo", "DPPO requires token-level GRPO advantages."
+        assert args.use_rollout_logprobs, "DPPO requires --use-rollout-logprobs."
+        assert args.dppo_divergence_threshold > 0.0, (
+            "DPPO divergence threshold must be positive."
+        )
 
     if args.get_mismatch_metrics:
         assert (

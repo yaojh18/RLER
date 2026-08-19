@@ -49,12 +49,26 @@ def checkpoint_policy_stale_lag(
     a resumed collector cannot silently bypass the coordinated version check.
     """
 
+    return policy_version_stale_lag(
+        policy_version,
+        policy_version_for_checkpoint(int(consumer_rollout_id) - 1),
+    )
+
+
+def policy_version_stale_lag(
+    policy_version: str,
+    observed_policy_version: str,
+) -> int:
+    """Return checkpoint distance between a dispatched and observed policy."""
+
     checkpoint_id = _checkpoint_id_for_policy_version(policy_version)
-    if checkpoint_id is None:
+    observed_id = _checkpoint_id_for_policy_version(observed_policy_version)
+    if checkpoint_id is None or observed_id is None:
         raise PolicyVersionMismatch(
-            f"invalid coordinated policy version: {policy_version!r}"
+            "invalid coordinated policy versions: "
+            f"dispatched={policy_version!r} observed={observed_policy_version!r}"
         )
-    return int(consumer_rollout_id) - 1 - checkpoint_id
+    return observed_id - checkpoint_id
 
 
 def policy_version_state_path() -> Path | None:
@@ -197,20 +211,17 @@ def fail_policy_weight_update(
     _atomic_write_state(path, state)
 
 
-def committed_policy_version(*, allow_target_during_update: bool = False) -> str | None:
+def committed_policy_version() -> str | None:
     """Return a dispatchable policy version.
 
-    ``None`` means coordination is disabled.  During an update, ordinary
-    training dispatch fails closed; validation scheduling may record the
-    target version that will become visible after the transition.
+    ``None`` means coordination is disabled. During an update, dispatch fails
+    closed; diagnostic validation records the last committed version instead.
     """
     path = policy_version_state_path()
     if path is None:
         return None
     state = _read_state(path)
     if bool(state.get("updating")):
-        if allow_target_during_update:
-            return str(state["target_version"])
         raise PolicyVersionMismatch(
             "policy weights are transitioning: "
             f"committed={state.get('committed_version')!r} "
@@ -220,6 +231,20 @@ def committed_policy_version(*, allow_target_during_update: bool = False) -> str
     if not version:
         raise PolicyVersionMismatch(
             f"policy version state has no committed version: {state}"
+        )
+    return version
+
+
+def observed_policy_version() -> str | None:
+    """Return the currently committed policy, including during an update."""
+
+    path = policy_version_state_path()
+    if path is None:
+        return None
+    version = str(_read_state(path).get("committed_version") or "").strip()
+    if not version:
+        raise PolicyVersionMismatch(
+            f"policy version state has no committed version: {path}"
         )
     return version
 
@@ -237,54 +262,3 @@ def assert_policy_version(expected_version: str | None, *, stage: str) -> None:
             f"observed={observed!r} updating={bool(state.get('updating'))} "
             f"target={state.get('target_version')!r}"
         )
-
-
-def wait_for_policy_version(
-    expected_version: str,
-    *,
-    timeout_seconds: float = 900.0,
-    poll_seconds: float = 0.2,
-    allow_future: bool = False,
-) -> None:
-    """Wait in a background consumer until an in-progress update commits.
-
-    This helper is intended for the dedicated validation actor.  It never
-    blocks the training driver or the next training rollout.
-    """
-    if policy_version_state_path() is None:
-        return
-    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
-    while True:
-        state = _read_state(policy_version_state_path())
-        committed = str(state.get("committed_version") or "")
-        target = str(state.get("target_version") or "")
-        updating = bool(state.get("updating"))
-        if not updating and committed == str(expected_version):
-            return
-        if not updating and committed != str(expected_version):
-            committed_id = _checkpoint_id_for_policy_version(committed)
-            expected_id = _checkpoint_id_for_policy_version(
-                expected_version
-            )
-            if not (
-                allow_future
-                and committed_id is not None
-                and expected_id is not None
-                and committed_id < expected_id
-            ):
-                raise PolicyVersionMismatch(
-                    "validation policy became stale before dispatch: "
-                    f"expected={expected_version!r} "
-                    f"observed={committed!r}"
-                )
-        if updating and target != str(expected_version):
-            raise PolicyVersionMismatch(
-                "validation policy transition targets another checkpoint: "
-                f"expected={expected_version!r} target={target!r}"
-            )
-        if time.monotonic() >= deadline:
-            raise PolicyVersionMismatch(
-                "timed out waiting for validation policy version "
-                f"{expected_version!r}"
-            )
-        time.sleep(max(0.01, float(poll_seconds)))

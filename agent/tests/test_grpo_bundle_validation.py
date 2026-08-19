@@ -1,12 +1,12 @@
 import asyncio
 import copy
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-import swe_agent.trajectory_search_parallel as trajectory_search_parallel
 from swe_agent.lane_to_grpo_bundle import fork_group_to_export_group
 from swe_agent.exceptions import PolicyVersionMismatch
 from swe_agent.naive_search import (
@@ -21,16 +21,12 @@ from swe_agent.parallel_utils import (
     extract_terminal_patch_from_session,
     normalize_terminal_patch_text,
 )
-from swe_agent.rubric_bank import RubricGenerationSample, RubricRecord
-
 from swe_agent.trajectory_search_parallel import (
     ForkGroup,
     LaneBBranch,
     MidCp,
     ParallelSearchConfig,
     TrajectorySearchParallelRunner,
-    _score_map_errors,
-    _tie_break_errors,
     _unexpected_rollout_exit,
 )
 
@@ -50,6 +46,41 @@ def _messages(*, valid: bool = True) -> list[dict]:
         {"role": "user", "content": "problem"},
         assistant,
     ]
+
+
+def test_naive_dump_preserves_exhausted_rollout_error(tmp_path):
+    runner = object.__new__(NaiveSearchRunner)
+    runner.run_dir = tmp_path
+    runner.task_id = "django__django-1"
+    runner.policy_model_name = "Qwen/Qwen3.5-9B"
+    runner.config = NaiveSearchConfig(evaluate_gt=True)
+    runner._rollout_run_dir = lambda rollout_index: tmp_path / f"rollout_{rollout_index:04d}"
+    rollout_error = "rollout_retry_exhausted after 8 attempts: connection error"
+    record = NaiveRecord(
+        instance_id="django__django-1",
+        run_dir=str(tmp_path),
+        task_id="django__django-1",
+        config={},
+        rollouts=[
+            NaiveRollout(
+                rollout_index=0,
+                node_id="naive-django__django-1-r00-test",
+                status="error",
+                error=rollout_error,
+            )
+        ],
+    )
+
+    runner._dump_record(record)
+
+    payload = json.loads(
+        (tmp_path / "rollout_0000" / "evaluation.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["status"] == "error"
+    assert payload["metainfo"]["infrastructure_error"] is True
+    assert rollout_error in payload["metainfo"]["output"]
 
 
 def test_terminal_patch_normalization_preserves_diff_and_strips_only_cwd_warning():
@@ -220,6 +251,49 @@ def test_policy_mismatch_uses_normal_session_cleanup():
     assert cleanup_calls == [session]
 
 
+@pytest.mark.parametrize(
+    ("exit_status", "expected_patch"),
+    [
+        ("CompletionLengthExceeded", "fallback"),
+        ("ContextWindowExceeded", "fallback"),
+        ("", "fallback"),
+        ("Submitted", "fallback"),
+    ],
+)
+def test_naive_extracts_terminal_or_workspace_patch(
+    monkeypatch, exit_status, expected_patch
+):
+    runner = object.__new__(NaiveSearchRunner)
+    runner.task_id = "django__django-1"
+    runner.config = NaiveSearchConfig(step_limit=250)
+    snapshot = {
+        "metadata": {"model_turns": [], "events": []},
+        "agent": {"state": {"messages": _messages()}},
+    }
+    session = SimpleNamespace(
+        snapshot=lambda: SimpleNamespace(model_dump=lambda mode="json": snapshot)
+    )
+    runner._make_session = lambda rollout_index: session
+    runner._step_session = lambda session, max_steps: {
+        "status": "finished",
+        "exit_status": exit_status,
+        "submission": "",
+    }
+    runner._cleanup_session = lambda session: None
+    extraction_calls = []
+    monkeypatch.setattr(
+        "swe_agent.naive_search.extract_terminal_patch_from_session",
+        lambda result, session: extraction_calls.append((result, session)) or ("fallback", True),
+    )
+
+    rollout = runner._run_one_rollout(0)
+
+    assert len(extraction_calls) == 1
+    assert rollout.terminated_early is (exit_status == "Submitted")
+    assert rollout.terminal_patch == expected_patch
+    assert rollout.terminal_patch_from_fallback is bool(expected_patch)
+
+
 def test_naive_gt_creates_rollout_work_dir_before_evaluation(
     monkeypatch, tmp_path
 ):
@@ -263,6 +337,64 @@ def test_naive_gt_creates_rollout_work_dir_before_evaluation(
 
     assert rollout.gt_score == 0.0
     assert rollout.evaluation_payload["status"] == "unresolved"
+
+
+def test_naive_retries_only_failed_rollout_before_completing_group(tmp_path):
+    runner = object.__new__(NaiveSearchRunner)
+    runner.task_id = "django__django-1"
+    runner.run_dir = tmp_path
+    runner.policy_base_urls = ["http://127.0.0.1:30000"]
+    runner.config = NaiveSearchConfig(
+        m=1,
+        rollout_pool_size=1,
+        gt_eval_workers=1,
+        rollout_max_attempts=3,
+    )
+    runner._live_sessions = []
+    attempts = []
+    evaluations = []
+    events = []
+
+    def run_one(rollout_index):
+        attempts.append(rollout_index)
+        return NaiveRollout(
+            rollout_index=rollout_index,
+            node_id=f"node-{len(attempts)}",
+            error="transient sglang error" if len(attempts) == 1 else None,
+        )
+
+    runner._run_one_rollout = run_one
+
+    def evaluate(rollout):
+        evaluations.append(rollout.rollout_index)
+        events.append("evaluate")
+        rollout.gt_score = 0.5 if len(evaluations) == 2 else None
+
+    runner._evaluate_gt = evaluate
+    runner._dump_record = lambda record: None
+    runner._cleanup_all = lambda: None
+
+    def release(rollout_index):
+        events.append(f"release-{rollout_index}")
+
+    try:
+        record = asyncio.run(
+            asyncio.wait_for(
+                runner.run(on_rollout_done=release),
+                timeout=10,
+            )
+        )
+    except asyncio.TimeoutError:
+        pytest.fail(
+            f"naive retry deadlocked: attempts={attempts} "
+            f"evaluations={evaluations}"
+        )
+
+    assert attempts == [0, 0]
+    assert evaluations == [0, 0]
+    assert events == ["release-0", "evaluate", "evaluate"]
+    assert record.completed is True
+    assert record.rollouts[0].gt_score == 0.5
 
 
 def test_invalid_lane_branch_drops_complete_group():
@@ -336,7 +468,7 @@ def test_judge_reward_uses_real_node_id():
     assert exported.samples[0].metadata["child_assistant_spans"] == [[0, 1]]
 
 
-def test_formal_submission_binary_gt_overrides_hosted_judge_reward():
+def test_explicit_gt_on_submit_reward_overrides_direct_judge_reward():
     mid_cp = MidCp(
         idx=0,
         asst_step=0,
@@ -357,6 +489,10 @@ def test_formal_submission_binary_gt_overrides_hosted_judge_reward():
         mid_cp=mid_cp,
         branches=[branch],
         judge_score_by_node={"submitted-node": 0.15},
+        training_reward_by_node={"submitted-node": 1.0},
+        reward_source_by_node={
+            "submitted-node": "terminal_swebench_binary"
+        },
     )
 
     exported = fork_group_to_export_group(
@@ -372,6 +508,47 @@ def test_formal_submission_binary_gt_overrides_hosted_judge_reward():
         == "terminal_swebench_binary"
     )
     assert exported.samples[0].metadata["raw_rubric_score"] == 0.15
+
+
+def test_direct_reward_remains_default_for_submitted_branch():
+    mid_cp = MidCp(
+        idx=0,
+        asst_step=0,
+        image_tag="root-image",
+        snapshot={"agent": {"state": {"messages": _messages()[:2]}}},
+    )
+    branch = LaneBBranch(
+        group_index=0,
+        branch_index=0,
+        node_id="submitted-node",
+        parent_image_tag="root-image",
+        messages=_messages()[2:],
+        terminated_early=True,
+        gt_score=1.0,
+    )
+    group = ForkGroup(
+        group_index=0,
+        mid_cp=mid_cp,
+        branches=[branch],
+        judge_score_by_node={"submitted-node": 0.15},
+        training_reward_by_node={"submitted-node": 0.15},
+        reward_source_by_node={
+            "submitted-node": "direct_golden_rubric_judge"
+        },
+    )
+
+    exported = fork_group_to_export_group(
+        instance_id="instance",
+        group=group,
+        steps_per_round=1,
+    )
+
+    assert exported is not None
+    assert exported.samples[0].reward == 0.15
+    assert (
+        exported.samples[0].metadata["reward_source"]
+        == "direct_golden_rubric_judge"
+    )
 
 
 def test_empty_formal_submission_has_binary_zero_reward():
@@ -474,7 +651,7 @@ def test_policy_overlength_uses_unscaled_hosted_judge_reward():
     )
 
 
-def test_negative_hosted_judge_reward_is_clipped_to_zero():
+def test_negative_collapse_reward_is_preserved():
     mid_cp = MidCp(
         idx=0,
         asst_step=0,
@@ -493,6 +670,8 @@ def test_negative_hosted_judge_reward_is_clipped_to_zero():
         mid_cp=mid_cp,
         branches=[branch],
         judge_score_by_node={"negative-judge-node": -0.35},
+        training_reward_by_node={"negative-judge-node": -0.35},
+        reward_source_by_node={"negative-judge-node": "code_mode_collapse"},
     )
 
     exported = fork_group_to_export_group(
@@ -503,9 +682,9 @@ def test_negative_hosted_judge_reward_is_clipped_to_zero():
 
     assert exported is not None
     sample = exported.samples[0]
-    assert sample.reward == 0.0
+    assert sample.reward == pytest.approx(-0.35)
     assert sample.metadata["raw_rubric_score"] == pytest.approx(-0.35)
-    assert sample.metadata["reward_source"] == "hosted_judge"
+    assert sample.metadata["reward_source"] == "code_mode_collapse"
 
 
 def test_beam_parent_assistant_tokens_are_trainable_from_root_prompt():
@@ -807,9 +986,9 @@ def test_depth2_config_is_two_parents_and_two_size_eight_groups():
     assert cfg.m // cfg.p == 4
     assert cfg.terminal_rollout is False
     assert cfg.all_pass_reward == 1.0
-    assert cfg.rubric_max_tokens == 20480
     assert cfg.judge_max_tokens == 20480
-    assert cfg.psu_max_tokens == 20480
+    assert cfg.judge_context_length == 256000
+    assert cfg.collapse_reward_margin is None
 
 
 def test_depth2_uses_only_nonterminal_sampled_parents_without_resampling():
@@ -880,375 +1059,6 @@ def test_usage_group_ids_separate_root_and_beam_cost():
 
     assert runner._usage_group_id(0) == "train:r17:instance:g0"
     assert runner._usage_group_id(1) == "train:r17:instance:g1"
-
-
-class _FakeExperienceBank:
-    async def build_generation_context(self, **_kwargs):
-        return SimpleNamespace(
-            extra_prompt_sections=[],
-            retrieved=[],
-            retrieve_messages=[],
-        )
-
-
-class _FakeScoreBank:
-    def build_generation_context(self):
-        return SimpleNamespace(
-            extra_prompt_sections=[],
-            existing_rubrics=[],
-        )
-
-    def update_from_model(self, *, generated):
-        return SimpleNamespace(
-            active_after=list(generated),
-            inactive_after=[],
-        )
-
-    def set_state(self, *, active_bank, inactive_bank):
-        self.active_bank = active_bank
-        self.inactive_bank = inactive_bank
-
-
-def _run_fake_lane_c_scope(
-    monkeypatch,
-    *,
-    initial_format_errors=None,
-    initial_terminal_error=None,
-    initial_judge_errors=None,
-    initial_scores=(0.25, 0.75),
-    tie_break_result=None,
-):
-    node_ids = ["node-a", "node-b"]
-    rubric = RubricRecord(
-        rubric_id="rubric-1",
-        title="Criterion",
-        direction="positive",
-        description="Distinguishes the branches.",
-        scale={str(index): str(index) for index in range(1, 6)},
-        weight=1.0,
-        source_round=1,
-    )
-    generated_sample = RubricGenerationSample(
-        sample_index=0,
-        rubric_list_id="rubric-r001-s00",
-        generated=[rubric],
-        messages=[{"role": "assistant", "content": "corrected rubric"}],
-        format_errors=copy.deepcopy(initial_format_errors or []),
-        terminal_error=initial_terminal_error,
-    )
-    judge_errors = copy.deepcopy(initial_judge_errors or [])
-    score_batch = {
-        "generated_samples": [generated_sample],
-        "sample_generated_rubrics": [[rubric]],
-        "generated_score_results": {
-            0: (
-                [
-                    [
-                        {
-                            "rubric_id": rubric.rubric_id,
-                            "score_normalized": initial_scores[0],
-                            "judge_message": [],
-                        }
-                    ],
-                    [
-                        {
-                            "rubric_id": rubric.rubric_id,
-                            "score_normalized": initial_scores[1],
-                            "judge_message": [],
-                        }
-                    ],
-                ],
-                judge_errors,
-            )
-        },
-    }
-
-    async def fake_generate_and_score(**_kwargs):
-        return copy.deepcopy(score_batch)
-
-    async def fake_tie_break(**_kwargs):
-        return copy.deepcopy(tie_break_result)
-
-    monkeypatch.setattr(
-        trajectory_search_parallel,
-        "_generate_and_score_rubric_batch",
-        fake_generate_and_score,
-    )
-    monkeypatch.setattr(
-        trajectory_search_parallel,
-        "_run_score_tie_break",
-        fake_tie_break,
-    )
-
-    runner = object.__new__(TrajectorySearchParallelRunner)
-    runner.config = ParallelSearchConfig(n=1)
-    runner.rubric_model_name = "glm-rubric"
-    runner.judge_model_name = "glm-judge"
-    runner.rubric_model_kwargs = {}
-    runner.judge_model_kwargs = {}
-    runner.task_id = "instance"
-    group = ForkGroup(
-        group_index=0,
-        mid_cp=MidCp(
-            idx=0,
-            asst_step=0,
-            image_tag="root-image",
-            snapshot={},
-        ),
-        branches=[
-            LaneBBranch(
-                group_index=0,
-                branch_index=index,
-                node_id=node_id,
-                parent_image_tag="root-image",
-            )
-            for index, node_id in enumerate(node_ids)
-        ],
-    )
-    result = asyncio.run(
-        runner._run_lane_c_scope(
-            group=group,
-            scope="siblings",
-            question={"system_prompt": "", "user_prompt": ""},
-            shared_context={
-                "previous_persistent_state": {},
-                "latest_agent_trajectory": None,
-            },
-            previous_state={},
-            latest_shared_segment=None,
-            continuations=[{"node_id": node_id} for node_id in node_ids],
-            score_bank=_FakeScoreBank(),
-            experience_bank=_FakeExperienceBank(),
-            generation_prompt="generate",
-            rubric_list_prefix="rubric",
-            judge_prompt="judge",
-        )
-    )
-    return result
-
-
-@pytest.mark.parametrize("status", ["success", "fallback"])
-def test_tie_break_judge_error_is_fail_closed_for_every_status(status):
-    errors = _tie_break_errors(
-        {
-            "status": status,
-            "judge_errors": [
-                {
-                    "node_id": "node-a",
-                    "rubric_id": "tie-rubric",
-                    "error": "provider timeout",
-                }
-            ],
-            "adjusted_scores": {"node-a": 0.1, "node-b": 0.2},
-        },
-        node_ids=["node-a", "node-b"],
-    )
-
-    assert errors
-    assert any("provider timeout" in error for error in errors)
-
-
-def test_tie_break_recovered_format_error_is_not_fail_closed():
-    errors = _tie_break_errors(
-        {
-            "status": "success",
-            "format_errors": ["invalid rubric json"],
-            "terminal_error": "Reached max rubrics=6.",
-            "judge_errors": [],
-            "adjusted_scores": {"node-a": 0.1, "node-b": 0.2},
-        },
-        node_ids=["node-a", "node-b"],
-    )
-
-    assert errors == []
-
-
-def test_tie_break_fallback_diagnostics_are_not_fail_closed():
-    errors = _tie_break_errors(
-        {
-            "status": "fallback",
-            "reason": "no_valid_tie_break_rubric",
-            "format_errors": ["invalid rubric json"],
-            "terminal_error": "Reached rubric generation max rounds=6.",
-        },
-        node_ids=["node-a", "node-b"],
-    )
-
-    assert errors == []
-
-
-def test_lane_c_accepts_recovered_initial_and_tie_break_format_errors(
-    monkeypatch,
-):
-    initial_format_errors = [
-        {"turn_index": 1, "error": "invalid initial rubric json"}
-    ]
-    tie_format_errors = [
-        {"turn_index": 1, "error": "returned {} before a rubric"}
-    ]
-    adjusted_scores = {"node-a": 0.500001, "node-b": 0.5}
-    result = _run_fake_lane_c_scope(
-        monkeypatch,
-        initial_format_errors=initial_format_errors,
-        initial_terminal_error="Reached max rubrics=6.",
-        initial_scores=(0.5, 0.5),
-        tie_break_result={
-            "status": "success",
-            "format_errors": tie_format_errors,
-            "terminal_error": "Reached max rubrics=6.",
-            "judge_errors": [],
-            "judge_messages": [],
-            "messages": [{"role": "assistant", "content": "corrected tie rubric"}],
-            "adjusted_scores": adjusted_scores,
-        },
-    )
-
-    assert result["errors"] == []
-    assert result["judge_score_by_node"] == adjusted_scores
-    assert result["model_response"]["format_errors"] == initial_format_errors
-    assert result["model_response"]["terminal_errors"] == [
-        "Reached max rubrics=6."
-    ]
-    sample = result["samples"][0]
-    assert sample["format_errors"] == initial_format_errors
-    assert sample["terminal_error"] == "Reached max rubrics=6."
-    assert sample["tie_break"]["format_errors"] == tie_format_errors
-    assert sample["tie_break"]["terminal_error"] == "Reached max rubrics=6."
-    assert sample["tie_break_messages"] == [
-        {"role": "assistant", "content": "corrected tie rubric"}
-    ]
-
-
-def test_lane_c_tie_break_fallback_preserves_initial_scores_and_diagnostics(
-    monkeypatch,
-):
-    tie_format_errors = [{"turn_index": 1, "error": "invalid tie rubric"}]
-    result = _run_fake_lane_c_scope(
-        monkeypatch,
-        initial_scores=(0.5, 0.5),
-        tie_break_result={
-            "status": "fallback",
-            "reason": "no_valid_tie_break_rubric",
-            "format_errors": tie_format_errors,
-            "terminal_error": "Reached rubric generation max rounds=6.",
-            "messages": [{"role": "assistant", "content": "unusable rubric"}],
-        },
-    )
-
-    assert result["errors"] == []
-    assert result["judge_score_by_node"] == {
-        "node-a": 0.5,
-        "node-b": 0.5,
-    }
-    sample = result["samples"][0]
-    assert sample["tie_break"]["status"] == "fallback"
-    assert sample["tie_break"]["format_errors"] == tie_format_errors
-    assert (
-        sample["tie_break"]["terminal_error"]
-        == "Reached rubric generation max rounds=6."
-    )
-
-
-def test_lane_c_initial_judge_error_remains_fail_closed(monkeypatch):
-    result = _run_fake_lane_c_scope(
-        monkeypatch,
-        initial_judge_errors=[
-            {
-                "node_id": "node-a",
-                "rubric_id": "rubric-1",
-                "error": "InvalidJudgeResponse",
-            }
-        ],
-    )
-
-    assert result["judge_score_by_node"] == {}
-    assert any("InvalidJudgeResponse" in error for error in result["errors"])
-
-
-def test_lane_c_nonfinite_initial_score_remains_fail_closed(monkeypatch):
-    # Keep the fake judge records finite so the oracle metric helper can
-    # construct its diagnostics, then inject the malformed aggregate at the
-    # parallel runner's score-map boundary.  This exercises the fail-closed
-    # check without asking statistics.pvariance() to accept NaN input.
-    monkeypatch.setattr(
-        trajectory_search_parallel,
-        "_avg_scores_from_rubrics",
-        lambda **_kwargs: {"node-a": float("nan"), "node-b": 0.75},
-    )
-    result = _run_fake_lane_c_scope(
-        monkeypatch,
-        initial_scores=(0.25, 0.75),
-    )
-
-    assert result["judge_score_by_node"] == {}
-    assert any("non_finite:node-a" in error for error in result["errors"])
-
-
-def test_tie_break_unknown_status_is_fail_closed():
-    errors = _tie_break_errors(
-        {"status": "partial"},
-        node_ids=["node-a", "node-b"],
-    )
-
-    assert errors == ["tie_break_status:partial"]
-
-
-@pytest.mark.parametrize(
-    "adjusted_scores",
-    [
-        None,
-        {"node-a": 0.1},
-        {"node-a": 0.1, "node-b": 0.2, "node-c": 0.3},
-        {"node-a": float("nan"), "node-b": 0.2},
-        {"node-a": 0.1, "node-b": float("inf")},
-    ],
-)
-def test_tie_break_success_with_invalid_adjusted_scores_is_fail_closed(
-    adjusted_scores,
-):
-    errors = _tie_break_errors(
-        {
-            "status": "success",
-            "adjusted_scores": adjusted_scores,
-        },
-        node_ids=["node-a", "node-b"],
-    )
-
-    assert errors
-
-
-@pytest.mark.parametrize(
-    ("scores", "expected_fragment"),
-    [
-        (None, "not_a_mapping"),
-        ({"node-a": 0.1}, "coverage"),
-        ({"node-a": 0.1, "node-b": 0.2, "node-c": 0.3}, "coverage"),
-        ({"node-a": float("nan"), "node-b": 0.2}, "non_finite"),
-        ({"node-a": 0.1, "node-b": float("inf")}, "non_finite"),
-        ({"node-a": "0.1", "node-b": 0.2}, "non_numeric"),
-        ({"node-a": "not-a-score", "node-b": 0.2}, "non_numeric"),
-    ],
-)
-def test_score_map_validation_rejects_inexact_or_nonfinite_scores(
-    scores, expected_fragment
-):
-    errors = _score_map_errors(
-        scores,
-        node_ids=["node-a", "node-b"],
-        label="scores",
-    )
-
-    assert any(expected_fragment in error for error in errors)
-
-
-def test_score_map_validation_rejects_duplicate_expected_node_ids():
-    errors = _score_map_errors(
-        {"node-a": 0.1},
-        node_ids=["node-a", "node-a"],
-        label="scores",
-    )
-
-    assert "scores:duplicate_expected_node_ids" in errors
 
 
 def test_policy_overlength_clean_returns_are_expected_terminals():

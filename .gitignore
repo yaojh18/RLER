@@ -1,4 +1,3 @@
-agent/evaluation/**/data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -223,9 +222,6 @@ uv.lock
 import
 PY
 eval_output/
-agent/evaluation/sqa_eval/test.jsonl
-agent/evaluation/sqa_eval/test_asta_format.jsonl
-agent/evaluation/deep_research_bench_eval/data/
 agent/outputs*
 agent/logs
 agent/search_outputs*

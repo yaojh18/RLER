@@ -7,7 +7,6 @@ from swe_agent.run.run_swe_agent import (
     EvaluationRewardConfig,
     _benchmark_result_payload,
     _evaluator_exception_payload,
-    _r2egym_result_payload,
     make_evaluation_payload,
 )
 
@@ -28,7 +27,7 @@ def test_payload_reward_uses_configured_soft_kind(monkeypatch):
 def test_r2egym_result_does_not_override_configured_reward(monkeypatch):
     monkeypatch.setenv("RLER_REWARD_KIND", "joint")
 
-    payload = _r2egym_result_payload(
+    payload = _benchmark_result_payload(
         {
             "resolved": False,
             "reward": 1.0,

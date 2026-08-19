@@ -12,7 +12,6 @@ import subprocess
 
 from dotenv import load_dotenv, set_key, unset_key
 from rich.console import Console
-from rich.rule import Rule
 from typer import Argument, Typer
 
 from swe_agent import global_config_file
@@ -57,13 +56,6 @@ def prompt(*args, **kwargs):
     from prompt_toolkit.shortcuts.prompt import prompt as _prompt
 
     return _prompt(*args, **kwargs)
-
-
-def configure_if_first_time():
-    if not os.getenv("MSWEA_CONFIGURED"):
-        console.print(Rule())
-        setup()
-        console.print(Rule())
 
 
 @app.command()

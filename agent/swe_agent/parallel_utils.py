@@ -22,10 +22,6 @@ INVALID_SAMPLE_REWARD = -1.0
 RUBRIC_FORMAT_ERROR_REWARD = -1.0
 RUBRIC_TERMINAL_ERROR_REWARD = -0.2
 
-MAX_RUBRICS = 6
-MAX_RUBRIC_GENERATION_ROUNDS = 10
-
-
 @dataclass
 class TurnTokenInfo:
     turn_index: int
@@ -34,13 +30,6 @@ class TurnTokenInfo:
     completion_tokens: int
     output_token_ids: list[int]
     output_logprobs: list[float]
-
-
-_RAW_ONLY_KEYS = ("prompt_token_ids", "token_ids", "logprobs", "extra", "usage", "content_no_thinking")
-
-
-def _strip_token_fields(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{key: value for key, value in message.items() if key not in _RAW_ONLY_KEYS} for message in messages]
 
 
 def _stamp_steps(
@@ -601,6 +590,7 @@ class PatchEvalManager:
         collector: GRPOCollector | None = None,
         write_artifacts: bool = True,
         max_workers: int = 1,
+        patch_workers: int | None = None,
     ) -> None:
         self.instance = instance
         self.task_id = task_id
@@ -610,6 +600,10 @@ class PatchEvalManager:
         self.evaluate_patches_fn = evaluate_patches_fn
         self.collector = collector
         self.write_artifacts = write_artifacts
+        self.patch_workers = max(
+            1,
+            max_workers if patch_workers is None else patch_workers,
+        )
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="search-gt-eval")
         self._futures: list[Future] = []
 
@@ -642,7 +636,7 @@ class PatchEvalManager:
                     instance=self.instance,
                     patches_by_key=patches_by_node_id,
                     model_name=self.model_name,
-                    max_workers=1,
+                    max_workers=self.patch_workers,
                     namespace=self.namespace,
                     work_dir=self.work_dir,
                 )

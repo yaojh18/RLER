@@ -192,8 +192,8 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
             ref = Ref(
                 {
                     "eval/attempted": 50,
-                    "eval/completed": 50,
-                    "eval/incomplete": 0,
+                    "eval/completed": 49,
+                    "eval/incomplete": 1,
                     "eval/train_instance_attempt": attempted_instances,
                 }
             )
@@ -208,28 +208,13 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
         def __init__(self):
             self.completed = 0
             self.scheduled = 0
-            self.validation_rollout_ids = {}
-            self.validation_policy_versions = {}
 
         def mark_validation_scheduled(
             self,
             attempted_instances,
-            rollout_id,
-            policy_version,
         ):
-            events.append(
-                (
-                    "mark_scheduled",
-                    attempted_instances,
-                    rollout_id,
-                    policy_version,
-                )
-            )
+            events.append(("mark_scheduled", attempted_instances))
             self.scheduled = attempted_instances
-            self.validation_rollout_ids[attempted_instances] = rollout_id
-            self.validation_policy_versions[attempted_instances] = (
-                policy_version
-            )
 
         def acknowledge_validation(self, attempted_instances):
             events.append(("ack", attempted_instances))
@@ -241,12 +226,6 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
                 "attempted_instances": 125,
                 "last_validation_attempt": self.completed,
                 "last_validation_scheduled_attempt": self.scheduled,
-                "validation_rollout_ids": dict(
-                    self.validation_rollout_ids
-                ),
-                "validation_policy_versions": dict(
-                    self.validation_policy_versions
-                ),
             }
 
     methods = _load_rollout_manager_methods(
@@ -259,8 +238,7 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
         Any=object,
         logger=Logger,
         ray=FakeRay,
-        committed_policy_version=lambda **_kwargs: "checkpoint-0000003",
-        _require_complete_train_validation_metrics=lambda metrics, **_: metrics,
+        observed_policy_version=lambda: "checkpoint-0000003",
     )
 
     class Manager:
@@ -277,8 +255,6 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
             self.data_source = DataSource()
             self._train_validation_manager = ValidationManager()
             self._train_validation_refs = {}
-            self._train_validation_rollout_ids = {}
-            self._train_validation_policy_versions = {}
 
         def get_train_instance_progress(self):
             return self.data_source.training_progress()
@@ -324,66 +300,122 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
     assert ("get", 125) in events
 
 
-def test_generation_boundary_validation_uses_upcoming_policy_version():
+def test_validation_actor_failure_is_acknowledged_without_retry():
+    events = []
+
+    class FakeRay:
+        @staticmethod
+        def wait(refs, *, num_returns, timeout):
+            assert len(refs) == num_returns == 1
+            assert timeout == 0
+            return refs, []
+
+        @staticmethod
+        def get(_ref):
+            raise RuntimeError("validation actor died")
+
+    class Logger:
+        @staticmethod
+        def info(*_args):
+            pass
+
+        @staticmethod
+        def warning(*_args):
+            events.append("warning")
+
+    class DataSource:
+        def acknowledge_validation(self, attempted_instances):
+            events.append(("ack", attempted_instances))
+
     methods = _load_rollout_manager_methods(
-        {"_validation_policy_version_for_generation"},
-        policy_version_state_path=lambda: object(),
-        policy_version_for_checkpoint=(
-            lambda checkpoint_id: f"checkpoint-{checkpoint_id:07d}"
-        ),
-        committed_policy_version=(
-            lambda **_kwargs: "checkpoint-0000003"
-        ),
+        {"_complete_train_validation", "_poll_train_validations"},
+        logger=Logger,
+        ray=FakeRay,
     )
 
     class Manager:
-        _validation_policy_version_for_generation = methods[
-            "_validation_policy_version_for_generation"
+        _complete_train_validation = methods[
+            "_complete_train_validation"
         ]
+        _poll_train_validations = methods["_poll_train_validations"]
 
-        def __init__(self, update_weights_interval):
-            self.args = SimpleNamespace(
-                update_weights_interval=update_weights_interval
-            )
+        def __init__(self):
+            self.data_source = DataSource()
+            self._train_validation_refs = {100: object()}
 
-    assert (
-        Manager(1)._validation_policy_version_for_generation(6)
-        == "checkpoint-0000005"
-    )
-    assert (
-        Manager(2)._validation_policy_version_for_generation(6)
-        == "checkpoint-0000005"
-    )
-    assert (
-        Manager(2)._validation_policy_version_for_generation(5)
-        == "checkpoint-0000003"
-    )
+    manager = Manager()
+    manager._poll_train_validations()
+    assert manager._train_validation_refs == {}
+    assert events == ["warning", ("ack", 100)]
 
 
-def test_rollout_manager_resume_uses_persisted_validation_rollout_id():
+def test_validation_dispatch_failure_is_acknowledged_without_retry():
     events = []
 
+    class Logger:
+        @staticmethod
+        def info(*_args):
+            pass
+
+        @staticmethod
+        def warning(*_args):
+            events.append("warning")
+
     class EvalRemote:
-        def remote(
-            self,
-            rollout_id,
-            attempted_instances,
-            policy_version,
-        ):
-            events.append(
-                (
-                    "schedule",
-                    rollout_id,
-                    attempted_instances,
-                    policy_version,
-                )
+        @staticmethod
+        def remote(*_args):
+            raise RuntimeError("validation actor unavailable")
+
+    class DataSource:
+        def training_progress(self):
+            return {"last_validation_attempt": 0}
+
+        def mark_validation_scheduled(self, attempted_instances):
+            events.append(("scheduled", attempted_instances))
+
+        def acknowledge_validation(self, attempted_instances):
+            events.append(("ack", attempted_instances))
+
+    methods = _load_rollout_manager_methods(
+        {"_schedule_train_validation"},
+        observed_policy_version=lambda: "checkpoint-0000003",
+        logger=Logger,
+    )
+
+    class Manager:
+        _schedule_train_validation = methods[
+            "_schedule_train_validation"
+        ]
+
+        def __init__(self):
+            self.data_source = DataSource()
+            self._train_validation_refs = {}
+            self._train_validation_manager = SimpleNamespace(
+                eval=EvalRemote()
             )
-            return object()
+
+        def get_train_instance_progress(self):
+            return self.data_source.training_progress()
+
+    manager = Manager()
+    manager._schedule_train_validation(
+        attempted_instances=100,
+        rollout_id=7,
+    )
+    assert manager._train_validation_refs == {}
+    assert events == [
+        ("scheduled", 100),
+        ("ack", 100),
+        "warning",
+    ]
+
+
+def test_rollout_manager_resume_does_not_replay_interrupted_validation():
+    events = []
 
     class DataSource:
         def __init__(self):
-            self.mapping = {100: 5}
-            self.versions = {100: "checkpoint-0000004"}
+            self.completed = 0
 
         def load(self, rollout_id):
             events.append(("load", rollout_id))
@@ -391,26 +423,17 @@ def test_rollout_manager_resume_uses_persisted_validation_rollout_id():
         def training_progress(self):
             return {
                 "attempted_instances": 156,
-                "last_validation_attempt": 0,
+                "last_validation_attempt": self.completed,
                 "last_validation_scheduled_attempt": 100,
-                "validation_rollout_ids": dict(self.mapping),
-                "validation_policy_versions": dict(self.versions),
-                "eval_instance_interval": 100,
             }
 
-        def mark_validation_scheduled(
-            self,
-            attempted_instances,
-            rollout_id,
-            policy_version,
-        ):
-            assert self.mapping[attempted_instances] == rollout_id
-            assert self.versions[attempted_instances] == policy_version
+        def acknowledge_validation(self, attempted_instances):
+            events.append(("ack", attempted_instances))
+            self.completed = attempted_instances
 
     methods = _load_rollout_manager_methods(
-        {"load", "_schedule_train_validation"},
-        policy_version_state_path=lambda: object(),
-        logger=SimpleNamespace(info=lambda *_args: None),
+        {"load"},
+        logger=SimpleNamespace(warning=lambda *_args: None),
         ROLLOUT_COLLECTOR_STATE_METADATA_KEY=(
             ROLLOUT_COLLECTOR_STATE_METADATA_KEY
         ),
@@ -418,18 +441,10 @@ def test_rollout_manager_resume_uses_persisted_validation_rollout_id():
 
     class Manager:
         load = methods["load"]
-        _schedule_train_validation = methods[
-            "_schedule_train_validation"
-        ]
 
         def __init__(self):
             self.data_source = DataSource()
-            self._train_validation_manager = SimpleNamespace(
-                eval=EvalRemote()
-            )
-            self._train_validation_refs = {}
-            self._train_validation_rollout_ids = {}
-            self._train_validation_policy_versions = {}
+            self._train_validation_manager = object()
             self._collector_checkpoint_hook = lambda _name: None
             self._requires_collector_checkpoint_state = lambda: False
 
@@ -441,7 +456,7 @@ def test_rollout_manager_resume_uses_persisted_validation_rollout_id():
 
     assert events == [
         ("load", 7),
-        ("schedule", 5, 100, "checkpoint-0000004"),
+        ("ack", 100),
     ]
 
 
@@ -528,55 +543,6 @@ def test_rollout_manager_allows_fresh_negative_cursor_but_rejects_old_online_sta
         match="exact training position",
     ):
         manager.load(3)
-
-
-def test_rollout_manager_resume_requires_persisted_validation_mapping():
-    class DataSource:
-        def load(self, _rollout_id):
-            pass
-
-        @staticmethod
-        def training_progress():
-            return {
-                "attempted_instances": 156,
-                "last_validation_attempt": 0,
-                "last_validation_scheduled_attempt": 100,
-                "validation_rollout_ids": {},
-                "eval_instance_interval": 100,
-            }
-
-    methods = _load_rollout_manager_methods(
-        {"load", "_schedule_train_validation"},
-        policy_version_state_path=lambda: None,
-        logger=SimpleNamespace(info=lambda *_args: None),
-        ROLLOUT_COLLECTOR_STATE_METADATA_KEY=(
-            ROLLOUT_COLLECTOR_STATE_METADATA_KEY
-        ),
-    )
-
-    class Manager:
-        load = methods["load"]
-        _schedule_train_validation = methods[
-            "_schedule_train_validation"
-        ]
-
-        def __init__(self):
-            self.data_source = DataSource()
-            self._train_validation_manager = object()
-            self._train_validation_refs = {}
-            self._train_validation_rollout_ids = {}
-            self._train_validation_policy_versions = {}
-            self._collector_checkpoint_hook = lambda _name: None
-            self._requires_collector_checkpoint_state = lambda: False
-
-        def get_train_instance_progress(self):
-            return self.data_source.training_progress()
-
-    with pytest.raises(
-        RuntimeError,
-        match="outstanding asynchronous validation.*without its exact policy",
-    ):
-        Manager().load(7)
 
 
 def test_rollout_manager_eval_legacy_fast_path_does_not_touch_cursor():
@@ -1709,46 +1675,6 @@ def test_intermediate_chunk_partial_refill_is_checkpointed_or_fails_closed(
     ) in events
     assert ("model_save", 0, True) in events
     assert events[-1] == ("dispose",)
-
-
-def test_incomplete_validation_does_not_acknowledge_boundary(monkeypatch):
-    module = _load_train_async(monkeypatch)
-    acknowledgements = []
-
-    class Ref:
-        def __init__(self, value=None):
-            self.value = value
-
-    class FakeRay:
-        @staticmethod
-        def get(ref):
-            assert isinstance(ref, Ref)
-            return ref.value
-
-    class RemoteMethod:
-        def __init__(self, callback):
-            self.callback = callback
-
-        def remote(self, *args, **kwargs):
-            return Ref(self.callback(*args, **kwargs))
-
-    class Manager:
-        drain_train_validations = RemoteMethod(
-            lambda rollout_id, attempted: (_ for _ in ()).throw(
-                RuntimeError(
-                    "validation was incomplete: completed=49 attempted=50"
-                )
-            )
-        )
-
-    module.ray = FakeRay
-    with pytest.raises(RuntimeError, match="validation was incomplete"):
-        module._run_instance_validation(
-            Manager(),
-            rollout_id=7,
-            attempted_instances=100,
-        )
-    assert acknowledgements == []
 
 
 def test_budget_after_resume_persists_ack_with_existing_checkpoint(

@@ -62,3 +62,40 @@ def test_completion_length_stops_before_executing_truncated_action(monkeypatch):
     # The canonical assistant schema initializes actions to an empty list.
     # Length-truncated output must never be parsed into executable actions.
     assert assistant["extra"]["actions"] == []
+
+
+def test_route_error_is_raised_instead_of_becoming_an_empty_response(monkeypatch):
+    completion = ChatCompletion(
+        content="",
+        model_name="policy",
+        metadata={"error": "Cannot connect to host 127.0.0.1:31003"},
+    )
+    monkeypatch.setenv("MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT", "1")
+    monkeypatch.setattr(
+        route_module,
+        "tokenize_messages_with_template",
+        lambda *args, **kwargs: [1, 2],
+    )
+    monkeypatch.setattr(
+        route_module,
+        "get_stop_token_ids",
+        lambda *args, **kwargs: [99],
+    )
+    monkeypatch.setattr(
+        route_module,
+        "run_generate_with_route_async",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(route_module, "run_async", lambda _: completion)
+
+    model = RouteTextbasedModel(
+        model_name="Qwen/Qwen3.6-27B",
+        model_kwargs={
+            "api_base": "http://127.0.0.1:31003/v1",
+            "api_key": "EMPTY",
+            "max_tokens": 20480,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="token-in/out generation failed"):
+        model.query([{"role": "user", "content": "fix it"}])

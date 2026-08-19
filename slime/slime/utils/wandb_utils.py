@@ -160,10 +160,6 @@ _WANDB_DYNAMIC_ENV_CONFIG = {
         "lanes_completion_max_tokens",
         int,
     ),
-    "SWE_AGENT_LANES_RUBRIC_MAX_TOKENS": (
-        "lanes_rubric_max_tokens",
-        int,
-    ),
     "SWE_AGENT_LANES_JUDGE_MAX_TOKENS": (
         "lanes_judge_max_tokens",
         int,

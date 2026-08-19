@@ -12,7 +12,6 @@ from typing import Any, Sequence
 from agent_rl import clear_model_services, register_model_service
 from agent_rl.run_utils import ModelRouteConfig, clear_model_routes, configure_model_route
 from swe_agent.backend import SWEAgentRolloutBackend
-from swe_agent.run.benchmarks.rebench_eval import is_rebench_instance, rebench_workdir
 from swe_agent.run.benchmarks.swebench import (
     build_swebench_config,
     get_swebench_docker_image_name,
@@ -50,7 +49,6 @@ from swe_agent.run.run_swe_agent import SWE_AGENT_TEXTBASED_CONFIG
 from swe_agent.rubric_bank import ExperienceRubricBank
 from swe_agent.trajectory_search import SearchConfig, TrajectorySearchRunner
 from swe_agent.serving import SGLangChatService
-from swe_agent.parallel_utils import _atomic_write_json
 
 
 DEFAULT_FROZEN_EXPERIENCE_BANK = (
@@ -65,25 +63,6 @@ DEFAULT_SEARCH_LOG_ROOT = Path(
         Path(__file__).resolve().parents[4] / "tmp" / "trajectory_search" / "logs",
     )
 )
-
-
-def _flush_experience_bank_summaries(
-    *,
-    run_root: Path,
-    experience_banks: dict[str, ExperienceRubricBank] | None,
-    initial_snapshots: dict[str, list[dict[str, Any]]],
-    write_artifacts: bool,
-) -> None:
-    if not write_artifacts or not experience_banks:
-        return
-    for scope, bank in experience_banks.items():
-        _atomic_write_json(
-            run_root / f"{scope}_rubric_bank.json",
-            {
-                "before": copy.deepcopy(initial_snapshots.get(scope, [])),
-                "after": copy.deepcopy(bank.to_list()),
-            },
-        )
 
 
 def _run_single_instance(
@@ -110,10 +89,7 @@ def _run_single_instance(
         environment_config["image"] = get_swebench_docker_image_name(instance)
     elif environment_config.get("environment_class") == "singularity":
         environment_config["image"] = get_swebench_singularity_image_name(instance)
-    if is_rebench_instance(instance):
-        environment_config["cwd"] = rebench_workdir(instance)
-        environment_config.setdefault("dataset_name", "rebench")
-    elif instance.get("expected_output_json"):
+    if instance.get("expected_output_json"):
         environment_config["cwd"] = "/testbed"
         environment_config.setdefault("dataset_name", "r2egym")
     else:
@@ -186,7 +162,7 @@ def run_search(
     slime_api_base = os.environ.get("SEARCH_SWE_SLIME_API_BASE", SLIME_API_BASE)
     slime_api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", SLIME_API_KEY)
     if args.backend == "vllm":
-        from dr_agent.utils import launch_vllm_server_handle
+        from agent_rl.vllm_server import launch_vllm_server_handle
 
         gpu_ids = choose_gpus(args.gpu_id)
         gpu_id = gpu_ids[0] if gpu_ids else None
@@ -265,7 +241,8 @@ def run_search(
     # Optional: route the judge to a separate sglang server (e.g. DeepSeek-V4-Pro on a different node).
     # Probes the endpoint at startup so we fail loudly if the Qwen node can't reach the judge node.
     if args.judge_base_url:
-        import urllib.request, urllib.error, json as _json
+        import urllib.error
+        import urllib.request
         judge_service_name = "judge_remote"
         judge_model = args.judge_model or args.judge_served_model
         if judge_model is None:
@@ -343,7 +320,6 @@ def run_search(
             write_artifacts=args.write_artifacts,
             strategy=args.strategy,
             rubric_bank_strategy=args.rubric_bank_strategy,
-            update_experience_bank=args.update_experience_bank,
             score_tie_break=args.score_tie_break,
             stop_on_first_round_no_variance=args.stop_on_first_round_no_variance,
         )
@@ -357,8 +333,6 @@ def run_search(
                 raise FileNotFoundError(
                     f"Frozen experience checkpoint not found: {args.experience_bank}"
                 )
-            if search_config.update_experience_bank:
-                raise ValueError("A frozen experience checkpoint cannot be updated in place")
             experience_banks = {
                 "siblings": ExperienceRubricBank(
                     bank_path=args.experience_bank,
@@ -369,16 +343,6 @@ def run_search(
                     scope="pc",
                 ),
             }
-        experience_bank_initial_snapshots = {
-            scope: copy.deepcopy(bank.to_list())
-            for scope, bank in (experience_banks or {}).items()
-        }
-        _flush_experience_bank_summaries(
-            run_root=run_root,
-            experience_banks=experience_banks,
-            initial_snapshots=experience_bank_initial_snapshots,
-            write_artifacts=search_config.write_artifacts,
-        )
         with temporary_env({"MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": str(args.model_retry_attempts), "LITELLM_LOG": "ERROR"}):
             with tee_console(run_log_path):
                 for instance in instances:
@@ -398,12 +362,6 @@ def run_search(
                             search_config=search_config,
                             experience_banks=experience_banks,
                             resume=bool(args.resume_run_dir),
-                        )
-                        _flush_experience_bank_summaries(
-                            run_root=run_root,
-                            experience_banks=experience_banks,
-                            initial_snapshots=experience_bank_initial_snapshots,
-                            write_artifacts=search_config.write_artifacts,
                         )
                     except Exception as exc:
                         errors.append(f"{instance['instance_id']}: {exc}")
@@ -471,9 +429,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--experience-bank",
         type=Path,
         default=DEFAULT_FROZEN_EXPERIENCE_BANK,
-        help="Frozen scoped experience checkpoint directory.",
+        help=(
+            "Frozen scoped experience checkpoint directory. Experiences labeled "
+            "with the current instance are excluded during retrieval."
+        ),
     )
-    parser.add_argument("--update-experience-bank", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--score-tie-break",
         action=argparse.BooleanOptionalAction,

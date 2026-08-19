@@ -45,22 +45,10 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
-def committed_policy_version(**kwargs) -> str | None:
-    from swe_agent.policy_version import committed_policy_version as impl
-
-    return impl(**kwargs)
-
-
-def policy_version_state_path():
-    from swe_agent.policy_version import policy_version_state_path as impl
+def observed_policy_version() -> str | None:
+    from swe_agent.policy_version import observed_policy_version as impl
 
     return impl()
-
-
-def policy_version_for_checkpoint(checkpoint_id: int) -> str:
-    from swe_agent.policy_version import policy_version_for_checkpoint as impl
-
-    return impl(checkpoint_id)
 
 _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
@@ -444,40 +432,6 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
 
-def _require_complete_train_validation_metrics(
-    metrics: Any,
-    *,
-    attempted_instances: int,
-) -> dict[str, Any]:
-    if not isinstance(metrics, dict):
-        raise RuntimeError(
-            "attempt-scheduled validation did not return completion metrics"
-        )
-    required = ("eval/attempted", "eval/completed", "eval/incomplete")
-    missing = [key for key in required if key not in metrics]
-    if missing:
-        raise RuntimeError(
-            "attempt-scheduled validation is missing fail-closed metrics "
-            f"{missing}"
-        )
-    attempted = int(metrics["eval/attempted"])
-    completed = int(metrics["eval/completed"])
-    incomplete = int(metrics["eval/incomplete"])
-    if attempted < 0 or completed < 0 or completed > attempted:
-        raise RuntimeError(
-            "attempt-scheduled validation returned invalid counts: "
-            f"source_attempt={attempted_instances} attempted={attempted} "
-            f"completed={completed} incomplete={incomplete}"
-        )
-    if incomplete != int(completed != attempted):
-        raise RuntimeError(
-            "attempt-scheduled validation returned an inconsistent "
-            f"incomplete flag: attempted={attempted} completed={completed} "
-            f"incomplete={incomplete}"
-        )
-    return metrics
-
-
 @ray.remote
 class AsyncValidationManager:
     """Run terminal validation independently of the training collector.
@@ -503,123 +457,67 @@ class AsyncValidationManager:
         attempted_instances: int,
         policy_version: str,
     ):
-        from swe_agent.exceptions import PolicyVersionMismatch
-        from swe_agent.policy_version import wait_for_policy_version
-
         attempted_instances = int(attempted_instances)
         self.args.eval_instance_attempt = attempted_instances
         self.args.eval_policy_version = str(policy_version)
-        self.args.eval_policy_stale_before_dispatch = False
         try:
-            wait_for_policy_version(
-                str(policy_version),
-                allow_future=True,
+            result = call_rollout_fn(
+                self.eval_generate_rollout,
+                self.args,
+                rollout_id,
+                None,
+                evaluation=True,
             )
-        except PolicyVersionMismatch as exc:
-            # The validation actor may have been queued behind an earlier
-            # checkpoint.  Dispatch fail-closed tasks anyway so the collector
-            # records a zero/partial denominator instead of killing training.
+        except Exception as exc:
+            # Validation is diagnostic and must never block or replay the
+            # training stream. Report one failed attempt and let the caller
+            # acknowledge the source cursor.
             logger.warning(
-                "validation policy %s was stale before dispatch: %s",
-                policy_version,
+                "validation at source attempt %d failed without retry: %s",
+                attempted_instances,
                 exc,
             )
-            self.args.eval_policy_stale_before_dispatch = True
-        max_attempts = max(
-            1,
-            int(os.environ.get("RLER_VALIDATION_MAX_ATTEMPTS", "5")),
-        )
-        errors: list[str] = []
-        for validation_try in range(1, max_attempts + 1):
-            try:
-                result = call_rollout_fn(
-                    self.eval_generate_rollout,
-                    self.args,
-                    rollout_id,
-                    None,
-                    evaluation=True,
-                )
-                metrics = dict(result.metrics or {})
-                metrics["eval/train_instance_attempt"] = (
-                    attempted_instances
-                )
-                _require_complete_train_validation_metrics(
-                    metrics,
-                    attempted_instances=attempted_instances,
-                )
-            except Exception as exc:
-                errors.append(f"{type(exc).__name__}: {exc}")
-                logger.warning(
-                    "validation at source attempt %d failed try %d/%d: %s",
-                    attempted_instances,
-                    validation_try,
-                    max_attempts,
-                    errors[-1],
-                )
-                continue
+            return {
+                "eval/train_instance_attempt": attempted_instances,
+                "eval/driver_error": f"{type(exc).__name__}: {exc}",
+                "eval/incomplete": 1,
+            }
 
-            stale_aborted = int(
-                metrics.get("eval/stale_policy_aborted", 0) or 0
-            )
-            incomplete = int(metrics.get("eval/incomplete", 0) or 0)
-            if (
-                incomplete
-                and not stale_aborted
-                and validation_try < max_attempts
-            ):
-                logger.warning(
-                    "validation at source attempt %d is incomplete "
-                    "(completed=%s attempted=%s); retrying missing "
-                    "instances under policy %s",
-                    attempted_instances,
-                    metrics.get("eval/completed"),
-                    metrics.get("eval/attempted"),
-                    policy_version,
-                )
-                continue
-            metrics["eval/retries_exhausted"] = int(
-                incomplete and not stale_aborted
-            )
-
-            data = result.data
-            if (
-                path_template := getattr(
-                    self.args,
-                    "save_debug_rollout_data",
-                    None,
-                )
-            ) is not None:
-                path = Path(
-                    path_template.format(rollout_id=f"eval_{rollout_id}")
-                )
-                path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    {
-                        "rollout_id": rollout_id,
-                        "samples": [
-                            sample.to_dict()
-                            for info in data.values()
-                            for sample in info["samples"]
-                        ],
-                    },
-                    path,
-                )
-            logged_metrics = _log_eval_rollout_data(
-                rollout_id,
+        metrics = dict(result.metrics or {})
+        metrics["eval/train_instance_attempt"] = attempted_instances
+        data = result.data
+        if (
+            path_template := getattr(
                 self.args,
-                data,
-                metrics,
+                "save_debug_rollout_data",
+                None,
             )
-            return (
-                logged_metrics
-                if isinstance(logged_metrics, dict)
-                else metrics
+        ) is not None:
+            path = Path(
+                path_template.format(rollout_id=f"eval_{rollout_id}")
             )
-
-        raise RuntimeError(
-            "validation remained incomplete after "
-            f"{max_attempts} attempts at source cursor "
-            f"{attempted_instances}: {errors[-1] if errors else 'unknown'}"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "rollout_id": rollout_id,
+                    "samples": [
+                        sample.to_dict()
+                        for info in data.values()
+                        for sample in info["samples"]
+                    ],
+                },
+                path,
+            )
+        logged_metrics = _log_eval_rollout_data(
+            rollout_id,
+            self.args,
+            data,
+            metrics,
+        )
+        return (
+            logged_metrics
+            if isinstance(logged_metrics, dict)
+            else metrics
         )
 
     def dispose(self):
@@ -682,8 +580,6 @@ class RolloutManager:
         ).remote()
         self._train_validation_manager = None
         self._train_validation_refs: dict[int, Any] = {}
-        self._train_validation_rollout_ids: dict[int, int] = {}
-        self._train_validation_policy_versions: dict[int, str] = {}
         if getattr(self.args, "eval_instance_interval", None) is not None:
             self._train_validation_manager = (
                 AsyncValidationManager.options(
@@ -737,8 +633,19 @@ class RolloutManager:
         for monitor in self._health_monitors:
             monitor.stop()
         if self._train_validation_manager is not None:
-            ray.get(self._train_validation_manager.dispose.remote())
-            ray.kill(self._train_validation_manager, no_restart=True)
+            try:
+                ray.get(self._train_validation_manager.dispose.remote())
+            except Exception as exc:
+                logger.warning(
+                    "validation actor cleanup failed after diagnostics were "
+                    "acknowledged: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            try:
+                ray.kill(self._train_validation_manager, no_restart=True)
+            except Exception:
+                pass
             self._train_validation_manager = None
         logging_utils.finish_tracking(self.args)
 
@@ -813,32 +720,30 @@ class RolloutManager:
                 "as scheduled"
             )
         if policy_version is None:
-            policy_version = committed_policy_version(
-                allow_target_during_update=True
-            )
+            policy_version = observed_policy_version()
         if policy_version is None:
             raise RuntimeError(
                 "source-attempt validation requires policy-version coordination"
             )
         policy_version = str(policy_version)
-        mark_scheduled(
-            attempted_instances,
-            int(rollout_id),
-            policy_version,
-        )
-        self._train_validation_refs[attempted_instances] = (
-            self._train_validation_manager.eval.remote(
+        mark_scheduled(attempted_instances)
+        try:
+            ref = self._train_validation_manager.eval.remote(
                 int(rollout_id),
                 attempted_instances,
                 policy_version,
             )
-        )
-        self._train_validation_rollout_ids[attempted_instances] = int(
-            rollout_id
-        )
-        self._train_validation_policy_versions[attempted_instances] = (
-            policy_version
-        )
+        except Exception as exc:
+            self.data_source.acknowledge_validation(attempted_instances)
+            logger.warning(
+                "validation dispatch failed without retry at source "
+                "attempt %d: %s: %s",
+                attempted_instances,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        self._train_validation_refs[attempted_instances] = ref
         logger.info(
             "scheduled validation at source attempt %d for policy %s "
             "without pausing training rollout %d",
@@ -847,48 +752,13 @@ class RolloutManager:
             rollout_id,
         )
 
-    def _validation_policy_version_for_generation(
-        self,
-        rollout_id: int,
-    ) -> str | None:
-        """Pin interval validation to the next policy used by this rollout.
-
-        Rollout N is generated while update N-1 trains.  When that update is
-        a weight-sync boundary, the validation actor waits for checkpoint
-        N-1 before dispatching.  This gives validation the same full overlap
-        window as rollout N without delaying either path.
-        """
-        if policy_version_state_path() is None:
-            return None
-        rollout_id = int(rollout_id)
-        update_interval = max(
-            1,
-            int(getattr(self.args, "update_weights_interval", 1)),
-        )
-        if rollout_id > 0 and rollout_id % update_interval == 0:
-            return policy_version_for_checkpoint(rollout_id - 1)
-        return committed_policy_version(allow_target_during_update=True)
-
     def _complete_train_validation(
         self,
         attempted_instances: int,
-        metrics: Any,
     ) -> None:
         attempted_instances = int(attempted_instances)
-        _require_complete_train_validation_metrics(
-            metrics,
-            attempted_instances=attempted_instances,
-        )
         self.data_source.acknowledge_validation(attempted_instances)
         self._train_validation_refs.pop(attempted_instances, None)
-        self._train_validation_rollout_ids.pop(
-            attempted_instances,
-            None,
-        )
-        self._train_validation_policy_versions.pop(
-            attempted_instances,
-            None,
-        )
         logger.info(
             "completed validation at source attempt %d",
             attempted_instances,
@@ -897,15 +767,33 @@ class RolloutManager:
     def _poll_train_validations(self) -> None:
         for attempted_instances in sorted(self._train_validation_refs):
             ref = self._train_validation_refs[attempted_instances]
-            ready, _ = ray.wait([ref], num_returns=1, timeout=0)
+            try:
+                ready, _ = ray.wait([ref], num_returns=1, timeout=0)
+            except Exception as exc:
+                logger.warning(
+                    "validation readiness check failed without retry at "
+                    "source attempt %d: %s: %s",
+                    attempted_instances,
+                    type(exc).__name__,
+                    exc,
+                )
+                self._complete_train_validation(attempted_instances)
+                continue
             if not ready:
                 # The validation actor is single-threaded, so later refs
                 # cannot complete before the earliest outstanding one.
                 break
-            self._complete_train_validation(
-                attempted_instances,
-                ray.get(ref),
-            )
+            try:
+                ray.get(ref)
+            except Exception as exc:
+                logger.warning(
+                    "validation actor failed without retry at source "
+                    "attempt %d: %s: %s",
+                    attempted_instances,
+                    type(exc).__name__,
+                    exc,
+                )
+            self._complete_train_validation(attempted_instances)
 
     def drain_train_validations(
         self,
@@ -932,10 +820,17 @@ class RolloutManager:
             for attempt in self._train_validation_refs
             if attempt <= attempted_instances
         ):
-            self._complete_train_validation(
-                pending_attempt,
-                ray.get(self._train_validation_refs[pending_attempt]),
-            )
+            try:
+                ray.get(self._train_validation_refs[pending_attempt])
+            except Exception as exc:
+                logger.warning(
+                    "validation actor failed without retry while draining "
+                    "source attempt %d: %s: %s",
+                    pending_attempt,
+                    type(exc).__name__,
+                    exc,
+                )
+            self._complete_train_validation(pending_attempt)
         progress = self.get_train_instance_progress()
         if int(progress.get("last_validation_attempt", 0)) < attempted_instances:
             raise RuntimeError(
@@ -978,11 +873,7 @@ class RolloutManager:
                 self._schedule_train_validation(
                     attempted_instances=boundary,
                     rollout_id=int(rollout_id),
-                    policy_version=(
-                        self._validation_policy_version_for_generation(
-                            int(rollout_id)
-                        )
-                    ),
+                    policy_version=observed_policy_version(),
                 )
                 stop_after = getattr(
                     self.args,
@@ -991,8 +882,8 @@ class RolloutManager:
                 )
                 if stop_after is None or int(stop_after) != boundary:
                     # Scheduling, rather than completion, unlocks source
-                    # attempt N+1. Retry this same optimizer batch while
-                    # validation runs in its dedicated actor.
+                    # attempt N+1. Validation follows the same stale=1
+                    # overlap semantics as training rollout.
                     continue
                 progress = self.get_train_instance_progress()
                 logger.info(
@@ -1248,52 +1139,17 @@ class RolloutManager:
                 completed,
             )
         )
-        interval = progress.get("eval_instance_interval")
-        outstanding: list[int] = []
-        if interval is not None:
-            interval = int(interval)
-            next_interval = ((completed // interval) + 1) * interval
-            outstanding.extend(
-                range(next_interval, scheduled + 1, interval)
-            )
-        if scheduled > completed and scheduled not in outstanding:
-            outstanding.append(scheduled)
-        validation_rollout_ids = {
-            int(attempt): int(validation_rollout_id)
-            for attempt, validation_rollout_id in dict(
-                progress.get("validation_rollout_ids") or {}
-            ).items()
-        }
-        validation_policy_versions = {
-            int(attempt): str(policy_version)
-            for attempt, policy_version in dict(
-                progress.get("validation_policy_versions") or {}
-            ).items()
-        }
-        for attempted_instances in sorted(set(outstanding)):
-            if attempted_instances not in validation_rollout_ids:
-                raise RuntimeError(
-                    "checkpoint has an outstanding asynchronous validation "
-                    "without its exact policy rollout ID: "
-                    f"attempt={attempted_instances} checkpoint={rollout_id}"
-                )
-            if (
-                policy_version_state_path() is not None
-                and attempted_instances not in validation_policy_versions
-            ):
-                raise RuntimeError(
-                    "checkpoint has an outstanding asynchronous validation "
-                    "without its exact policy version: "
-                    f"attempt={attempted_instances} checkpoint={rollout_id}"
-                )
-            self._schedule_train_validation(
-                attempted_instances=attempted_instances,
-                rollout_id=validation_rollout_ids[
-                    attempted_instances
-                ],
-                policy_version=validation_policy_versions.get(
-                    attempted_instances
-                ),
+        if scheduled > completed:
+            # A process restart destroys the diagnostic actor. Do not replay
+            # old validation under a newer policy; report the skipped cursor
+            # and let the next source boundary schedule one fresh pass.
+            self.data_source.acknowledge_validation(scheduled)
+            logger.warning(
+                "not replaying interrupted validation after resume: "
+                "completed=%d scheduled=%d checkpoint=%s",
+                completed,
+                scheduled,
+                rollout_id,
             )
 
     def offload(self):

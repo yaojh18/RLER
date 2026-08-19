@@ -15,7 +15,6 @@ from swe_agent.parallel_utils import PatchEvalManager
 from swe_agent.parallel_utils import RubricArtifactBundle
 from swe_agent.parallel_utils import _write_base_artifacts
 from swe_agent.parallel_utils import progress_reward
-from swe_agent.prompt import PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT
 from swe_agent.rubric_bank import ExperienceRubricBank
 from swe_agent.rubric_bank import RubricRecord
 from swe_agent.rubric_bank import ScoreRubricBank
@@ -39,7 +38,6 @@ def test_rubric_converter_accepts_unambiguous_field_aliases_and_scale_list():
     assert rubric is not None
     assert rubric.weight == 1.5
     assert rubric.scale["5"] == "complete"
-from swe_agent.run.search_swe_agent import _flush_experience_bank_summaries
 from swe_agent.run.search_swe_agent import build_arg_parser
 from swe_agent.trajectory_search import (
     SearchConfig,
@@ -484,6 +482,16 @@ def test_finalize_outputs_reuses_selected_node_terminal_artifacts(tmp_path):
         ),
         encoding="utf-8",
     )
+    (node_dir / "async_terminal.json").write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "round_index": 5,
+                "selected_node_id": node_id,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
     runner.run_dir = tmp_path
@@ -491,10 +499,11 @@ def test_finalize_outputs_reuses_selected_node_terminal_artifacts(tmp_path):
     runner.task_id = task_id
     runner.policy_model_name = "policy-model"
     runner.search_config = SearchConfig(
-        calculate_gt_reward=True,
+        calculate_gt_reward=False,
         evaluate_final_patch=False,
         write_artifacts=True,
     )
+    runner._async_terminal_enabled = True
     runner.nodes = {
         node_id: SearchNode(
             node_id=node_id,
@@ -532,6 +541,53 @@ def test_finalize_outputs_reuses_selected_node_terminal_artifacts(tmp_path):
     assert model_patch[task_id]["model_name_or_path"] == "terminal-model"
     assert model_patch[task_id]["model_patch"] == terminal_patch
     assert runner.nodes[node_id].submission == terminal_patch
+
+
+def test_async_terminal_evaluation_persists_reward_and_disposes_session(
+    tmp_path,
+    monkeypatch,
+):
+    node_id = "node-r001-s00-selected"
+    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
+    runner.nodes_dir = tmp_path / "nodes"
+    runner.run_dir = tmp_path
+    runner.task_id = "repo__pkg-1"
+    runner.instance = {"instance_id": runner.task_id}
+    runner.harness_namespace = "test"
+    disposed = []
+    runner._dispose_session = disposed.append
+    runner._complete_terminal_branch = lambda _branch: (
+        {"messages": [{"role": "assistant", "message": "done"}]},
+        "diff --git a/pkg.py b/pkg.py\n",
+        None,
+    )
+    monkeypatch.setattr(
+        trajectory_search,
+        "evaluate_swebench_instance_patches",
+        lambda **_kwargs: {
+            node_id: {"status": "resolved", "reward": 2.0}
+        },
+    )
+    session = object()
+
+    runner._run_async_terminal_evaluation(
+        branch={
+            "node_id": node_id,
+            "policy_model_name": "policy-model",
+            "score": 0.75,
+            "session": session,
+        },
+        round_index=1,
+        tied_node_ids=[node_id],
+    )
+
+    node_dir = runner.nodes_dir / node_id
+    status = json.loads((node_dir / "async_terminal.json").read_text())
+    evaluation = json.loads((node_dir / "terminal_evalution.json").read_text())
+    assert status["status"] == "completed"
+    assert status["reward"] == 2.0
+    assert evaluation["reward"] == 2.0
+    assert disposed == [session]
 
 
 def test_checkpoint_environment_copies_singularity_sandbox(tmp_path, monkeypatch):
@@ -836,7 +892,10 @@ def test_patch_eval_manager_writes_error_payload_when_evaluation_raises(tmp_path
         messages_payload=[{"role": "assistant", "content": "{}"}],
     )
 
+    seen_workers = []
+
     def raising_eval(**kwargs):
+        seen_workers.append(kwargs["max_workers"])
         raise RuntimeError("harness crashed")
 
     manager = PatchEvalManager(
@@ -847,6 +906,7 @@ def test_patch_eval_manager_writes_error_payload_when_evaluation_raises(tmp_path
         work_dir=tmp_path,
         evaluate_patches_fn=raising_eval,
         write_artifacts=True,
+        patch_workers=3,
     )
     try:
         manager.submit_round([bundle], [rubric_bundle])
@@ -863,6 +923,7 @@ def test_patch_eval_manager_writes_error_payload_when_evaluation_raises(tmp_path
     assert judge["ground_truth_reward"] == 0.0
     assert rubric["gt_by_rubric"]["rubric-1"]["ground_truth_by_node"] == {"node-a": 0.0}
     assert result["rubric_update_payloads"][0]["scope"] == "siblings"
+    assert seen_workers == [3]
 
 
 def test_rubric_base_artifacts_use_dedicated_message_files(tmp_path):
@@ -1023,126 +1084,6 @@ def test_rubric_scope_only_judges_model_selected_rubrics(monkeypatch):
     assert sample["active_after"][0].rubric_id == "generated-rubric"
 
 
-def test_experience_bank_evidence_uses_average_judged_scores_and_does_not_write(tmp_path):
-    bank_path = tmp_path / "siblings_rubric_bank.json"
-    bank = ExperienceRubricBank(bank_path=bank_path, scope="siblings")
-    assert (
-        ExperienceRubricBank(scope="pc").update_prompt
-        == PC_RUBRIC_EXPERIENCE_UPDATE_PROMPT
-    )
-    payload = {
-        "messages": [{"role": "user", "content": "prompt"}],
-        "average_rubric_judged_scores": {"node-a": 0.2, "node-b": 0.8},
-        "generated": [
-            {
-                "rubric_id": "rubric-1",
-                "direction": "positive",
-                "weight": 1.0,
-                "title": "Semantic Fix",
-                "description": "Rewards a real fix.",
-                "metadata": {},
-                "scale": {str(i): str(i) for i in range(1, 6)},
-            }
-        ],
-        "score_by_rubric": {"rubric-1": {"node-a": 0.0, "node-b": 1.0}},
-        "gt_by_rubric": {
-            "rubric-1": {
-                "ground_truth_by_node": {"node-a": 0.0, "node-b": 1.0},
-            }
-        },
-    }
-
-    evidence = bank._build_instance_evidence(
-        instance={"instance_id": "demo", "patch": "diff --git a/a b/a\n"},
-        rubric_payloads=[payload],
-    )
-
-    assert evidence["rubric_attempts"][0]["average_rubric_judged_scores"] == [0.2, 0.8]
-    assert "avg_scores" not in evidence["rubric_attempts"][0]
-
-    result = asyncio.run(
-        bank.update_after_instance(
-            instance={"instance_id": "demo", "patch": ""},
-            rubric_payloads=[],
-            model_name="dummy",
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=16,
-        )
-    )
-
-    assert "before" in result and "after" in result
-    assert not bank_path.exists()
-
-
-def test_trajectory_search_experience_updates_are_written_by_runner(tmp_path):
-    class FakeBank:
-        def __init__(self, scope):
-            self.scope = scope
-            self.seen_payloads = None
-
-        async def update_after_instance(self, **kwargs):
-            self.seen_payloads = kwargs["rubric_payloads"]
-            round_index = kwargs["rubric_payloads"][0]["round_index"]
-            return {
-                "before": [{"title": f"{self.scope}-before"}],
-                "after": [{"title": f"{self.scope}-after"}],
-                "groups": [
-                    {
-                        "round_index": round_index,
-                        "before": [{"title": f"{self.scope}-before"}],
-                        "actions": [{"action": "add"}],
-                        "after": [{"title": f"{self.scope}-after"}],
-                        "messages": [{"role": "user", "content": f"{self.scope}-update"}],
-                    }
-                ],
-            }
-
-    runner = TrajectorySearchRunner.__new__(TrajectorySearchRunner)
-    runner.run_dir = tmp_path
-    runner.rubrics_dir = tmp_path / "rubrics"
-    runner.rubric_scopes = ("siblings", "pc")
-    runner.experience_banks = {"siblings": FakeBank("siblings"), "pc": FakeBank("pc")}
-    runner.instance = {"instance_id": "demo", "patch": ""}
-    runner.rubric_model_name = "dummy"
-    runner.rubric_model_kwargs = {}
-    runner.search_config = SearchConfig(write_artifacts=True)
-
-    runner._update_experience_banks(
-        [
-            {
-                "scope": "siblings",
-                "round_index": 1,
-                "rubric_payload": {"rubric_list_id": "rubric-r001-s00"},
-                "messages": [{"role": "user", "content": "siblings"}],
-            },
-            {
-                "scope": "pc",
-                "round_index": 2,
-                "rubric_payload": {"rubric_list_id": "pc-rubric-r002-s00"},
-                "messages": [{"role": "user", "content": "pc"}],
-            },
-        ]
-    )
-
-    assert (tmp_path / "siblings_rubric_bank.json").exists()
-    assert (tmp_path / "pc_rubric_bank.json").exists()
-    assert not (tmp_path / "rubric_bank.json").exists()
-    assert json.loads((tmp_path / "siblings_rubric_bank.json").read_text())["after"] == [
-        {"title": "siblings-after"}
-    ]
-    sibling_bank = tmp_path / "rubrics" / "siblings" / "rubric-r001-s00" / "rubric_bank.json"
-    sibling_message = tmp_path / "rubrics" / "siblings" / "rubric-r001-s00" / "rubric_bank_message.json"
-    pc_bank = tmp_path / "rubrics" / "pc" / "pc-rubric-r002-s00" / "rubric_bank.json"
-    assert sibling_bank.exists()
-    assert sibling_message.exists()
-    assert pc_bank.exists()
-    assert not (tmp_path / "rubrics" / "siblings" / "round_001" / "rubric_bank.json").exists()
-    assert sorted(json.loads(sibling_bank.read_text())) == ["actions", "after", "before"]
-    assert "messages" not in runner.experience_banks["siblings"].seen_payloads[0]
-    assert runner.experience_banks["siblings"].seen_payloads[0]["generation_context"] == {}
-
-
 def test_prompt_context_uses_compact_markdown():
     rendered = render_compact_markdown(
         {
@@ -1168,9 +1109,11 @@ def test_search_defaults_to_search_outputs_and_tmp_logs():
     assert args.judge_temperature == 0.01
     assert args.score_tie_break is True
     assert args.stop_on_first_round_no_variance is False
+    assert not hasattr(ExperienceRubricBank, "update_after_instance")
     assert SearchConfig().judge_temperature == 0.01
     assert SearchConfig().score_tie_break is True
     assert SearchConfig().stop_on_first_round_no_variance is False
+    assert not hasattr(args, "update_experience_bank")
     assert parser.parse_args(
         ["--stop-on-first-round-no-variance"]
     ).stop_on_first_round_no_variance is True
@@ -1541,40 +1484,3 @@ def test_rubric_artifact_payload_excludes_all_message_fields():
     payload = runner._rubric_artifact_payload(sample, "root")
 
     assert not any("message" in key for key in payload)
-
-
-def test_search_runner_flushes_final_root_experience_bank_summary(tmp_path):
-    class FakeRootBank:
-        def __init__(self, values):
-            self.values = values
-
-        def to_list(self):
-            return list(self.values)
-
-    banks = {
-        "siblings": FakeRootBank([{"title": "siblings-initial"}]),
-        "pc": FakeRootBank([{"title": "pc-initial"}]),
-    }
-    initial = {scope: bank.to_list() for scope, bank in banks.items()}
-
-    banks["siblings"].values.append({"title": "siblings-final"})
-    banks["pc"].values.append({"title": "pc-final"})
-
-    _flush_experience_bank_summaries(
-        run_root=tmp_path,
-        experience_banks=banks,
-        initial_snapshots=initial,
-        write_artifacts=True,
-    )
-
-    siblings = json.loads((tmp_path / "siblings_rubric_bank.json").read_text())
-    pc = json.loads((tmp_path / "pc_rubric_bank.json").read_text())
-
-    assert siblings == {
-        "before": [{"title": "siblings-initial"}],
-        "after": [{"title": "siblings-initial"}, {"title": "siblings-final"}],
-    }
-    assert pc == {
-        "before": [{"title": "pc-initial"}],
-        "after": [{"title": "pc-initial"}, {"title": "pc-final"}],
-    }

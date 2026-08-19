@@ -18,7 +18,11 @@ COLLECTOR_CHECKPOINT_SCHEMA_VERSION = 1
 
 _RUNTIME_TASK_KEYS = {
     "_endpoints_picked",
+    "_branch_done_dir",
+    "_released_branch_indices",
     "_pinned_endpoints",
+    "_policy_done_marker",
+    "_policy_slot_released",
     "api_key",
     "policy_api_key",
     "rubric_api_key",
@@ -27,6 +31,7 @@ _RUNTIME_TASK_KEYS = {
     "rubric_base_url",
     "usage_ledger",
 }
+
 
 def checkpoint_task_source_group_index(task: dict[str, Any]) -> int:
     """Return the explicitly checkpointed source-attempt cursor."""
@@ -126,49 +131,42 @@ def serialize_pending_tasks(
     return rows
 
 
-def serialize_budget_error(error: Any) -> dict[str, int] | None:
+def _serialize_attempt_error(
+    error: Any,
+    limit_field: str,
+) -> dict[str, int] | None:
     if error is None:
         return None
     attempted = getattr(error, "attempted_instances", None)
-    budget = getattr(error, "budget", None)
+    limit = getattr(error, limit_field, None)
     return {
-        "attempted_instances": (
-            -1 if attempted is None else int(attempted)
-        ),
-        "budget": -1 if budget is None else int(budget),
+        "attempted_instances": -1 if attempted is None else int(attempted),
+        limit_field: -1 if limit is None else int(limit),
     }
+
+
+def _deserialize_attempt_error(payload, error_class, limit_field: str):
+    if not payload:
+        return None
+    attempted = int(payload.get("attempted_instances", -1))
+    limit = int(payload.get(limit_field, -1))
+    return error_class(
+        attempted_instances=None if attempted < 0 else attempted,
+        **{limit_field: None if limit < 0 else limit},
+    )
+
+
+def serialize_budget_error(error: Any) -> dict[str, int] | None:
+    return _serialize_attempt_error(error, "budget")
 
 
 def deserialize_budget_error(payload, error_class):
-    if not payload:
-        return None
-    attempted = int(payload.get("attempted_instances", -1))
-    budget = int(payload.get("budget", -1))
-    return error_class(
-        attempted_instances=None if attempted < 0 else attempted,
-        budget=None if budget < 0 else budget,
-    )
+    return _deserialize_attempt_error(payload, error_class, "budget")
 
 
 def serialize_validation_error(error: Any) -> dict[str, int] | None:
-    if error is None:
-        return None
-    attempted = getattr(error, "attempted_instances", None)
-    boundary = getattr(error, "boundary", None)
-    return {
-        "attempted_instances": (
-            -1 if attempted is None else int(attempted)
-        ),
-        "boundary": -1 if boundary is None else int(boundary),
-    }
+    return _serialize_attempt_error(error, "boundary")
 
 
 def deserialize_validation_error(payload, error_class):
-    if not payload:
-        return None
-    attempted = int(payload.get("attempted_instances", -1))
-    boundary = int(payload.get("boundary", -1))
-    return error_class(
-        attempted_instances=None if attempted < 0 else attempted,
-        boundary=None if boundary < 0 else boundary,
-    )
+    return _deserialize_attempt_error(payload, error_class, "boundary")

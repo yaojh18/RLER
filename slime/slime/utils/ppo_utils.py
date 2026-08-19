@@ -148,6 +148,55 @@ def compute_policy_loss(
     return pg_losses, clipfrac
 
 
+def compute_binary_divergence(
+    behavior_log_probs: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    divergence_type: str,
+) -> torch.Tensor:
+    """Compute the sampled-token Bernoulli divergence used by DPPO."""
+    eps = 1e-9
+    behavior_probs = torch.exp(behavior_log_probs.clamp(min=-30.0, max=0.0))
+    policy_probs = torch.exp(policy_log_probs.clamp(min=-30.0, max=0.0))
+
+    if divergence_type == "tv":
+        divergence = (behavior_probs - policy_probs).abs()
+    elif divergence_type == "kl":
+        behavior_probs = behavior_probs.clamp(eps, 1.0 - eps)
+        policy_probs = policy_probs.clamp(eps, 1.0 - eps)
+        divergence = behavior_probs * (behavior_probs.log() - policy_probs.log()) + (
+            1.0 - behavior_probs
+        ) * ((1.0 - behavior_probs).log() - (1.0 - policy_probs).log())
+    else:
+        raise ValueError(f"Unknown DPPO divergence type: {divergence_type!r}")
+
+    return torch.where(response_mask, divergence, torch.zeros_like(divergence))
+
+
+def compute_dppo_loss(
+    behavior_log_probs: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    divergence_type: str,
+    divergence_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the unclipped DPPO surrogate and its asymmetric trust-region mask."""
+    ratio = torch.exp(policy_log_probs - behavior_log_probs)
+    with torch.no_grad():
+        divergence = compute_binary_divergence(
+            behavior_log_probs,
+            policy_log_probs,
+            response_mask,
+            divergence_type,
+        )
+        outside_region = divergence > divergence_threshold
+        moves_farther = ((advantages > 0) & (ratio > 1.0)) | ((advantages < 0) & (ratio < 1.0))
+        keep_mask = (~(outside_region & moves_farther) & response_mask).to(policy_log_probs.dtype)
+
+    return -advantages * ratio * keep_mask, keep_mask, divergence
+
+
 @torch.compile(dynamic=True)
 def compute_cispo_loss(
     ppo_kl: torch.Tensor,

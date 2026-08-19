@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import concurrent.futures
 import importlib.util
 import json
 import sys
+import threading
 import types
 from enum import Enum
 from pathlib import Path
@@ -122,6 +124,24 @@ def _load_collector(monkeypatch, filename: str):
                 f"invalid coordinated policy version: {policy_version!r}"
             )
         return int(consumer_rollout_id) - 1 - checkpoint_id
+
+    def _policy_version_stale_lag(policy_version, observed_policy_version):
+        def checkpoint_id(value):
+            if value == "checkpoint-base":
+                return -1
+            if (
+                isinstance(value, str)
+                and value.startswith("checkpoint-")
+                and value.removeprefix("checkpoint-").isdigit()
+            ):
+                return int(value.removeprefix("checkpoint-"))
+            raise _PolicyVersionMismatch(
+                f"invalid coordinated policy version: {value!r}"
+            )
+
+        return checkpoint_id(observed_policy_version) - checkpoint_id(
+            policy_version
+        )
 
     usage_state = {"path": None, "events": [], "tracker_calls": []}
 
@@ -243,6 +263,8 @@ def _load_collector(monkeypatch, filename: str):
             "swe_agent.policy_version",
             checkpoint_policy_stale_lag=_checkpoint_policy_stale_lag,
             committed_policy_version=lambda **_kwargs: "checkpoint-base",
+            observed_policy_version=lambda: "checkpoint-base",
+            policy_version_stale_lag=_policy_version_stale_lag,
         ),
         "swe_agent.usage": usage_module,
         "train_agent": _module("train_agent"),
@@ -276,6 +298,89 @@ def _load_collector(monkeypatch, filename: str):
     )
 
 
+def test_naive_broken_executor_is_rebuilt_once_for_concurrent_callers(
+    monkeypatch,
+):
+    module = _load_collector(monkeypatch, "collect_naive_rollout_async.py")
+    worker = object.__new__(module._NaiveNodeWorker)
+    worker.name = "test-node"
+    worker._executor_rebuild_lock = threading.Lock()
+    both_submitted = threading.Barrier(2)
+
+    class BrokenExecutor:
+        def submit(self, *_args):
+            both_submitted.wait(timeout=5)
+            raise concurrent.futures.process.BrokenProcessPool("test break")
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    class HealthyExecutor:
+        def submit(self, function, argument):
+            future = concurrent.futures.Future()
+            future.set_result(function(argument))
+            return future
+
+    worker._executor = BrokenExecutor()
+    rebuilds = []
+
+    def rebuild():
+        rebuilds.append(True)
+        worker._executor = HealthyExecutor()
+
+    worker._build_executor = rebuild
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda value: worker._submit_with_rebuild(
+                    lambda item: item,
+                    value,
+                    instance_id=f"instance-{value}",
+                ),
+                (1, 2),
+            )
+        )
+
+    assert sorted(results) == [1, 2]
+    assert rebuilds == [True]
+
+
+def test_naive_validation_rebuilds_without_replaying_failed_task(monkeypatch):
+    module = _load_collector(monkeypatch, "collect_naive_rollout_async.py")
+    worker = object.__new__(module._NaiveNodeWorker)
+    worker.name = "test-node"
+    worker._executor_rebuild_lock = threading.Lock()
+
+    class BrokenExecutor:
+        submissions = 0
+
+        def submit(self, *_args):
+            self.submissions += 1
+            raise concurrent.futures.process.BrokenProcessPool("test break")
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    broken = BrokenExecutor()
+    worker._executor = broken
+    rebuilds = []
+
+    def rebuild():
+        rebuilds.append(True)
+        worker._executor = object()
+
+    worker._build_executor = rebuild
+    with pytest.raises(concurrent.futures.process.BrokenProcessPool):
+        worker._submit_validation_once(
+            lambda item: item,
+            1,
+            instance_id="instance-1",
+        )
+
+    assert broken.submissions == 1
+    assert rebuilds == [True]
+
+
 def test_naive_wrapper_defaults_to_fair_joint_reward(monkeypatch):
     module = _load_file(
         monkeypatch,
@@ -290,6 +395,7 @@ def test_naive_wrapper_defaults_to_fair_joint_reward(monkeypatch):
     assert args.validation_top_p == 0.95
     assert args.validation_process_workers == 8
     assert args.naive_gt_eval_timeout == 600
+    assert args.naive_rollout_max_attempts == 8
     assert args.validation_gt_eval_timeout == 1800
     module._export_naive_env(args)
     assert module.os.environ["SWE_AGENT_NAIVE_REWARD_KIND"] == "joint"
@@ -298,6 +404,7 @@ def test_naive_wrapper_defaults_to_fair_joint_reward(monkeypatch):
     assert module.os.environ["SWE_AGENT_VALIDATION_TOP_P"] == "0.95"
     assert module.os.environ["SWE_AGENT_VALIDATION_PROCESS_WORKERS"] == "8"
     assert module.os.environ["SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT"] == "600"
+    assert module.os.environ["SWE_AGENT_NAIVE_ROLLOUT_MAX_ATTEMPTS"] == "8"
     assert (
         module.os.environ["SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT"]
         == "1800"
@@ -305,7 +412,6 @@ def test_naive_wrapper_defaults_to_fair_joint_reward(monkeypatch):
 
 
 def test_lanes_wrapper_defaults_to_depth1_hosted_luna(monkeypatch):
-    monkeypatch.delenv("SWE_AGENT_LANES_RUBRIC_MODEL", raising=False)
     monkeypatch.delenv("SWE_AGENT_LANES_JUDGE_MODEL", raising=False)
     module = _load_file(
         monkeypatch,
@@ -317,9 +423,7 @@ def test_lanes_wrapper_defaults_to_depth1_hosted_luna(monkeypatch):
     assert args.lanes_topology == "depth1"
     assert args.lanes_beam_parents == 2
     assert args.lanes_terminal_rollout is False
-    assert args.lanes_rubric_model == "openai/azure/openai/gpt-5.6-luna"
     assert args.lanes_judge_model == "openai/azure/openai/gpt-5.6-luna"
-    assert args.lanes_rubric_max_tokens == 20480
     assert args.lanes_judge_max_tokens == 20480
     assert args.validation_temperature == 0.2
     assert args.validation_top_p == 0.95
@@ -327,7 +431,6 @@ def test_lanes_wrapper_defaults_to_depth1_hosted_luna(monkeypatch):
     assert args.validation_gt_eval_timeout == 1800
     module._export_lanes_env(args)
     assert module.os.environ["SWE_AGENT_LANES_TERMINAL_ROLLOUT"] == "0"
-    assert module.os.environ["SWE_AGENT_LANES_RUBRIC_MAX_TOKENS"] == "20480"
     assert module.os.environ["SWE_AGENT_LANES_JUDGE_MAX_TOKENS"] == "20480"
     assert module.os.environ["SWE_AGENT_VALIDATION_TEMPERATURE"] == "0.2"
     assert module.os.environ["SWE_AGENT_VALIDATION_TOP_P"] == "0.95"
@@ -349,15 +452,12 @@ def test_lanes_wrapper_exports_explicit_lane_c_token_limits(monkeypatch):
     )
     args, forwarded = module._parse_lanes_args(
         [
-            "--lanes-rubric-max-tokens",
-            "32768",
             "--lanes-judge-max-tokens",
             "32768",
         ]
     )
     assert forwarded == []
     module._export_lanes_env(args)
-    assert module.os.environ["SWE_AGENT_LANES_RUBRIC_MAX_TOKENS"] == "32768"
     assert module.os.environ["SWE_AGENT_LANES_JUDGE_MAX_TOKENS"] == "32768"
 
 
@@ -506,6 +606,43 @@ def test_validation_counts_model_caused_evaluator_error_as_zero_reward(
     assert sample.status is sample.Status.COMPLETED
 
 
+def test_validation_counts_model_rollout_limit_as_zero_reward(monkeypatch):
+    module = _load_collector(
+        monkeypatch,
+        "collect_naive_rollout_async.py",
+    )
+    sample, completed, _ = module._validation_sample(
+        result={
+            "validation": {
+                "status": "error",
+                "infrastructure_error": False,
+                "rollout_error": "CompletionLengthExceeded",
+            }
+        },
+        metadata={"instance_id": "django__django-1"},
+        index=0,
+    )
+
+    assert completed is True
+    assert sample.reward == 0.0
+    assert sample.status is sample.Status.COMPLETED
+
+
+def test_validation_drops_driver_error_without_result(monkeypatch):
+    module = _load_collector(
+        monkeypatch,
+        "collect_naive_rollout_async.py",
+    )
+    sample, completed, _ = module._validation_sample(
+        result={"error": "WorkerCrashedError: process died"},
+        metadata={"instance_id": "django__django-1"},
+        index=0,
+    )
+
+    assert completed is False
+    assert sample.status is sample.Status.FAILED
+
+
 def test_validation_drops_infrastructure_evaluator_error(monkeypatch):
     module = _load_collector(
         monkeypatch,
@@ -525,298 +662,6 @@ def test_validation_drops_infrastructure_evaluator_error(monkeypatch):
 
     assert completed is False
     assert sample.status is sample.Status.FAILED
-
-
-def test_validation_retry_only_regenerates_missing_instances(
-    monkeypatch, tmp_path
-):
-    module = _load_collector(
-        monkeypatch, "collect_naive_rollout_async.py"
-    )
-    monkeypatch.setenv(
-        "RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl")
-    )
-    rows = [
-        (
-            "swebench_validation",
-            {
-                "instance_id": "django__django-1",
-                "subset": "verified",
-                "split": "test",
-            },
-        ),
-        (
-            "swebench_validation",
-            {
-                "instance_id": "pytest-dev__pytest-2",
-                "subset": "verified",
-                "split": "test",
-            },
-        ),
-    ]
-    monkeypatch.setattr(
-        module, "_validation_rows_from_args", lambda _args: rows
-    )
-    monkeypatch.setattr(
-        module,
-        "_policy_endpoints_for_model",
-        lambda *_args, **_kwargs: [("127.0.0.1", 30000)],
-    )
-    ensure_calls = []
-    monkeypatch.setattr(
-        module,
-        "_ensure_validation_node_workers",
-        lambda **kwargs: ensure_calls.append(kwargs),
-    )
-
-    submissions = []
-
-    class SubmitPolicyBatch:
-        def remote(self, tasks):
-            submissions.extend(tasks)
-            return SimpleNamespace(kind="policy", tasks=tasks)
-
-    class SubmitGt:
-        def remote(self, task):
-            return SimpleNamespace(kind="gt", task=task)
-
-    module._NODE_WORKERS.append(
-        SimpleNamespace(
-            submit_validation_policy_batch=SubmitPolicyBatch(),
-            submit_validation_gt=SubmitGt(),
-        )
-    )
-    result_attempts = {}
-
-    def ray_get(ref, **_kwargs):
-        if ref.kind == "policy":
-            results = []
-            for task in ref.tasks:
-                instance_id = task["instance_id"]
-                result_attempts[instance_id] = (
-                    result_attempts.get(instance_id, 0) + 1
-                )
-                if (
-                    instance_id == "pytest-dev__pytest-2"
-                    and result_attempts[instance_id] == 1
-                ):
-                    results.append(
-                        {
-                            "bundle": None,
-                            "validation_policy": None,
-                            "error": "validation actor died",
-                            "usage_group_id": task["usage_group_id"],
-                        }
-                    )
-                else:
-                    results.append(
-                        {
-                            "bundle": None,
-                            "validation_policy": {
-                                "rollout_dir": str(tmp_path / instance_id),
-                                "terminal_patch": "diff",
-                                "rollout_error": "",
-                            },
-                            "error": "",
-                            "usage_group_id": task["usage_group_id"],
-                        }
-                    )
-            return results
-        task = ref.task
-        return {
-            "bundle": None,
-            "validation": {
-                "status": "unresolved",
-                "infrastructure_error": False,
-                "rollout_error": "",
-            },
-            "usage_group_id": task["usage_group_id"],
-        }
-
-    monkeypatch.setattr(module.ray, "get", ray_get)
-    args = SimpleNamespace(eval_instance_attempt=100)
-
-    first = module.generate_validation_rollout(
-        args,
-        rollout_id=7,
-        output_root=tmp_path,
-        model_name="Qwen",
-    )
-    assert first.metrics["eval/attempted"] == 2
-    assert first.metrics["eval/completed"] == 1
-    assert first.metrics["eval/incomplete"] == 1
-    assert module._EVAL_PARTIAL_STATE is not None
-
-    second = module.generate_validation_rollout(
-        args,
-        rollout_id=7,
-        output_root=tmp_path,
-        model_name="Qwen",
-    )
-    assert second.metrics["eval/attempted"] == 2
-    assert second.metrics["eval/completed"] == 2
-    assert second.metrics["eval/incomplete"] == 0
-    assert module._EVAL_PARTIAL_STATE is None
-    assert result_attempts == {
-        "django__django-1": 1,
-        "pytest-dev__pytest-2": 2,
-    }
-    assert [call["verify_existing"] for call in ensure_calls] == [
-        False,
-        True,
-    ]
-    assert len(submissions) == 3
-    dispositions = [
-        event["disposition"]
-        for event in sys.modules["swe_agent.usage"]._test_state["events"]
-    ]
-    assert dispositions.count("accepted") == 2
-    assert dispositions.count("invalid") == 1
-
-
-def test_validation_restart_restores_complete_artifacts_only(
-    monkeypatch, tmp_path
-):
-    module = _load_collector(
-        monkeypatch, "collect_naive_rollout_async.py"
-    )
-    monkeypatch.setenv(
-        "RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl")
-    )
-    rows = [
-        (
-            "swebench_validation",
-            {
-                "instance_id": "django__django-1",
-                "subset": "verified",
-                "split": "test",
-            },
-        ),
-        (
-            "swebench_validation",
-            {
-                "instance_id": "pytest-dev__pytest-2",
-                "subset": "verified",
-                "split": "test",
-            },
-        ),
-    ]
-    monkeypatch.setattr(
-        module, "_validation_rows_from_args", lambda _args: rows
-    )
-    artifact_root = (
-        tmp_path
-        / "validation"
-        / "rollout_0007"
-        / "swebench_validation"
-        / "django__django-1"
-        / "20260101-000000"
-        / "task-000000"
-        / "django__django-1"
-        / "20260101-000000-r00"
-    )
-    artifact_root.mkdir(parents=True)
-    (artifact_root / "evaluation.json").write_text(
-        json.dumps(
-            {
-                "status": "error",
-                "reward": 0,
-                "metainfo": {"infrastructure_error": False},
-            }
-        ),
-        encoding="utf-8",
-    )
-    (artifact_root / "messages.json").write_text(
-        json.dumps({"messages": []}),
-        encoding="utf-8",
-    )
-    (artifact_root / "model_patch.json").write_text(
-        json.dumps({"django__django-1": {"model_patch": ""}}),
-        encoding="utf-8",
-    )
-    (artifact_root.parent.parent / "validation_policy.json").write_text(
-        json.dumps({"policy_version": "checkpoint-base"}),
-        encoding="utf-8",
-    )
-
-    ensure_calls = []
-    monkeypatch.setattr(
-        module,
-        "_ensure_validation_node_workers",
-        lambda **kwargs: ensure_calls.append(kwargs),
-    )
-    monkeypatch.setattr(
-        module,
-        "_policy_endpoints_for_model",
-        lambda *_args, **_kwargs: [("127.0.0.1", 30000)],
-    )
-    submissions = []
-
-    class SubmitPolicyBatch:
-        def remote(self, tasks):
-            submissions.extend(tasks)
-            return SimpleNamespace(kind="policy", tasks=tasks)
-
-    class SubmitGt:
-        def remote(self, task):
-            return SimpleNamespace(kind="gt", task=task)
-
-    module._NODE_WORKERS.append(
-        SimpleNamespace(
-            submit_validation_policy_batch=SubmitPolicyBatch(),
-            submit_validation_gt=SubmitGt(),
-        )
-    )
-
-    def ray_get(ref, **_kwargs):
-        if ref.kind == "policy":
-            return [
-                {
-                    "bundle": None,
-                    "validation_policy": {
-                        "rollout_dir": str(
-                            tmp_path / task["instance_id"]
-                        ),
-                        "terminal_patch": "diff",
-                        "rollout_error": "",
-                    },
-                    "error": "",
-                    "usage_group_id": task["usage_group_id"],
-                }
-                for task in ref.tasks
-            ]
-        return {
-            "bundle": None,
-            "validation": {
-                "status": "resolved",
-                "infrastructure_error": False,
-                "rollout_error": "",
-            },
-            "usage_group_id": ref.task["usage_group_id"],
-        }
-
-    monkeypatch.setattr(module.ray, "get", ray_get)
-    result = module.generate_validation_rollout(
-        SimpleNamespace(eval_instance_attempt=156),
-        rollout_id=7,
-        output_root=tmp_path,
-        model_name="Qwen",
-    )
-
-    assert result.metrics["eval/attempted"] == 2
-    assert result.metrics["eval/completed"] == 2
-    assert result.metrics["eval/resolved"] == 1
-    assert result.metrics["eval/incomplete"] == 0
-    assert [task["instance_id"] for task in submissions] == [
-        "pytest-dev__pytest-2"
-    ]
-    assert ensure_calls == [
-        {"instance_workers": 8, "verify_existing": False}
-    ]
-    restored = result.data["swebench_validation"]["samples"][0]
-    assert restored.metadata["validation_persisted"] is True
-    assert restored.metadata["validation_status"] == "error"
-    assert restored.reward == 0.0
 
 
 def test_validation_gt_preserves_trailing_patch_context(monkeypatch, tmp_path):
@@ -871,143 +716,31 @@ def test_validation_gt_preserves_trailing_patch_context(monkeypatch, tmp_path):
 
     assert list(captured.values()) == [patch]
     assert result["validation"]["status"] == "unresolved"
-    assert module._EVAL_PARTIAL_STATE is None
 
 
-def test_validation_restart_skips_worker_pool_when_all_artifacts_exist(
-    monkeypatch, tmp_path
-):
-    module = _load_collector(
-        monkeypatch, "collect_naive_rollout_async.py"
-    )
-    rows = [
-        (
-            "swebench_validation",
-            {
-                "instance_id": "django__django-1",
-                "subset": "verified",
-                "split": "test",
-            },
-        )
-    ]
-    monkeypatch.setattr(
-        module, "_validation_rows_from_args", lambda _args: rows
-    )
-    artifact_root = (
-        tmp_path
-        / "validation"
-        / "rollout_0005"
-        / "swebench_validation"
-        / "django__django-1"
-        / "20260101-000000"
-        / "task-000000"
-        / "django__django-1"
-        / "20260101-000000-r00"
-    )
-    artifact_root.mkdir(parents=True)
-    for name, payload in (
-        (
-            "evaluation.json",
-            {
-                "status": "resolved",
-                "metainfo": {"infrastructure_error": False},
-            },
-        ),
-        ("messages.json", {"messages": []}),
-        (
-            "model_patch.json",
-            {"django__django-1": {"model_patch": "diff"}},
-        ),
-    ):
-        (artifact_root / name).write_text(
-            json.dumps(payload),
-            encoding="utf-8",
-        )
-    (artifact_root.parent.parent / "validation_policy.json").write_text(
-        json.dumps({"policy_version": "checkpoint-base"}),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        module,
-        "_ensure_validation_node_workers",
-        lambda **_kwargs: pytest.fail("worker pool should not start"),
-    )
-    monkeypatch.setattr(
-        module,
-        "_policy_endpoints_for_model",
-        lambda *_args, **_kwargs: pytest.fail("endpoints should not resolve"),
-    )
-
-    result = module.generate_validation_rollout(
-        SimpleNamespace(eval_instance_attempt=100),
-        rollout_id=5,
-        output_root=tmp_path,
-        model_name="Qwen",
-    )
-
-    assert result.metrics["eval/completed"] == 1
-    assert result.metrics["eval/resolved"] == 1
-    assert module._EVAL_PARTIAL_STATE is None
-
-
-def test_stale_validation_before_dispatch_does_not_start_worker_pool(
-    monkeypatch,
-    tmp_path,
-):
+def test_validation_sample_reports_stale_one(monkeypatch):
     module = _load_collector(
         monkeypatch,
         "collect_naive_rollout_async.py",
     )
-    monkeypatch.setattr(
-        module,
-        "_validation_rows_from_args",
-        lambda _args: [
-            (
-                "swebench_validation",
-                {
-                    "instance_id": "django__django-1",
-                    "subset": "verified",
-                    "split": "test",
-                },
-            )
-        ],
+    sample, completed, _ = module._validation_sample(
+        result={
+            "validation": {
+                "status": "unresolved",
+                "policy_version": "checkpoint-0000007",
+                "observed_policy_start": "checkpoint-0000007",
+                "observed_policy_end": "checkpoint-0000008",
+            }
+        },
+        metadata={"instance_id": "django__django-1"},
+        index=0,
     )
-    monkeypatch.setattr(
-        module,
-        "_ensure_validation_node_workers",
-        lambda **_kwargs: pytest.fail(
-            "stale validation must not start a worker pool"
-        ),
-    )
-    monkeypatch.setattr(
-        module,
-        "_policy_endpoints_for_model",
-        lambda *_args, **_kwargs: pytest.fail(
-            "stale validation must not reserve a policy endpoint"
-        ),
-    )
-
-    result = module.generate_validation_rollout(
-        SimpleNamespace(
-            eval_instance_attempt=128,
-            eval_policy_version="checkpoint-0000007",
-            eval_policy_stale_before_dispatch=True,
-        ),
-        rollout_id=8,
-        output_root=tmp_path,
-        model_name="Qwen",
-    )
-
-    assert result.data == {}
-    assert result.metrics["eval/attempted"] == 1
-    assert result.metrics["eval/completed"] == 0
-    assert result.metrics["eval/stale_policy_aborted"] == 1
-    assert result.metrics["eval/incomplete"] == 1
+    assert completed
+    assert sample.metadata["validation_policy_stale_lag"] == 1
 
 
-def test_lane_c_route_is_single_hosted_model_and_not_local_policy(monkeypatch):
+def test_lane_c_routes_direct_judge_to_hosted_model(monkeypatch):
     module = _load_collector(monkeypatch, "collect_lanes_rollout_async.py")
-    monkeypatch.delenv("SWE_AGENT_LANES_RUBRIC_MODEL", raising=False)
     monkeypatch.delenv("SWE_AGENT_LANES_JUDGE_MODEL", raising=False)
     monkeypatch.delenv("SWE_AGENT_LANES_RUBRIC_API_KEY", raising=False)
     monkeypatch.setenv("LITELLM_API_KEY", "secret-for-test")
@@ -1015,31 +748,24 @@ def test_lane_c_route_is_single_hosted_model_and_not_local_policy(monkeypatch):
         "SWE_AGENT_LANES_RUBRIC_API_BASE",
         "https://inference-api.nvidia.com/v1/chat/completions",
     )
-    rubric, judge, api_base, api_key = module._hosted_lane_c_settings()
-    assert rubric == judge == "openai/azure/openai/gpt-5.6-luna"
+    judge, api_base, api_key = module._hosted_lane_c_settings()
+    assert judge == "openai/azure/openai/gpt-5.6-luna"
     assert api_base == "https://inference-api.nvidia.com/v1"
     assert api_key == "secret-for-test"
-    monkeypatch.setenv(
-        "SWE_AGENT_LANES_RUBRIC_MODEL",
-        "openai/azure/zai-org/glm-5.2",
-    )
     monkeypatch.setenv(
         "SWE_AGENT_LANES_JUDGE_MODEL",
         "openai/azure/zai-org/glm-5.2",
     )
-    rubric, judge, api_base, api_key = module._hosted_lane_c_settings()
-    assert rubric == judge == "openai/azure/zai-org/glm-5.2"
+    judge, api_base, api_key = module._hosted_lane_c_settings()
+    assert judge == "openai/azure/zai-org/glm-5.2"
     assert api_base == "https://inference-api.nvidia.com/v1"
     assert api_key == "secret-for-test"
     monkeypatch.setenv(
         "SWE_AGENT_LANES_JUDGE_MODEL",
         "nvidia/zai-org/glm-5.2",
     )
-    with pytest.raises(
-        ValueError,
-        match="approved NVIDIA-gateway model",
-    ):
-        module._hosted_lane_c_settings()
+    judge, _, _ = module._hosted_lane_c_settings()
+    assert judge == "nvidia/zai-org/glm-5.2"
     monkeypatch.setenv(
         "SWE_AGENT_LANES_JUDGE_MODEL",
         "openai/azure/zai-org/glm-5.2",
@@ -1498,9 +1224,13 @@ def test_train_usage_id_uses_checkpointed_source_cursor(
         )
         monkeypatch.setattr(
             module,
+            "_eligible_direct_instances",
+            lambda _path: {"django__django-1"},
+        )
+        monkeypatch.setattr(
+            module,
             "_hosted_lane_c_settings",
             lambda: (
-                "nvidia/zai-org/glm-5.2",
                 "nvidia/zai-org/glm-5.2",
                 "https://inference-api.nvidia.com/v1",
                 "secret",
@@ -1523,6 +1253,195 @@ def test_train_usage_id_uses_checkpointed_source_cursor(
     assert captured_tasks[0]["usage_group_prefix"].endswith(
         "/t000432"
     )
+
+
+def test_naive_pending_is_capped_by_groups_remaining(
+    monkeypatch, tmp_path
+):
+    module = _load_collector(
+        monkeypatch, "collect_naive_rollout_async.py"
+    )
+    monkeypatch.setenv(
+        "RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl")
+    )
+    monkeypatch.setenv("SWE_AGENT_NAIVE_MAX_TAIL_PENDING", "0")
+    captured_tasks = []
+
+    class SubmitTask:
+        def remote(self, task):
+            captured_tasks.append(task)
+            return object()
+
+    module._NODE_WORKERS.append(
+        SimpleNamespace(submit_task=SubmitTask())
+    )
+    module._BUFFER.extend(
+        module._BufferedGroup(samples=[], rollout_id=3)
+        for _ in range(2)
+    )
+    sample_cls = module.Sample
+    prompt_group = [
+        sample_cls(
+            group_index=11,
+            metadata={
+                "instance_id": "django__django-1",
+                "subset": "princeton-nlp/SWE-Bench_Verified",
+                "split": "test",
+            },
+        )
+        for _ in range(8)
+    ]
+
+    class DataBuffer:
+        calls = 0
+
+        def get_samples(self, _count):
+            self.calls += 1
+            return [prompt_group]
+
+    data_buffer = DataBuffer()
+    monkeypatch.setattr(
+        module,
+        "_policy_endpoints_for_model",
+        lambda *_args, **_kwargs: [("127.0.0.1", 30000)],
+    )
+    submitted = module._submit_until_full(
+        args=SimpleNamespace(),
+        data_buffer=data_buffer,
+        rollout_id=3,
+        output_root=tmp_path,
+        model_name="Qwen",
+        max_pending=16,
+        target_groups=3,
+    )
+
+    assert submitted == 1
+    assert data_buffer.calls == 1
+    assert len(module._PENDING) == 1
+    assert len(captured_tasks) == 1
+
+
+def test_naive_branch_marker_releases_only_completed_endpoint(
+    monkeypatch, tmp_path
+):
+    module = _load_collector(
+        monkeypatch, "collect_naive_rollout_async.py"
+    )
+    endpoints = [("127.0.0.1", 30000 + index) for index in range(8)]
+    marker_dir = tmp_path / "branch-done"
+    marker_dir.mkdir()
+    (marker_dir / "rollout-03.ready").write_text(
+        "ready\n", encoding="utf-8"
+    )
+    task = {
+        "_endpoints_picked": endpoints,
+        "_branch_done_dir": str(marker_dir),
+        "_released_branch_indices": [],
+    }
+    module._ENDPOINT_INFLIGHT.update({endpoint: 1 for endpoint in endpoints})
+    module._PENDING[object()] = task
+
+    assert module._refresh_branch_slots() == 1
+    assert module._ENDPOINT_INFLIGHT[endpoints[3]] == 0
+    assert all(
+        module._ENDPOINT_INFLIGHT[endpoint] == 1
+        for index, endpoint in enumerate(endpoints)
+        if index != 3
+    )
+    assert task["_released_branch_indices"] == [3]
+    assert module._refresh_branch_slots() == 0
+
+
+def test_naive_first_free_branch_starts_tail_instance(
+    monkeypatch, tmp_path
+):
+    module = _load_collector(
+        monkeypatch, "collect_naive_rollout_async.py"
+    )
+    monkeypatch.setenv("RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl"))
+    monkeypatch.setenv("SWE_AGENT_NAIVE_MAX_TAIL_PENDING", "1")
+    endpoints = [("127.0.0.1", 30000 + index) for index in range(8)]
+    marker_dir = tmp_path / "existing-markers"
+    marker_dir.mkdir()
+    (marker_dir / "rollout-00.ready").write_text(
+        "ready\n", encoding="utf-8"
+    )
+    module._ENDPOINT_INFLIGHT.update({endpoint: 1 for endpoint in endpoints})
+    module._PENDING[object()] = {
+        "m": 8,
+        "_endpoints_picked": endpoints,
+        "_branch_done_dir": str(marker_dir),
+        "_released_branch_indices": [],
+    }
+    captured_tasks = []
+
+    class SubmitTask:
+        def remote(self, task):
+            captured_tasks.append(task)
+            return object()
+
+    module._NODE_WORKERS.append(SimpleNamespace(submit_task=SubmitTask()))
+    prompt_group = [
+        module.Sample(
+            group_index=12,
+            metadata={
+                "instance_id": "django__django-2",
+                "subset": "verified",
+                "split": "test",
+            },
+        )
+        for _ in range(8)
+    ]
+
+    class DataBuffer:
+        calls = 0
+
+        def get_samples(self, _count):
+            self.calls += 1
+            return [prompt_group]
+
+    data_buffer = DataBuffer()
+    monkeypatch.setattr(
+        module,
+        "_policy_endpoints_for_model",
+        lambda *_args, **_kwargs: endpoints,
+    )
+
+    submitted = module._submit_until_full(
+        args=SimpleNamespace(),
+        data_buffer=data_buffer,
+        rollout_id=4,
+        output_root=tmp_path,
+        model_name="Qwen",
+        max_pending=1,
+        target_groups=1,
+    )
+
+    assert submitted == 1
+    assert data_buffer.calls == 1
+    assert len(captured_tasks) == 1
+    assert len(module._PENDING) == 2
+    assert captured_tasks[0]["instance_id"] == "django__django-2"
+
+
+def test_lanes_policy_marker_releases_endpoint_once(monkeypatch, tmp_path):
+    module = _load_collector(monkeypatch, "collect_lanes_rollout_async.py")
+    endpoint = "http://127.0.0.1:30000"
+    marker = tmp_path / "policy.ready"
+    marker.write_text("ready\n", encoding="utf-8")
+    task = {
+        "_pinned_endpoints": [endpoint],
+        "_policy_done_marker": str(marker),
+        "_policy_slot_released": False,
+    }
+    module._ENDPOINT_LOAD[endpoint] = 1
+    module._PENDING[object()] = task
+
+    assert module._refresh_policy_slots() == 1
+    assert module._ENDPOINT_LOAD[endpoint] == 0
+    assert task["_policy_slot_released"] is True
+    assert module._refresh_policy_slots() == 0
+    assert module._ENDPOINT_LOAD[endpoint] == 0
 
 
 def test_lanes_discards_excess_groups_and_updates_usage_disposition(
@@ -1738,7 +1657,7 @@ def test_lanes_harvest_normalizes_zero_variance_disposition(
         (
             "train/r0002/django__django-1/t000002:g0",
             "filtered",
-            "zero_variance",
+                "zero_std_1.0",
         )
     ]
 
@@ -1839,82 +1758,8 @@ def test_group_outcome_metrics_use_attempted_denominator_and_conserve(
         )
 
 
-def test_naive_harvest_counts_prefilter_zero_variance_group(
-    monkeypatch, tmp_path
-):
-    module = _load_collector(monkeypatch, "collect_naive_rollout_async.py")
-    monkeypatch.setenv("RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl"))
-    usage_group_id = "train/r0004/django__django-1/t000004:g0"
-    task = {
-        "instance_id": "django__django-1",
-        "usage_group_id": usage_group_id,
-        "policy_version": "checkpoint-0000004",
-        "m": 8,
-        "_endpoints_picked": [],
-    }
-    group = SimpleNamespace(metadata={})
-    bundle = SimpleNamespace(
-        policy_groups=[group],
-        rubric_groups=[],
-        metadata={},
-    )
-    ref = object()
-    module._PENDING[ref] = task
-    monkeypatch.setattr(
-        module.ray,
-        "wait",
-        lambda *_args, **_kwargs: ([ref], []),
-    )
-    monkeypatch.setattr(
-        module.ray,
-        "get",
-        lambda _ref: {
-            "bundle": bundle,
-            "error": "",
-            "policy_version": "checkpoint-0000004",
-        },
-    )
-    monkeypatch.setattr(
-        module,
-        "build_rollout_samples",
-        lambda **_kwargs: (
-            [module.Sample(metadata={}, reward=0.25) for _ in range(8)],
-            0,
-        ),
-    )
-    monkeypatch.setattr(module, "load_function", lambda _path: object())
-    monkeypatch.setattr(
-        module,
-        "call_dynamic_filter",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            keep=False,
-            reason="zero_std_0.2",
-        ),
-    )
 
-    assert module._harvest_ready(
-        args=SimpleNamespace(
-            dynamic_sampling_filter_path="dynamic.filter",
-            max_tokens_per_gpu=0,
-            context_parallel_size=1,
-            reward_key=None,
-        ),
-        target="policy",
-        block=True,
-    ) == 0
-    assert module._TOTAL_GROUPS_ATTEMPTED == 1
-    assert module._INFRA_DROPPED_GROUPS == 0
-    assert module._FILTER_DROPPED_GROUPS == 1
-    assert module._REWARD_GROUPS_OBSERVED == 1
-    assert module._ZERO_VARIANCE_GROUPS == 1
-    events = sys.modules["swe_agent.usage"]._test_state["events"]
-    assert [
-        (event["group_id"], event["disposition"], event["reason"])
-        for event in events
-    ] == [(usage_group_id, "filtered", "zero_variance")]
-
-
-def test_naive_runner_failure_is_one_attempt_and_one_invalid(
+def test_naive_runner_failure_is_one_invalid_group_after_rollout_retries(
     monkeypatch, tmp_path
 ):
     module = _load_collector(monkeypatch, "collect_naive_rollout_async.py")
@@ -2000,7 +1845,6 @@ def test_collectors_stop_source_dispatch_on_validation_boundary(
             module,
             "_hosted_lane_c_settings",
             lambda: (
-                "nvidia/zai-org/glm-5.2",
                 "nvidia/zai-org/glm-5.2",
                 "https://inference-api.nvidia.com/v1",
                 "secret",
@@ -2139,7 +1983,9 @@ def test_collectors_preserve_partial_through_validation_ack_and_refill(
     assert output.metrics["swe_agent/groups_dynamic_filtered"] == 1
     assert module._BUFFER == []
     assert module._VALIDATION_PARTIAL_STATE is None
-    assert calls == 3
+    assert calls == (
+        2 if filename == "collect_naive_rollout_async.py" else 3
+    )
     assert [
         event["disposition"]
         for event in events
@@ -2464,7 +2310,6 @@ def test_collectors_stop_source_dispatch_on_instance_budget(
             "_hosted_lane_c_settings",
             lambda: (
                 "nvidia/zai-org/glm-5.2",
-                "nvidia/zai-org/glm-5.2",
                 "https://inference-api.nvidia.com/v1",
                 "secret",
             ),
@@ -2628,6 +2473,7 @@ def test_collector_checkpoint_round_trips_buffer_pending_and_counters(
             "split": "test",
             "model_name": "Qwen/Qwen3.5-9B",
             "m": 8,
+            "gt_eval_workers": 8,
             "usage_group_prefix": "train/pending",
             "usage_group_id": "train/pending:g0",
             "policy_version": "checkpoint-0000002",
@@ -2636,6 +2482,8 @@ def test_collector_checkpoint_round_trips_buffer_pending_and_counters(
             "api_key": "must-not-be-checkpointed",
             "policy_base_urls": ["http://stale-route"],
             "_pinned_endpoints": ["http://stale-route"],
+            "_branch_done_dir": "/tmp/stale-branch-markers",
+            "_released_branch_indices": [0, 2],
         }
         module._TASK_INDEX = 18
         module._DISPATCH_COUNTER = 11
@@ -2656,6 +2504,8 @@ def test_collector_checkpoint_round_trips_buffer_pending_and_counters(
         assert "rubric_api_key" not in pending_state
         assert "policy_base_urls" not in pending_state
         assert "_pinned_endpoints" not in pending_state
+        assert "_branch_done_dir" not in pending_state
+        assert "_released_branch_indices" not in pending_state
 
         module._BUFFER.clear()
         module._PENDING.clear()
@@ -2775,12 +2625,12 @@ def test_checkpoint_pending_replay_uses_current_routes_without_source_draw(
             "_hosted_lane_c_settings",
             lambda: (
                 "nvidia/zai-org/glm-5.2",
-                "nvidia/zai-org/glm-5.2",
                 "https://inference-api.nvidia.com/v1",
                 "new-hosted-key",
             ),
         )
     else:
+        monkeypatch.setenv("SWE_AGENT_NAIVE_GT_EVAL_WORKERS", "1")
         monkeypatch.setattr(
             module,
             "_policy_endpoints_for_model",
@@ -2820,6 +2670,7 @@ def test_checkpoint_pending_replay_uses_current_routes_without_source_draw(
             "train/attempt-old/r0003/repo__task-3/t000123:g1",
         }
     else:
+        assert replayed["gt_eval_workers"] == 1
         assert replayed["usage_group_id"] == (
             "train/attempt-test/r0004/repo__task-3/t000123:g0"
         )

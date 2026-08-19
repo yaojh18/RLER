@@ -10,7 +10,6 @@ import os
 import random
 import re
 import subprocess
-import tempfile
 import threading
 import time
 import traceback
@@ -81,8 +80,6 @@ DATASET_MAPPING = {
     "multilingual": "swe-bench/SWE-Bench_Multilingual",
     "smith": "SWE-bench/SWE-smith",
     "_test": "klieret/swe-bench-dummy-test-dataset",
-    "rebench": "nebius/SWE-rebench",
-    "rebench_v2": "nebius/SWE-rebench-V2",
     "r2egym": "R2E-Gym/R2E-Gym-Subset",
     "swebench_pro": "ScaleAI/SWE-bench_Pro",
     "deepswe": "datacurve/deep-swe",
@@ -95,8 +92,6 @@ _PREPARED_IMAGES: set[str] = set()
 _IMAGE_RESOLUTION_LOCK = threading.Lock()
 _IMAGE_RESOLUTION_CACHE: dict[str, tuple[str, str | None]] = {}
 OFFICIAL_IMAGE_NAMESPACE = "swebench"
-REBENCH_VENDOR_ROOT = Path(__file__).resolve().parent / "swe_rebench_v2"
-LOCAL_DATASETS_ROOT = Path(__file__).resolve().parents[5] / "datasets"
 LOCAL_DATASET_DIRS = {
     "princeton-nlp/SWE-Bench_Verified": "swebench_verified",
     "ScaleAI/SWE-bench_Pro": "swebench_pro",
@@ -108,20 +103,26 @@ LOCAL_DATASET_DIRS = {
 def _load_dataset(*args, **kwargs):
     dataset_path = args[0] if args else kwargs.get("path")
     local_name = LOCAL_DATASET_DIRS.get(str(dataset_path))
-    local_path = LOCAL_DATASETS_ROOT / local_name / "raw" if local_name else None
-    if os.getenv("RLER_HF_DATASET_LOCAL_ONLY", "0") != "0" and local_path and local_path.exists():
+    dataset_roots = []
+    if configured_root := os.getenv("RLER_DATASETS_ROOT"):
+        dataset_roots.append(Path(configured_root).expanduser())
+    dataset_roots.extend(parent / "datasets" for parent in Path(__file__).resolve().parents)
+    local_path = next(
+        (
+            root / local_name / "raw"
+            for root in dataset_roots
+            if local_name and (root / local_name / "raw").exists()
+        ),
+        None,
+    )
+    if local_path is not None:
         if args:
             return load_dataset(str(local_path), *args[1:], **kwargs)
         return load_dataset(**{**kwargs, "path": str(local_path)})
-    try:
-        return load_dataset(*args, **kwargs)
-    except Exception:
-        if local_path and local_path.exists():
-            if args:
-                return load_dataset(str(local_path), *args[1:], **kwargs)
-            return load_dataset(**{**kwargs, "path": str(local_path)})
+    if os.getenv("RLER_HF_DATASET_LOCAL_ONLY", "0") != "0":
         local_kwargs = {**kwargs, "download_config": DownloadConfig(local_files_only=True)}
         return load_dataset(*args, **local_kwargs)
+    return load_dataset(*args, **kwargs)
 
 
 class ProgressTrackingAgent(DefaultAgent):
@@ -164,14 +165,11 @@ def resolve_swebench_image(instance: dict) -> tuple[str, str | None]:
     if cached is not None:
         return cached
 
-    if _is_rebench_instance(instance):
-        resolved = _resolve_rebench_image(instance)
+    image_name = instance.get("image_name") or instance.get("docker_image")
+    if image_name:
+        resolved = (image_name, _infer_harness_namespace(image_name, instance))
     else:
-        image_name = instance.get("image_name") or instance.get("docker_image")
-        if image_name:
-            resolved = (image_name, _infer_harness_namespace(image_name, instance))
-        else:
-            resolved = _resolve_generated_swebench_image(instance)
+        resolved = _resolve_generated_swebench_image(instance)
 
     with _IMAGE_RESOLUTION_LOCK:
         _IMAGE_RESOLUTION_CACHE[instance_id] = resolved
@@ -207,10 +205,6 @@ def _resolve_generated_swebench_image(instance: dict) -> tuple[str, str | None]:
     return image_name, None
 
 
-def _is_rebench_instance(instance: dict) -> bool:
-    return bool(instance.get("image_name")) and isinstance(instance.get("install_config"), dict)
-
-
 def select_container_environment_class(requested: str | None) -> str:
     if requested is not None:
         if requested == "docker" and docker_available():
@@ -222,167 +216,6 @@ def select_container_environment_class(requested: str | None) -> str:
     if singularity_available():
         return "singularity"
     raise RuntimeError(f"No supported container environment is available on this system")
-
-
-def _local_image_exists(image_name: str) -> bool:
-    image_not_found = getattr(docker.errors, "ImageNotFound", docker.errors.NotFound)
-    client = docker.from_env()
-    try:
-        client.images.get(image_name)
-        return True
-    except (image_not_found, docker.errors.NotFound):
-        return False
-    finally:
-        client.close()
-
-
-# Per-image locks + global concurrency semaphore for lustre tarball loads.
-# Multiple agents racing for the same image must coalesce; lustre I/O is shared
-# across all 8 GPUs on the node, so we cap parallel loads to avoid saturating it.
-_LUSTRE_LOAD_LOCKS: dict[str, threading.Lock] = {}
-_LUSTRE_LOAD_LOCKS_GUARD = threading.Lock()
-_LUSTRE_LOAD_SEM = threading.Semaphore(int(os.environ.get("DOCKER_LUSTRE_LOAD_PARALLEL", "8")))
-
-
-def _per_image_lock(image_name: str) -> threading.Lock:
-    with _LUSTRE_LOAD_LOCKS_GUARD:
-        lock = _LUSTRE_LOAD_LOCKS.get(image_name)
-        if lock is None:
-            lock = threading.Lock()
-            _LUSTRE_LOAD_LOCKS[image_name] = lock
-        return lock
-
-
-def _try_load_from_lustre_tarball(image_name: str) -> bool:
-    """Mirror of bin/docker shim logic at the Python level.
-
-    swe_agent's Python SDK calls (client.images.get / get_registry_data) bypass
-    the CLI shim. Without this fallback, on a fresh node every instance hits
-    Docker Hub for the registry probe + base-image build, exhausting the
-    unauthenticated pull rate limit within seconds when 100+ agents start
-    concurrently.
-    """
-    tardir = os.environ.get("DOCKER_LUSTRE_TARDIR")
-    if not tardir:
-        return False
-    short = image_name.removeprefix("docker.io/")
-    safe = short.replace("/", "_").replace(":", "_")
-    tarball = Path(tardir) / f"{safe}.tar"
-    if not tarball.exists():
-        return False
-    with _per_image_lock(image_name):
-        if _local_image_exists(image_name):
-            return True
-        with _LUSTRE_LOAD_SEM:
-            if _local_image_exists(image_name):
-                return True
-            try:
-                subprocess.run(
-                    ["docker", "load", "-i", str(tarball)],
-                    check=True,
-                    capture_output=True,
-                    timeout=600,
-                )
-            except Exception as e:
-                logger.error(f"docker load failed for {image_name} from {tarball}: {e}")
-                return False
-        return _local_image_exists(image_name)
-
-
-def _resolve_rebench_image(instance: dict) -> tuple[str, str | None]:
-    image_name = instance["image_name"]
-    if _local_image_exists(image_name):
-        return image_name, None
-    if _try_load_from_lustre_tarball(image_name):
-        return image_name, None
-    if _registry_image_exists(image_name):
-        return image_name, None
-    _build_rebench_instance_image(instance)
-    return image_name, None
-
-
-def _build_rebench_instance_image(instance: dict) -> None:
-    image_name = instance["image_name"]
-    with _PREPARED_IMAGE_LOCK:
-        if image_name in _PREPARED_IMAGES or _local_image_exists(image_name):
-            _PREPARED_IMAGES.add(image_name)
-            return
-        install_config = instance.get("install_config") or {}
-        base_image_name = install_config.get("image_name") or install_config.get("base_image_name")
-        if not isinstance(base_image_name, str) or not base_image_name.strip():
-            raise RuntimeError(f"Instance {instance['instance_id']} is missing install_config.base_image_name")
-        _build_rebench_base_image(base_image_name)
-        repo = instance["repo"]
-        project_dir = f"/{repo.split('/', 1)[1]}"
-        install_commands = [command for command in install_config.get("install", []) if isinstance(command, str) and command.strip()]
-        dockerfile_lines = [
-            f"FROM --platform=linux/amd64 {base_image_name} AS base",
-            f"FROM --platform=linux/amd64 base AS {instance['instance_id']}",
-            "RUN <<'DOCKER_RUN_EOF'",
-            "set -eux",
-            f"git clone -o origin https://github.com/{repo} {project_dir}",
-            f"chmod -R 777 {project_dir}",
-            f"cd {project_dir}",
-            f"git reset --hard {instance['base_commit']}",
-            "git remote remove origin || true",
-        ]
-        dockerfile_lines.extend(f"( {command} ) || true" for command in install_commands)
-        dockerfile_lines.extend(["DOCKER_RUN_EOF", "", f"WORKDIR {project_dir}", ""])
-        with tempfile.TemporaryDirectory(prefix="rebench-build-") as temp_dir:
-            dockerfile_path = Path(temp_dir) / "Dockerfile"
-            dockerfile_path.write_text("\n".join(dockerfile_lines), encoding="utf-8")
-            subprocess.run(
-                ["docker", "build", "--platform", "linux/amd64", "-f", str(dockerfile_path), "-t", image_name, temp_dir],
-                check=True,
-            )
-        _PREPARED_IMAGES.add(image_name)
-
-
-def _build_rebench_base_image(base_image_name: str) -> None:
-    if _local_image_exists(base_image_name):
-        return
-    if _registry_image_exists(base_image_name):
-        return
-    dockerfile = _resolve_rebench_base_dockerfile(base_image_name)
-    subprocess.run(
-        [
-            "docker",
-            "build",
-            "--platform",
-            "linux/amd64",
-            "-f",
-            str(dockerfile),
-            "-t",
-            base_image_name,
-            str(dockerfile.parent),
-        ],
-        check=True,
-    )
-
-
-def _resolve_rebench_base_dockerfile(base_image_name: str) -> Path:
-    dockerfiles_dir = REBENCH_VENDOR_ROOT / "base_dockerfiles"
-    image_name_with_tag = base_image_name.rsplit("/", 1)[-1]
-    image_stub, _, image_tag = image_name_with_tag.partition(":")
-    candidates = [f"Dockerfile_{image_stub}"]
-    if image_tag:
-        candidates.append(f"Dockerfile_{image_stub}_{image_tag}")
-    if image_stub.endswith("_base"):
-        candidates.append(f"Dockerfile_{image_stub.removesuffix('_base')}")
-    if image_stub.startswith("python_base_"):
-        suffix = image_stub.removeprefix("python_base_")
-        if suffix.isdigit() and len(suffix) in {2, 3}:
-            candidates.append(f"Dockerfile_python_{suffix[0]}.{suffix[1:]}")
-        candidates.append(f"Dockerfile_python_{suffix}")
-    else:
-        match = re.match(r"(?P<lang>[a-z]+)_base_(?P<version>.+)", image_stub)
-        if match:
-            candidates.append(f"Dockerfile_{match.group('lang')}_{match.group('version')}")
-    for candidate in candidates:
-        path = dockerfiles_dir / candidate
-        if path.exists():
-            return path
-    raise FileNotFoundError(f"Could not map Rebench base image {base_image_name} to a Dockerfile in {dockerfiles_dir}")
 
 
 def _registry_image_exists(image_name: str) -> bool:
@@ -416,12 +249,7 @@ def get_sb_environment(config: dict, instance: dict) -> Environment:
         env_config["image"] = get_swebench_docker_image_name(instance)
     elif env_config["environment_class"] in ["singularity", "contree"]:
         env_config["image"] = get_swebench_singularity_image_name(instance)
-    if _is_rebench_instance(instance):
-        repo = instance.get("repo") or ""
-        if "/" in repo:
-            env_config["cwd"] = f"/{repo.split('/', 1)[1]}"
-        env_config.setdefault("dataset_name", "rebench")
-    elif is_r2egym_instance(instance):
+    if is_r2egym_instance(instance):
         env_config["cwd"] = "/testbed"
         env_config.setdefault("dataset_name", "r2egym")
     elif is_swebench_pro_instance(instance) or is_deepswe_instance(instance):

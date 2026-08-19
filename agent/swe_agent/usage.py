@@ -375,8 +375,12 @@ def _resolve_event_context(
     return {
         "phase": _safe_label(context.phase, default="unspecified"),
         "group_id": str(context.group_id or ""),
-        "model_family": _safe_label(context.model_family or model_family, default="other"),
-        "model_role": _safe_label(context.model_role or model_role, default="unspecified"),
+        # A broad rollout context supplies defaults for policy calls, while a
+        # nested hosted rubric call supplies its actual provider family and
+        # role explicitly. The physical call label must win in that case;
+        # otherwise Luna traffic is silently accounted as Qwen policy usage.
+        "model_family": _safe_label(model_family or context.model_family, default="other"),
+        "model_role": _safe_label(model_role or context.model_role, default="unspecified"),
         "logical_call_id": str(context.logical_call_id or logical_call_id or new_logical_call_id()),
         "attempt_index": max(
             0,

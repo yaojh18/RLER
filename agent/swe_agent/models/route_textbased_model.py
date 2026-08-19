@@ -195,6 +195,11 @@ class RouteTextbasedModel(LitellmTextbasedModel):
                             return_logprobs=True,
                         )
                     )
+                    error = completion.metadata.get("error")
+                    if error is not None:
+                        raise RuntimeError(
+                            f"{self.config.route_name} token-in/out generation failed: {error}"
+                        )
                 except RuntimeError as exc:
                     # sglang /generate returns 400 with a context-overflow
                     # message when input_ids+max_new_tokens exceeds the

@@ -3,7 +3,6 @@ import copy
 import json
 
 import swe_agent.run.aggregate_swe_agent as aggregate_swe_agent
-import swe_agent.rubric_bank as rubric_bank
 import swe_agent.trajectory_search as trajectory_search
 from agent_rl.run_utils import extract_last_json_object
 from swe_agent.trajectory_search import _normalized_weight_by_rubric, _pc_avg_scores_from_rubrics
@@ -650,62 +649,6 @@ def test_step_cards_bound_long_commands():
 
     assert len(cards[0]["commands"][0]) <= trajectory_search.MAX_OBSERVATION_CHARS
     assert "truncated due to length" in cards[0]["commands"][0]
-
-
-def test_experience_update_uses_freeform_markdown_json(monkeypatch):
-    bank = rubric_bank.ExperienceRubricBank()
-    calls = []
-    generated_rubric = _rubric("Generated Evidence")
-    action = {
-        "action": "add",
-        "title": "Free Form Output Lesson",
-        "description": "Use when structured decoding suppresses useful rubric analysis.",
-        "context": "The evaluator needs room to compare trajectory evidence before committing to one action.",
-        "experience": "Reason freely first, then emit one validated action in the final JSON block.",
-        "metadata": {
-            "analysis": "The visible evidence supports separating reasoning from the final action.",
-            "reference_golden_rubrics": [_rubric("Reference Criterion")],
-        },
-    }
-    pending = iter([action, {}])
-
-    async def fake_route_completion_message(**kwargs):
-        _assert_freeform_call(kwargs)
-        calls.append(copy.deepcopy(kwargs))
-        content = _freeform_json(next(pending), thought="Choose one durable bank action.")
-        return {
-            "role": "assistant",
-            "content": content,
-            "content_no_thinking": content,
-            "usage": {},
-        }
-
-    monkeypatch.setattr(rubric_bank, "route_completion_message", fake_route_completion_message)
-    applied, _ = asyncio.run(
-        bank._update_bank_from_evidence(
-            evidence={
-                "instance_id": "demo",
-                "rubric_attempts": [
-                    {
-                        "rubric_list_id": "rubric-demo",
-                        "generated_rubrics": [generated_rubric],
-                        "gt_skeleton": "",
-                        "generated_rubric_accuracy": {},
-                        "gt_scores": [0.0, 1.0],
-                    }
-                ],
-            },
-            model_name="test-model",
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=128,
-            model_kwargs=None,
-        )
-    )
-
-    assert applied[0]["action"] == "add"
-    assert all("response_format" not in call for call in calls)
-    assert "THOUGHT:" in calls[0]["messages"][0]["content"]
 
 
 def test_aggregate_rubric_duplicate_becomes_a_user_correction(monkeypatch):

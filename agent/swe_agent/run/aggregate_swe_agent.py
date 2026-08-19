@@ -71,6 +71,7 @@ from swe_agent.run.run_swe_agent import (
     SLIME_SERVICE_NAME,
     SWE_AGENT_TEXTBASED_CONFIG,
     VLLM_SERVICE_NAME,
+    _resolve_model_name,
     _openai_server_ready,
     _litellm_model_kwargs,
     _start_sglang_server,
@@ -964,14 +965,6 @@ class AggregateTrajectoryRunner:
         _write_json(self.run_dir / "evaluation.json", best_candidate.get("terminal_evaluation") or make_evaluation_payload("error", error="Missing selected node evaluation"))
 
 
-def _resolve_model_name(args: argparse.Namespace) -> str:
-    if args.backend == "vllm":
-        return args.vllm_model
-    if args.backend == "sglang":
-        return args.sglang_model
-    return args.openai_model
-
-
 def _find_source_run_dirs(args: argparse.Namespace, instance_id: str) -> list[Path]:
     if args.source_rollout_root is None:
         return []
@@ -1032,7 +1025,7 @@ def run_aggregate(
     sglang_server = None
     shared_model_kwargs: dict[str, Any]
     if args.backend == "vllm":
-        from dr_agent.utils import launch_vllm_server_handle
+        from agent_rl.vllm_server import launch_vllm_server_handle
 
         gpu_ids = choose_gpus(args.gpu_id)
         gpu_id = gpu_ids[0] if gpu_ids else None

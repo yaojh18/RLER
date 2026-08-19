@@ -600,6 +600,16 @@ def _train_upstream(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
+    # Match the synchronous driver's eval-only contract.  Starting the async
+    # pipeline unconditionally would launch one training rollout even when
+    # num_rollout=0, producing n_samples_per_prompt siblings under the train
+    # output tree instead of the requested one-sample validation set.
+    if args.num_rollout == 0 and args.eval_interval is not None:
+        ray.get(rollout_manager.eval.remote(rollout_id=0))
+        ray.get(rollout_manager.dispose.remote())
+        finish_tracking(args)
+        return
+
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):

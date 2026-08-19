@@ -15,6 +15,7 @@ yield no training data (empty buffer), fail-loud by design.
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import Any
 
@@ -66,33 +67,35 @@ def _build_branch_sample(
     at 2k assistant turns, so both the judged parent and judged child stay in
     the trainable sequence.
     """
-    # Formal submissions use binary SWE-bench reward. Unfinished trajectories
-    # use the final oracle-equivalent hosted-judge score.
+    # Direct mode uses its judge score for both submitted and unfinished
+    # prefixes. The separate GT-on-submit mode is materialized by the runner
+    # in training_reward_by_node/reward_source_by_node.
     if branch.error is not None:
         return None
-    if gt_only_reward or branch.terminated_early:
+    if gt_only_reward:
         gt = branch.gt_score
         if gt is None or not math.isfinite(float(gt)):
             return None
         reward = float(gt)
-        reward_source = (
-            "gt_only"
-            if gt_only_reward
-            else "terminal_swebench_binary"
-        )
+        reward_source = "gt_only"
     else:
         rubric = _branch_overall_rubric_score(
             branch.node_id, group.judge_score_by_node
         )
         if rubric is None or not math.isfinite(rubric):
             return None
-        # The oracle joint aggregation is signed when a negative-direction
-        # rubric fires, while this training recipe requires the judge signal
-        # to stay on the same non-negative scale as terminal binary reward.
-        # Preserve the signed value in raw_rubric_score for auditability, but
-        # clip only the reward consumed by GRPO.
-        reward = max(0.0, float(rubric))
-        reward_source = "hosted_judge"
+        training_reward = group.training_reward_by_node.get(
+            branch.node_id, rubric
+        )
+        if not math.isfinite(float(training_reward)):
+            return None
+        # Direct judge rewards are already mapped to [0, 1].  An optional
+        # code-collapse override intentionally sits below the group minimum
+        # and may be negative; do not clip that training signal away.
+        reward = float(training_reward)
+        reward_source = group.reward_source_by_node.get(
+            branch.node_id, "direct_golden_rubric_judge"
+        )
 
     # Every training group shares the root system/user prompt.  For a beam
     # sample, prepend the corresponding Lane-A parent continuation to the
@@ -286,6 +289,24 @@ def _build_branch_sample(
                 branch.node_id, group.judge_score_by_node
             ),
             "reward_source": reward_source,
+            "collapse_reason": group.collapse_reason_by_node.get(
+                branch.node_id
+            ),
+            "collapse_reward_applied": (
+                branch.node_id in group.collapse_reason_by_node
+            ),
+            "predicted_zero_variance": group.predicted_zero_variance,
+            "explicit_abstain": bool(
+                (
+                    (group.direct_judge.get("explicit_abstain") or {}).get(
+                        "parsed"
+                    )
+                    or {}
+                ).get("should_abstain", False)
+            ),
+            "numeric_variance_detector": copy.deepcopy(
+                group.direct_judge.get("numeric_detector")
+            ),
             "policy_overlength_reason": branch.overlength_reason,
             "group_kind": group.group_kind,
             "beam_parent_index": branch.beam_parent_index,
@@ -377,6 +398,16 @@ def fork_group_to_export_group(
             "n_real": len(samples),
             "group_kind": group.group_kind,
             "n_beam_parents": len(group.parent_mid_cps),
+            "predicted_zero_variance": group.predicted_zero_variance,
+            "explicit_abstain": bool(
+                (
+                    (group.direct_judge.get("explicit_abstain") or {}).get(
+                        "parsed"
+                    )
+                    or {}
+                ).get("should_abstain", False)
+            ),
+            "collapse_count": len(group.collapse_reason_by_node),
         },
     )
 
@@ -392,15 +423,19 @@ def instance_record_to_bundle(
     ``depth1`` exports the root M=8 group. ``depth2`` exports that same group
     plus a second M=8 beam group when at least one sampled parent remains
     unfinished. Lane-A parent tokens are included in each corresponding beam
-    response. Unfinished traces use the hosted judge score; formal submissions
-    use their binary SWE-bench terminal result.
+    response. Direct mode uses the frozen-rubric judge for every prefix;
+    optional GT-on-submit replacement is recorded per sample.
 
     rubric_groups: always empty — true rubric-model training is a
     separate piece of work (see docs/rubric_rl.md)."""
     cap = steps_per_round
     if cap is None:
         try:
-            cap = int(record.config.get("steps_per_round")) if record.config else None
+            cap = (
+                int(record.config.get("k"))
+                if record.config and record.config.get("k") is not None
+                else None
+            )
         except (TypeError, ValueError):
             cap = None
     policy_groups: list[ExportGroup] = []
@@ -427,7 +462,7 @@ def instance_record_to_bundle(
             "reward_recipe": (
                 "gt_only"
                 if gt_only_reward
-                else "terminal_swebench_binary_else_nonnegative_hosted_judge"
+                else "direct_golden_rubric_with_optional_gt_submit_and_collapse"
             ),
             "steps_per_round_cap": cap,
             "completed": record.completed,

@@ -27,7 +27,7 @@ def test_wandb_config_only_contains_training_dynamic_allowlist(monkeypatch):
         eval_top_p=None,
         use_critic=False,
         # Static identity and sensitive/runtime fields must not be uploaded.
-        method="judge_depth2_beam2",
+        method="judge_direct_depth2",
         fold=0,
         hf_checkpoint="/models/Qwen3.6-27B",
         prompt_data=["fold0", "/datasets/train.jsonl"],

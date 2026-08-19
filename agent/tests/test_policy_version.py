@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
-import time
 
 import pytest
 
@@ -14,8 +12,8 @@ from swe_agent.policy_version import (
     checkpoint_policy_stale_lag,
     commit_policy_weight_update,
     committed_policy_version,
+    observed_policy_version,
     policy_version_for_checkpoint,
-    wait_for_policy_version,
 )
 
 
@@ -68,10 +66,12 @@ def test_policy_version_transition_is_fail_closed(monkeypatch, tmp_path):
 
     commit_policy_weight_update(base, transition)
     assert committed_policy_version() == base
+    assert observed_policy_version() == base
     assert_policy_version(base, stage="request_complete")
 
     next_version = policy_version_for_checkpoint(0)
     transition = begin_policy_weight_update(next_version)
+    assert observed_policy_version() == base
     with pytest.raises(PolicyVersionMismatch, match="request_complete"):
         assert_policy_version(base, stage="request_complete")
     commit_policy_weight_update(next_version, transition)
@@ -91,47 +91,3 @@ def test_policy_version_coordination_is_opt_in(monkeypatch):
     assert begin_policy_weight_update("checkpoint-base") is None
     commit_policy_weight_update("checkpoint-base", None)
     assert_policy_version("any-legacy-label", stage="request_start")
-
-
-def test_validation_can_wait_for_the_next_policy_commit(
-    monkeypatch,
-    tmp_path,
-):
-    state_path = tmp_path / "policy-version.json"
-    monkeypatch.setenv(POLICY_VERSION_STATE_ENV, str(state_path))
-    base = policy_version_for_checkpoint(-1)
-    transition = begin_policy_weight_update(base)
-    commit_policy_weight_update(base, transition)
-    next_version = policy_version_for_checkpoint(0)
-
-    def commit_next_version():
-        time.sleep(0.02)
-        next_transition = begin_policy_weight_update(next_version)
-        commit_policy_weight_update(next_version, next_transition)
-
-    thread = threading.Thread(target=commit_next_version)
-    thread.start()
-    wait_for_policy_version(
-        next_version,
-        timeout_seconds=1,
-        poll_seconds=0.005,
-        allow_future=True,
-    )
-    thread.join()
-
-
-def test_validation_does_not_wait_for_a_future_policy_by_default(
-    monkeypatch,
-    tmp_path,
-):
-    state_path = tmp_path / "policy-version.json"
-    monkeypatch.setenv(POLICY_VERSION_STATE_ENV, str(state_path))
-    base = policy_version_for_checkpoint(-1)
-    transition = begin_policy_weight_update(base)
-    commit_policy_weight_update(base, transition)
-
-    with pytest.raises(PolicyVersionMismatch, match="stale before dispatch"):
-        wait_for_policy_version(
-            policy_version_for_checkpoint(0),
-            timeout_seconds=0,
-        )

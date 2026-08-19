@@ -10,7 +10,6 @@ import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, List, Literal
 
-import jsonlines
 import litellm
 from agent_rl import ChatCompletion, ChatSamplingParams, call_model_service_async, get_model_service
 
@@ -266,17 +265,6 @@ def freeform_thought_model_kwargs(model_kwargs: Dict[str, Any] | None) -> Dict[s
         raise TypeError("model_kwargs.extra_body.chat_template_kwargs must be a dict")
     chat_template_kwargs["enable_thinking"] = True
     return kwargs
-
-
-def load_jsonlines(file):
-    with jsonlines.open(file, "r") as jsonl_f:
-        lst = [obj for obj in jsonl_f]
-    return lst
-
-
-def save_file_jsonl(data, fp):
-    with jsonlines.open(fp, mode="w") as writer:
-        writer.write_all(data)
 
 
 async def run_litellm_completion_async(
@@ -897,28 +885,6 @@ async def run_chat_with_route_completion_async(
             policy_version=policy_version,
         )
     except Exception as e:
-        print(f"Error in run_chat_with_route_async({route_name}): {e}")
+        print(f"Error in run_chat_with_route_completion_async({route_name}): {e}")
         return ChatCompletion(content="")
     return completion
-
-async def run_chat_with_route_async(
-    route_name: str,
-    model_name: str,
-    user_prompt: Optional[str] = None,
-    system_prompt: Optional[str] = None,
-    messages: Optional[List[Dict[str, str]]] = None,
-    **chat_kwargs,
-) -> str:
-    completion = await run_chat_with_route_completion_async(
-        route_name,
-        model_name,
-        user_prompt=user_prompt,
-        system_prompt=system_prompt,
-        messages=messages,
-        **chat_kwargs,
-    )
-    return completion.content
-
-
-if __name__ == "__main__":
-    pass

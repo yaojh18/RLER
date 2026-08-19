@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dr-agent"
+name = "rler-agent"
 version = "0.1.2.post1"
-description = "dr-agent-lib is an agent library for building deep research agents"
+description = "SWE agent rollout and training support for RLER"
 authors = [
     {name = "Shannon Shen", email = "zejiang@gmail.com"},
     {name = "Rulin Shao", email = "rulins@cs.washington.edu"}
@@ -52,7 +52,6 @@ dependencies = [
     "diskcache",
     "docker",
     "jinja2",
-    "jsonlines",
     "kubernetes",
     "typer",
     "rich",
@@ -64,11 +63,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ui = [
-    "dr-agent-ui~=0.1.0",
-    "fastapi",
-    "uvicorn[standard]",
-]
 dev = [
     "pytest",
     "pytest-asyncio",
@@ -83,11 +77,8 @@ all = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["dr_agent*", "swe_agent*", "agent_rl*"]
+include = ["swe_agent*", "agent_rl*"]
 exclude = ["tests*", "docs*"]
-
-[tool.setuptools.package-data]
-"dr_agent.shared_prompts" = ["*.txt", "*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = "tests"

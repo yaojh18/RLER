@@ -2,7 +2,14 @@ import asyncio
 import json
 
 import swe_agent.experience_retrieval as experience_retrieval
-from swe_agent.experience_retrieval import WeightedKeywordExperienceRetriever
+from swe_agent.experience_retrieval import (
+    CANDIDATE_LIMIT,
+    DOCUMENT_WEIGHTS,
+    QUERY_WEIGHTS,
+    SUMMARY_MAX_TOKENS,
+    SUMMARY_TEMPERATURE,
+    WeightedKeywordExperienceRetriever,
+)
 from swe_agent.rubric_bank import ExperienceRubricBank, _retrieval_summary_context
 
 
@@ -14,6 +21,7 @@ def _write_checkpoint(root):
             "description": "Judge the alpha API contract.",
             "context": "Apply when the alpha API is visible.",
             "experience": "Require concrete alpha behavior.",
+            "instance_label": "repo__blocked-1",
             "metadata": {
                 "reference_golden_rubrics": [
                     {
@@ -31,6 +39,7 @@ def _write_checkpoint(root):
             "description": "Judge the beta API contract.",
             "context": "Apply when the beta API is visible.",
             "experience": "Require concrete beta behavior.",
+            "instance_label": None,
             "metadata": {"reference_golden_rubrics": []},
         },
     ]
@@ -41,72 +50,28 @@ def _write_checkpoint(root):
     (bank_dir / "experience_bank.json").write_text(
         json.dumps({"experiences": records}), encoding="utf-8"
     )
-    (bank_dir / "lineage.json").write_text(
-        json.dumps(
-            {
-                "versions": {
-                    "exp-alpha": {"instance_label": "repo__blocked-1"},
-                    "exp-beta": {"instance_label": ""},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
     (retrieval_dir / "keyword_bank.json").write_text(
         json.dumps(
             {
                 "bank": {
                     "siblings": {
-                        "exp-alpha": {"keywords": ["alpha contract"]},
-                        "exp-beta": {"keywords": ["beta contract"]},
+                        "exp-alpha": {
+                            "generated_keywords": ["alpha", "contract"],
+                            "selected_keywords": ["alpha contract"],
+                        },
+                        "exp-beta": {
+                            "generated_keywords": ["beta", "contract"],
+                            "selected_keywords": ["beta contract"],
+                        },
                     }
                 }
             }
         ),
         encoding="utf-8",
     )
-    (retrieval_dir / "card_features.json").write_text(
-        json.dumps(
-            {
-                "features": {
-                    "siblings": {
-                        "exp-alpha": {},
-                        "exp-beta": {},
-                    }
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    (retrieval_dir / "recall_config.json").write_text(
-        json.dumps(
-            {
-                "candidate_limit": 2,
-                "rerank": False,
-                "query_summary": {},
-                "query_weights": {
-                    "problem": 1.0,
-                    "prior": 0.0,
-                    "continuations": 0.0,
-                    "stage": 0.0,
-                    "llm_contract": 0.0,
-                    "llm_state": 0.0,
-                    "symbols": 0.0,
-                },
-                "document_weights": {
-                    "full": 1.0,
-                    "routing": 0.0,
-                    "lesson": 0.0,
-                    "features": 0.0,
-                    "keywords": 1.0,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
 
 
-def test_weighted_retriever_uses_frozen_directory_without_instance_exclusion(tmp_path):
+def test_weighted_retriever_uses_only_frozen_instance_excluding_method(tmp_path):
     _write_checkpoint(tmp_path)
     retriever = WeightedKeywordExperienceRetriever(tmp_path, scope="siblings")
     context = {
@@ -124,7 +89,7 @@ def test_weighted_retriever_uses_frozen_directory_without_instance_exclusion(tmp
         context=context,
         summary={},
         instance_id="repo__blocked-1",
-    ) == ["exp-alpha", "exp-beta"]
+    ) == ["exp-beta"]
 
     bank = ExperienceRubricBank(bank_path=tmp_path, scope="siblings")
     assert bank.retriever is not None
@@ -133,7 +98,6 @@ def test_weighted_retriever_uses_frozen_directory_without_instance_exclusion(tmp
         "exp-alpha",
         "exp-beta",
     }
-
     async def fake_retrieve(**kwargs):
         return ["exp-beta", "exp-alpha"], []
 
@@ -157,17 +121,19 @@ def test_weighted_retriever_uses_frozen_directory_without_instance_exclusion(tmp
     ]
 
 
-def test_weighted_retriever_uses_only_configured_document_fields(tmp_path):
+def test_weighted_retriever_has_only_the_selected_frozen_configuration(tmp_path):
     _write_checkpoint(tmp_path)
-    config_path = tmp_path / "retrieval" / "recall_config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["document_weights"] = {"full": 0.25, "keywords": 1.75}
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-
     retriever = WeightedKeywordExperienceRetriever(tmp_path, scope="siblings")
 
-    assert retriever.document_fields == ("full", "keywords")
     assert set(retriever.bm25) == {"full", "keywords"}
+    assert CANDIDATE_LIMIT == 6
+    assert QUERY_WEIGHTS == {
+        "prior": 0.6,
+        "stage": 0.69,
+        "llm_contract": 1.48,
+        "llm_state": 4.01,
+    }
+    assert DOCUMENT_WEIGHTS == {"full": 0.19, "keywords": 1.39}
 
 
 def test_summary_corrects_malformed_quoted_code_example(monkeypatch, tmp_path):
@@ -178,7 +144,10 @@ def test_summary_corrects_malformed_quoted_code_example(monkeypatch, tmp_path):
         '{"retrieval_queries":["MultiValueField required child"]}',
     ]
 
-    async def fake_completion_message(**_kwargs):
+    calls = []
+
+    async def fake_completion_message(**kwargs):
+        calls.append(kwargs)
         content = responses.pop(0)
         return {
             "role": "assistant",
@@ -207,6 +176,8 @@ def test_summary_corrects_malformed_quoted_code_example(monkeypatch, tmp_path):
     ]
     assert len([message for message in messages if message["role"] == "assistant"]) == 2
     assert messages[-1]["role"] == "assistant"
+    assert all(call["temperature"] == SUMMARY_TEMPERATURE for call in calls)
+    assert all(call["max_tokens"] == SUMMARY_MAX_TOKENS for call in calls)
 
 
 def test_retrieval_summary_context_accepts_current_raw_continuation_key():

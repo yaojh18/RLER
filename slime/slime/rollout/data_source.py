@@ -138,8 +138,6 @@ class RolloutDataSource(DataSource):
         self.sample_offset = 0
         self.last_validation_scheduled_attempt = 0
         self.last_validation_attempt = 0
-        self.validation_rollout_ids: dict[int, int] = {}
-        self.validation_policy_versions: dict[int, str] = {}
         # TODO remove this
         self.metadata = {}
 
@@ -292,12 +290,6 @@ class RolloutDataSource(DataSource):
                 self.last_validation_scheduled_attempt
             ),
             "last_validation_attempt": self.last_validation_attempt,
-            "validation_rollout_ids": dict(
-                self.validation_rollout_ids
-            ),
-            "validation_policy_versions": dict(
-                self.validation_policy_versions
-            ),
             "metadata": self.metadata,
         }
         path = self._checkpoint_path(rollout_id, staged=staged)
@@ -353,62 +345,6 @@ class RolloutDataSource(DataSource):
         self.last_validation_attempt = state_dict.get(
             "last_validation_attempt", 0
         )
-        raw_validation_rollout_ids = state_dict.get(
-            "validation_rollout_ids",
-            {},
-        )
-        if not isinstance(raw_validation_rollout_ids, dict):
-            raise TypeError(
-                "checkpoint validation_rollout_ids must be a mapping"
-            )
-        self.validation_rollout_ids = {}
-        for raw_attempt, raw_rollout_id in (
-            raw_validation_rollout_ids.items()
-        ):
-            attempt = int(raw_attempt)
-            validation_rollout_id = int(raw_rollout_id)
-            if attempt <= 0 or validation_rollout_id < 0:
-                raise ValueError(
-                    "checkpoint validation rollout mapping must contain "
-                    "positive attempts and non-negative rollout IDs: "
-                    f"{raw_attempt!r}:{raw_rollout_id!r}"
-                )
-            if attempt > self.last_validation_scheduled_attempt:
-                raise ValueError(
-                    "checkpoint validation rollout mapping exceeds the "
-                    "scheduled validation cursor: "
-                    f"{attempt}>{self.last_validation_scheduled_attempt}"
-                )
-            self.validation_rollout_ids[attempt] = (
-                validation_rollout_id
-            )
-        raw_validation_policy_versions = state_dict.get(
-            "validation_policy_versions",
-            {},
-        )
-        if not isinstance(raw_validation_policy_versions, dict):
-            raise TypeError(
-                "checkpoint validation_policy_versions must be a mapping"
-            )
-        self.validation_policy_versions = {}
-        for raw_attempt, raw_version in (
-            raw_validation_policy_versions.items()
-        ):
-            attempt = int(raw_attempt)
-            version = str(raw_version or "").strip()
-            if attempt <= 0 or not version:
-                raise ValueError(
-                    "checkpoint validation policy mapping must contain "
-                    "positive attempts and non-empty versions: "
-                    f"{raw_attempt!r}:{raw_version!r}"
-                )
-            if attempt > self.last_validation_scheduled_attempt:
-                raise ValueError(
-                    "checkpoint validation policy mapping exceeds the "
-                    "scheduled validation cursor: "
-                    f"{attempt}>{self.last_validation_scheduled_attempt}"
-                )
-            self.validation_policy_versions[attempt] = version
         self.metadata = state_dict.get("metadata", {})
 
         if self.args.rollout_global_dataset and self.args.rollout_shuffle and self.dataset is not None:
@@ -453,12 +389,6 @@ class RolloutDataSource(DataSource):
             "last_validation_scheduled_attempt": int(
                 self.last_validation_scheduled_attempt
             ),
-            "validation_rollout_ids": dict(
-                self.validation_rollout_ids
-            ),
-            "validation_policy_versions": dict(
-                self.validation_policy_versions
-            ),
             "eval_instance_interval": (
                 None if interval is None else int(interval)
             ),
@@ -467,8 +397,6 @@ class RolloutDataSource(DataSource):
     def mark_validation_scheduled(
         self,
         attempted_instances: int,
-        rollout_id: int | None = None,
-        policy_version: str | None = None,
     ) -> None:
         attempted_instances = int(attempted_instances)
         if attempted_instances > self.sample_group_index:
@@ -482,53 +410,10 @@ class RolloutDataSource(DataSource):
                 f"cursor: {attempted_instances}<"
                 f"{self.last_validation_attempt}"
             )
-        if rollout_id is not None:
-            rollout_id = int(rollout_id)
-            if rollout_id < 0:
-                raise ValueError(
-                    "validation rollout ID must be non-negative, got "
-                    f"{rollout_id}"
-                )
-            existing = self.validation_rollout_ids.get(
-                attempted_instances
-            )
-            if existing is not None and existing != rollout_id:
-                raise ValueError(
-                    "cannot remap validation attempt to a different "
-                    "policy rollout: "
-                    f"attempt={attempted_instances} "
-                    f"existing={existing} requested={rollout_id}"
-                )
-        if policy_version is not None:
-            policy_version = str(policy_version).strip()
-            if not policy_version:
-                raise ValueError(
-                    "validation policy version must be non-empty"
-                )
-            existing_version = self.validation_policy_versions.get(
-                attempted_instances
-            )
-            if (
-                existing_version is not None
-                and existing_version != policy_version
-            ):
-                raise ValueError(
-                    "cannot remap validation attempt to a different policy "
-                    "version: "
-                    f"attempt={attempted_instances} "
-                    f"existing={existing_version!r} "
-                    f"requested={policy_version!r}"
-                )
         self.last_validation_scheduled_attempt = max(
             self.last_validation_scheduled_attempt,
             attempted_instances,
         )
-        if rollout_id is not None:
-            self.validation_rollout_ids[attempted_instances] = rollout_id
-        if policy_version is not None:
-            self.validation_policy_versions[attempted_instances] = (
-                policy_version
-            )
 
     def acknowledge_validation(self, attempted_instances: int) -> None:
         attempted_instances = int(attempted_instances)
