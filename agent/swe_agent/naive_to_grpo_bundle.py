@@ -27,6 +27,7 @@ def _build_rollout_sample(
     *,
     instance_id: str,
     rollout: NaiveRollout,
+    assistant_step_limit: int | None = None,
 ) -> ExportSample | None:
     """Build one ExportSample from a single naive rollout.
 
@@ -37,7 +38,11 @@ def _build_rollout_sample(
     """
     if rollout.error is not None or rollout.gt_score is None:
         return None
-    reward = float(rollout.gt_score)
+    reward = float(
+        rollout.training_reward
+        if rollout.training_reward is not None
+        else rollout.gt_score
+    )
     if not _math.isfinite(reward):
         return None
 
@@ -51,9 +56,15 @@ def _build_rollout_sample(
     rollout_logprobs: list[float] | None = None
 
     assistant_messages = [m for m in full_messages if m.get("role") == "assistant"]
-    if not assistant_messages or not all(map(has_exact_rollout_tokens, assistant_messages)):
+    asst_with_tokens = (
+        assistant_messages[:assistant_step_limit]
+        if assistant_step_limit is not None
+        else assistant_messages
+    )
+    if not asst_with_tokens or not all(
+        map(has_exact_rollout_tokens, asst_with_tokens)
+    ):
         return None
-    asst_with_tokens = assistant_messages
     if asst_with_tokens:
         last = asst_with_tokens[-1]
         last_prompt = list(last["prompt_token_ids"])
@@ -113,19 +124,38 @@ def _build_rollout_sample(
         rollout_logprobs = dense_lp
 
     # Split prompt (sys+user) from turns (everything assistant onward) for
-    # build_training_messages downstream. First assistant index = boundary.
+    # build_training_messages downstream.  With a cap, physically discard all
+    # messages after the final retained assistant turn; terminal continuation
+    # exists only for evaluator diagnostics and must not enter actor forward.
     first_asst_idx = next(
         (i for i, m in enumerate(full_messages) if m.get("role") == "assistant"),
         len(full_messages),
     )
+    cutoff_idx = len(full_messages)
+    if assistant_step_limit is not None:
+        assistant_count = 0
+        for message_index, message in enumerate(full_messages):
+            if message.get("role") != "assistant":
+                continue
+            assistant_count += 1
+            if assistant_count >= assistant_step_limit:
+                cutoff_idx = message_index + 1
+                break
     prompt_messages = [
         {"role": m.get("role", "user"), "content": m.get("content", "") or ""}
         for m in full_messages[:first_asst_idx]
     ]
     turn_messages = [
         {"role": m.get("role", "assistant"), "content": m.get("content", "") or ""}
-        for m in full_messages[first_asst_idx:]
+        for m in full_messages[first_asst_idx:cutoff_idx]
     ]
+
+    full_step_count = len(rollout.step_cards)
+    trained_step_count = (
+        min(full_step_count, assistant_step_limit)
+        if assistant_step_limit is not None
+        else full_step_count
+    )
 
     return ExportSample(
         sample_id=rollout.node_id,
@@ -138,16 +168,24 @@ def _build_rollout_sample(
             "group_index": 0,
             "terminated_early": rollout.terminated_early,
             "raw_gt_score": rollout.gt_score,
-            "raw_rubric_score": None,
+            "raw_rubric_score": rollout.judge_score,
+            "signed_mapped_judge_score": rollout.signed_judge_score,
+            "reward_source": rollout.reward_source,
+            "collapse_reward_applied": (
+                rollout.reward_source == "code_mode_collapse"
+            ),
+            "collapse_reason": rollout.collapse_reason,
             "total_tokens": rollout.total_tokens,
             "parent_token_count": (len(token_ids) - response_length)
             if token_ids is not None and response_length is not None else None,
             "token_source": "sglang_stored",
             # Per-sample step counts — same keys as lanes for shared metric
             # aggregation in the rollout-fn (sample_cont_steps_mean etc.).
-            "n_continuation_steps": len(rollout.step_cards),
+            "n_continuation_steps": trained_step_count,
             "n_parent_steps": 0,
-            "n_full_trace_steps": len(rollout.step_cards),
+            "n_full_trace_steps": full_step_count,
+            "train_assistant_step_limit": assistant_step_limit,
+            "n_discarded_steps": full_step_count - trained_step_count,
             # Patch field used by rollout metrics.
             "terminal_patch_len": len(rollout.terminal_patch or ""),
         },
@@ -169,12 +207,35 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
     """
     samples: list[ExportSample] = []
     invalid_rollouts: list[str] = []
+    raw_step_limit = record.config.get("train_assistant_step_limit")
+    assistant_step_limit = (
+        int(raw_step_limit) if raw_step_limit is not None else None
+    )
     for r in record.rollouts:
-        s = _build_rollout_sample(instance_id=record.instance_id, rollout=r)
+        s = _build_rollout_sample(
+            instance_id=record.instance_id,
+            rollout=r,
+            assistant_step_limit=assistant_step_limit,
+        )
         if s is None:
             invalid_rollouts.append(r.node_id)
             continue
         samples.append(s)
+
+    direct_judge = record.direct_judge or {}
+    for sample in samples:
+        sample.metadata = {
+            **(sample.metadata or {}),
+            "predicted_zero_variance": bool(
+                direct_judge.get("predicted_zero_variance", False)
+            ),
+            "explicit_abstain": (
+                (direct_judge.get("explicit_abstain") or {})
+                .get("parsed", {})
+                .get("should_abstain")
+            ),
+            "numeric_detector": direct_judge.get("numeric_detector"),
+        }
 
     group_dropped_reason = (
         f"invalid_rollouts ({len(invalid_rollouts)}/{len(record.rollouts)})"
@@ -192,6 +253,9 @@ def naive_record_to_bundle(record: NaiveRecord) -> GRPOExportBundle:
                     "group_index": 0,
                     "n_rollouts": len(record.rollouts),
                     "n_real": len(samples),
+                    "predicted_zero_variance": bool(
+                        direct_judge.get("predicted_zero_variance", False)
+                    ),
                 },
             )
         )

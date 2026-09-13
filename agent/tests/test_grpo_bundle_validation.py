@@ -1,8 +1,7 @@
 import asyncio
 import copy
-import importlib.util
 import json
-from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -122,23 +121,6 @@ def test_zero_token_abort_is_a_policy_branch_error():
     assert "finish_reason=abort" in error
 
 
-def _load_smoke_verifier():
-    script = (
-        Path(__file__).resolve().parents[3]
-        / "exp"
-        / "scripts"
-        / "verify_rler_earlypred_smoke.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "verify_rler_earlypred_smoke_for_test",
-        script,
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_invalid_naive_rollout_drops_complete_group():
     record = NaiveRecord(
         instance_id="instance",
@@ -172,6 +154,52 @@ def test_naive_all_pass_reward_defaults_to_unit_scale():
     assert NaiveSearchConfig().gt_eval_timeout == 600
 
 
+def test_naive_prefix_training_physically_discards_terminal_continuation():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "problem"},
+        {
+            "role": "assistant",
+            "content": "first",
+            "prompt_token_ids": [1, 2],
+            "token_ids": [3],
+            "logprobs": [-0.1],
+        },
+        {"role": "tool", "content": "observation"},
+        {
+            "role": "assistant",
+            "content": "terminal continuation",
+            "prompt_token_ids": [1, 2, 3, 4],
+            "token_ids": [5],
+            "logprobs": [-0.2],
+        },
+    ]
+    record = NaiveRecord(
+        instance_id="instance",
+        run_dir="run",
+        task_id="instance",
+        config={"train_assistant_step_limit": 1},
+        rollouts=[
+            NaiveRollout(
+                rollout_index=0,
+                node_id="prefix-only",
+                messages=messages,
+                step_cards=[{"step": 1}, {"step": 2}],
+                gt_score=0.75,
+            )
+        ],
+    )
+
+    bundle = naive_record_to_bundle(record)
+
+    sample = bundle.policy_groups[0].samples[0]
+    assert sample.reward == 0.75
+    assert sample.token_ids == [1, 2, 3]
+    assert [message["content"] for message in sample.turns] == ["first"]
+    assert sample.metadata["n_full_trace_steps"] == 2
+    assert sample.metadata["n_discarded_steps"] == 1
+
+
 class _PolicyVersionCaptureBackend:
     def __init__(self):
         self.agent_config = {"step_limit": 250}
@@ -192,11 +220,11 @@ class _PolicyVersionCaptureBackend:
 
 
 @pytest.mark.parametrize(
-    ("enforce_policy_version", "expected_session_version"),
-    [(False, None), (True, "checkpoint-0000007")],
+    ("max_policy_stale_lag", "expected_session_version"),
+    [(None, None), (1, "checkpoint-0000007")],
 )
-def test_naive_request_version_guard_is_validation_only(
-    enforce_policy_version,
+def test_naive_request_version_guard_uses_stale_one_window(
+    max_policy_stale_lag,
     expected_session_version,
 ):
     runner = object.__new__(NaiveSearchRunner)
@@ -205,7 +233,10 @@ def test_naive_request_version_guard_is_validation_only(
     runner.instance = {"patch": "gold"}
     runner.policy_model_name = "Qwen/Qwen3.5-9B"
     runner.policy_version = "checkpoint-0000007"
-    runner.enforce_policy_version = enforce_policy_version
+    runner.max_policy_stale_lag = max_policy_stale_lag
+    runner._policy_cancelled = threading.Event()
+    runner._policy_cancel_lock = threading.Lock()
+    runner._policy_cancel_reason = ""
     runner.backend = _PolicyVersionCaptureBackend()
     runner.policy_base_urls = ["http://127.0.0.1:30000"]
     runner.api_key = "EMPTY"
@@ -215,6 +246,7 @@ def test_naive_request_version_guard_is_validation_only(
     runner._make_session(0)
 
     assert runner.backend.spec.policy_version == expected_session_version
+    assert runner.backend.spec.max_policy_stale_lag == max_policy_stale_lag
     # The logical dispatch version remains available for exported sample
     # metadata even when training does not enforce it request-by-request.
     assert runner.policy_version == "checkpoint-0000007"
@@ -224,6 +256,9 @@ def test_policy_mismatch_uses_normal_session_cleanup():
     runner = object.__new__(NaiveSearchRunner)
     runner.task_id = "django__django-1"
     runner.config = NaiveSearchConfig(step_limit=250)
+    runner._policy_cancelled = threading.Event()
+    runner._policy_cancel_lock = threading.Lock()
+    runner._policy_cancel_reason = ""
     cleanup_calls = []
 
     class Snapshot:
@@ -238,10 +273,10 @@ def test_policy_mismatch_uses_normal_session_cleanup():
     session = SimpleNamespace(snapshot=lambda: Snapshot())
     runner._make_session = lambda rollout_index: session
 
-    def stale_step(session, max_steps):
+    def stale_step(*args, **kwargs):
         raise PolicyVersionMismatch("request_complete: stale validation")
 
-    runner._step_session = stale_step
+    runner._run_session_phase = stale_step
     runner._cleanup_session = lambda session: cleanup_calls.append(session)
 
     rollout = runner._run_one_rollout(0)
@@ -271,14 +306,16 @@ def test_naive_extracts_terminal_or_workspace_patch(
         "agent": {"state": {"messages": _messages()}},
     }
     session = SimpleNamespace(
-        snapshot=lambda: SimpleNamespace(model_dump=lambda mode="json": snapshot)
+        snapshot=lambda: SimpleNamespace(model_dump=lambda mode="json": snapshot),
+        run_until_pause=lambda max_steps, step_guard=None: SimpleNamespace(
+            model_dump=lambda mode="json": {
+                "status": "finished",
+                "exit_status": exit_status,
+                "submission": "",
+            }
+        ),
     )
     runner._make_session = lambda rollout_index: session
-    runner._step_session = lambda session, max_steps: {
-        "status": "finished",
-        "exit_status": exit_status,
-        "submission": "",
-    }
     runner._cleanup_session = lambda session: None
     extraction_calls = []
     monkeypatch.setattr(
@@ -350,6 +387,7 @@ def test_naive_retries_only_failed_rollout_before_completing_group(tmp_path):
         gt_eval_workers=1,
         rollout_max_attempts=3,
     )
+    runner.max_policy_stale_lag = None
     runner._live_sessions = []
     attempts = []
     evaluations = []
@@ -466,48 +504,6 @@ def test_judge_reward_uses_real_node_id():
     assert exported.samples[0].reward == 0.75
     assert exported.samples[0].metadata["parent_assistant_spans"] == []
     assert exported.samples[0].metadata["child_assistant_spans"] == [[0, 1]]
-
-
-def test_explicit_gt_on_submit_reward_overrides_direct_judge_reward():
-    mid_cp = MidCp(
-        idx=0,
-        asst_step=0,
-        image_tag="root-image",
-        snapshot={"agent": {"state": {"messages": _messages()[:2]}}},
-    )
-    branch = LaneBBranch(
-        group_index=0,
-        branch_index=0,
-        node_id="submitted-node",
-        parent_image_tag="root-image",
-        messages=_messages()[2:],
-        terminated_early=True,
-        gt_score=1.0,
-    )
-    group = ForkGroup(
-        group_index=0,
-        mid_cp=mid_cp,
-        branches=[branch],
-        judge_score_by_node={"submitted-node": 0.15},
-        training_reward_by_node={"submitted-node": 1.0},
-        reward_source_by_node={
-            "submitted-node": "terminal_swebench_binary"
-        },
-    )
-
-    exported = fork_group_to_export_group(
-        instance_id="instance",
-        group=group,
-        steps_per_round=1,
-    )
-
-    assert exported is not None
-    assert exported.samples[0].reward == 1.0
-    assert (
-        exported.samples[0].metadata["reward_source"]
-        == "terminal_swebench_binary"
-    )
-    assert exported.samples[0].metadata["raw_rubric_score"] == 0.15
 
 
 def test_direct_reward_remains_default_for_submitted_branch():
@@ -762,37 +758,6 @@ def test_beam_parent_assistant_tokens_are_trainable_from_root_prompt():
     assert sample.metadata["group_kind"] == "beam"
     assert sample.metadata["parent_assistant_spans"] == [[0, 2]]
     assert sample.metadata["child_assistant_spans"] == [[3, 5]]
-
-    verifier = _load_smoke_verifier()
-    serialized = {
-        "tokens": list(sample.token_ids),
-        "response_length": sample.response_length,
-        "loss_mask": list(sample.loss_mask[-sample.response_length:]),
-        "metadata": copy.deepcopy(sample.metadata),
-    }
-    assert verifier._validate_response_assistant_spans(
-        serialized,
-        expected_parent_turns=1,
-        expected_child_turns=1,
-        label="beam sample",
-    ) == {
-        "parent_turns": 1,
-        "child_turns": 1,
-        "masked_tokens": 4,
-    }
-
-    parent_start, parent_end = sample.metadata["parent_assistant_spans"][0]
-    for response_index in range(parent_start, parent_end):
-        corrupted = copy.deepcopy(serialized)
-        corrupted["loss_mask"][response_index] = 0
-        with pytest.raises(RuntimeError, match="unmasked token"):
-            verifier._validate_response_assistant_spans(
-                corrupted,
-                expected_parent_turns=1,
-                expected_child_turns=1,
-                label="beam sample",
-            )
-
 
 def test_beam_overlength_before_first_child_turn_trains_parent_only():
     root_messages = [

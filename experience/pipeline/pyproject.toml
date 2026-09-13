@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rler-experience-pipeline"
+version = "1.0.0"
+description = "Final automatic Qwen and Nemotron TTS experience pipeline"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+experience-gen = "experience_gen.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["experience_gen*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

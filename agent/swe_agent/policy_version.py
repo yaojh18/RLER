@@ -249,16 +249,44 @@ def observed_policy_version() -> str | None:
     return version
 
 
-def assert_policy_version(expected_version: str | None, *, stage: str) -> None:
-    """Fail when a policy request starts or ends under another weight epoch."""
+def assert_policy_staleness(
+    expected_version: str | None,
+    *,
+    max_lag: int,
+    stage: str,
+    reject_transition: bool = False,
+) -> int | None:
+    """Fail when the committed policy exceeds an allowed checkpoint lag.
+
+    A weight update does not make the previously committed policy stale.  The
+    stale-window collector therefore keeps using the committed version while
+    an update is in progress and rechecks after every inference boundary.
+    Exact-version callers can opt into transition rejection.
+    """
+
+    if int(max_lag) < 0:
+        raise ValueError(f"max_lag must be non-negative, got {max_lag}")
     if expected_version is None or policy_version_state_path() is None:
-        return
-    state = _read_state(policy_version_state_path())
+        return None
+    path = policy_version_state_path()
+    assert path is not None
+    state = _read_state(path)
     observed = str(state.get("committed_version") or "")
-    if bool(state.get("updating")) or observed != str(expected_version):
+    if reject_transition and bool(state.get("updating")):
         raise PolicyVersionMismatch(
-            "policy version changed during trajectory generation: "
+            "policy version is outside the allowed rollout window: "
+            f"stage={stage} expected={expected_version!r} "
+            f"observed={observed!r} updating=True "
+            f"target={state.get('target_version')!r} lag=unknown "
+            f"max_lag={int(max_lag)}"
+        )
+    lag = policy_version_stale_lag(str(expected_version), observed)
+    if lag < 0 or lag > int(max_lag):
+        raise PolicyVersionMismatch(
+            "policy version is outside the allowed rollout window: "
             f"stage={stage} expected={expected_version!r} "
             f"observed={observed!r} updating={bool(state.get('updating'))} "
-            f"target={state.get('target_version')!r}"
+            f"target={state.get('target_version')!r} lag={lag} "
+            f"max_lag={int(max_lag)}"
         )
+    return lag

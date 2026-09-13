@@ -1,8 +1,8 @@
 import pytest
 
 from slime.utils.types import Sample
-from train_agent.collect_grpo_rollout import build_rollout_samples
 from train_agent.contracts import ExportGroup, ExportSample
+from train_agent.sample_conversion import build_rollout_samples
 
 
 def _export_group() -> ExportGroup:
@@ -34,7 +34,6 @@ def test_oversized_sample_keeps_aligned_trainable_prefix():
 
     samples, truncated = build_rollout_samples(
         groups=[group],
-        include_turn_rewards=False,
         max_sample_tokens=5,
     )
 
@@ -55,14 +54,12 @@ def test_missing_exact_rollout_fields_raise():
     with pytest.raises(ValueError, match="missing exact rollout training fields"):
         build_rollout_samples(
             groups=[group],
-            include_turn_rewards=False,
         )
 
 
 def test_export_ids_are_preserved_as_authoritative_sample_metadata():
     samples, truncated = build_rollout_samples(
         groups=[_export_group()],
-        include_turn_rewards=False,
     )
 
     assert truncated == 0
@@ -81,5 +78,4 @@ def test_export_sample_group_id_must_match_its_container_group():
     with pytest.raises(ValueError, match="declares group"):
         build_rollout_samples(
             groups=[group],
-            include_turn_rewards=False,
         )

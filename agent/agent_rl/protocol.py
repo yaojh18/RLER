@@ -48,6 +48,7 @@ class RolloutSessionSpec(BaseModel):
     sample_index: int = 0
     policy_ref: str = "policy"
     policy_version: Optional[str] = None
+    max_policy_stale_lag: Optional[int] = None
     dataset_name: Optional[Any] = None
     ground_truth: Optional[Any] = None
     raw_user_query: Optional[str] = None

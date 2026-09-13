@@ -30,16 +30,6 @@ def _load_grpo(monkeypatch):
                 "__rler_rollout_collector_state_v1__"
             ),
         ),
-        "slime.backends": _module("slime.backends"),
-        "slime.backends.megatron_utils": _module("slime.backends.megatron_utils"),
-        "slime.backends.megatron_utils.cp_utils": _module(
-            "slime.backends.megatron_utils.cp_utils",
-            slice_log_prob_with_cp=lambda *args, **kwargs: None,
-        ),
-        "slime.backends.megatron_utils.loss": _module(
-            "slime.backends.megatron_utils.loss",
-            policy_loss_function=lambda *args, **kwargs: (None, {}),
-        ),
     }
     for name, module in stubs.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -53,8 +43,6 @@ def _load_grpo(monkeypatch):
 
 def _required_args(tmp_path: Path) -> list[str]:
     return [
-        "--target",
-        "policy",
         "--prompt-data",
         str(tmp_path / "train.jsonl"),
         "--hf-checkpoint",
@@ -63,8 +51,8 @@ def _required_args(tmp_path: Path) -> list[str]:
         str(tmp_path / "load"),
         "--save-dir",
         str(tmp_path / "save"),
-        "--search-output-root",
-        str(tmp_path / "search"),
+        "--rollout-function-path",
+        "train_agent.collect_naive_rollout_async.generate_rollout",
         "--wandb-mode",
         "disabled",
     ]
@@ -100,8 +88,6 @@ def test_grpo_forwards_fixed_validation_usage_and_smoke_overrides(
             "--train-instance-budget",
             "1250",
             "--require-train-instance-budget-exhaustion",
-            "--stop-after-validation-attempt",
-            "100",
             "--log-probs-chunk-size",
             "32",
             "--sglang-mem-fraction-static",
@@ -126,12 +112,13 @@ def test_grpo_forwards_fixed_validation_usage_and_smoke_overrides(
     assert script.count(
         "--require-train-instance-budget-exhaustion"
     ) == 1
-    assert "--stop-after-validation-attempt 100" in script
     assert "export RLER_CHECKPOINT_RETAIN_LATEST=2" in script
     assert script.count("--log-probs-chunk-size 32") == 1
     assert script.count("--sglang-mem-fraction-static 0.75") == 1
     assert script.count("--sglang-disable-custom-all-reduce") == 1
-    assert script.count("GRPO_OVERRIDE_ARGS") >= 3
+    assert "GRPO_OVERRIDE_ARGS" not in script
+    assert "GRPO_COMMON_ARGS_STRIPPED" not in script
+    assert "GRPO_COMMON_ARGS_RESUME" not in script
 
 
 @pytest.mark.parametrize(
@@ -145,9 +132,9 @@ def test_grpo_forwards_fixed_validation_usage_and_smoke_overrides(
                 "val",
                 "/tmp/val.jsonl",
                 "--n-samples-per-eval-prompt",
-                "2",
+                "0",
             ],
-            "n-samples-per-eval-prompt 1",
+            "positive --n-samples-per-eval-prompt",
         ),
         (["--save-interval", "0"], "--save-interval must be positive"),
         (
@@ -162,11 +149,6 @@ def test_grpo_forwards_fixed_validation_usage_and_smoke_overrides(
             ["--require-train-instance-budget-exhaustion"],
             "--require-train-instance-budget-exhaustion requires "
             "--train-instance-budget",
-        ),
-        (
-            ["--stop-after-validation-attempt", "100"],
-            "--stop-after-validation-attempt requires "
-            "--eval-instance-interval",
         ),
         (
             ["--checkpoint-retain-latest", "-1"],
@@ -213,12 +195,8 @@ def test_grpo_explicit_resume_restores_training_state(monkeypatch, tmp_path):
 
     assert rc == 0
     script = captured["command"][2]
-    assert "GRPO_COMMON_ARGS_RESUME" in script
-    assert (
-        "--no-load-optim|--no-load-optim=*|--no-load-rng|--no-load-rng=*"
-        in script
-    )
-    assert "--start-rollout-id=*" in script
+    assert '"${GRPO_FRESH_START_ARGS[@]}"' not in script
+    assert "GRPO_COMMON_ARGS_RESUME" not in script
     assert "export RLER_CHECKPOINT_RETAIN_LATEST=0" in script
     assert "export RLER_USAGE_RESUME=1" in script
     assert "Explicit resume: preserve the checkpoint's recorded rollout id" in script
@@ -328,7 +306,8 @@ def test_grpo_auto_resume_uses_latest_complete_model_cursor_pair(
 
     assert tracker.read_text() == "5\n"
     script = captured["command"][2]
-    assert "GRPO_COMMON_ARGS_RESUME" in script
+    assert "GRPO_COMMON_ARGS_RESUME" not in script
+    assert '"${GRPO_FRESH_START_ARGS[@]}"' not in script
     assert "after rollout 5" in script
     assert f"--load {save_dir}" in script
     # The reference model remains the immutable base load directory.

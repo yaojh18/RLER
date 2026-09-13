@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Async rollout function backed by NaiveSearchRunner.
 
-Drop-in for collect_lanes_rollout_async.generate_rollout — same signature,
-same return type. Each instance produces ONE ExportGroup of M=8 samples,
-one per independent linear rollout. No Lane A spine or Lane B forks from
-intermediate states.
+Each instance produces one ``ExportGroup`` of M=8 independent linear
+rollouts. The collector implements Slime's custom train/eval rollout contract
+directly; it does not use trajectory-search lanes or intermediate forks.
 
 ENV CONTRACT (set by slime/train_agent/run/grpo_async_naive.py from the
 SLURM script's tunables):
   SWE_AGENT_NAIVE_M                  int    rollouts per instance (default 8)
   SWE_AGENT_NAIVE_STEP_LIMIT         int    hard cap per rollout (default 120)
+  SWE_AGENT_NAIVE_TRAIN_ASSISTANT_STEP_LIMIT int optional exported prefix cap
   SWE_AGENT_NAIVE_INSTANCE_WORKERS   int    concurrent instance subprocesses (default 8)
   SWE_AGENT_NAIVE_GT_EVAL_WORKERS    int    per-instance GT eval threads (default 8)
   SWE_AGENT_NAIVE_COMPLETION_MAX_TOKENS int per-call max_new_tokens (default 20480)
@@ -22,6 +22,7 @@ SLURM script's tunables):
   SWE_AGENT_NAIVE_REWARD_KIND        str    hard, soft, joint, or f2p_only;
                                             default joint
   SWE_AGENT_NAIVE_ALL_PASS_REWARD    float  resolved reward multiplier (default 1)
+  SWE_AGENT_NAIVE_DIRECT_REWARD_MODE str    none or direct_judge
 Per-engine endpoints come from args.sglang_model_engines, populated when the
 rollout engines are initialized in slime/ray/rollout.py.
 """
@@ -33,6 +34,7 @@ import atexit
 import copy
 import json
 import logging
+import math
 import os
 import random
 import threading
@@ -40,7 +42,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -54,22 +56,25 @@ from slime.rollout.filter_hub.base_types import call_dynamic_filter
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
-from train_agent.collect_grpo_rollout import build_rollout_samples
+from train_agent.sample_conversion import build_rollout_samples
 from train_agent.collector_checkpoint import (
     COLLECTOR_CHECKPOINT_SCHEMA_VERSION,
+    DIRECT_DIAGNOSTIC_KEYS,
+    checkpoint_task_descriptor,
     checkpoint_task_source_group_index,
-    deserialize_budget_error,
+    deserialize_attempt_error,
     deserialize_buffer,
-    deserialize_validation_error,
-    serialize_budget_error,
+    group_outcome_stats,
+    observe_direct_group,
+    restore_direct_diagnostics,
+    serialize_attempt_error,
     serialize_buffer,
-    serialize_pending_tasks,
-    serialize_validation_error,
 )
 from train_agent.serving.sglang_chat_service import start_slime_policy_route_warmup
 from swe_agent.exceptions import PolicyVersionMismatch
 from swe_agent.parallel_utils import normalize_terminal_patch_text
 from swe_agent.policy_version import (
+    assert_policy_staleness,
     checkpoint_policy_stale_lag,
     committed_policy_version,
     observed_policy_version,
@@ -150,7 +155,7 @@ def _is_fatal_ray_infrastructure_error(exc: BaseException) -> bool:
     return False
 
 
-def _raise_fatal_ray_infrastructure_error(
+def raise_fatal_ray_infrastructure_error(
     exc: BaseException,
     *,
     collector: str,
@@ -163,6 +168,200 @@ def _raise_fatal_ray_infrastructure_error(
         f"instance {instance_id}; aborting before drawing replacement source "
         f"instances: {type(exc).__name__}: {str(exc)[:500]}"
     ) from exc
+
+
+def _direct_judge_prefix(record: Any) -> dict[str, Any]:
+    return {
+        "instance_id": record.instance_id,
+        "branches": [
+            {
+                "node_id": rollout.node_id,
+                "visible_assistant_steps": len(
+                    rollout.cutoff_step_cards
+                ),
+                "ended_by_prefix": bool(rollout.cutoff_terminated),
+                "step_cards": copy.deepcopy(
+                    rollout.cutoff_step_cards
+                ),
+                "workspace_meta": copy.deepcopy(
+                    rollout.cutoff_workspace_meta
+                ),
+            }
+            for rollout in record.rollouts
+        ],
+    }
+
+
+def _apply_direct_collapse_overrides(
+    record: Any,
+    *,
+    assistant_step_limit: int,
+    margin: float,
+) -> None:
+    from swe_agent.collapse_detector import trajectory_collapse_reason
+
+    collapse_reward = min(
+        float(rollout.training_reward)
+        for rollout in record.rollouts
+    ) - margin
+    for rollout in record.rollouts:
+        reason = trajectory_collapse_reason(
+            rollout.messages,
+            assistant_step_limit=assistant_step_limit,
+        )
+        if reason is None:
+            continue
+        rollout.training_reward = collapse_reward
+        rollout.reward_source = "code_mode_collapse"
+        rollout.collapse_reason = reason
+
+
+async def _apply_naive_direct_rewards(
+    *,
+    record: Any,
+    problem_statement: str,
+    expected_rollouts: int,
+    assistant_step_limit: int,
+    rubric_bank_path: str,
+    judge_model_name: str,
+    judge_api_base: str,
+    judge_api_key: str,
+    judge_context_length: int,
+    judge_max_tokens: int,
+    judge_temperature: float,
+    judge_top_p: float,
+    enable_variance_detector: bool,
+    collapse_reward_margin: float,
+    stale_check: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Apply the training-only direct reward after terminal GT scoring."""
+
+    from swe_agent.direct_rubric_judge import (
+        DirectRubricBank,
+        judge_direct_rubric_group,
+    )
+    from swe_agent.run.run_swe_agent import _litellm_model_kwargs
+    from swe_agent.variance_detector import load_variance_detector
+
+    if assistant_step_limit <= 0:
+        raise ValueError(
+            "naive direct reward requires a positive prefix limit"
+        )
+    if (
+        not math.isfinite(collapse_reward_margin)
+        or collapse_reward_margin <= 0
+    ):
+        raise ValueError(
+            "collapse_reward_margin must be finite and positive"
+        )
+    if len(record.rollouts) != expected_rollouts:
+        raise ValueError(
+            f"direct reward expected {expected_rollouts} rollouts, "
+            f"got {len(record.rollouts)}"
+        )
+    if any(
+        rollout.gt_score is None
+        or not math.isfinite(float(rollout.gt_score))
+        for rollout in record.rollouts
+    ):
+        raise ValueError(
+            "direct reward requires finite terminal GT diagnostics"
+        )
+
+    bank = DirectRubricBank(Path(rubric_bank_path))
+    if not bank.is_eligible(record.instance_id):
+        raise ValueError(
+            "instance is not eligible for direct rubric training: "
+            f"{record.instance_id}"
+        )
+    detector = load_variance_detector() if enable_variance_detector else None
+    if detector is not None and tuple(
+        float(value) for value in detector["score_mapping"]
+    ) != bank.score_mapping:
+        raise ValueError(
+            "variance detector score mapping does not match the direct rubric bank"
+        )
+
+    api_base = judge_api_base.rstrip("/")
+    if not api_base.endswith("/v1"):
+        api_base += "/v1"
+    judge_task = asyncio.create_task(
+        judge_direct_rubric_group(
+            instance_id=record.instance_id,
+            problem_statement=problem_statement,
+            prefix=_direct_judge_prefix(record),
+            bank=bank,
+            judge_model_name=judge_model_name,
+            judge_model_kwargs={
+                **_litellm_model_kwargs(judge_model_name),
+                "api_base": api_base,
+                "api_key": judge_api_key,
+                "completion_backend": "litellm",
+            },
+            detector=detector,
+            context_length=judge_context_length,
+            max_tokens=judge_max_tokens,
+            judge_temperature=judge_temperature,
+            judge_top_p=judge_top_p,
+        )
+    )
+    try:
+        while not judge_task.done():
+            if stale_check is not None:
+                stale_check("direct_judge_wait")
+            await asyncio.wait({judge_task}, timeout=1.0)
+        judged = await judge_task
+        if stale_check is not None:
+            stale_check("direct_judge_complete")
+    except BaseException:
+        judge_task.cancel()
+        await asyncio.gather(judge_task, return_exceptions=True)
+        raise
+    expected_ids = {rollout.node_id for rollout in record.rollouts}
+    scores = {
+        str(node_id): float(score)
+        for node_id, score in judged["judge_scores"].items()
+    }
+    signed = {
+        str(node_id): float(score)
+        for node_id, score in judged["signed_mapped_scores"].items()
+    }
+    if set(scores) != expected_ids or set(signed) != expected_ids:
+        raise ValueError("direct judge returned an incomplete node set")
+    for rollout in record.rollouts:
+        rollout.judge_score = scores[rollout.node_id]
+        rollout.signed_judge_score = signed[rollout.node_id]
+        rollout.training_reward = scores[rollout.node_id]
+        rollout.reward_source = "direct_golden_rubric_judge"
+
+    _apply_direct_collapse_overrides(
+        record,
+        assistant_step_limit=assistant_step_limit,
+        margin=collapse_reward_margin,
+    )
+    judged["training_reward_by_node"] = {
+        rollout.node_id: float(rollout.training_reward)
+        for rollout in record.rollouts
+    }
+    judged["reward_source_by_node"] = {
+        rollout.node_id: rollout.reward_source
+        for rollout in record.rollouts
+    }
+    judged["collapse_reason_by_node"] = {
+        rollout.node_id: rollout.collapse_reason
+        for rollout in record.rollouts
+        if rollout.collapse_reason is not None
+    }
+    judged["terminal_gt_scores"] = {
+        rollout.node_id: float(rollout.gt_score)
+        for rollout in record.rollouts
+    }
+    record.direct_judge = judged
+    Path(record.run_dir, "direct_judge.json").write_text(
+        json.dumps(judged, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    return judged
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +378,11 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         configure_usage_ledger(task.get("usage_ledger") or None)
         os.environ["SEARCH_SWE_SLIME_API_BASE"] = task["policy_base_url"]
         os.environ["SEARCH_SWE_SLIME_API_KEY"] = task["api_key"]
+        assert_policy_staleness(
+            task.get("policy_version"),
+            max_lag=1,
+            stage="naive_group_start",
+        )
         from swe_agent.backend import SWEAgentRolloutBackend
         from swe_agent.naive_search import NaiveSearchConfig, NaiveSearchRunner
         from swe_agent.naive_to_grpo_bundle import naive_record_to_bundle
@@ -265,10 +469,19 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             m=task["m"],
             step_limit=task["step_limit"],
             gt_eval_workers=task.get("gt_eval_workers", 8),
-            gt_eval_timeout=task.get("gt_eval_timeout", 600),
+            gt_eval_timeout=min(int(task.get("gt_eval_timeout", 600)), 600),
             evaluate_gt=not bool(task.get("defer_gt_evaluation")),
             rollout_pool_size=task.get("rollout_pool_size") or task["m"],
             rollout_max_attempts=task.get("rollout_max_attempts", 8),
+            require_exact_token_info=bool(
+                task.get("require_exact_token_info", True)
+            ),
+            train_assistant_step_limit=(
+                int(task["train_assistant_step_limit"])
+                if int(task.get("train_assistant_step_limit") or 0) > 0
+                and not task.get("validation")
+                else None
+            ),
             policy_temperature=task.get("policy_temperature", 1.0),
             policy_top_p=task.get("policy_top_p", 0.95),
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
@@ -277,11 +490,20 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             joint_alpha=task.get("joint_alpha", 1.0),
             all_pass_reward=task.get("all_pass_reward", 1.0),
         )
+        variance_resample_attempt = int(
+            task.get("variance_resample_attempt", 0)
+        )
+        stale_retry_attempt = int(task.get("stale_retry_attempt", 0))
+        task_dir_name = f"task-{task['index']:06d}"
+        if variance_resample_attempt:
+            task_dir_name += f"-v{variance_resample_attempt}"
+        if stale_retry_attempt:
+            task_dir_name += f"-s{stale_retry_attempt}"
         run_dir = (
             output_root
             / instance_id
             / time.strftime("%Y%m%d-%H%M%S")
-            / f"task-{task['index']:06d}"
+            / task_dir_name
         )
         run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -292,9 +514,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             run_dir=run_dir,
             policy_model_name=model_name,
             policy_version=task.get("policy_version"),
-            # Validation uses the same stale=1 rollout semantics as training.
-            # Record weight drift for diagnostics instead of aborting work.
-            enforce_policy_version=False,
+            max_policy_stale_lag=1,
             config=cfg,
             harness_namespace=get_swebench_harness_namespace(instance),
             policy_base_url=policy_base_url,
@@ -333,19 +553,30 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(
                 record.error or "naive rollout group did not complete"
             )
-        if task.get("validation"):
-            (run_dir / "validation_policy.json").write_text(
-                json.dumps(
-                    {
-                        "policy_version": task.get("policy_version"),
-                        "observed_policy_start": observed_policy_start,
-                        "observed_policy_end": observed_policy_end,
-                        "rollout_id": int(task["rollout_id"]),
-                    },
-                    sort_keys=True,
+        direct_mode = str(task.get("direct_reward_mode") or "none")
+        if not task.get("validation") and direct_mode != "none":
+            asyncio.run(
+                _apply_naive_direct_rewards(
+                    record=record,
+                    problem_statement=str(instance["problem_statement"]),
+                    expected_rollouts=int(task["m"]),
+                    assistant_step_limit=int(task["train_assistant_step_limit"]),
+                    rubric_bank_path=str(task["direct_rubric_bank"]),
+                    judge_model_name=str(task["direct_judge_model"]),
+                    judge_api_base=str(task["direct_judge_api_base"]),
+                    judge_api_key=str(task["direct_judge_api_key"]),
+                    judge_context_length=int(task["direct_judge_context_length"]),
+                    judge_max_tokens=int(task["direct_judge_max_tokens"]),
+                    judge_temperature=float(task["direct_judge_temperature"]),
+                    judge_top_p=float(task["direct_judge_top_p"]),
+                    enable_variance_detector=bool(
+                        task["direct_enable_variance_detector"]
+                    ),
+                    collapse_reward_margin=float(
+                        task["direct_collapse_reward_margin"]
+                    ),
+                    stale_check=runner.check_policy_staleness,
                 )
-                + "\n",
-                encoding="utf-8",
             )
         bundle = (
             None
@@ -410,6 +641,19 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                     "observed_policy_start": observed_policy_start,
                     "observed_policy_end": observed_policy_end,
                 }
+            (run_dir / "validation_policy.json").write_text(
+                json.dumps(
+                    {
+                        "index": int(task["index"]),
+                        "attempt": variance_resample_attempt,
+                        "rollout_id": int(task["rollout_id"]),
+                        "validation_policy": validation_policy,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
         result = {
             "index": task["index"],
             "instance_id": instance_id,
@@ -555,7 +799,7 @@ def _naive_validation_gt_task(task: dict[str, Any]) -> dict[str, Any]:
                 patches_by_key={eval_key: patch},
                 model_name=task["model_name"],
                 max_workers=1,
-                timeout=int(task.get("gt_eval_timeout", 1800)),
+                timeout=min(int(task.get("gt_eval_timeout", 600)), 600),
                 namespace=get_swebench_harness_namespace(instance),
                 work_dir=rollout_dir,
                 reward_config=reward_config,
@@ -619,12 +863,14 @@ class _BufferedGroup:
     samples: list[Sample]
     rollout_id: int = 0
     usage_group_id: str = ""
+    source_task: dict[str, Any] | None = None
 
 
 _BUFFER: list[_BufferedGroup] = []
 _TASK_INDEX = 0
 _WARMUP_DONE = False
 _STALE_DROPPED_GROUPS = 0
+_STALE_REQUEUED_GROUPS = 0
 _FAILED_INSTANCES = 0
 _TRUNCATED_OVERSIZED = 0
 _FILTER_DROPPED_GROUPS = 0
@@ -643,6 +889,7 @@ _REWARD_GROUPS_OBSERVED = 0
 _REWARD_GROUP_MEAN_SUM = 0.0
 _REWARD_GROUP_VARIANCE_SUM = 0.0
 _ZERO_VARIANCE_GROUPS = 0
+_DIRECT_DIAGNOSTICS = dict.fromkeys(DIRECT_DIAGNOSTIC_KEYS, 0)
 # Per-endpoint in-flight trial count, used by _pick_least_loaded_endpoints
 # to route each new instance's M trials across the engines that are currently
 # least loaded. Bumped when an instance is dispatched, decremented when its
@@ -658,6 +905,7 @@ _NODE_WORKER_IPS: list[str] = []
 _NODE_WORKER_GENERATION = 0
 _PENDING: dict[Any, dict[str, Any]] = {}
 _REPLAY_PENDING_TASKS: list[dict[str, Any]] = []
+_SOURCE_RETRY_TASKS: list[dict[str, Any]] = []
 _DISPATCH_COUNTER = 0
 _USAGE_TRACKER: UsageMetricsTracker | None = None
 _USAGE_TRACKER_PATH = ""
@@ -682,19 +930,19 @@ def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
         "checkpoint_rollout_id": int(rollout_id),
         "buffer": serialize_buffer(_BUFFER),
         "pending_tasks": (
-            serialize_pending_tasks(_PENDING)
-            + serialize_pending_tasks(
-                dict(enumerate(_REPLAY_PENDING_TASKS))
-            )
+            [checkpoint_task_descriptor(task) for task in _PENDING.values()]
+            + copy.deepcopy(_REPLAY_PENDING_TASKS)
+            + copy.deepcopy(_SOURCE_RETRY_TASKS)
         ),
         "task_index": int(_TASK_INDEX),
         "dispatch_counter": int(_DISPATCH_COUNTER),
         "usage_ledger_offset": usage_ledger_offset(
-            _ensure_usage_tracking()
+            ensure_usage_tracking()
         ),
         "random_state": random.getstate(),
         "counters": {
             "stale_dropped_groups": int(_STALE_DROPPED_GROUPS),
+            "stale_requeued_groups": int(_STALE_REQUEUED_GROUPS),
             "failed_instances": int(_FAILED_INSTANCES),
             "truncated_oversized": int(_TRUNCATED_OVERSIZED),
             "filter_dropped_groups": int(_FILTER_DROPPED_GROUPS),
@@ -708,17 +956,75 @@ def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
                 _REWARD_GROUP_VARIANCE_SUM
             ),
             "zero_variance_groups": int(_ZERO_VARIANCE_GROUPS),
+            "direct_diagnostics": dict(_DIRECT_DIAGNOSTICS),
         },
         "source_budget_exhausted": bool(_SOURCE_BUDGET_EXHAUSTED),
-        "source_budget_error": serialize_budget_error(
-            _SOURCE_BUDGET_ERROR
+        "source_budget_error": serialize_attempt_error(
+            _SOURCE_BUDGET_ERROR,
+            "budget",
         ),
-        "source_validation_error": serialize_validation_error(
-            _SOURCE_VALIDATION_ERROR
+        "source_validation_error": serialize_attempt_error(
+            _SOURCE_VALIDATION_ERROR,
+            "boundary",
         ),
         "validation_partial_state": copy.deepcopy(
             _VALIDATION_PARTIAL_STATE
         ),
+    }
+
+
+def discard_terminal_source_work() -> dict[str, int]:
+    """Forget final-epoch lookahead that cannot feed another update."""
+    global _PENDING, _REPLAY_PENDING_TASKS, _SOURCE_RETRY_TASKS
+    global _VALIDATION_PARTIAL_STATE
+
+    pending = list(_PENDING.items())
+    replayed = list(_REPLAY_PENDING_TASKS)
+    source_retries = list(_SOURCE_RETRY_TASKS)
+    for ref, task in pending:
+        released_indices = {
+            int(index)
+            for index in task.get("_released_branch_indices", [])
+        }
+        endpoints_picked = [
+            tuple(endpoint)
+            for endpoint in task.get("_endpoints_picked", [])
+        ]
+        _release_endpoints(
+            [
+                endpoint
+                for index, endpoint in enumerate(endpoints_picked)
+                if index not in released_indices
+            ]
+        )
+        marker_value = task.get("_branch_done_dir")
+        if marker_value:
+            for marker in Path(str(marker_value)).glob("rollout-*.ready"):
+                marker.unlink(missing_ok=True)
+        usage_group_id = str(task.get("usage_group_id") or "")
+        if usage_group_id:
+            record_usage_disposition(
+                usage_group_id,
+                disposition="dropped",
+                reason="terminal_source_budget_lookahead",
+            )
+        try:
+            ray.cancel(ref, force=False)
+        except Exception:
+            pass
+    _PENDING = {}
+    _REPLAY_PENDING_TASKS = []
+    _SOURCE_RETRY_TASKS = []
+    buffered = len(_BUFFER)
+    _drop_incomplete_source_budget_buffer(
+        reason="terminal_source_budget_lookahead"
+    )
+    _VALIDATION_PARTIAL_STATE = None
+    return {
+        "pending": len(pending),
+        "replay_pending": len(replayed),
+        "source_retry_pending": len(source_retries),
+        "buffered_groups": buffered,
     }
 
 
@@ -728,15 +1034,17 @@ def load_checkpoint_state_dict(
 ) -> None:
     """Restore logical state; live pending tasks are rebound on first generate."""
     global _BUFFER, _TASK_INDEX, _WARMUP_DONE
-    global _STALE_DROPPED_GROUPS, _FAILED_INSTANCES
+    global _STALE_DROPPED_GROUPS, _STALE_REQUEUED_GROUPS
+    global _FAILED_INSTANCES
     global _TRUNCATED_OVERSIZED, _FILTER_DROPPED_GROUPS
     global _FILTER_DROP_REASONS, _INFRA_DROPPED_GROUPS
     global _INFRA_DROP_REASONS, _TOTAL_GROUPS_ATTEMPTED
     global _REWARD_GROUPS_OBSERVED, _REWARD_GROUP_MEAN_SUM
     global _REWARD_GROUP_VARIANCE_SUM, _ZERO_VARIANCE_GROUPS
+    global _DIRECT_DIAGNOSTICS
     global _NODE_WORKERS, _NODE_WORKER_IPS
     global _NODE_WORKER_GENERATION, _PENDING
-    global _REPLAY_PENDING_TASKS
+    global _REPLAY_PENDING_TASKS, _SOURCE_RETRY_TASKS
     global _DISPATCH_COUNTER
     global _USAGE_TRACKER, _USAGE_TRACKER_PATH
     global _HEARTBEAT_EVENT_STEP, _HEARTBEAT_OUTPUT_ROOT
@@ -765,6 +1073,7 @@ def load_checkpoint_state_dict(
         _BUFFER
         or _PENDING
         or _REPLAY_PENDING_TASKS
+        or _SOURCE_RETRY_TASKS
     ):
         raise RuntimeError(
             "refusing to overlay a naive collector checkpoint on live state"
@@ -778,11 +1087,15 @@ def load_checkpoint_state_dict(
     _REPLAY_PENDING_TASKS = copy.deepcopy(
         list(state.get("pending_tasks") or [])
     )
+    _SOURCE_RETRY_TASKS = []
     _TASK_INDEX = int(state.get("task_index", 0))
     _DISPATCH_COUNTER = int(state.get("dispatch_counter", 0))
     counters = dict(state.get("counters") or {})
     _STALE_DROPPED_GROUPS = int(
         counters.get("stale_dropped_groups", 0)
+    )
+    _STALE_REQUEUED_GROUPS = int(
+        counters.get("stale_requeued_groups", 0)
     )
     _FAILED_INSTANCES = int(counters.get("failed_instances", 0))
     _TRUNCATED_OVERSIZED = int(counters.get("truncated_oversized", 0))
@@ -813,21 +1126,26 @@ def load_checkpoint_state_dict(
     _ZERO_VARIANCE_GROUPS = int(
         counters.get("zero_variance_groups", 0)
     )
+    _DIRECT_DIAGNOSTICS = restore_direct_diagnostics(
+        counters.get("direct_diagnostics")
+    )
     _SOURCE_BUDGET_EXHAUSTED = bool(
         state.get("source_budget_exhausted", False)
     )
-    _SOURCE_BUDGET_ERROR = deserialize_budget_error(
+    _SOURCE_BUDGET_ERROR = deserialize_attempt_error(
         state.get("source_budget_error"),
         TrainingInstanceBudgetExhausted,
+        "budget",
     )
-    _SOURCE_VALIDATION_ERROR = deserialize_validation_error(
+    _SOURCE_VALIDATION_ERROR = deserialize_attempt_error(
         state.get("source_validation_error"),
         TrainingValidationBoundaryReached,
+        "boundary",
     )
     _VALIDATION_PARTIAL_STATE = copy.deepcopy(
         state.get("validation_partial_state")
     )
-    _restore_usage_tracking_checkpoint(
+    restore_usage_tracking_checkpoint(
         state.get("usage_ledger_offset")
     )
     random_state = state.get("random_state")
@@ -881,54 +1199,7 @@ def _observe_reward_group(args, samples: list[Sample]) -> None:
         _ZERO_VARIANCE_GROUPS += 1
 
 
-def _group_outcome_metrics(
-    *,
-    attempted: int,
-    accepted: int,
-    invalid: int,
-    dynamic_filtered: int,
-    excess: int,
-    carried_in: int = 0,
-    carried_out: int = 0,
-    prefix: str = "",
-) -> dict[str, float | int]:
-    """Build conserved per-update group counts and attempted-denominator rates.
-
-    The Lane collector historically carries valid over-sampling excess into
-    the next rollout cycle.  ``carried_in``/``carried_out`` make that lifecycle
-    explicit without reclassifying valid data as dropped.
-    """
-    accounted = accepted + invalid + dynamic_filtered + excess
-    available = attempted + carried_in
-    consumed = accounted + carried_out
-    if available != consumed:
-        raise AssertionError(
-            "group outcome conservation failed: "
-            f"attempted={attempted} carried_in={carried_in} "
-            f"accepted={accepted} invalid={invalid} "
-            f"dynamic_filtered={dynamic_filtered} excess={excess} "
-            f"carried_out={carried_out}"
-        )
-    stem = f"swe_agent/{prefix}"
-    denominator = attempted if attempted > 0 else 1
-    return {
-        f"{stem}groups_attempted": attempted,
-        f"{stem}groups_accepted": accepted,
-        f"{stem}groups_invalid": invalid,
-        f"{stem}groups_dynamic_filtered": dynamic_filtered,
-        f"{stem}groups_excess": excess,
-        f"{stem}groups_carried_in": carried_in,
-        f"{stem}groups_carried_out": carried_out,
-        f"{stem}groups_accepted_rate": accepted / denominator if attempted else 0.0,
-        f"{stem}groups_invalid_rate": invalid / denominator if attempted else 0.0,
-        f"{stem}groups_dynamic_filtered_rate": (
-            dynamic_filtered / denominator if attempted else 0.0
-        ),
-        f"{stem}groups_excess_rate": excess / denominator if attempted else 0.0,
-    }
-
-
-def _ensure_usage_tracking() -> str:
+def ensure_usage_tracking() -> str:
     global _USAGE_TRACKER, _USAGE_TRACKER_PATH
     path = str(os.environ.get("RLER_USAGE_LEDGER_PATH") or "").strip()
     configure_usage_ledger(path or None)
@@ -938,7 +1209,7 @@ def _ensure_usage_tracking() -> str:
     return path
 
 
-def _restore_usage_tracking_checkpoint(
+def restore_usage_tracking_checkpoint(
     historical_end_offset: int | None,
 ) -> None:
     """Reset the shared tracker around a durable model/data checkpoint."""
@@ -949,13 +1220,13 @@ def _restore_usage_tracking_checkpoint(
     _USAGE_TRACKER_PATH = ""
 
 
-def _usage_metrics(
+def usage_metrics(
     *,
     commit_update: bool = False,
 ) -> dict[str, float | int]:
     """Return the small approximate token-cost surface logged to W&B."""
 
-    _ensure_usage_tracking()
+    ensure_usage_tracking()
     if _USAGE_TRACKER is None:
         return {}
     if commit_update:
@@ -973,7 +1244,7 @@ def _usage_metrics(
     return {key: value for key, value in metrics.items() if key in retained}
 
 
-def _emit_heartbeat(
+def emit_heartbeat(
     *,
     source: str,
     rollout_id: int,
@@ -1042,7 +1313,7 @@ def _emit_heartbeat(
             "heartbeat/buffered_groups": int(buffered_groups),
             "heartbeat/submitted": int(submitted),
         }
-        metrics.update(_usage_metrics())
+        metrics.update(usage_metrics())
         wandb.log(metrics)
     except Exception:
         # A telemetry failure must never kill an optimizer update. The local
@@ -1050,24 +1321,7 @@ def _emit_heartbeat(
         logger.exception("[%s-async] W&B heartbeat failed", source)
 
 
-def _usage_group_prefix(
-    *,
-    phase: str,
-    rollout_id: int,
-    instance_id: str,
-    task_index: int,
-    dataset_name: str = "",
-) -> str:
-    return build_usage_group_prefix(
-        phase=phase,
-        rollout_id=rollout_id,
-        instance_id=instance_id,
-        task_index=task_index,
-        dataset_name=dataset_name,
-    )
-
-
-def _record_usage_disposition(
+def record_usage_disposition(
     group_id: str,
     *,
     disposition: str,
@@ -1076,7 +1330,7 @@ def _record_usage_disposition(
 ) -> None:
     if not group_id:
         return
-    _ensure_usage_tracking()
+    ensure_usage_tracking()
     record_group_disposition(
         group_id,
         disposition=disposition,
@@ -1265,14 +1519,24 @@ def _spawn_node_workers(per_node_concurrency: int) -> None:
         for s in os.environ.get(env_name, "").split(",")
         if s.strip()
     }
+    preferred = {
+        value.strip()
+        for value in os.environ.get(
+            "SWE_AGENT_NAIVE_ROLLOUT_NODE_IPS", ""
+        ).split(",")
+        if value.strip()
+    }
     nodes = []
     for n in ray.nodes():
         if not n.get("Alive"):
             continue
-        if float(n.get("Resources", {}).get("GPU", 0)) <= 0:
-            continue
         node_ip = n.get("NodeManagerAddress") or ""
         node_name = n.get("NodeName") or ""
+        if preferred:
+            if node_ip not in preferred and node_name not in preferred:
+                continue
+        elif float(n.get("Resources", {}).get("GPU", 0)) <= 0:
+            continue
         if node_ip in skip or node_name in skip:
             logger.info(
                 f"[naive-async] SKIP node {node_name or node_ip} "
@@ -1378,6 +1642,13 @@ def _ensure_validation_node_workers(
         for s in os.environ.get(env_name, "").split(",")
         if s.strip()
     }
+    preferred = {
+        value.strip()
+        for value in os.environ.get(
+            "SWE_AGENT_NAIVE_ROLLOUT_NODE_IPS", ""
+        ).split(",")
+        if value.strip()
+    }
     n_nodes = max(
         1,
         len(
@@ -1385,7 +1656,23 @@ def _ensure_validation_node_workers(
                 node
                 for node in ray.nodes()
                 if node.get("Alive")
-                and float(node.get("Resources", {}).get("GPU", 0)) > 0
+                and (
+                    (
+                        preferred
+                        and (
+                            (node.get("NodeManagerAddress") or "")
+                            in preferred
+                            or (node.get("NodeName") or "") in preferred
+                        )
+                    )
+                    or (
+                        not preferred
+                        and float(
+                            node.get("Resources", {}).get("GPU", 0)
+                        )
+                        > 0
+                    )
+                )
                 and (node.get("NodeManagerAddress") or "") not in skip
                 and (node.get("NodeName") or "") not in skip
             ]
@@ -1411,12 +1698,21 @@ def _naive_values_from_env() -> dict[str, Any]:
         v = os.environ.get(name, "")
         return float(v) if v else default
 
+    def _bool(name, default):
+        v = os.environ.get(name, "")
+        if not v:
+            return default
+        return v.strip().lower() in {"1", "true", "yes", "on"}
+
     return {
         "m": _int("SWE_AGENT_NAIVE_M", 8),
         "step_limit": _int("SWE_AGENT_NAIVE_STEP_LIMIT", 120),
+        "train_assistant_step_limit": _int(
+            "SWE_AGENT_NAIVE_TRAIN_ASSISTANT_STEP_LIMIT", 0
+        ),
         "gt_eval_workers": _int("SWE_AGENT_NAIVE_GT_EVAL_WORKERS", 8),
-        "gt_eval_timeout": _int(
-            "SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT", 600
+        "gt_eval_timeout": min(
+            _int("SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT", 600), 600
         ),
         "rollout_pool_size": _int("SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE"),
         "rollout_max_attempts": _int(
@@ -1431,7 +1727,61 @@ def _naive_values_from_env() -> dict[str, Any]:
         "reward_kind": (os.environ.get("SWE_AGENT_NAIVE_REWARD_KIND") or "joint").lower(),
         "joint_alpha": _float("SWE_AGENT_NAIVE_JOINT_ALPHA", 1.0),
         "all_pass_reward": _float("SWE_AGENT_NAIVE_ALL_PASS_REWARD", 1.0),
+        "direct_reward_mode": (
+            os.environ.get("SWE_AGENT_NAIVE_DIRECT_REWARD_MODE") or "none"
+        ).strip(),
+        "direct_rubric_bank": os.environ.get(
+            "SWE_AGENT_NAIVE_DIRECT_RUBRIC_BANK", ""
+        ),
+        "direct_enable_variance_detector": _bool(
+            "SWE_AGENT_NAIVE_DIRECT_ENABLE_VARIANCE_DETECTOR", True
+        ),
+        "direct_collapse_reward_margin": _float(
+            "SWE_AGENT_NAIVE_DIRECT_COLLAPSE_REWARD_MARGIN", 0.5
+        ),
+        "direct_judge_context_length": _int(
+            "SWE_AGENT_NAIVE_DIRECT_JUDGE_CONTEXT_LENGTH", 256000
+        ),
+        "direct_judge_max_tokens": _int(
+            "SWE_AGENT_NAIVE_DIRECT_JUDGE_MAX_TOKENS", 20480
+        ),
+        "direct_judge_temperature": _float(
+            "SWE_AGENT_NAIVE_DIRECT_JUDGE_TEMPERATURE", 0.02
+        ),
+        "direct_judge_top_p": _float(
+            "SWE_AGENT_NAIVE_DIRECT_JUDGE_TOP_P", 1.0
+        ),
     }
+
+
+def _hosted_direct_settings() -> tuple[str, str, str]:
+    """Return the frozen direct-judge route, endpoint, and credential."""
+    judge_model = (
+        os.environ.get("SWE_AGENT_NAIVE_DIRECT_JUDGE_MODEL")
+        or "openai/azure/openai/gpt-5.6-luna"
+    ).strip()
+    api_base = (
+        os.environ.get("SWE_AGENT_NAIVE_DIRECT_JUDGE_API_BASE")
+        or os.environ.get("LITELLM_API_BASE")
+        or os.environ.get("NVIDIA_API_BASE")
+        or "https://inference-api.nvidia.com/v1"
+    ).strip().rstrip("/")
+    api_key = next(
+        (
+            value.strip()
+            for name in (
+                "SWE_AGENT_NAIVE_DIRECT_JUDGE_API_KEY",
+                "LITELLM_API_KEY",
+                "NVIDIA_API_KEY",
+                "NVIDIA_NIM_API_KEY",
+            )
+            if (value := os.environ.get(name)) and value.strip()
+        ),
+        "",
+    )
+    if not api_key:
+        raise ValueError("direct judge API key is missing")
+    return judge_model, api_base, api_key
 
 
 def _pick_least_loaded_endpoints(
@@ -1581,7 +1931,21 @@ def _replay_checkpoint_pending_tasks(
         )
     endpoints = _policy_endpoints_for_model(args, model_name)
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
-    gt_eval_workers = _naive_values_from_env()["gt_eval_workers"]
+    naive_values = _naive_values_from_env()
+    gt_eval_workers = naive_values["gt_eval_workers"]
+    direct_reward_mode = str(
+        naive_values.get("direct_reward_mode") or "none"
+    )
+    if direct_reward_mode == "none":
+        direct_judge_model = ""
+        direct_judge_api_base = ""
+        direct_judge_api_key = ""
+    else:
+        (
+            direct_judge_model,
+            direct_judge_api_base,
+            direct_judge_api_key,
+        ) = _hosted_direct_settings()
     replay_tasks = _REPLAY_PENDING_TASKS
     _REPLAY_PENDING_TASKS = []
     for original in replay_tasks:
@@ -1594,13 +1958,17 @@ def _replay_checkpoint_pending_tasks(
                 else ""
             )
         )
-        _record_usage_disposition(
+        record_usage_disposition(
             old_usage_group_id,
             disposition="dropped",
             reason="checkpoint_replay",
         )
         source_group_index = checkpoint_task_source_group_index(task)
-        usage_prefix = _usage_group_prefix(
+        variance_resample_attempt = int(
+            task.get("variance_resample_attempt", 0)
+        )
+        stale_retry_attempt = int(task.get("stale_retry_attempt", 0))
+        usage_prefix = build_usage_group_prefix(
             phase=str(task.get("usage_phase") or "train"),
             rollout_id=int(rollout_id),
             instance_id=str(task["instance_id"]),
@@ -1632,10 +2000,13 @@ def _replay_checkpoint_pending_tasks(
                 "_branch_done_dir": str(marker_dir),
                 "_released_branch_indices": [],
                 "api_key": api_key,
+                "direct_judge_model": direct_judge_model,
+                "direct_judge_api_base": direct_judge_api_base,
+                "direct_judge_api_key": direct_judge_api_key,
                 # Capacity knobs follow the resumed job; experiment semantics
                 # and the drawn source instance remain checkpointed.
                 "gt_eval_workers": gt_eval_workers,
-                "usage_ledger": _ensure_usage_tracking(),
+                "usage_ledger": ensure_usage_tracking(),
                 # The durable ledger prefix already contains one approximate
                 # cost for this pending source instance. Re-execution is a
                 # checkpoint retry and must not be charged a second time.
@@ -1643,7 +2014,14 @@ def _replay_checkpoint_pending_tasks(
                 "policy_version": policy_version,
                 "source_group_index": source_group_index,
                 "usage_group_prefix": usage_prefix,
-                "usage_group_id": f"{usage_prefix}:g0",
+                "usage_group_id": (
+                    f"{usage_prefix}:g{variance_resample_attempt}"
+                    + (
+                        f"-s{stale_retry_attempt}"
+                        if stale_retry_attempt
+                        else ""
+                    )
+                ),
             }
         )
         worker = _NODE_WORKERS[
@@ -1708,11 +2086,14 @@ def _validation_rows_from_args(args) -> list[tuple[str, dict[str, Any]]]:
         path = Path(str(getattr(dataset_cfg, "path", "")))
         if not path.is_file():
             raise FileNotFoundError(f"validation manifest does not exist: {path}")
-        n_eval = getattr(dataset_cfg, "n_samples_per_eval_prompt", None)
-        if n_eval not in (None, 1):
+        configured_n_eval = getattr(
+            dataset_cfg, "n_samples_per_eval_prompt", None
+        )
+        n_eval = 3 if configured_n_eval is None else int(configured_n_eval)
+        if n_eval <= 0:
             raise ValueError(
-                f"{dataset_name}: validation protocol requires exactly one "
-                f"rollout per instance, got n_samples_per_eval_prompt={n_eval}"
+                f"{dataset_name}: validation sample count must be positive, "
+                f"got n_samples_per_eval_prompt={n_eval}"
             )
         metadata_key = str(getattr(dataset_cfg, "metadata_key", "") or "metadata")
         metadata_overrides = dict(
@@ -1783,7 +2164,18 @@ def _validation_rows_from_args(args) -> list[tuple[str, dict[str, Any]]]:
                 f"{dataset_name}: manifest has {len(dataset_rows)} rows, "
                 f"below min_eval_samples={min_eval}"
             )
-        rows.extend(dataset_rows)
+        for dataset_name_value, metadata in dataset_rows:
+            for sample_index in range(n_eval):
+                rows.append(
+                    (
+                        dataset_name_value,
+                        {
+                            **metadata,
+                            "validation_sample_index": sample_index,
+                            "validation_samples_per_instance": n_eval,
+                        },
+                    )
+                )
     return rows
 
 
@@ -1825,7 +2217,6 @@ def _validation_sample(
         try:
             built, _ = build_rollout_samples(
                 groups=[groups[0]],
-                include_turn_rewards=False,
             )
             if built:
                 sample = built[0]
@@ -1930,7 +2321,7 @@ def generate_validation_rollout(
     for index in dispatch_indices:
         dataset_name, metadata = rows[index]
         policy_urls, picked = _pick_least_loaded_endpoints(1, endpoints)
-        usage_prefix = _usage_group_prefix(
+        usage_prefix = build_usage_group_prefix(
             phase="validation",
             rollout_id=rollout_id,
             instance_id=metadata["instance_id"],
@@ -1958,15 +2349,18 @@ def generate_validation_rollout(
                 os.environ.get("SWE_AGENT_VALIDATION_STEP_LIMIT", "120")
             ),
             "gt_eval_workers": 1,
-            "gt_eval_timeout": int(
-                os.environ.get(
-                    "SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT", "1800"
-                )
+            "gt_eval_timeout": min(
+                int(
+                    os.environ.get(
+                        "SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT", "600"
+                    )
+                ),
+                600,
             ),
             "rollout_pool_size": 1,
             "completion_max_tokens": int(
                 os.environ.get(
-                    "SWE_AGENT_VALIDATION_COMPLETION_MAX_TOKENS", "20480"
+                    "SWE_AGENT_VALIDATION_COMPLETION_MAX_TOKENS", "10240"
                 )
             ),
             "context_length": int(
@@ -1976,7 +2370,7 @@ def generate_validation_rollout(
                 )
             ),
             "policy_temperature": float(
-                os.environ.get("SWE_AGENT_VALIDATION_TEMPERATURE", "1.0")
+                os.environ.get("SWE_AGENT_VALIDATION_TEMPERATURE", "0.7")
             ),
             "policy_top_p": float(
                 os.environ.get("SWE_AGENT_VALIDATION_TOP_P", "0.95")
@@ -1988,7 +2382,7 @@ def generate_validation_rollout(
             "all_pass_reward": 1.0,
             "validation": True,
             "defer_gt_evaluation": True,
-            "usage_ledger": _ensure_usage_tracking(),
+            "usage_ledger": ensure_usage_tracking(),
             "usage_phase": "validation",
             "usage_group_prefix": usage_prefix,
             "usage_group_id": f"{usage_prefix}:g0",
@@ -2113,7 +2507,7 @@ def generate_validation_rollout(
             metadata=metadata,
             index=index,
         )
-        _record_usage_disposition(
+        record_usage_disposition(
             str(result.get("usage_group_id") or usage_group_id),
             disposition="accepted" if completed else "invalid",
             reason="" if completed else "validation_error",
@@ -2211,8 +2605,35 @@ def generate_validation_rollout(
             "eval/incomplete": int(total_completed != total_attempted),
         }
     )
-    metrics.update(_usage_metrics())
+    metrics.update(usage_metrics())
     return RolloutFnEvalOutput(data=data, metrics=metrics)
+
+
+def _queue_source_retry(
+    task: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    """Retry the same source group without advancing the dataset cursor."""
+
+    global _TASK_INDEX, _STALE_REQUEUED_GROUPS
+    retry_task = checkpoint_task_descriptor(task)
+    retry_task["index"] = _TASK_INDEX
+    _TASK_INDEX += 1
+    retry_task["source_retry_reason"] = str(reason)
+    if reason == "stale":
+        retry_task["stale_retry_attempt"] = (
+            int(retry_task.get("stale_retry_attempt", 0)) + 1
+        )
+        _STALE_REQUEUED_GROUPS += 1
+    elif reason == "zero_variance_resample":
+        retry_task["variance_resample_attempt"] = (
+            int(retry_task.get("variance_resample_attempt", 0)) + 1
+        )
+    else:
+        raise ValueError(f"unsupported source retry reason: {reason!r}")
+    _SOURCE_RETRY_TASKS.append(retry_task)
+    return retry_task
 
 
 def _submit_until_full(
@@ -2251,6 +2672,17 @@ def _submit_until_full(
     endpoints = _policy_endpoints_for_model(args, model_name)
 
     api_key = os.environ.get("SEARCH_SWE_SLIME_API_KEY", "EMPTY")
+    direct_mode = str(naive_values.get("direct_reward_mode") or "none")
+    if direct_mode == "none":
+        direct_judge_model = ""
+        direct_judge_api_base = ""
+        direct_judge_api_key = ""
+    else:
+        (
+            direct_judge_model,
+            direct_judge_api_base,
+            direct_judge_api_key,
+        ) = _hosted_direct_settings()
     m_trials = int(naive_values.get("m", 8))
     max_tail_pending = max(
         0,
@@ -2290,49 +2722,66 @@ def _submit_until_full(
         policy_version = _dispatch_policy_version()
         if policy_version is None:
             break
-        projected_groups = len(_BUFFER) + len(_PENDING)
-        if projected_groups >= target_groups + max_tail_pending:
-            break
-        if (
-            _SOURCE_BUDGET_EXHAUSTED
-            or _SOURCE_VALIDATION_ERROR is not None
-        ):
-            break
-        try:
-            prompt_groups = data_buffer.get_samples(1)
-        except TrainingValidationBoundaryReached as exc:
-            _SOURCE_VALIDATION_ERROR = exc
-            logger.info("[naive-async] %s", exc)
-            break
-        except TrainingInstanceBudgetExhausted as exc:
-            _SOURCE_BUDGET_EXHAUSTED = True
-            _SOURCE_BUDGET_ERROR = exc
-            logger.info("[naive-async] %s", exc)
-            break
-        if not prompt_groups:
-            break
-        (prompt_group,) = prompt_groups
-        # Slime duplicates one prompt M times; the runner owns the actual
-        # sibling rollout group, so only the first copy supplies metadata.
-        metadata = prompt_group[0].metadata
-        instance_id = metadata["instance_id"]
-        source_group_index = int(prompt_group[0].group_index)
-        usage_prefix = _usage_group_prefix(
-            phase="train",
-            rollout_id=rollout_id,
-            instance_id=instance_id,
-            task_index=source_group_index,
-        )
-        task = {
-            "index": _TASK_INDEX,
-            "instance_id": instance_id,
-            "subset": metadata["subset"],
-            "split": metadata["split"],
-            "usage_phase": "train",
-            "source_group_index": source_group_index,
-            **naive_values,
-        }
-        _TASK_INDEX += 1
+        if _SOURCE_RETRY_TASKS:
+            task = _SOURCE_RETRY_TASKS.pop(0)
+            variance_resample_attempt = int(
+                task.get("variance_resample_attempt", 0)
+            )
+            stale_retry_attempt = int(
+                task.get("stale_retry_attempt", 0)
+            )
+            instance_id = str(task["instance_id"])
+            source_group_index = checkpoint_task_source_group_index(task)
+            usage_prefix = build_usage_group_prefix(
+                phase="train",
+                rollout_id=rollout_id,
+                instance_id=instance_id,
+                task_index=source_group_index,
+            )
+        else:
+            projected_groups = len(_BUFFER) + len(_PENDING)
+            if projected_groups >= target_groups + max_tail_pending:
+                break
+            if (
+                _SOURCE_BUDGET_EXHAUSTED
+                or _SOURCE_VALIDATION_ERROR is not None
+            ):
+                break
+            try:
+                prompt_groups = data_buffer.get_samples(1)
+            except TrainingValidationBoundaryReached as exc:
+                _SOURCE_VALIDATION_ERROR = exc
+                logger.info("[naive-async] %s", exc)
+                break
+            except TrainingInstanceBudgetExhausted as exc:
+                _SOURCE_BUDGET_EXHAUSTED = True
+                _SOURCE_BUDGET_ERROR = exc
+                logger.info("[naive-async] %s", exc)
+                break
+            if not prompt_groups:
+                break
+            (prompt_group,) = prompt_groups
+            metadata = prompt_group[0].metadata
+            instance_id = metadata["instance_id"]
+            source_group_index = int(prompt_group[0].group_index)
+            variance_resample_attempt = 0
+            stale_retry_attempt = 0
+            usage_prefix = build_usage_group_prefix(
+                phase="train",
+                rollout_id=rollout_id,
+                instance_id=instance_id,
+                task_index=source_group_index,
+            )
+            task = {
+                "index": _TASK_INDEX,
+                "instance_id": instance_id,
+                "subset": metadata["subset"],
+                "split": metadata["split"],
+                "usage_phase": "train",
+                "source_group_index": source_group_index,
+                **naive_values,
+            }
+            _TASK_INDEX += 1
 
         # Per-trial routing remains sticky.  Endpoint reservations now end per
         # completed branch rather than at the slowest sibling in the bundle.
@@ -2359,13 +2808,25 @@ def _submit_until_full(
             "_branch_done_dir": str(marker_dir),
             "_released_branch_indices": [],
             "api_key": api_key,
-            "usage_ledger": _ensure_usage_tracking(),
+            "direct_judge_model": direct_judge_model,
+            "direct_judge_api_base": direct_judge_api_base,
+            "direct_judge_api_key": direct_judge_api_key,
+            "usage_ledger": ensure_usage_tracking(),
             "usage_phase": "train",
             "usage_group_prefix": usage_prefix,
-            "usage_group_id": f"{usage_prefix}:g0",
+            "usage_group_id": (
+                f"{usage_prefix}:g{variance_resample_attempt}"
+                + (
+                    f"-s{stale_retry_attempt}"
+                    if stale_retry_attempt
+                    else ""
+                )
+            ),
             "source_group_index": source_group_index,
             "policy_version": policy_version,
             "suppress_usage_accounting": False,
+            "variance_resample_attempt": variance_resample_attempt,
+            "stale_retry_attempt": stale_retry_attempt,
         })
         worker = _NODE_WORKERS[_DISPATCH_COUNTER % len(_NODE_WORKERS)]
         _DISPATCH_COUNTER += 1
@@ -2378,7 +2839,6 @@ def _submit_until_full(
 def _harvest_ready(
     *,
     args,
-    target: str,
     block: bool,
     current_rollout_id: int | None = None,
 ) -> int:
@@ -2470,19 +2930,21 @@ def _harvest_ready(
                 and policy_stale_lag > 1
             )
         ):
-            # Restore the pre-diff stale=1 contract exactly. Stale work still
-            # counts in the token ledger, but is not an on-policy attempted
-            # group for this optimizer batch.
+            # Preserve the stale=1 contract.  Stale work is retained in the
+            # append-only request ledger for audit, marked dropped so it is
+            # excluded from accounted training tokens, and the same source is
+            # resampled without advancing the instance-attempt cursor.
             try:
                 ray.get(ref)
             except Exception as exc:
-                _raise_fatal_ray_infrastructure_error(
+                raise_fatal_ray_infrastructure_error(
                     exc,
                     collector="naive",
                     instance_id=task.get("instance_id"),
                 )
             _STALE_DROPPED_GROUPS += 1
-            _record_usage_disposition(
+            _queue_source_retry(task, reason="stale")
+            record_usage_disposition(
                 usage_group_id,
                 disposition="dropped",
                 reason="stale",
@@ -2492,7 +2954,7 @@ def _harvest_ready(
         try:
             result = ray.get(ref)
         except Exception as exc:
-            _raise_fatal_ray_infrastructure_error(
+            raise_fatal_ray_infrastructure_error(
                 exc,
                 collector="naive",
                 instance_id=task.get("instance_id"),
@@ -2505,16 +2967,30 @@ def _harvest_ready(
         # A returned worker result is one attempted model group even when the
         # runner later reports an application/bundle error. A lost Ray node is
         # infrastructure recovery and is intentionally excluded.
+        if result.get("error"):
+            if "PolicyVersionMismatch" in str(result["error"]):
+                _STALE_DROPPED_GROUPS += 1
+                _queue_source_retry(task, reason="stale")
+                record_usage_disposition(
+                    usage_group_id,
+                    disposition="dropped",
+                    reason="stale",
+                )
+                logger.info(
+                    "[naive-async] resampling stale instance %s: %s",
+                    result.get("instance_id"),
+                    str(result["error"])[:200],
+                )
+                del result, ref
+                continue
+        # A returned non-stale worker result is one attempted model group even
+        # when the runner later reports an application/bundle error.
         _TOTAL_GROUPS_ATTEMPTED += 1
         if result.get("error"):
             _FAILED_INSTANCES += 1
-            invalid_reason = (
-                "policy_version_mismatch"
-                if "PolicyVersionMismatch" in str(result["error"])
-                else "runner_error"
-            )
+            invalid_reason = "runner_error"
             _mark_invalid_group(invalid_reason)
-            _record_usage_disposition(
+            record_usage_disposition(
                 usage_group_id,
                 disposition="invalid",
                 reason=invalid_reason,
@@ -2528,7 +3004,7 @@ def _harvest_ready(
             continue
         if result.get("policy_version") != task.get("policy_version"):
             _mark_invalid_group("policy_version_metadata_mismatch")
-            _record_usage_disposition(
+            record_usage_disposition(
                 usage_group_id,
                 disposition="invalid",
                 reason="policy_version_metadata_mismatch",
@@ -2538,22 +3014,19 @@ def _harvest_ready(
         bundle = result.get("bundle")
         if bundle is None:
             _mark_invalid_group("missing_bundle")
-            _record_usage_disposition(
+            record_usage_disposition(
                 usage_group_id,
                 disposition="invalid",
                 reason="missing_bundle",
             )
             del result, ref
             continue
-        # Naive baseline is policy-only. target=rubric is invalid here.
-        groups = (
-            bundle.policy_groups if target == "policy" else bundle.rubric_groups
-        )
+        groups = bundle.policy_groups
         if len(groups) != 1:
             drop_reason = (bundle.metadata or {}).get("group_dropped_reason")
             invalid_reason = "invalid_branch" if drop_reason else "wrong_group_count"
             _mark_invalid_group(str(drop_reason or invalid_reason))
-            _record_usage_disposition(
+            record_usage_disposition(
                 usage_group_id,
                 disposition="invalid",
                 reason=invalid_reason,
@@ -2563,13 +3036,12 @@ def _harvest_ready(
         for group in groups:
             samples, truncated_here = build_rollout_samples(
                 groups=[group],
-                include_turn_rewards=False,
                 max_sample_tokens=max_sample_tokens,
             )
             _TRUNCATED_OVERSIZED += truncated_here
             if len(samples) != int(task["m"]):
                 _mark_invalid_group("wrong_sample_count")
-                _record_usage_disposition(
+                record_usage_disposition(
                     usage_group_id,
                     disposition="invalid",
                     reason="wrong_sample_count",
@@ -2584,24 +3056,60 @@ def _harvest_ready(
                     "source_rollout_id": source_rollout_id,
                     "instance_id": task["instance_id"],
                 }
-            _observe_reward_group(args, samples)
+            observe_direct_group(_DIRECT_DIAGNOSTICS, samples)
             if dynamic_filter is not None and samples:
                 filter_out = call_dynamic_filter(dynamic_filter, args, samples)
                 if not filter_out.keep:
-                    _FILTER_DROPPED_GROUPS += 1
                     reason = filter_out.reason or "unspecified"
-                    _FILTER_DROP_REASONS[reason] = _FILTER_DROP_REASONS.get(reason, 0) + 1
-                    _record_usage_disposition(
+                    # Every completed, valid-reward group is an attempted
+                    # group, including zero-variance attempts that are queued
+                    # for another sample.  Account for the filtered attempt
+                    # before deciding whether the same source is retried so
+                    # the update-level conservation equation remains exact.
+                    _observe_reward_group(args, samples)
+                    _FILTER_DROPPED_GROUPS += 1
+                    _FILTER_DROP_REASONS[reason] = (
+                        _FILTER_DROP_REASONS.get(reason, 0) + 1
+                    )
+                    variance_resample_attempt = int(
+                        task.get("variance_resample_attempt", 0)
+                    )
+                    if (
+                        (
+                            reason == "direct_predicted_zero_variance"
+                            or reason.startswith("zero_std")
+                        )
+                        and variance_resample_attempt < 3
+                    ):
+                        record_usage_disposition(
+                            usage_group_id,
+                            disposition="filtered",
+                            reason="zero_variance_resample",
+                        )
+                        _queue_source_retry(
+                            task,
+                            reason="zero_variance_resample",
+                        )
+                        logger.info(
+                            "[naive-async] resampling zero-variance "
+                            "instance %s group_attempt=%d/4",
+                            task.get("instance_id"),
+                            variance_resample_attempt + 2,
+                        )
+                        continue
+                    record_usage_disposition(
                         usage_group_id,
                         disposition="filtered",
                         reason=reason,
                     )
                     continue
+            _observe_reward_group(args, samples)
             _BUFFER.append(
                 _BufferedGroup(
                     samples=samples,
                     rollout_id=source_rollout_id,
                     usage_group_id=usage_group_id,
+                    source_task=checkpoint_task_descriptor(task),
                 )
             )
             harvested += 1
@@ -2655,7 +3163,12 @@ def _drop_stale_buffer(current_rollout_id: int) -> None:
             kept.append(group)
             continue
         _STALE_DROPPED_GROUPS += 1
-        _record_usage_disposition(
+        if group.source_task is None:
+            raise RuntimeError(
+                "buffered stale naive group is missing its retryable source task"
+            )
+        _queue_source_retry(group.source_task, reason="stale")
+        record_usage_disposition(
             group.usage_group_id,
             disposition="dropped",
             reason="stale",
@@ -2670,7 +3183,7 @@ def _drop_incomplete_source_budget_buffer(
     groups = list(_BUFFER)
     _BUFFER.clear()
     for group in groups:
-        _record_usage_disposition(
+        record_usage_disposition(
             group.usage_group_id,
             disposition="dropped",
             reason=reason,
@@ -2751,7 +3264,11 @@ def _validation_partial_resume_state(
             "validation is "
             f"scheduled: scheduled={scheduled} boundary={boundary}"
         )
-    checkpoint_pending_count = len(_PENDING) + len(_REPLAY_PENDING_TASKS)
+    checkpoint_pending_count = (
+        len(_PENDING)
+        + len(_REPLAY_PENDING_TASKS)
+        + len(_SOURCE_RETRY_TASKS)
+    )
     if (
         int(state["group_count"]) != len(_BUFFER)
         or int(state["pending_count"]) != checkpoint_pending_count
@@ -2798,26 +3315,33 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         if resume_state is not None
         else time.perf_counter()
     )
-    target = os.environ.get("SWE_AGENT_GRPO_TARGET", "policy")
     if resume_state is not None:
         attempted_at_start = int(resume_state["attempted_at_start"])
         invalid_at_start = int(resume_state["invalid_at_start"])
         filtered_at_start = int(resume_state["filtered_at_start"])
         stale_at_start = int(resume_state["stale_at_start"])
+        stale_requeued_at_start = int(
+            resume_state.get("stale_requeued_at_start", 0)
+        )
         carried_in = int(resume_state["carried_in"])
         reward_stats_at_start = tuple(resume_state["reward_stats_at_start"])
+        direct_diagnostics_at_start = dict(
+            resume_state["direct_diagnostics_at_start"]
+        )
     else:
         carried_in = len(_BUFFER)
         attempted_at_start = _TOTAL_GROUPS_ATTEMPTED
         invalid_at_start = _INFRA_DROPPED_GROUPS
         filtered_at_start = _FILTER_DROPPED_GROUPS
         stale_at_start = _STALE_DROPPED_GROUPS
+        stale_requeued_at_start = _STALE_REQUEUED_GROUPS
         reward_stats_at_start = (
             _REWARD_GROUPS_OBSERVED,
             _REWARD_GROUP_MEAN_SUM,
             _REWARD_GROUP_VARIANCE_SUM,
             _ZERO_VARIANCE_GROUPS,
         )
+        direct_diagnostics_at_start = dict(_DIRECT_DIAGNOSTICS)
     if _SOURCE_VALIDATION_ERROR is not None:
         scheduled = int(
             getattr(
@@ -2864,10 +3388,29 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             for s in os.environ.get("SWE_AGENT_NAIVE_SKIP_NODE_IPS", "").split(",")
             if s.strip()
         }
+        preferred = {
+            value.strip()
+            for value in os.environ.get(
+                "SWE_AGENT_NAIVE_ROLLOUT_NODE_IPS", ""
+            ).split(",")
+            if value.strip()
+        }
         n_nodes = max(1, len([
             n for n in ray.nodes()
             if n.get("Alive")
-            and float(n.get("Resources", {}).get("GPU", 0)) > 0
+            and (
+                (
+                    preferred
+                    and (
+                        (n.get("NodeManagerAddress") or "") in preferred
+                        or (n.get("NodeName") or "") in preferred
+                    )
+                )
+                or (
+                    not preferred
+                    and float(n.get("Resources", {}).get("GPU", 0)) > 0
+                )
+            )
             and (n.get("NodeManagerAddress") or "") not in skip
             and (n.get("NodeName") or "") not in skip
         ]))
@@ -2881,9 +3424,9 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     )
 
     logger.info(
-        "[naive-async] generate_rollout START rollout_id=%d target=%s "
+        "[naive-async] generate_rollout START rollout_id=%d "
         "min_ready_groups=%d max_pending=%d buffer_at_entry=%d pending_at_entry=%d",
-        rollout_id, target, min_ready_groups, max_pending,
+        rollout_id, min_ready_groups, max_pending,
         len(_BUFFER), len(_PENDING),
     )
 
@@ -2898,7 +3441,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     ) -> None:
         global _VALIDATION_PARTIAL_STATE
         preserved_count = len(_BUFFER)
-        preserved_pending = len(_PENDING)
+        preserved_pending = len(_PENDING) + len(_SOURCE_RETRY_TASKS)
         exc.preserved_partial = (
             preserved_count > 0 or preserved_pending > 0
         )
@@ -2917,8 +3460,10 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             "invalid_at_start": invalid_at_start,
             "filtered_at_start": filtered_at_start,
             "stale_at_start": stale_at_start,
+            "stale_requeued_at_start": stale_requeued_at_start,
             "carried_in": carried_in,
             "reward_stats_at_start": reward_stats_at_start,
+            "direct_diagnostics_at_start": direct_diagnostics_at_start,
             "submitted": submitted,
         }
         raise exc
@@ -2928,7 +3473,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
 
     _harvest_ready(
         args=args,
-        target=target,
         current_rollout_id=rollout_id,
         block=False,
     )
@@ -2954,7 +3498,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             )
         _harvest_ready(
             args=args,
-            target=target,
             current_rollout_id=rollout_id,
             block=bool(_PENDING),
         )
@@ -2987,7 +3530,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 len(_BUFFER), min_ready_groups, len(_PENDING), submitted,
             )
             logger.info("[naive-mem] %s", " | ".join(mems))
-            _emit_heartbeat(
+            emit_heartbeat(
                 source="naive",
                 rollout_id=rollout_id,
                 elapsed_seconds=time.perf_counter() - wait_started,
@@ -3006,7 +3549,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                     )
                 raise _SOURCE_BUDGET_ERROR
             raise RuntimeError(
-                f"Naive async produced no {target} samples and has no pending instance."
+                "Naive async produced no policy samples and has no pending instance."
             )
 
     # As with Lane collection, attempt N can be the group that exactly fills
@@ -3122,9 +3665,12 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     filter_dropped_step = _FILTER_DROPPED_GROUPS - filtered_at_start
     infra_dropped_step = _INFRA_DROPPED_GROUPS - invalid_at_start
     stale_dropped_step = _STALE_DROPPED_GROUPS - stale_at_start
+    stale_requeued_step = (
+        _STALE_REQUEUED_GROUPS - stale_requeued_at_start
+    )
     attempted_step = _TOTAL_GROUPS_ATTEMPTED - attempted_at_start
     n_groups_kept = len(selected_groups)
-    outcome_metrics = _group_outcome_metrics(
+    outcome_metrics = group_outcome_stats(
         attempted=attempted_step,
         accepted=n_groups_kept,
         invalid=infra_dropped_step,
@@ -3151,6 +3697,68 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     zero_variance_groups_step = (
         _ZERO_VARIANCE_GROUPS - reward_stats_at_start[3]
     )
+    direct_delta = {
+        key: int(_DIRECT_DIAGNOSTICS.get(key, 0))
+        - int(direct_diagnostics_at_start.get(key, 0))
+        for key in _DIRECT_DIAGNOSTICS
+    }
+
+    def _ratio(numerator: int, denominator: int) -> float:
+        return float(numerator / denominator) if denominator else 0.0
+
+    variance_total = sum(
+        direct_delta.get(f"variance_{outcome}", 0)
+        for outcome in ("tp", "fp", "tn", "fn")
+    )
+    stage1_total = sum(
+        direct_delta.get(f"stage1_{outcome}", 0)
+        for outcome in ("tp", "fp", "tn", "fn")
+    )
+    direct_metrics = {
+        "swe_agent/direct_judge_groups": direct_delta.get("groups", 0),
+        "swe_agent/direct_gt_pair_count": direct_delta.get("gt_pairs", 0),
+        "swe_agent/direct_gt_pairwise_accuracy": _ratio(
+            direct_delta.get("gt_correct", 0),
+            direct_delta.get("gt_pairs", 0),
+        ),
+        "swe_agent/direct_predicted_zero_variance_rate": _ratio(
+            direct_delta.get("predicted_zero_groups", 0),
+            direct_delta.get("groups", 0),
+        ),
+        "swe_agent/direct_explicit_abstain_rate": _ratio(
+            direct_delta.get("explicit_abstain_groups", 0),
+            direct_delta.get("groups", 0),
+        ),
+        "swe_agent/direct_variance_detector_count": variance_total,
+        "swe_agent/direct_variance_detector_accuracy": _ratio(
+            direct_delta.get("variance_tp", 0)
+            + direct_delta.get("variance_tn", 0),
+            variance_total,
+        ),
+        "swe_agent/direct_variance_detector_recall": _ratio(
+            direct_delta.get("variance_tp", 0),
+            direct_delta.get("variance_tp", 0)
+            + direct_delta.get("variance_fn", 0),
+        ),
+        "swe_agent/direct_stage1_detector_count": stage1_total,
+        "swe_agent/direct_stage1_detector_accuracy": _ratio(
+            direct_delta.get("stage1_tp", 0)
+            + direct_delta.get("stage1_tn", 0),
+            stage1_total,
+        ),
+        "swe_agent/direct_stage1_detector_recall": _ratio(
+            direct_delta.get("stage1_tp", 0),
+            direct_delta.get("stage1_tp", 0)
+            + direct_delta.get("stage1_fn", 0),
+        ),
+        "swe_agent/direct_collapse_reward_rate": _ratio(
+            direct_delta.get("collapse_rollouts", 0),
+            direct_delta.get("rollouts", 0),
+        ),
+        "swe_agent/direct_collapse_reward_rollouts": direct_delta.get(
+            "collapse_rollouts", 0
+        ),
+    }
     # L3 circuit-breaker. Raise if too many groups were dropped for infra
     # reasons (docker pull misses, cache failures, etc.). Default 50% with
     # a minimum of 8 attempted groups in the step, both overridable via env
@@ -3202,15 +3810,20 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     output = RolloutFnTrainOutput(
         samples=samples,
         metrics={
-            "swe_agent/target": target,
+            "swe_agent/target": "policy",
             "swe_agent/samples": len(samples),
             "swe_agent/groups": len(selected_groups),
-            "swe_agent/pending_instances": len(_PENDING),
+            "swe_agent/pending_instances": (
+                len(_PENDING) + len(_SOURCE_RETRY_TASKS)
+            ),
             "swe_agent/buffer_groups": len(_BUFFER),
             "swe_agent/submitted_instances": submitted,
             "swe_agent/failed_instances_total": _FAILED_INSTANCES,
             "swe_agent/stale_dropped_groups_total": (
                 _STALE_DROPPED_GROUPS
+            ),
+            "swe_agent/stale_requeued_groups_total": (
+                _STALE_REQUEUED_GROUPS
             ),
             "swe_agent/truncated_oversized_samples_total": _TRUNCATED_OVERSIZED,
             "swe_agent/filter_dropped_groups_total": _FILTER_DROPPED_GROUPS,
@@ -3236,6 +3849,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             ),
             # --- per-step drop deltas (easier to chart than diff of totals) ---
             "swe_agent/stale_dropped_groups": stale_dropped_step,
+            "swe_agent/stale_requeued_groups": stale_requeued_step,
             "swe_agent/dynamic_filter_dropped_groups": filter_dropped_step,
             "swe_agent/dynamic_filter_drop_rate": filter_drop_rate_step,
             "swe_agent/infra_dropped_groups": infra_dropped_step,
@@ -3256,6 +3870,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 zero_variance_groups_step / reward_groups_step
                 if reward_groups_step else 0.0
             ),
+            **direct_metrics,
             "swe_agent/wait_seconds": time.perf_counter() - wait_started,
             "swe_agent/seconds": time.perf_counter() - started,
             "swe_agent/source": "naive",
@@ -3297,9 +3912,9 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     # return to Slime. Validation/budget tails therefore remain pending until
     # they are either selected here or explicitly disposition-dropped.
     for group in selected_groups:
-        _record_usage_disposition(
+        record_usage_disposition(
             group.usage_group_id,
             disposition="accepted",
         )
-    output.metrics.update(_usage_metrics(commit_update=True))
+    output.metrics.update(usage_metrics(commit_update=True))
     return output

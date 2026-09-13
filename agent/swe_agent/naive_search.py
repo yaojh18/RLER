@@ -39,6 +39,7 @@ from typing import Any
 from agent_rl import RolloutSessionSpec
 from swe_agent.backend import SWEAgentRolloutBackend
 from swe_agent.exceptions import PolicyVersionMismatch
+from swe_agent.policy_version import assert_policy_staleness
 
 from swe_agent.parallel_utils import (
     TurnTokenInfo,
@@ -53,7 +54,7 @@ from swe_agent.run.run_swe_agent import (
     evaluate_swebench_instance_patches,
     make_evaluation_payload,
 )
-from swe_agent.trajectory_search import _build_step_cards
+from swe_agent.trajectory_search import _build_step_cards, _collect_workspace_meta
 from swe_agent.usage import usage_context
 
 
@@ -80,6 +81,14 @@ class NaiveSearchConfig:
     evaluate_gt: bool = True
     rollout_pool_size: int | None = None  # default = m
     rollout_max_attempts: int = 8
+    # Training requires exact SGLang token IDs/logprobs. Hosted
+    # chat-completions validation does not expose them and only needs the
+    # terminal messages, patch, usage counts, and GT result.
+    require_exact_token_info: bool = True
+    # Finish and evaluate the terminal trajectory, but export only the first
+    # N assistant turns to the optimizer.  ``None`` is the full-trajectory
+    # baseline.
+    train_assistant_step_limit: int | None = None
 
     # Same fallback-patch penalty recipe as v0/lanes.
     fallback_patch_penalty: float = 0.5
@@ -90,6 +99,15 @@ class NaiveSearchConfig:
     joint_alpha: float = 1.0
     # Keep a fully solved rollout on the same unit scale as judge rewards.
     all_pass_reward: float = 1.0
+
+    def __post_init__(self) -> None:
+        if (
+            self.train_assistant_step_limit is not None
+            and self.train_assistant_step_limit <= 0
+        ):
+            raise ValueError(
+                "train_assistant_step_limit must be positive when set"
+            )
 
 @dataclass
 class NaiveRollout:
@@ -103,6 +121,9 @@ class NaiveRollout:
     node_id: str
     messages: list[dict[str, Any]] = field(default_factory=list)
     step_cards: list[dict[str, Any]] = field(default_factory=list)
+    cutoff_step_cards: list[dict[str, Any]] = field(default_factory=list)
+    cutoff_workspace_meta: dict[str, Any] = field(default_factory=dict)
+    cutoff_terminated: bool = False
     turns: list[TurnTokenInfo] = field(default_factory=list)
     total_tokens: dict[str, int] = field(default_factory=dict)
     status: str = ""
@@ -112,6 +133,11 @@ class NaiveRollout:
     n_action_steps: int = 0  # count of step_cards with at least one command
     error: str | None = None
     gt_score: float | None = None
+    judge_score: float | None = None
+    signed_judge_score: float | None = None
+    training_reward: float | None = None
+    reward_source: str = "terminal_gt"
+    collapse_reason: str | None = None
     evaluation_payload: dict[str, Any] | None = None
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -126,6 +152,7 @@ class NaiveRecord:
     task_id: str
     config: dict[str, Any]
     rollouts: list[NaiveRollout] = field(default_factory=list)
+    direct_judge: dict[str, Any] | None = None
     completed: bool = False
     error: str | None = None
     seconds: float = 0.0
@@ -147,7 +174,7 @@ class NaiveSearchRunner:
         run_dir: Path,
         policy_model_name: str,
         policy_version: str | None = None,
-        enforce_policy_version: bool = False,
+        max_policy_stale_lag: int | None = None,
         config: NaiveSearchConfig,
         harness_namespace: str | None,
         policy_base_url: str,
@@ -161,7 +188,15 @@ class NaiveSearchRunner:
         self.run_dir = Path(run_dir)
         self.policy_model_name = policy_model_name
         self.policy_version = policy_version or policy_model_name
-        self.enforce_policy_version = bool(enforce_policy_version)
+        if max_policy_stale_lag is not None and int(max_policy_stale_lag) < 0:
+            raise ValueError(
+                "max_policy_stale_lag must be non-negative when set"
+            )
+        self.max_policy_stale_lag = (
+            None
+            if max_policy_stale_lag is None
+            else int(max_policy_stale_lag)
+        )
         self.config = config
         self.harness_namespace = harness_namespace
         self.policy_base_url = policy_base_url.rstrip("/")
@@ -177,8 +212,50 @@ class NaiveSearchRunner:
 
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._live_sessions: list[Any] = []
+        self._policy_cancelled = threading.Event()
+        self._policy_cancel_lock = threading.Lock()
+        self._policy_cancel_reason = ""
 
     # -- session plumbing ----------------------------------------------------
+
+    def check_policy_staleness(self, stage: str) -> int | None:
+        """Enforce stale=1 and atomically cancel every sibling on failure."""
+
+        if self.max_policy_stale_lag is None:
+            return None
+        if self._policy_cancelled.is_set():
+            raise PolicyVersionMismatch(
+                self._policy_cancel_reason
+                or "another rollout in this group exceeded the policy window"
+            )
+        try:
+            return assert_policy_staleness(
+                self.policy_version,
+                max_lag=self.max_policy_stale_lag,
+                stage=stage,
+            )
+        except PolicyVersionMismatch as exc:
+            with self._policy_cancel_lock:
+                if not self._policy_cancelled.is_set():
+                    self._policy_cancel_reason = str(exc)
+                    self._policy_cancelled.set()
+            raise
+
+    def _run_session_phase(
+        self,
+        session: Any,
+        *,
+        rollout_index: int,
+        phase: str,
+        max_steps: int,
+    ) -> dict[str, Any]:
+        result = session.run_until_pause(
+            max_steps=max_steps,
+            step_guard=lambda boundary, step: self.check_policy_staleness(
+                f"rollout_{rollout_index}:{phase}:{boundary}:{step}"
+            ),
+        )
+        return result.model_dump(mode="json")
 
     def _make_session(self, rollout_index: int) -> Any:
         """Create a fresh agent session pinned to the policy sglang endpoint.
@@ -186,20 +263,19 @@ class NaiveSearchRunner:
         Mirrors TrajectorySearchParallelRunner._make_initial_session but with
         a per-rollout session_id so M concurrent sessions don't collide.
         """
+        self.check_policy_staleness(f"rollout_{rollout_index}:start")
         spec = RolloutSessionSpec(
             session_id=f"naive-{rollout_index:02d}-{uuid.uuid4().hex}",
             task=self.task,
             task_id=self.task_id,
             sample_index=rollout_index,
             policy_ref=self.policy_model_name,
-            # Training uses slime's original stale-window semantics: the
-            # dispatch version is retained in the exported record/sample, but
-            # an in-flight trajectory is not aborted when the next update is
-            # committed. Validation opts into the strict request-level guard
-            # so unfinished policy work can be discarded on an update.
             policy_version=(
-                self.policy_version if self.enforce_policy_version else None
+                self.policy_version
+                if self.max_policy_stale_lag is not None
+                else None
             ),
+            max_policy_stale_lag=self.max_policy_stale_lag,
             dataset_name="swebench",
             ground_truth=self.instance.get("patch"),
             raw_user_query=self.task,
@@ -234,9 +310,6 @@ class NaiveSearchRunner:
             )
         self._live_sessions.append(session)
         return session
-
-    def _step_session(self, session: Any, max_steps: int) -> dict[str, Any]:
-        return session.run_until_pause(max_steps=max_steps).model_dump(mode="json")
 
     def _extract_turn_token_info(
         self, snapshot_dict: dict[str, Any], starting_turn_index: int
@@ -331,9 +404,52 @@ class NaiveSearchRunner:
                 base_turn_count = 0
                 base_event_count = 0
 
-            result = self._step_session(
-                session, max_steps=self.config.step_limit
-            )
+            cutoff_events: list[dict[str, Any]] = []
+            if self.config.train_assistant_step_limit is None:
+                result = self._run_session_phase(
+                    session,
+                    rollout_index=rollout_index,
+                    phase="full",
+                    max_steps=self.config.step_limit,
+                )
+            else:
+                cutoff_limit = int(self.config.train_assistant_step_limit)
+                result = self._run_session_phase(
+                    session,
+                    rollout_index=rollout_index,
+                    phase="prefix",
+                    max_steps=cutoff_limit,
+                )
+                cutoff_snapshot = session.snapshot().model_dump(mode="json")
+                cutoff_events = copy.deepcopy(
+                    cutoff_snapshot.get("metadata", {}).get("events", [
+                    ])[base_event_count:]
+                )
+                rollout.cutoff_step_cards = _build_step_cards(cutoff_events, 0)
+                rollout.cutoff_workspace_meta = _collect_workspace_meta(
+                    session.agent.env
+                )
+                rollout.cutoff_terminated = bool(
+                    str(result.get("exit_status") or "").strip()
+                    or result.get("status") == "finished"
+                )
+                first_phase_steps = int(
+                    result.get(
+                        "executed_steps", len(rollout.cutoff_step_cards)
+                    )
+                    or 0
+                )
+                remaining_steps = max(
+                    int(self.config.step_limit) - first_phase_steps,
+                    0,
+                )
+                if not rollout.cutoff_terminated and remaining_steps > 0:
+                    result = self._run_session_phase(
+                        session,
+                        rollout_index=rollout_index,
+                        phase="continuation",
+                        max_steps=remaining_steps,
+                    )
             snapshot_after = session.snapshot().model_dump(mode="json")
             # The training sample wants the FULL chat (sys+user+all asst+tool)
             # so we keep messages from index 0 — the lane-to-grpo path will
@@ -345,8 +461,31 @@ class NaiveSearchRunner:
                 snapshot_after.get("metadata", {}).get("events", [])[base_event_count:]
             )
             rollout.messages = all_messages
-            rollout.error = exact_rollout_token_error(all_messages)
+            token_checked_messages = all_messages
+            if self.config.train_assistant_step_limit is not None:
+                assistant_count = 0
+                cutoff = len(all_messages)
+                for message_index, message in enumerate(all_messages):
+                    if message.get("role") != "assistant":
+                        continue
+                    assistant_count += 1
+                    if (
+                        assistant_count
+                        >= self.config.train_assistant_step_limit
+                    ):
+                        cutoff = message_index + 1
+                        break
+                token_checked_messages = all_messages[:cutoff]
+            rollout.error = (
+                exact_rollout_token_error(token_checked_messages)
+                if self.config.require_exact_token_info
+                else None
+            )
             rollout.step_cards = _build_step_cards(segment_events, 0)
+            if self.config.train_assistant_step_limit is not None and not cutoff_events:
+                rollout.cutoff_step_cards = copy.deepcopy(
+                    rollout.step_cards[: self.config.train_assistant_step_limit]
+                )
             rollout.n_action_steps = sum(
                 1 for c in rollout.step_cards if c.get("commands")
             )
@@ -378,9 +517,10 @@ class NaiveSearchRunner:
                 rollout.total_tokens.get("completion", 0),
             )
         except PolicyVersionMismatch as exc:
-            # The next policy update invalidates only unfinished validation
-            # trajectories. Normal session cleanup remains unchanged from the
-            # TTS path.
+            with self._policy_cancel_lock:
+                if not self._policy_cancelled.is_set():
+                    self._policy_cancel_reason = str(exc)
+                    self._policy_cancelled.set()
             rollout.error = f"{type(exc).__name__}: {exc}"
             rollout.status = "error"
             logger.warning(
@@ -407,24 +547,46 @@ class NaiveSearchRunner:
         """Evaluate one terminal patch with the shared reward definition."""
         t_gt = time.perf_counter()
         patch = normalize_terminal_patch_text(rollout.terminal_patch)
-        reward_config = EvaluationRewardConfig(
-            kind=self.config.reward_kind,
-            joint_alpha=self.config.joint_alpha,
-            all_pass_reward=self.config.all_pass_reward,
-            fallback_patch_penalty=(
-                self.config.fallback_patch_penalty
-                if rollout.terminal_patch_from_fallback
-                else 1.0
-            ),
-            no_action_patch_penalty=(
-                self.config.no_action_patch_penalty
-                if rollout.n_action_steps == 0
-                else 0.0
-            ),
-        )
+        if self.config.reward_kind == "hard":
+            # Hard reward is the verifiable binary baseline: every resolved
+            # patch is 1 and every other model outcome is 0.  Do not leak the
+            # fallback/no-action shaping terms into this control arm.
+            reward_config = EvaluationRewardConfig(
+                kind="hard",
+                all_pass_reward=1.0,
+                fallback_patch_penalty=1.0,
+                no_action_patch_penalty=0.0,
+            )
+        else:
+            reward_config = EvaluationRewardConfig(
+                kind=self.config.reward_kind,
+                joint_alpha=self.config.joint_alpha,
+                all_pass_reward=self.config.all_pass_reward,
+                fallback_patch_penalty=(
+                    self.config.fallback_patch_penalty
+                    if rollout.terminal_patch_from_fallback
+                    else 1.0
+                ),
+                no_action_patch_penalty=(
+                    self.config.no_action_patch_penalty
+                    if rollout.n_action_steps == 0
+                    else 0.0
+                ),
+            )
         if not patch:
+            empty_status = (
+                "unresolved"
+                if self.config.reward_kind == "hard"
+                else "empty"
+            )
             rollout.evaluation_payload = make_evaluation_payload(
-                "empty", reward_config=reward_config
+                empty_status,
+                output=(
+                    "empty_patch"
+                    if self.config.reward_kind == "hard"
+                    else ""
+                ),
+                reward_config=reward_config,
             )
             rollout.gt_score = float(rollout.evaluation_payload["reward"])
             logger.info(
@@ -497,6 +659,19 @@ class NaiveSearchRunner:
         )
         gt_slots = threading.Semaphore(max(1, int(cfg.gt_eval_workers)))
         try:
+            def _notify_policy_done(rollout_index: int) -> None:
+                if on_rollout_done is None:
+                    return
+                try:
+                    on_rollout_done(rollout_index)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] on_rollout_done r=%d raised: %s",
+                        self.task_id,
+                        rollout_index,
+                        exc,
+                    )
+
             def _run_valid_rollout(rollout_index: int) -> NaiveRollout:
                 last_rollout: NaiveRollout | None = None
                 attempts = max(1, int(cfg.rollout_max_attempts))
@@ -510,18 +685,10 @@ class NaiveSearchRunner:
                         rollout.error is not None
                         and "PolicyVersionMismatch" in rollout.error
                     ):
+                        _notify_policy_done(rollout_index)
                         return rollout
                     if rollout.error is None:
-                        if on_rollout_done is not None:
-                            try:
-                                on_rollout_done(rollout_index)
-                            except Exception as exc:
-                                logger.warning(
-                                    "[%s] on_rollout_done r=%d raised: %s",
-                                    self.task_id,
-                                    rollout_index,
-                                    exc,
-                                )
+                        _notify_policy_done(rollout_index)
                         break
                     if attempt < attempts:
                         logger.warning(
@@ -551,6 +718,17 @@ class NaiveSearchRunner:
                 # patch rather than wasting another policy rollout or holding
                 # an inference slot idle.
                 for eval_attempt in range(1, attempts + 1):
+                    try:
+                        self.check_policy_staleness(
+                            f"rollout_{rollout_index}:before_gt_eval:{eval_attempt}"
+                        )
+                    except PolicyVersionMismatch as exc:
+                        last_rollout.error = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        last_rollout.status = "error"
+                        last_rollout.gt_score = None
+                        return last_rollout
                     with gt_slots:
                         self._evaluate_gt(last_rollout)
                     if last_rollout.gt_score is not None:
@@ -615,7 +793,17 @@ class NaiveSearchRunner:
 
             record.completed = all(r.error is None for r in record.rollouts)
             if not record.completed and record.error is None:
-                record.error = "one or more naive rollouts errored"
+                policy_error = next(
+                    (
+                        str(rollout.error)
+                        for rollout in record.rollouts
+                        if "PolicyVersionMismatch" in str(rollout.error or "")
+                    ),
+                    None,
+                )
+                record.error = (
+                    policy_error or "one or more naive rollouts errored"
+                )
         except Exception as exc:
             record.error = f"runner exception: {exc}\n{traceback.format_exc()}"
             record.completed = False

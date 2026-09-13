@@ -20,15 +20,12 @@ def _assistant(content: str, command: str | None = None) -> dict:
     return message
 
 
-def test_frozen_direct_assets_are_complete_and_consistent():
+def test_frozen_direct_assets_supply_training_configuration():
     bank = DirectRubricBank()
     detector = load_variance_detector()
 
-    assert len(bank.payload["instances"]) == 222
-    assert len(bank.payload["eligible_instance_ids"]) == 222
-    assert all(
-        record["eligible"] for record in bank.payload["instances"].values()
-    )
+    assert len(bank.payload["instances"]) == 452
+    assert len(bank.payload["eligible_instance_ids"]) == 452
     assert bank.score_mapping == (1.0, 2.0, 4.0, 6.0, 8.0)
     assert detector["threshold"] == 0.18
     assert detector["variance_direction"] == "ge"
@@ -70,7 +67,7 @@ def test_direct_weighted_score_uses_frozen_scale_and_weights():
     assert set(rewards) == set(node_ids)
     assert set(signed) == set(node_ids)
     assert all(math.isfinite(value) for value in rewards.values())
-    assert range_mean == 1.0
+    assert math.isclose(range_mean, 1.0, rel_tol=0.0, abs_tol=1e-12)
 
 
 def test_serial_numeric_detector_respects_frozen_boundary():

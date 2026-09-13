@@ -23,7 +23,7 @@ from slime.rollout.base_types import call_rollout_fn
 from slime.rollout.data_source import (
     ROLLOUT_COLLECTOR_STATE_METADATA_KEY,
     TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY,
-    TRAIN_VALIDATION_BOUNDARY_KEY,
+    VALIDATION_CHECKPOINT_MARKER_PREFIX,
     TrainingInstanceBudgetExhausted,
     TrainingValidationBoundaryReached,
 )
@@ -35,6 +35,7 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.types import Sample
+from swe_agent.policy_version import observed_policy_version
 from ..utils.metric_utils import has_repetition
 from .rollout_validation import validate_server_group_gpu_indices
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock, add_default_ray_env_vars
@@ -43,12 +44,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
-
-
-def observed_policy_version() -> str | None:
-    from swe_agent.policy_version import observed_policy_version as impl
-
-    return impl()
 
 _ROLLOUT_DATA_TENSOR_DTYPES = {
     "tokens": torch.long,
@@ -240,7 +235,7 @@ class ServerGroup:
 
         # Compute base_port from the maximum cursor across all nodes that
         # this group's engines may land on (conservative: just use global max).
-        base_port = max(port_cursors.values()) if port_cursors else 15000
+        base_port = max(port_cursors.values()) if port_cursors else 20000
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             args=self.args,
             rollout_engines=rollout_engines,
@@ -580,7 +575,14 @@ class RolloutManager:
         ).remote()
         self._train_validation_manager = None
         self._train_validation_refs: dict[int, Any] = {}
-        if getattr(self.args, "eval_instance_interval", None) is not None:
+        if (
+            getattr(self.args, "eval_instance_interval", None) is not None
+            and not getattr(
+                self.args,
+                "defer_instance_validation",
+                False,
+            )
+        ):
             self._train_validation_manager = (
                 AsyncValidationManager.options(
                     num_cpus=1,
@@ -697,11 +699,6 @@ class RolloutManager:
         rollout_id: int,
         policy_version: str | None = None,
     ) -> None:
-        if self._train_validation_manager is None:
-            raise RuntimeError(
-                "source-attempt validation reached a boundary without an "
-                "async validation manager"
-            )
         attempted_instances = int(attempted_instances)
         progress = self.get_train_instance_progress()
         completed = int(progress.get("last_validation_attempt", 0))
@@ -726,7 +723,63 @@ class RolloutManager:
                 "source-attempt validation requires policy-version coordination"
             )
         policy_version = str(policy_version)
+        checkpoint_prefix = "checkpoint-"
+        checkpoint_suffix = (
+            policy_version[len(checkpoint_prefix) :]
+            if policy_version.startswith(checkpoint_prefix)
+            else ""
+        )
+        if checkpoint_suffix.isdigit():
+            checkpoint_dir = (
+                Path(self.args.save)
+                / f"iter_{int(checkpoint_suffix):07d}"
+            )
+            try:
+                if not checkpoint_dir.is_dir() or checkpoint_dir.is_symlink():
+                    raise OSError(f"checkpoint is unavailable: {checkpoint_dir}")
+                marker = checkpoint_dir / (
+                    f"{VALIDATION_CHECKPOINT_MARKER_PREFIX}"
+                    f"{attempted_instances:09d}"
+                )
+                marker.write_text(
+                    f"policy_version={policy_version}\n"
+                    f"source_attempt={attempted_instances}\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning(
+                    "could not mark validation checkpoint for asynchronous "
+                    "HF export; validation will continue: policy=%s "
+                    "source_attempt=%d error=%s",
+                    policy_version,
+                    attempted_instances,
+                    exc,
+                )
+        else:
+            logger.warning(
+                "could not map validation policy %r to a numeric checkpoint; "
+                "validation will continue without an HF-export marker",
+                policy_version,
+            )
         mark_scheduled(attempted_instances)
+        if getattr(
+            self.args,
+            "defer_instance_validation",
+            False,
+        ):
+            self.data_source.acknowledge_validation(attempted_instances)
+            logger.info(
+                "marked checkpoint at source attempt %d for deferred "
+                "post-training validation under policy %s",
+                attempted_instances,
+                policy_version,
+            )
+            return
+        if self._train_validation_manager is None:
+            raise RuntimeError(
+                "source-attempt validation reached a boundary without an "
+                "async validation manager"
+            )
         try:
             ref = self._train_validation_manager.eval.remote(
                 int(rollout_id),
@@ -875,42 +928,10 @@ class RolloutManager:
                     rollout_id=int(rollout_id),
                     policy_version=observed_policy_version(),
                 )
-                stop_after = getattr(
-                    self.args,
-                    "stop_after_validation_attempt",
-                    None,
-                )
-                if stop_after is None or int(stop_after) != boundary:
-                    # Scheduling, rather than completion, unlocks source
-                    # attempt N+1. Validation follows the same stale=1
-                    # overlap semantics as training rollout.
-                    continue
-                progress = self.get_train_instance_progress()
-                logger.info(
-                    "rollout %d reached explicit chunk-stop validation "
-                    "boundary %d",
-                    rollout_id,
-                    boundary,
-                )
-                return {
-                    TRAIN_VALIDATION_BOUNDARY_KEY: True,
-                    "rollout_id": int(rollout_id),
-                    "attempted_instances": attempted_instances,
-                    "boundary": boundary,
-                    "preserved_partial": bool(
-                        getattr(exc, "preserved_partial", False)
-                    ),
-                    "preserved_group_count": int(
-                        getattr(exc, "preserved_group_count", 0) or 0
-                    ),
-                    "preserved_pending_count": int(
-                        getattr(exc, "preserved_pending_count", 0) or 0
-                    ),
-                    "preserved_group_kinds": dict(
-                        getattr(exc, "preserved_group_kinds", {}) or {}
-                    ),
-                    "progress": progress,
-                }
+                # Scheduling, rather than completion, unlocks source attempt
+                # N+1. Validation follows the same stale=1 overlap semantics
+                # as training rollout.
+                continue
             except TrainingInstanceBudgetExhausted as exc:
                 progress = self.get_train_instance_progress()
                 attempted_instances = int(
@@ -1025,6 +1046,25 @@ class RolloutManager:
             }
         return progress_fn()
 
+    def discard_terminal_source_work(self):
+        """Drop speculative collector work after the source budget is met.
+
+        Instance-attempt training may have already dispatched a bounded stale=1
+        lookahead while the final optimizer batch was being assembled.  Once
+        that batch has reached the terminal source cursor, none of that work
+        can contribute to a later update.  Discard it before checkpointing so
+        final validation can start immediately and resume cannot replay it.
+        """
+        hook = self._collector_checkpoint_hook(
+            "discard_terminal_source_work"
+        )
+        if hook is None:
+            raise RuntimeError(
+                "source-instance training requires the rollout collector "
+                "to implement discard_terminal_source_work"
+            )
+        return hook()
+
     def _collector_checkpoint_hook(self, name: str):
         module_name = getattr(self.generate_rollout, "__module__", "")
         if not module_name:
@@ -1047,12 +1087,6 @@ class RolloutManager:
                         False,
                     )
                 ),
-                getattr(
-                    self.args,
-                    "stop_after_validation_attempt",
-                    None,
-                )
-                is not None,
             )
         )
 
@@ -1511,7 +1545,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     worker_type="regular",
     num_gpus_per_engine=None,
     rank_offset=0,
-    base_port=15000,
+    base_port=20000,
 ):
     # get ports
     # there are 4 ports we need to allocate
@@ -1540,7 +1574,8 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
         def get_addr_and_ports(engine, node_idx):
             # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
+            # Ray workers use 10002-19999. Start above that range so a port
+            # probed before model loading cannot be claimed by Ray meanwhile.
             start_port = node_port_cursor.get(node_idx, base_port)
 
             def port(consecutive=1):

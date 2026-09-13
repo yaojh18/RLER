@@ -1,8 +1,9 @@
 """Training-only direct judging with frozen per-instance golden rubrics.
 
 This module deliberately has no experience retrieval, persistent-state update,
-or rubric-generation path.  It is used only by ``trajectory_search_parallel``;
-the TTS trajectory-search implementation keeps its existing judge pipeline.
+or rubric-generation path.  It is shared by the training-only lane and naive
+collectors; the TTS trajectory-search implementation keeps its existing judge
+pipeline.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import logging
 import math
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agent_rl.run_utils import (
     extract_last_json_object,
@@ -103,53 +104,30 @@ where `score` is an integer from 1 to 5.
 @lru_cache(maxsize=8)
 def _cached_bank(path: str) -> dict[str, Any]:
     with Path(path).open(encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if payload.get("schema_version") != "direct_golden_rubric_bank.v1":
-        raise ValueError(f"unsupported direct rubric bank: {path}")
-    instances = payload.get("instances")
-    eligible = payload.get("eligible_instance_ids")
-    if not isinstance(instances, dict) or not isinstance(eligible, list):
-        raise ValueError(f"invalid direct rubric bank: {path}")
-    if set(eligible) != {
-        instance_id
-        for instance_id, record in instances.items()
-        if isinstance(record, dict) and record.get("eligible") is True
-    }:
-        raise ValueError(f"direct rubric eligibility mismatch: {path}")
-    return payload
+        return json.load(handle)
 
 
 class DirectRubricBank:
-    """Validated, process-cached view of the frozen direct-rubric bank."""
+    """Process-cached view of the frozen direct-rubric bank."""
 
     def __init__(self, path: Path | str = DEFAULT_RUBRIC_BANK) -> None:
         self.path = Path(path).resolve()
         self.payload = _cached_bank(str(self.path))
-        values = tuple(float(value) for value in self.payload["score_mapping"])
-        if len(values) != 5 or any(
-            left >= right for left, right in zip(values, values[1:])
-        ):
-            raise ValueError("direct rubric bank has invalid score mapping")
-        self._score_mapping = values
+        self._score_mapping = tuple(
+            float(value) for value in self.payload["score_mapping"]
+        )
 
     @property
     def score_mapping(self) -> tuple[float, float, float, float, float]:
         return self._score_mapping  # type: ignore[return-value]
 
     def is_eligible(self, instance_id: str) -> bool:
-        record = self.payload["instances"].get(instance_id)
-        return bool(record and record.get("eligible"))
+        return instance_id in self.payload["eligible_instance_ids"]
 
     def raw_references(self, instance_id: str) -> list[dict[str, Any]]:
-        record = self.payload["instances"].get(instance_id)
-        if not isinstance(record, dict):
-            raise KeyError(f"no frozen direct rubrics for {instance_id}")
-        if not record.get("eligible"):
-            raise ValueError(f"instance is statically ineligible: {instance_id}")
-        references = record.get("reference_golden_rubrics")
-        if not isinstance(references, list) or not 1 <= len(references) <= 6:
-            raise ValueError(f"invalid frozen direct rubrics for {instance_id}")
-        return copy.deepcopy(references)
+        return copy.deepcopy(
+            self.payload["instances"][instance_id]["reference_golden_rubrics"]
+        )
 
     def rubrics(
         self,
@@ -159,14 +137,10 @@ class DirectRubricBank:
         references: list[dict[str, Any]] | None = None,
     ) -> list[RubricRecord]:
         raw = self.raw_references(instance_id) if references is None else references
-        converted = [
-            rubric
-            for item in raw
-            if (rubric := _convert_rubric_item(task_text, item, 1)) is not None
-        ]
-        if len(converted) != len(raw):
-            raise ValueError(f"invalid frozen direct rubric in {instance_id}")
-        return converted
+        return cast(
+            list[RubricRecord],
+            [_convert_rubric_item(task_text, item, 1) for item in raw],
+        )
 
 
 def _render_section(title: str, payload: Any) -> str:

@@ -68,16 +68,33 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     if getattr(server_args, "node_rank", 0) != 0:
         return p
 
-    _wait_server_healthy(
-        base_url=server_args.url(),
-        api_key=server_args.api_key,
-        is_process_alive=lambda: p.is_alive(),
-    )
+    try:
+        _wait_server_healthy(
+            base_url=server_args.url(),
+            api_key=server_args.api_key,
+            is_process_alive=lambda: p.is_alive(),
+        )
+    except BaseException:
+        # ``launch_server`` can leave its wrapper process alive after a child
+        # (for example, uvicorn) fails during startup.  Do not leak that tree or
+        # let the Ray init call wait forever.
+        if p.pid is not None:
+            try:
+                kill_process_tree(p.pid)
+            except Exception:
+                logger.exception("Failed to clean up SGLang process tree pid=%s", p.pid)
+        if p.is_alive():
+            p.terminate()
+        p.join(timeout=5)
+        raise
 
     return p
 
 
 def _wait_server_healthy(base_url, api_key, is_process_alive):
+    startup_timeout = float(os.environ.get("SLIME_SGLANG_STARTUP_TIMEOUT_SECONDS", "1800"))
+    request_timeout = min(5.0, startup_timeout)
+    started_at = time.monotonic()
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "Authorization": f"Bearer {api_key}",
@@ -85,15 +102,25 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
 
     with requests.Session() as session:
         while True:
+            elapsed = time.monotonic() - started_at
+            if elapsed >= startup_timeout:
+                raise TimeoutError(
+                    f"SGLang server at {base_url} did not become healthy within "
+                    f"{startup_timeout:g} seconds."
+                )
+            if not is_process_alive():
+                raise RuntimeError(f"SGLang server process for {base_url} terminated during startup.")
+
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                    timeout=min(request_timeout, max(0.1, startup_timeout - elapsed)),
+                )
                 if response.status_code == 200:
                     break
             except requests.RequestException:
                 pass
-
-            if not is_process_alive():
-                raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
 

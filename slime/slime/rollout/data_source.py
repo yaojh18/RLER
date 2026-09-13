@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY = (
     "__slime_train_instance_budget_exhausted__"
 )
-TRAIN_VALIDATION_BOUNDARY_KEY = "__slime_train_validation_boundary__"
+VALIDATION_CHECKPOINT_MARKER_PREFIX = ".rler_validation_source_attempt_"
 ROLLOUT_CHECKPOINT_SCHEMA_VERSION = 2
 ROLLOUT_COLLECTOR_STATE_METADATA_KEY = (
     "__rler_rollout_collector_state_v1__"
@@ -479,11 +479,10 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             group = samples[i]  # type: ignore
             self.buffer.append(group)
 
-    # TODO remove
+    # Compatibility methods used by rollout-buffer plugins.
     def update_metadata(self, metadata: dict):
         self.metadata.update(metadata)
 
-    # TODO remove
     def get_metadata(self):
         return self.metadata
 

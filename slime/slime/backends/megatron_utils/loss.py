@@ -530,6 +530,7 @@ def get_log_probs_and_entropy(
         with_entropy=with_entropy,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        entropy_requires_grad=bool(getattr(args, "entropy_coef", 0.0)),
     )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 

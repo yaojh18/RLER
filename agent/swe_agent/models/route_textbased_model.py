@@ -41,9 +41,17 @@ class RouteTextbasedModel(LitellmTextbasedModel):
     def __init__(self, **kwargs):
         LitellmModel.__init__(self, config_class=RouteTextbasedModelConfig, **kwargs)
         self.policy_version: str | None = None
+        self.policy_stale_max_lag = 0
 
     def set_policy_version(self, policy_version: str | None) -> None:
         self.policy_version = policy_version
+
+    def set_policy_stale_max_lag(self, max_lag: int) -> None:
+        if int(max_lag) < 0:
+            raise ValueError(
+                f"policy stale max lag must be non-negative, got {max_lag}"
+            )
+        self.policy_stale_max_lag = int(max_lag)
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
         prepared_messages = self._prepare_messages_for_api(messages, preserve_token_fields=True)
@@ -169,7 +177,7 @@ class RouteTextbasedModel(LitellmTextbasedModel):
 
         accounting_context = current_usage_context()
         logical_call_id = accounting_context.logical_call_id or new_logical_call_id()
-        from swe_agent.policy_version import assert_policy_version
+        from swe_agent.policy_version import assert_policy_staleness
 
         for attempt in retry(
             logger=logger,
@@ -180,9 +188,11 @@ class RouteTextbasedModel(LitellmTextbasedModel):
             model_name=self.config.model_name,
         ):
             with attempt:
-                assert_policy_version(
+                assert_policy_staleness(
                     self.policy_version,
+                    max_lag=self.policy_stale_max_lag,
                     stage="request_start",
+                    reject_transition=self.policy_stale_max_lag == 0,
                 )
                 try:
                     completion = run_async(
@@ -223,9 +233,11 @@ class RouteTextbasedModel(LitellmTextbasedModel):
                             llm_provider="sglang",
                         ) from exc
                     raise
-                assert_policy_version(
+                assert_policy_staleness(
                     self.policy_version,
+                    max_lag=self.policy_stale_max_lag,
                     stage="request_complete",
+                    reject_transition=self.policy_stale_max_lag == 0,
                 )
         content = completion.content or ""
         assistant_message = _build_assistant_message(
@@ -302,7 +314,13 @@ class RouteTextbasedModel(LitellmTextbasedModel):
         return assistant_message
 
     def get_state(self) -> dict[str, Any]:
-        return {"policy_version": self.policy_version}
+        return {
+            "policy_version": self.policy_version,
+            "policy_stale_max_lag": self.policy_stale_max_lag,
+        }
 
     def set_state(self, state: dict[str, Any]) -> None:
         self.policy_version = state.get("policy_version")
+        self.set_policy_stale_max_lag(
+            int(state.get("policy_stale_max_lag", 0))
+        )

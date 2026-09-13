@@ -187,12 +187,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     is not None,
                     getattr(self.args, "eval_instance_interval", None)
                     is not None,
-                    getattr(
-                        self.args,
-                        "stop_after_validation_attempt",
-                        None,
-                    )
-                    is not None,
                 )
             )
         )

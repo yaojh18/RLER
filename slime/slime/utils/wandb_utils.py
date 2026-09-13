@@ -9,9 +9,8 @@ logger = logging.getLogger(__name__)
 _WANDB_METRIC_ALLOWLIST_ENV = "SLIME_WANDB_METRIC_ALLOWLIST"
 
 # Keep W&B config focused on knobs that change optimization, sampling, or the
-# train/eval schedule. Static experiment identity (model/data/provider/SHA and
-# filesystem paths) belongs in the run name and the frozen local manifest.
-# Credentials and proxy settings must never be copied from the full Namespace.
+# train/eval schedule. Static experiment identity, filesystem paths,
+# credentials, and proxy settings are intentionally excluded.
 _WANDB_CONFIG_ALLOWLIST = (
     # Duration, batching, and dataset traversal.
     "num_epoch",
@@ -102,7 +101,7 @@ _WANDB_DYNAMIC_ENV_CONFIG = {
     ),
     "SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT": (
         "validation_gt_eval_timeout",
-        int,
+        lambda value: min(int(value), 600),
     ),
     "SWE_AGENT_VALIDATION_TEMPERATURE": (
         "validation_temperature",
@@ -122,7 +121,7 @@ _WANDB_DYNAMIC_ENV_CONFIG = {
     ),
     "SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT": (
         "naive_gt_eval_timeout",
-        int,
+        lambda value: min(int(value), 600),
     ),
     "SWE_AGENT_NAIVE_POLICY_TEMPERATURE": (
         "naive_policy_temperature",

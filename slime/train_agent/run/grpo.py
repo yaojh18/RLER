@@ -9,51 +9,15 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
-from slime.backends.megatron_utils.loss import policy_loss_function
 from slime.rollout.data_source import (
     ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
     ROLLOUT_COLLECTOR_STATE_METADATA_KEY,
 )
 
 
-def _apply_deferred_experience_update_rewards(samples) -> None:
-    rewards_by_scope_and_instance: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    deferred_by_scope: dict[str, list] = defaultdict(list)
-    for sample in samples:
-        metadata = sample.metadata or {}
-        scope = metadata.get("scope")
-        stage = metadata.get("stage")
-        deferred_kind = metadata.get("deferred_reward_kind")
-        instance_id = metadata.get("instance_id") or metadata.get("source_instance_id") or "unknown"
-        if deferred_kind:
-            if isinstance(scope, str):
-                deferred_by_scope[scope].append(sample)
-            continue
-        if isinstance(scope, str) and stage in {"retrieve", "generate"}:
-            rewards_by_scope_and_instance[scope][str(instance_id)].append(float(sample.reward or 0.0))
-
-    for scope, deferred_samples in deferred_by_scope.items():
-        per_instance_means = [
-            sum(values) / len(values)
-            for values in rewards_by_scope_and_instance.get(scope, {}).values()
-            if values
-        ]
-        if not per_instance_means:
-            continue
-        deferred_reward = float(sum(per_instance_means) / len(per_instance_means))
-        for sample in deferred_samples:
-            metadata = dict(sample.metadata or {})
-            metadata["raw_deferred_reward"] = float(sample.reward or 0.0)
-            metadata["resolved_deferred_reward"] = deferred_reward
-            sample.metadata = metadata
-            sample.reward = deferred_reward
-
-
 def convert_samples_to_train_data(args, samples):
     if samples and isinstance(samples[0], list):
         samples = [sample for group in samples for sample in group]
-    _apply_deferred_experience_update_rewards(samples)
     grouped_indices = defaultdict(list)
     for index, sample in enumerate(samples):
         group_key = sample.group_index if sample.group_index is not None else index
@@ -70,7 +34,7 @@ def convert_samples_to_train_data(args, samples):
     # to the policy update.
     samples_to_drop: set[int] = set()
     if (
-        args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+        args.advantage_estimator == "grpo"
         and args.rewards_normalization
     ):
         for indices in grouped_indices.values():
@@ -91,7 +55,7 @@ def convert_samples_to_train_data(args, samples):
                     samples_to_drop.add(idx)
                 continue
             centered = group_rewards - group_rewards.mean(dim=-1, keepdim=True)
-            if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+            if args.grpo_std_normalization:
                 centered = centered / (std + 1e-6)
             for sample_index, reward in zip(indices, centered.flatten().tolist(), strict=False):
                 rewards[sample_index] = reward
@@ -139,89 +103,9 @@ def convert_samples_to_train_data(args, samples):
             sample.metadata["raw_reward"] if sample.metadata and "raw_reward" in sample.metadata else sample.reward
             for sample in samples
         ]
-    if samples and samples[0].metadata and "round_number" in samples[0].metadata:
-        train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
     if samples and samples[0].rollout_log_probs is not None:
         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
-    if samples and samples[0].rollout_top_p_token_ids is not None:
-        train_data["rollout_top_p_token_ids"] = [sample.rollout_top_p_token_ids for sample in samples]
-        train_data["rollout_top_p_token_offsets"] = [sample.rollout_top_p_token_offsets for sample in samples]
-    if samples and samples[0].rollout_routed_experts is not None:
-        train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
-    if args.loss_type == "custom_loss" or any(sample.train_metadata is not None for sample in samples):
-        train_data["metadata"] = [
-            {**(sample.train_metadata or {}), "response_advantage": rewards[index]}
-            for index, sample in enumerate(samples)
-        ]
-    if any(sample.multimodal_train_inputs is not None for sample in samples):
-        train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
-    if samples and samples[0].teacher_log_probs is not None:
-        train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
     return train_data
-
-
-def compute_rubric_loss(args, batch, logits, sum_of_sample_mean):
-    alpha = 1.0
-    beta = 1.0
-    metadata_list = batch.get("metadata")
-    if metadata_list is None:
-        raise RuntimeError("rubric custom loss requires per-sample metadata")
-
-    token_advantages = []
-    for loss_mask, metadata, total_length, response_length in zip(
-        batch["loss_masks"], metadata_list, batch["total_lengths"], batch["response_lengths"], strict=False
-    ):
-        full_token_advantage = torch.zeros_like(loss_mask, dtype=torch.float32)
-        turn_rewards = list((metadata).get("turn_rewards"))
-        turn_masks = list((metadata).get("turn_loss_masks"))
-        if turn_rewards and turn_masks:
-            if len(turn_rewards) != len(turn_masks):
-                raise RuntimeError(
-                    f"rubric turn reward/mask mismatch: rewards={len(turn_rewards)} masks={len(turn_masks)}"
-                )
-            turn_values = torch.tensor(turn_rewards, device=loss_mask.device, dtype=torch.float32)
-            turn_values = turn_values - turn_values.mean()
-            if turn_values.numel() > 1:
-                turn_values = turn_values / (turn_values.std() + 1e-6)
-            for turn_value, turn_mask in zip(turn_values, turn_masks, strict=False):
-                turn_mask_tensor = torch.tensor(turn_mask, device=loss_mask.device, dtype=torch.float32)
-                if turn_mask_tensor.shape != loss_mask.shape:
-                    raise RuntimeError(
-                        f"rubric turn mask shape mismatch: mask={turn_mask_tensor.shape} loss_mask={loss_mask.shape}"
-                    )
-                full_token_advantage = full_token_advantage + turn_mask_tensor * turn_value
-            full_token_advantage = full_token_advantage * (loss_mask > 0)
-        token_advantages.append(
-            slice_log_prob_with_cp(
-                full_token_advantage,
-                total_length,
-                response_length,
-            )
-        )
-
-    response_advantages = batch["advantages"]
-    combined_advantages = []
-    for response_advantage, token_advantage in zip(response_advantages, token_advantages, strict=False):
-        if response_advantage.shape != token_advantage.shape:
-            raise RuntimeError(
-                f"rubric advantage shape mismatch: response={response_advantage.shape} token={token_advantage.shape}"
-            )
-        combined_advantages.append(
-            alpha * response_advantage + beta * token_advantage.to(response_advantage.device, response_advantage.dtype)
-        )
-
-    loss, metrics = policy_loss_function(args, {**batch, "advantages": combined_advantages}, logits, sum_of_sample_mean)
-    response_values = torch.cat(response_advantages, dim=0)
-    token_values = torch.cat(token_advantages, dim=0)
-    metrics["response_adv_mean"] = (
-        response_values.mean().clone().detach() if response_values.numel() else torch.zeros((), device=logits.device)
-    )
-    metrics["token_adv_mean"] = (
-        token_values.mean().clone().detach() if token_values.numel() else torch.zeros((), device=logits.device)
-    )
-    metrics["rtt_alpha"] = torch.tensor(alpha, device=logits.device)
-    metrics["rtt_beta"] = torch.tensor(beta, device=logits.device)
-    return loss, metrics
 
 
 def _dataset_state_has_exact_collector_position(
@@ -258,7 +142,6 @@ def _requires_exact_collector_resume(args) -> bool:
             args.train_instance_budget is not None,
             args.eval_instance_interval is not None,
             bool(args.require_train_instance_budget_exhaustion),
-            args.stop_after_validation_attempt is not None,
         )
     )
 
@@ -370,42 +253,10 @@ def _configure_auto_resume(args, parser: argparse.ArgumentParser) -> int | None:
     return resume_rollout_id
 
 
-def _bash_replace_array_option(
-    array_name: str,
-    flag: str,
-    value: object,
-) -> str:
-    """Render Bash that replaces one value option in an argument array."""
-    return f"""
-GRPO_OVERRIDE_ARGS=()
-GRPO_OVERRIDE_SKIP_NEXT=0
-for arg in "${{{array_name}[@]}}"; do
-  if [ "$GRPO_OVERRIDE_SKIP_NEXT" = 1 ]; then
-    GRPO_OVERRIDE_SKIP_NEXT=0
-    continue
-  fi
-  case "$arg" in
-    {flag})
-      GRPO_OVERRIDE_SKIP_NEXT=1
-      continue
-      ;;
-    {flag}=*)
-      continue
-      ;;
-  esac
-  GRPO_OVERRIDE_ARGS+=("$arg")
-done
-{array_name}=(
-  "${{GRPO_OVERRIDE_ARGS[@]}}"
-  {flag} {shlex.quote(str(value))}
-)
-unset GRPO_OVERRIDE_ARGS GRPO_OVERRIDE_SKIP_NEXT
-""".strip()
-
-
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run online slime GRPO for SWE-agent policy or rubric data.")
-    parser.add_argument("--target", choices=["policy", "rubric"], required=True)
+    parser = argparse.ArgumentParser(
+        description="Run online Slime DPPO for SWE-agent policy data."
+    )
     parser.add_argument("--prompt-data", type=Path, required=True)
     parser.add_argument("--hf-checkpoint", type=Path, required=True)
     parser.add_argument("--load-dir", type=Path, required=True)
@@ -431,11 +282,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--ref-load-dir", type=Path)
-    parser.add_argument("--config-path", type=Path)
     parser.add_argument("--rler-root", type=Path, default=Path("/workspace/rler"),
                         help="Root dir of the RLER repo as seen by the runtime (used to build PYTHONPATH and cd into slime). "
                              "Override when not running in the original docker layout (e.g. inside pyxis with --container-mounts to a Lustre path).")
-    parser.add_argument("--rollout-function-path", default="train_agent.collect_grpo_rollout.generate_rollout")
+    parser.add_argument("--rollout-function-path", required=True)
     parser.add_argument(
         "--eval-interval",
         type=int,
@@ -451,12 +301,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--stop-after-validation-attempt",
-        type=int,
+        "--defer-instance-validation",
+        action="store_true",
         help=(
-            "End an intermediate Slurm chunk after this exact attempt-based "
-            "validation boundary. A partial optimizer batch is refilled and "
-            "trained before the chunk checkpoints and exits."
+            "At each source-instance validation cadence, save and mark the "
+            "checkpoint but defer rollout/evaluation until after training."
         ),
     )
     eval_source = parser.add_mutually_exclusive_group()
@@ -473,8 +322,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--n-samples-per-eval-prompt",
         type=int,
-        default=1,
-        help="Must remain 1 for the fixed SWE validation protocol.",
+        default=3,
+        help="Number of independent terminal samples per SWE validation instance.",
     )
     parser.add_argument(
         "--usage-ledger",
@@ -521,23 +370,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ray-external", action="store_true",
                         help="Skip the inline 'ray start --head' (cluster is "
                         "brought up externally, e.g. by SLURM srun).")
-    parser.add_argument("--context-parallel-size", type=int)
-    parser.add_argument("--tensor-model-parallel-size", type=int)
-    parser.add_argument("--pipeline-model-parallel-size", type=int)
+    parser.add_argument("--context-parallel-size", type=int, default=2)
+    parser.add_argument("--tensor-model-parallel-size", type=int, default=1)
+    parser.add_argument("--pipeline-model-parallel-size", type=int, default=1)
     parser.add_argument("--decoder-last-pipeline-num-layers", type=int,
                         help="Pass to megatron when PP>1 with an unbalanced layer split "
                              "(e.g. 64 layers across PP=2 with last stage holding 30).")
-    parser.add_argument("--rollout-num-gpus-per-engine", type=int,
-                        help="sglang TP per engine. Default 1 from grpo.sh; bump to 2+ "
-                             "when the model weights don't fit on a single 80GB GPU "
-                             "alongside KV cache (e.g. Qwen3.5-27B BF16 is 54GB).")
-    parser.add_argument("--max-tokens-per-gpu", type=int)
-    parser.add_argument("--log-probs-chunk-size", type=int)
-    parser.add_argument("--rollout-max-context-len", type=int)
-    parser.add_argument("--rollout-max-response-len", type=int)
+    parser.add_argument(
+        "--rollout-num-gpus-per-engine",
+        type=int,
+        default=1,
+        help="SGLang tensor parallelism per rollout engine.",
+    )
+    parser.add_argument("--max-tokens-per-gpu", type=int, default=32768)
+    parser.add_argument("--log-probs-chunk-size", type=int, default=256)
+    parser.add_argument("--rollout-max-context-len", type=int, default=65536)
+    parser.add_argument("--rollout-max-response-len", type=int, default=20480)
     parser.add_argument(
         "--sglang-context-length",
         type=int,
+        default=128000,
         help=(
             "Optional SGLang served-context override. Keep this aligned with "
             "--rollout-max-context-len and the agent model context cap."
@@ -546,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--sglang-mem-fraction-static",
         type=float,
+        default=0.85,
         help=(
             "Optional SGLang static-memory fraction override. When omitted, "
             "the sourced GRPO config value is preserved."
@@ -562,9 +415,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--save-interval",
         type=int,
+        default=1,
         help=(
-            "Optional checkpoint interval override. Replaces, rather than "
-            "duplicates, the value from GRPO_COMMON_ARGS."
+            "Checkpoint interval."
         ),
     )
     parser.add_argument(
@@ -577,64 +430,14 @@ def main(argv: list[str] | None = None) -> int:
             "non-destructive; formal runs opt in explicitly."
         ),
     )
-    parser.add_argument("--model-config-name", type=str, default="qwen3.5-9B",
-                        help="Basename (no .sh) of a preset under "
-                             "$RLER/slime/train_agent/configs/ to source for MODEL_ARGS. "
-                             "Default 'qwen3.5-9B' preserves 59762-era behavior.")
-    parser.add_argument("--optimizer-cpu-offload", action="store_true", default=False,
-                        help="Offload Adam optimizer state (master weights + m + v) to CPU. "
-                             "Slime ref 27B recipe — needed when TP*PP weight shard factor "
-                             "is too small to fit Adam state on 80GB H100.")
-    parser.add_argument("--overlap-cpu-optimizer-d2h-h2d", action="store_true", default=False,
-                        help="Overlap CPU<->GPU optimizer state transfer with compute. Pairs "
-                             "with --optimizer-cpu-offload.")
-    parser.add_argument("--use-precision-aware-optimizer", action="store_true", default=False,
-                        help="Keep master weights in BF16 + Adam states in FP32; reduces "
-                             "optimizer memory by ~25%. Pairs with --optimizer-cpu-offload.")
-    parser.add_argument("--rollout-instance-workers", type=int, default=2)
     parser.add_argument("--ray-num-cpus", type=int, default=32)
     parser.add_argument("--student-model", default="Qwen/Qwen3.5-9B")
-    parser.add_argument("--search-output-root", type=Path, required=True)
-    parser.add_argument("--search-m", type=int)
-    parser.add_argument("--search-n", type=int)
-    parser.add_argument("--search-k", type=int)
-    parser.add_argument("--search-p", type=int)
-    parser.add_argument("--search-max-rounds", type=int)
-    parser.add_argument("--search-step-limit", type=int)
-    parser.add_argument("--search-workers", type=int, default=1)
     parser.add_argument("--wandb-dir", type=Path)
     parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE") or ("online" if os.environ.get("WANDB_API_KEY") else "offline"))
     parser.add_argument("--wandb-key", default=os.environ.get("WANDB_API_KEY"))
     parser.add_argument("--wandb-team", default=os.environ.get("WANDB_ENTITY"))
     parser.add_argument("--wandb-project", default="swe-agent-grpo")
     parser.add_argument("--wandb-group")
-    parser.add_argument(
-        "--use-tis",
-        action="store_true",
-        default=False,
-        help=(
-            "Forwarded to slime train_async.py. Enable Truncated Importance "
-            "Sampling for off-policy correction "
-            "(https://fengyao.notion.site/off-policy-rl)."
-        ),
-    )
-    parser.add_argument(
-        "--tis-clip",
-        type=float,
-        default=None,
-        help="Forwarded to slime train_async.py. TIS upper clip C (default 2.0 inside slime).",
-    )
-    parser.add_argument(
-        "--use-rollout-logprobs",
-        action="store_true",
-        default=False,
-        help=(
-            "Forwarded to slime train_async.py. Use sampling-time rollout "
-            "log-probs as the PPO 'old' reference instead of running a "
-            "separate Megatron compute_log_prob pass. Mutually exclusive "
-            "with --use-tis (asserted in slime arguments.py)."
-        ),
-    )
     parser.add_argument(
         "--dynamic-sampling-filter-path",
         type=str,
@@ -646,35 +449,15 @@ def main(argv: list[str] | None = None) -> int:
             "drops groups whose rewards have zero std → zero gradient)."
         ),
     )
-    parser.add_argument(
-        "--save-debug-train-data",
-        type=str,
-        default=None,
-        help=(
-            "Forwarded to slime train_async.py. Path template (e.g. "
-            "'/path/{rollout_id}_{rank}.pt') for per-rollout per-rank "
-            "rollout_data torch.save dumps — used for NaN post-mortem."
-        ),
-    )
-    parser.add_argument(
-        "--save-debug-rollout-data",
-        type=str,
-        default=None,
-        help=(
-            "Forwarded to slime train_async.py. Path template (e.g. "
-            "'/path/{rollout_id}.pt') for per-rollout sample dumps captured "
-            "at the rollout manager (one file per rollout, all samples). "
-            "Complements --save-debug-train-data which dumps the per-rank "
-            "training data after group-by-prompt + advantage compute."
-        ),
-    )
     args = parser.parse_args(argv)
-    if args.config_path is None:
-        args.config_path = args.rler_root / "slime/train_agent/configs/grpo.sh"
     eval_enabled = (
         args.eval_interval is not None
         or args.eval_instance_interval is not None
     )
+    if args.defer_instance_validation and args.eval_instance_interval is None:
+        parser.error(
+            "--defer-instance-validation requires --eval-instance-interval"
+        )
     if eval_enabled:
         if args.eval_interval is not None and args.eval_interval <= 0:
             parser.error("--eval-interval must be positive")
@@ -688,9 +471,9 @@ def main(argv: list[str] | None = None) -> int:
                 "validation scheduling requires --eval-prompt-data or "
                 "--eval-config"
             )
-        if args.n_samples_per_eval_prompt != 1:
+        if args.n_samples_per_eval_prompt <= 0:
             parser.error(
-                "SWE validation requires --n-samples-per-eval-prompt 1"
+                "SWE validation requires positive --n-samples-per-eval-prompt"
             )
         if args.eval_prompt_data is not None and len(args.eval_prompt_data) % 2:
             parser.error(
@@ -736,33 +519,6 @@ def main(argv: list[str] | None = None) -> int:
             "--require-train-instance-budget-exhaustion requires "
             "--train-instance-budget"
         )
-    if args.stop_after_validation_attempt is not None:
-        if args.stop_after_validation_attempt <= 0:
-            parser.error(
-                "--stop-after-validation-attempt must be positive"
-            )
-        if args.eval_instance_interval is None:
-            parser.error(
-                "--stop-after-validation-attempt requires "
-                "--eval-instance-interval"
-            )
-        if (
-            args.stop_after_validation_attempt
-            % args.eval_instance_interval
-        ):
-            parser.error(
-                "--stop-after-validation-attempt must be an exact "
-                "--eval-instance-interval boundary"
-            )
-        if (
-            args.train_instance_budget is not None
-            and args.stop_after_validation_attempt
-            >= args.train_instance_budget
-        ):
-            parser.error(
-                "--stop-after-validation-attempt is for an intermediate "
-                "boundary and must be below --train-instance-budget"
-            )
     original_load_dir = args.load_dir
     resume_rollout_id = _configure_auto_resume(args, parser)
     if args.resume:
@@ -839,16 +595,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.require_train_instance_budget_exhaustion
         else ""
     )
-    stop_after_validation_arg = (
-        shlex.join(
-            [
-                "--stop-after-validation-attempt",
-                str(args.stop_after_validation_attempt),
-            ]
-        )
-        if args.stop_after_validation_attempt is not None
-        else ""
-    )
     oversample_arg = (
         shlex.join(["--over-sampling-batch-size", str(args.over_sampling_batch_size)])
         if args.over_sampling_batch_size is not None else ""
@@ -856,21 +602,6 @@ def main(argv: list[str] | None = None) -> int:
     dynamic_filter_arg = (
         shlex.join(["--dynamic-sampling-filter-path", args.dynamic_sampling_filter_path])
         if args.dynamic_sampling_filter_path else ""
-    )
-    tis_arg_parts: list[str] = []
-    if args.use_tis:
-        tis_arg_parts.append("--use-tis")
-    if args.tis_clip is not None:
-        tis_arg_parts.extend(["--tis-clip", str(args.tis_clip)])
-    tis_arg = shlex.join(tis_arg_parts) if tis_arg_parts else ""
-    rollout_logprobs_arg = "--use-rollout-logprobs" if args.use_rollout_logprobs else ""
-    save_debug_arg = (
-        shlex.join(["--save-debug-train-data", args.save_debug_train_data])
-        if args.save_debug_train_data else ""
-    )
-    save_debug_rollout_arg = (
-        shlex.join(["--save-debug-rollout-data", args.save_debug_rollout_data])
-        if args.save_debug_rollout_data else ""
     )
     eval_arg_parts: list[str] = []
     if eval_enabled:
@@ -888,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
                 "--eval-interval",
                 str(framework_eval_interval),
                 "--n-samples-per-eval-prompt",
-                "1",
+                str(args.n_samples_per_eval_prompt),
             ]
         )
         if args.eval_instance_interval is not None:
@@ -898,6 +629,8 @@ def main(argv: list[str] | None = None) -> int:
                     str(args.eval_instance_interval),
                 ]
             )
+        if args.defer_instance_validation:
+            eval_arg_parts.append("--defer-instance-validation")
         if args.eval_config is not None:
             eval_arg_parts.extend(["--eval-config", str(args.eval_config)])
         else:
@@ -905,122 +638,36 @@ def main(argv: list[str] | None = None) -> int:
             eval_arg_parts.extend(str(value) for value in args.eval_prompt_data or [])
     eval_args = shlex.join(eval_arg_parts) if eval_arg_parts else ""
     usage_ledger = args.usage_ledger or (args.save_dir / "usage.jsonl")
-    override_lines = []
-    if args.context_parallel_size is not None:
-        override_lines.append(f"GRPO_PARALLEL_ARGS+=(--context-parallel-size {args.context_parallel_size})")
-    if args.tensor_model_parallel_size is not None:
-        override_lines.append(f"GRPO_PARALLEL_ARGS+=(--tensor-model-parallel-size {args.tensor_model_parallel_size})")
-    if args.pipeline_model_parallel_size is not None:
-        override_lines.append(f"GRPO_PARALLEL_ARGS+=(--pipeline-model-parallel-size {args.pipeline_model_parallel_size})")
+    runtime_arg_parts = [
+        "--save-interval", str(args.save_interval),
+        "--tensor-model-parallel-size", str(args.tensor_model_parallel_size),
+        "--pipeline-model-parallel-size", str(args.pipeline_model_parallel_size),
+        "--context-parallel-size", str(args.context_parallel_size),
+        "--rollout-num-gpus-per-engine", str(args.rollout_num_gpus_per_engine),
+        "--max-tokens-per-gpu", str(args.max_tokens_per_gpu),
+        "--log-probs-chunk-size", str(args.log_probs_chunk_size),
+        "--rollout-max-context-len", str(args.rollout_max_context_len),
+        "--rollout-max-response-len", str(args.rollout_max_response_len),
+        "--sglang-context-length", str(args.sglang_context_length),
+        "--sglang-mem-fraction-static", str(args.sglang_mem_fraction_static),
+    ]
     if args.decoder_last_pipeline_num_layers is not None:
-        override_lines.append(
-            f"GRPO_PARALLEL_ARGS+=(--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers})"
-        )
-    if args.rollout_num_gpus_per_engine is not None:
-        override_lines.append(
-            f"GRPO_ROLLOUT_ARGS+=(--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine})"
-        )
-    if args.optimizer_cpu_offload:
-        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--optimizer-cpu-offload)")
-    if args.overlap_cpu_optimizer_d2h_h2d:
-        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--overlap-cpu-optimizer-d2h-h2d)")
-    if args.use_precision_aware_optimizer:
-        override_lines.append("GRPO_OPTIMIZER_ARGS+=(--use-precision-aware-optimizer)")
-    if args.max_tokens_per_gpu is not None:
-        override_lines.append(f"GRPO_MISC_ARGS+=(--max-tokens-per-gpu {args.max_tokens_per_gpu})")
-    if args.log_probs_chunk_size is not None:
-        override_lines.append(
-            _bash_replace_array_option(
-                "GRPO_COMMON_ARGS",
-                "--log-probs-chunk-size",
-                args.log_probs_chunk_size,
-            )
-        )
-    if args.rollout_max_context_len is not None:
-        override_lines.append(f"GRPO_SGLANG_ARGS+=(--rollout-max-context-len {args.rollout_max_context_len})")
-    if args.rollout_max_response_len is not None:
-        override_lines.append(
-            f"GRPO_SGLANG_ARGS+=(--rollout-max-response-len {args.rollout_max_response_len})"
-        )
-    if args.sglang_context_length is not None:
-        override_lines.append(
-            f"GRPO_SGLANG_ARGS+=(--sglang-context-length {args.sglang_context_length})"
-        )
-    if args.sglang_mem_fraction_static is not None:
-        override_lines.append(
-            _bash_replace_array_option(
-                "GRPO_SGLANG_ARGS",
-                "--sglang-mem-fraction-static",
-                args.sglang_mem_fraction_static,
-            )
+        runtime_arg_parts.extend(
+            [
+                "--decoder-last-pipeline-num-layers",
+                str(args.decoder_last_pipeline_num_layers),
+            ]
         )
     if args.sglang_disable_custom_all_reduce:
-        override_lines.append(
-            "GRPO_SGLANG_ARGS+=(--sglang-disable-custom-all-reduce)"
-        )
-    if args.save_interval is not None:
-        override_lines.append(
-            _bash_replace_array_option(
-                "GRPO_COMMON_ARGS",
-                "--save-interval",
-                args.save_interval,
-            )
-        )
-    if args.num_epoch is not None and args.num_rollout is None:
-        override_lines.append(
-            """
-GRPO_COMMON_ARGS_STRIPPED=()
-GRPO_STRIP_NEXT=0
-for arg in "${GRPO_COMMON_ARGS[@]}"; do
-  if [ "$GRPO_STRIP_NEXT" = 1 ]; then
-    GRPO_STRIP_NEXT=0
-    continue
-  fi
-  if [ "$arg" = "--num-rollout" ]; then
-    GRPO_STRIP_NEXT=1
-    continue
-  fi
-  GRPO_COMMON_ARGS_STRIPPED+=("$arg")
-done
-GRPO_COMMON_ARGS=("${GRPO_COMMON_ARGS_STRIPPED[@]}")
-unset GRPO_COMMON_ARGS_STRIPPED GRPO_STRIP_NEXT
-""".strip()
-        )
-    if args.resume:
-        override_lines.append(
-            """
-GRPO_COMMON_ARGS_RESUME=()
-GRPO_COMMON_ARGS_SKIP_NEXT=0
-for arg in "${GRPO_COMMON_ARGS[@]}"; do
-  if [ "$GRPO_COMMON_ARGS_SKIP_NEXT" = 1 ]; then
-    GRPO_COMMON_ARGS_SKIP_NEXT=0
-    continue
-  fi
-  case "$arg" in
-    --no-load-optim|--no-load-optim=*|--no-load-rng|--no-load-rng=*|--finetune|--finetune=*)
-      continue
-      ;;
-    --start-rollout-id)
-      GRPO_COMMON_ARGS_SKIP_NEXT=1
-      continue
-      ;;
-    --start-rollout-id=*)
-      continue
-      ;;
-  esac
-  GRPO_COMMON_ARGS_RESUME+=("$arg")
-done
-GRPO_COMMON_ARGS=("${GRPO_COMMON_ARGS_RESUME[@]}")
-unset GRPO_COMMON_ARGS_RESUME GRPO_COMMON_ARGS_SKIP_NEXT
-""".strip()
-        )
-    config_overrides = "\n".join(override_lines)
+        runtime_arg_parts.append("--sglang-disable-custom-all-reduce")
+    runtime_args = shlex.join(runtime_arg_parts)
+    fresh_start_args = "" if args.resume else '"${GRPO_FRESH_START_ARGS[@]}"'
     wandb_args = ""
     if args.wandb_mode != "disabled":
         # Default the wandb group/run-name to the SLURM job name when running
         # under SLURM (so each launched job shows up in WandB as its job name
         # like "grpo-naive-cp4vftis-56612" rather than every run colliding on
-        # "policy-grpo"). Falls back to <target>-grpo for non-SLURM launches.
+        # "policy-grpo"). Falls back to policy-grpo for non-SLURM launches.
         slurm_job_name = os.environ.get("SLURM_JOB_NAME") or ""
         slurm_job_id = os.environ.get("SLURM_JOB_ID") or ""
         if args.wandb_group:
@@ -1030,7 +677,7 @@ unset GRPO_COMMON_ARGS_RESUME GRPO_COMMON_ARGS_SKIP_NEXT
                 f"{slurm_job_name}-{slurm_job_id}" if slurm_job_id else slurm_job_name
             )
         else:
-            wandb_group = f"{args.target}-grpo"
+            wandb_group = "policy-grpo"
         pieces = [
             "--use-wandb",
             "--wandb-mode", args.wandb_mode,
@@ -1077,6 +724,10 @@ done
 """.strip()
 
     rler_root = str(args.rler_root)
+    training_config_path = os.environ.get(
+        "TRAINING_CONFIG_PATH",
+        f"{rler_root}/slime/train_agent/configs/qwen3.5-9B.sh",
+    )
     # Preserve runtime dependencies installed into a Lustre-side site dir.
     extra_pp = os.environ.get("EXTRA_PYTHONPATH", "")
     pythonpath = f"{rler_root}/slime:{rler_root}:{rler_root}/agent:/root/Megatron-LM"
@@ -1087,17 +738,7 @@ set -euo pipefail
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="{pythonpath}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export SWE_AGENT_GRPO_TARGET={shlex.quote(args.target)}
-export SWE_AGENT_GRPO_OUTPUT_ROOT={shlex.quote(str(args.search_output_root))}
 export SWE_AGENT_GRPO_MODEL_NAME={shlex.quote(args.student_model)}
-export SWE_AGENT_GRPO_WORKERS={args.search_workers}
-export SWE_AGENT_GRPO_M={"" if args.search_m is None else args.search_m}
-export SWE_AGENT_GRPO_N={"" if args.search_n is None else args.search_n}
-export SWE_AGENT_GRPO_K={"" if args.search_k is None else args.search_k}
-export SWE_AGENT_GRPO_P={"" if args.search_p is None else args.search_p}
-export SWE_AGENT_GRPO_MAX_ROUNDS={"" if args.search_max_rounds is None else args.search_max_rounds}
-export SWE_AGENT_GRPO_STEP_LIMIT={"" if args.search_step_limit is None else args.search_step_limit}
-export SWE_AGENT_GRPO_INSTANCE_WORKERS={args.rollout_instance_workers}
 export SWE_AGENT_PYTHON="${{SWE_AGENT_PYTHON:-{rler_root}/agent/.venv/bin/python}}"
 export RLER_USAGE_LEDGER_PATH={shlex.quote(str(usage_ledger))}
 export RLER_USAGE_RESUME={"1" if args.resume else "0"}
@@ -1105,17 +746,10 @@ export RLER_CHECKPOINT_RETAIN_LATEST={args.checkpoint_retain_latest}
 {ray_trap_line}
 {ray_stop_line}
 cd {rler_root}/slime
-source {rler_root}/slime/train_agent/configs/{args.model_config_name}.sh
-source {shlex.quote(str(args.config_path))}
-{config_overrides}
-if [ {shlex.quote(args.target)} = "rubric" ]; then
-  GRPO_TARGET_ARGS=("${{GRPO_RUBRIC_ARGS[@]}}")
-else
-  GRPO_TARGET_ARGS=("${{GRPO_POLICY_ARGS[@]}}")
-fi
+source {shlex.quote(training_config_path)}
 GLOBAL_BATCH_SIZE={global_batch_size}
 {checkpoint_seed_fixup}
-RAY_TMPDIR="/tmp/ray-swe-{args.target}-grpo-$$"
+RAY_TMPDIR="/tmp/ray-swe-policy-grpo-$$"
 mkdir -p "${{RAY_TMPDIR}}"
 {ray_start_line}
 python3 train_async.py \\
@@ -1134,25 +768,20 @@ python3 train_async.py \\
   {oversample_arg} \\
   --sglang-served-model-name {shlex.quote(args.student_model)} \\
   "${{GRPO_COMMON_ARGS[@]}}" \\
+  {fresh_start_args} \\
   --rollout-function-path {shlex.quote(args.rollout_function_path)} \\
   {eval_args} \\
   {num_rollout_args} \\
   {num_epoch_args} \\
   {train_instance_budget_arg} \\
   {require_budget_exhaustion_arg} \\
-  {stop_after_validation_arg} \\
-  "${{GRPO_TARGET_ARGS[@]}}" \\
   "${{GRPO_PARALLEL_ARGS[@]}}" \\
   "${{GRPO_RECOMPUTE_ARGS[@]}}" \\
   "${{GRPO_OPTIMIZER_ARGS[@]}}" \\
-  "${{GRPO_ROLLOUT_ARGS[@]}}" \\
   "${{GRPO_SGLANG_ARGS[@]}}" \\
   "${{GRPO_MISC_ARGS[@]}}" \\
+  {runtime_args} \\
   {dynamic_filter_arg} \\
-  {tis_arg} \\
-  {rollout_logprobs_arg} \\
-  {save_debug_arg} \\
-  {save_debug_rollout_arg} \\
   {wandb_args}
 """
     subprocess.run(["bash", "-lc", command], check=True)

@@ -26,11 +26,39 @@ _RUNTIME_TASK_KEYS = {
     "api_key",
     "policy_api_key",
     "rubric_api_key",
+    "direct_judge_api_key",
     "policy_base_url",
     "policy_base_urls",
     "rubric_base_url",
+    "direct_judge_api_base",
     "usage_ledger",
 }
+
+DIRECT_DIAGNOSTIC_KEYS = (
+    "groups",
+    "predicted_zero_groups",
+    "explicit_abstain_groups",
+    "rollouts",
+    "collapse_rollouts",
+    "gt_pairs",
+    "gt_correct",
+    "variance_tp",
+    "variance_fp",
+    "variance_tn",
+    "variance_fn",
+    "stage1_tp",
+    "stage1_fp",
+    "stage1_tn",
+    "stage1_fn",
+)
+
+
+def restore_direct_diagnostics(payload: Any) -> dict[str, int]:
+    restored = dict(payload or {})
+    return {
+        key: int(restored.get(key, 0))
+        for key in DIRECT_DIAGNOSTIC_KEYS
+    }
 
 
 def checkpoint_task_source_group_index(task: dict[str, Any]) -> int:
@@ -91,6 +119,9 @@ def serialize_buffer(buffer: list[Any]) -> list[dict[str, Any]]:
         }
         if hasattr(group, "group_kind"):
             row["group_kind"] = str(group.group_kind)
+        source_task = getattr(group, "source_task", None)
+        if source_task is not None:
+            row["source_task"] = checkpoint_task_descriptor(source_task)
         rows.append(row)
     return rows
 
@@ -113,25 +144,23 @@ def deserialize_buffer(
         }
         if "group_kind" in row:
             kwargs["group_kind"] = str(row["group_kind"])
+        if "source_task" in row:
+            kwargs["source_task"] = copy.deepcopy(row["source_task"])
         groups.append(buffered_group_class(**kwargs))
     return groups
 
 
-def serialize_pending_tasks(
-    pending: dict[Any, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for task in pending.values():
-        row = {
-            key: copy.deepcopy(value)
-            for key, value in task.items()
-            if key not in _RUNTIME_TASK_KEYS
-        }
-        rows.append(row)
-    return rows
+def checkpoint_task_descriptor(task: dict[str, Any]) -> dict[str, Any]:
+    """Strip process-local routing state from a retryable source task."""
+
+    return {
+        key: copy.deepcopy(value)
+        for key, value in task.items()
+        if key not in _RUNTIME_TASK_KEYS
+    }
 
 
-def _serialize_attempt_error(
+def serialize_attempt_error(
     error: Any,
     limit_field: str,
 ) -> dict[str, int] | None:
@@ -145,7 +174,7 @@ def _serialize_attempt_error(
     }
 
 
-def _deserialize_attempt_error(payload, error_class, limit_field: str):
+def deserialize_attempt_error(payload, error_class, limit_field: str):
     if not payload:
         return None
     attempted = int(payload.get("attempted_instances", -1))
@@ -155,18 +184,93 @@ def _deserialize_attempt_error(payload, error_class, limit_field: str):
         **{limit_field: None if limit < 0 else limit},
     )
 
+def group_outcome_stats(
+    *,
+    attempted: int,
+    accepted: int,
+    invalid: int,
+    dynamic_filtered: int,
+    excess: int,
+    carried_in: int = 0,
+    carried_out: int = 0,
+    prefix: str = "",
+) -> dict[str, float | int]:
+    """Build per-update group counts and attempted-denominator rates."""
 
-def serialize_budget_error(error: Any) -> dict[str, int] | None:
-    return _serialize_attempt_error(error, "budget")
+    stem = f"swe_agent/{prefix}"
+    denominator = attempted if attempted > 0 else 1
+    return {
+        f"{stem}groups_attempted": attempted,
+        f"{stem}groups_accepted": accepted,
+        f"{stem}groups_invalid": invalid,
+        f"{stem}groups_dynamic_filtered": dynamic_filtered,
+        f"{stem}groups_excess": excess,
+        f"{stem}groups_carried_in": carried_in,
+        f"{stem}groups_carried_out": carried_out,
+        f"{stem}groups_accepted_rate": (
+            accepted / denominator if attempted else 0.0
+        ),
+        f"{stem}groups_invalid_rate": (
+            invalid / denominator if attempted else 0.0
+        ),
+        f"{stem}groups_dynamic_filtered_rate": (
+            dynamic_filtered / denominator if attempted else 0.0
+        ),
+        f"{stem}groups_excess_rate": (
+            excess / denominator if attempted else 0.0
+        ),
+    }
 
 
-def deserialize_budget_error(payload, error_class):
-    return _deserialize_attempt_error(payload, error_class, "budget")
+def observe_direct_group(
+    diagnostics: dict[str, int],
+    samples: list[Sample],
+) -> None:
+    """Accumulate direct-judge, collapse, and variance diagnostics."""
 
+    metadata = [sample.metadata or {} for sample in samples]
+    if not metadata or any(
+        item.get("raw_rubric_score") is None for item in metadata
+    ):
+        return
+    diagnostics["groups"] += 1
+    diagnostics["rollouts"] += len(metadata)
+    diagnostics["collapse_rollouts"] += sum(
+        bool(item.get("collapse_reward_applied")) for item in metadata
+    )
+    predicted_zero = bool(metadata[0].get("predicted_zero_variance"))
+    explicit_abstain = bool(metadata[0].get("explicit_abstain"))
+    diagnostics["predicted_zero_groups"] += int(predicted_zero)
+    diagnostics["explicit_abstain_groups"] += int(explicit_abstain)
+    if any(item.get("raw_gt_score") is None for item in metadata):
+        return
 
-def serialize_validation_error(error: Any) -> dict[str, int] | None:
-    return _serialize_attempt_error(error, "boundary")
+    gt_values = [float(item["raw_gt_score"]) for item in metadata]
+    judge_values = [float(item["raw_rubric_score"]) for item in metadata]
+    for left in range(len(samples)):
+        for right in range(left + 1, len(samples)):
+            gt_delta = gt_values[left] - gt_values[right]
+            if abs(gt_delta) <= 1e-12:
+                continue
+            judge_delta = judge_values[left] - judge_values[right]
+            diagnostics["gt_pairs"] += 1
+            if (gt_delta > 0.0 and judge_delta > 1e-12) or (
+                gt_delta < 0.0 and judge_delta < -1e-12
+            ):
+                diagnostics["gt_correct"] += 1
 
-
-def deserialize_validation_error(payload, error_class):
-    return _deserialize_attempt_error(payload, error_class, "boundary")
+    actual_variance = max(gt_values) - min(gt_values) > 1e-12
+    for prefix, predicts_variance in (
+        ("variance", not predicted_zero),
+        ("stage1", not explicit_abstain),
+    ):
+        outcome = (
+            "tp"
+            if predicts_variance and actual_variance
+            else "fp"
+            if predicts_variance
+            else "fn"
+            if actual_variance
+            else "tn"
+        )
+        diagnostics[f"{prefix}_{outcome}"] += 1

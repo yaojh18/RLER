@@ -739,7 +739,13 @@ def chunked_gae(
 
 
 def calculate_log_probs_and_entropy(
-    logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1, log_prob_keep_mask=None
+    logits,
+    tokens,
+    tp_group,
+    with_entropy: bool = False,
+    chunk_size: int = -1,
+    log_prob_keep_mask=None,
+    entropy_requires_grad: bool = True,
 ):
     logits = logits.contiguous()
     entropy = None
@@ -755,7 +761,11 @@ def calculate_log_probs_and_entropy(
             if with_entropy:
                 entropys = []
                 for logits_chunk in logits_chunks:
-                    entropy_input = logits_chunk.clone()
+                    entropy_input = (
+                        logits_chunk.clone()
+                        if entropy_requires_grad
+                        else logits_chunk.detach().clone()
+                    )
                     entropys.append(compute_entropy_from_logits(entropy_input, tp_group))
                 entropy = torch.cat(entropys, dim=0)
 
@@ -766,7 +776,7 @@ def calculate_log_probs_and_entropy(
             log_prob = torch.cat(log_probs, dim=0)
         else:
             if with_entropy:
-                entropy_input = logits.clone()
+                entropy_input = logits.clone() if entropy_requires_grad else logits.detach().clone()
                 entropy = compute_entropy_from_logits(entropy_input, tp_group)
 
             log_prob = compute_log_probs(logits.clone(), tokens, tp_group, keep_mask=log_prob_keep_mask)

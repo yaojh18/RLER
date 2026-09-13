@@ -18,6 +18,6 @@ VARIANCE_DETECTOR: dict[str, Any] = {
 
 
 def load_variance_detector() -> dict[str, Any]:
-    """Return an isolated copy of the frozen training detector contract."""
+    """Return an isolated copy of the frozen Qwen training detector."""
 
     return copy.deepcopy(VARIANCE_DETECTOR)

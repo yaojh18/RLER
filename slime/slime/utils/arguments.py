@@ -620,18 +620,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--stop-after-validation-attempt",
-                type=int,
-                default=None,
+                "--defer-instance-validation",
+                action="store_true",
                 help=(
-                    "End an intermediate training chunk after this exact "
-                    "attempt-scheduled validation boundary. If the collector "
-                    "preserved part of an optimizer batch at the boundary, "
-                    "the chunk first refills, trains, and checkpoints that "
-                    "one normal batch. Final-cursor validation is suppressed."
+                    "Mark source-attempt checkpoints for later validation "
+                    "without running validation during training."
                 ),
             )
-
             parser.add_argument(
                 "--disable-rollout-global-dataset",
                 action="store_false",
@@ -2065,24 +2060,10 @@ def slime_validate_args(args):
             "eval_instance_interval requires eval_interval and an evaluation "
             "dataset"
         )
-    if args.stop_after_validation_attempt is not None:
-        stop_attempt = int(args.stop_after_validation_attempt)
-        assert stop_attempt > 0, (
-            "stop_after_validation_attempt must be positive"
-        )
+    if args.defer_instance_validation:
         assert args.eval_instance_interval is not None, (
-            "stop_after_validation_attempt requires eval_instance_interval"
+            "defer_instance_validation requires eval_instance_interval"
         )
-        assert stop_attempt % int(args.eval_instance_interval) == 0, (
-            "stop_after_validation_attempt must be an exact "
-            "eval_instance_interval boundary"
-        )
-        if args.train_instance_budget is not None:
-            assert stop_attempt < int(args.train_instance_budget), (
-                "stop_after_validation_attempt is for an intermediate "
-                "boundary and must be below train_instance_budget"
-            )
-
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 

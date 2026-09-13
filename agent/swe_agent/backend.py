@@ -290,13 +290,21 @@ class SWEAgentSession:
         self.last_step_index = step_index
         self.status = "finished" if self.is_finished() else "running"
 
-    def run_until_pause(self, max_steps: Optional[int] = None) -> RolloutResult:
+    def run_until_pause(
+        self,
+        max_steps: Optional[int] = None,
+        step_guard: Optional[Callable[[str, int], None]] = None,
+    ) -> RolloutResult:
         executed_steps = 0
         while True:
+            if step_guard is not None:
+                step_guard("before_inference", executed_steps)
             if self._mark_paused_if_needed(max_steps=max_steps, executed_steps=executed_steps):
                 break
             self.step()
             executed_steps += 1
+            if step_guard is not None:
+                step_guard("after_inference", executed_steps)
         return self.export_result()
 
     def run_until_pause_or_trigger(
@@ -423,6 +431,13 @@ class SWEAgentRolloutBackend:
             agent.env.set_rollout_spec(spec)
         if spec.policy_version and hasattr(agent.model, "set_policy_version"):
             agent.model.set_policy_version(spec.policy_version)
+        if (
+            spec.max_policy_stale_lag is not None
+            and hasattr(agent.model, "set_policy_stale_max_lag")
+        ):
+            agent.model.set_policy_stale_max_lag(
+                spec.max_policy_stale_lag
+            )
         if "step_limit" in spec.limits and hasattr(agent.config, "step_limit"):
             agent.config.step_limit = spec.limits["step_limit"]
         if "cost_limit" in spec.limits and hasattr(agent.config, "cost_limit"):

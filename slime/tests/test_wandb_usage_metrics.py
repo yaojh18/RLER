@@ -45,7 +45,7 @@ def test_wandb_config_only_contains_training_dynamic_allowlist(monkeypatch):
         "model_context_length": 128000,
         "validation_temperature": 0.2,
         "validation_top_p": 0.95,
-        "validation_gt_eval_timeout": 1800,
+        "validation_gt_eval_timeout": 600,
         "lanes_topology": "depth2",
         "lanes_m": 8,
         "lanes_beam_parents": 2,

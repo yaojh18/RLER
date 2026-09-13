@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Async rollout function backed by TrajectorySearchParallelRunner.
 
-Drop-in for collect_grpo_rollout_async.generate_rollout — same signature,
-same return type. Uses lane-based search to produce per-instance
+Slime custom rollout function using lane-based search to produce per-instance
 GRPOExportBundle.policy_groups (one ExportGroup per fork-group = per
 mid_cp). Atomic mode only — no streaming queue.
 
-Selects target='policy'; Lane C is reward-only and is never trained.
+Lane C is reward-only; the collector exports policy samples exclusively.
 
 ENV CONTRACT (set by slime/train_agent/run/grpo_async_lanes.py to match
 the SLURM script's tunables):
@@ -57,29 +56,28 @@ from slime.rollout.filter_hub.base_types import call_dynamic_filter
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
-# Reuse v0's tokenizer cache + rollout-sample assembler — they're independent
-# of the search topology. build_rollout_samples consumes ExportGroup -> Sample.
-from train_agent.collect_grpo_rollout import build_rollout_samples
+# The shared rollout-sample assembler is independent of search topology.
+from train_agent.sample_conversion import build_rollout_samples
 from train_agent.collector_checkpoint import (
     COLLECTOR_CHECKPOINT_SCHEMA_VERSION,
+    DIRECT_DIAGNOSTIC_KEYS,
+    checkpoint_task_descriptor,
     checkpoint_task_source_group_index,
-    deserialize_budget_error,
+    deserialize_attempt_error,
     deserialize_buffer,
-    deserialize_validation_error,
-    serialize_budget_error,
+    group_outcome_stats,
+    observe_direct_group,
+    restore_direct_diagnostics,
+    serialize_attempt_error,
     serialize_buffer,
-    serialize_pending_tasks,
-    serialize_validation_error,
 )
 from train_agent.collect_naive_rollout_async import (
-    _emit_heartbeat,
-    _ensure_usage_tracking,
-    _group_outcome_metrics,
-    _raise_fatal_ray_infrastructure_error,
-    _record_usage_disposition,
-    _restore_usage_tracking_checkpoint,
-    _usage_group_prefix,
-    _usage_metrics,
+    emit_heartbeat,
+    ensure_usage_tracking,
+    raise_fatal_ray_infrastructure_error,
+    record_usage_disposition,
+    restore_usage_tracking_checkpoint,
+    usage_metrics,
 )
 from train_agent.serving.sglang_chat_service import start_slime_policy_route_warmup
 from swe_agent.exceptions import PolicyVersionMismatch
@@ -87,7 +85,7 @@ from swe_agent.policy_version import (
     checkpoint_policy_stale_lag,
     committed_policy_version,
 )
-from swe_agent.usage import usage_ledger_offset
+from swe_agent.usage import build_usage_group_prefix, usage_ledger_offset
 
 
 logger = logging.getLogger("train_agent.collect_lanes_rollout_async")
@@ -117,7 +115,7 @@ def _eligible_direct_instances(bank_path: str) -> frozenset[str]:
 
 def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
     """Worker-process entry. Builds backend + runner for one instance,
-    runs the v1 lane search, returns the GRPOExportBundle.
+    runs lane search, and returns the GRPOExportBundle.
 
     Atomic-only: no per-group streaming queue. The whole bundle is built
     after runner.run() returns; harvest reads it from the Ray Future.
@@ -231,7 +229,6 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             fallback_patch_penalty=task.get("fallback_patch_penalty", 0.5),
             no_action_patch_penalty=task.get("no_action_patch_penalty", -0.1),
             disable_rubric=task.get("disable_rubric", False),
-            gt_on_submit=task.get("gt_on_submit", False),
             reward_kind=reward_kind,
             joint_alpha=task.get("joint_alpha", 1.0),
             all_pass_reward=task.get("all_pass_reward", 1.0),
@@ -361,7 +358,7 @@ def _lanes_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Module-level rollout state (mirrors v0's pattern)
+# Module-level rollout state.
 # ---------------------------------------------------------------------------
 
 
@@ -394,26 +391,7 @@ _REWARD_GROUPS_OBSERVED_BY_KIND: dict[str, int] = {}
 _REWARD_GROUP_MEAN_SUM_BY_KIND: dict[str, float] = {}
 _REWARD_GROUP_VARIANCE_SUM_BY_KIND: dict[str, float] = {}
 _ZERO_VARIANCE_GROUPS_BY_KIND: dict[str, int] = {}
-_DIRECT_DIAGNOSTICS: dict[str, int] = {
-    key: 0
-    for key in (
-        "groups",
-        "predicted_zero_groups",
-        "explicit_abstain_groups",
-        "rollouts",
-        "collapse_rollouts",
-        "gt_pairs",
-        "gt_correct",
-        "variance_tp",
-        "variance_fp",
-        "variance_tn",
-        "variance_fn",
-        "stage1_tp",
-        "stage1_fp",
-        "stage1_tn",
-        "stage1_fn",
-    )
-}
+_DIRECT_DIAGNOSTICS = dict.fromkeys(DIRECT_DIAGNOSTIC_KEYS, 0)
 _SOURCE_BUDGET_EXHAUSTED = False
 _SOURCE_BUDGET_ERROR: TrainingInstanceBudgetExhausted | None = None
 _SOURCE_VALIDATION_ERROR: TrainingValidationBoundaryReached | None = None
@@ -447,14 +425,14 @@ def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
         "checkpoint_rollout_id": int(rollout_id),
         "buffer": serialize_buffer(_BUFFER),
         "pending_tasks": (
-            serialize_pending_tasks(_PENDING)
+            [checkpoint_task_descriptor(task) for task in _PENDING.values()]
             + copy.deepcopy(_REPLAY_PENDING_TASKS)
             + copy.deepcopy(_VARIANCE_RESAMPLE_TASKS)
         ),
         "task_index": int(_TASK_INDEX),
         "dispatch_counter": int(_DISPATCH_COUNTER),
         "usage_ledger_offset": usage_ledger_offset(
-            _ensure_usage_tracking()
+            ensure_usage_tracking()
         ),
         "counters": {
             "stale_dropped_groups": int(_STALE_DROPPED_GROUPS),
@@ -498,15 +476,55 @@ def checkpoint_state_dict(rollout_id: int) -> dict[str, Any]:
             "observed_instances": int(_OBSERVED_INSTANCES),
         },
         "source_budget_exhausted": bool(_SOURCE_BUDGET_EXHAUSTED),
-        "source_budget_error": serialize_budget_error(
-            _SOURCE_BUDGET_ERROR
+        "source_budget_error": serialize_attempt_error(
+            _SOURCE_BUDGET_ERROR,
+            "budget",
         ),
-        "source_validation_error": serialize_validation_error(
-            _SOURCE_VALIDATION_ERROR
+        "source_validation_error": serialize_attempt_error(
+            _SOURCE_VALIDATION_ERROR,
+            "boundary",
         ),
         "validation_partial_state": copy.deepcopy(
             _VALIDATION_PARTIAL_STATE
         ),
+    }
+
+
+def discard_terminal_source_work() -> dict[str, int]:
+    """Forget final-epoch lookahead that cannot feed another update."""
+    global _PENDING, _REPLAY_PENDING_TASKS
+    global _VARIANCE_RESAMPLE_TASKS, _VALIDATION_PARTIAL_STATE
+
+    pending = list(_PENDING.items())
+    replayed = list(_REPLAY_PENDING_TASKS)
+    resamples = list(_VARIANCE_RESAMPLE_TASKS)
+    for ref, task in pending:
+        if not task.get("_policy_slot_released"):
+            _release_endpoints(list(task.get("_pinned_endpoints", [])))
+        marker_value = task.get("_policy_done_marker")
+        if marker_value:
+            Path(str(marker_value)).unlink(missing_ok=True)
+        _record_task_disposition(
+            task,
+            disposition="dropped",
+            reason="terminal_source_budget_lookahead",
+        )
+        try:
+            ray.cancel(ref, force=False)
+        except Exception:
+            pass
+    _PENDING = {}
+    _REPLAY_PENDING_TASKS = []
+    _VARIANCE_RESAMPLE_TASKS = []
+    buffered = _discard_excess_buffer(
+        reason="terminal_source_budget_lookahead"
+    )
+    _VALIDATION_PARTIAL_STATE = None
+    return {
+        "pending": len(pending),
+        "replay_pending": len(replayed),
+        "variance_resamples": len(resamples),
+        "buffered_groups": int(buffered),
     }
 
 
@@ -625,12 +643,9 @@ def load_checkpoint_state_dict(
     _ZERO_VARIANCE_GROUPS_BY_KIND = dict(
         counters.get("zero_variance_groups_by_kind") or {}
     )
-    _DIRECT_DIAGNOSTICS = {
-        key: int(value)
-        for key, value in dict(
-            counters.get("direct_diagnostics") or {}
-        ).items()
-    }
+    _DIRECT_DIAGNOSTICS = restore_direct_diagnostics(
+        counters.get("direct_diagnostics")
+    )
     _OBSERVED_GROUPS_TOTAL = int(
         counters.get("observed_groups_total", 0)
     )
@@ -638,18 +653,20 @@ def load_checkpoint_state_dict(
     _SOURCE_BUDGET_EXHAUSTED = bool(
         state.get("source_budget_exhausted", False)
     )
-    _SOURCE_BUDGET_ERROR = deserialize_budget_error(
+    _SOURCE_BUDGET_ERROR = deserialize_attempt_error(
         state.get("source_budget_error"),
         TrainingInstanceBudgetExhausted,
+        "budget",
     )
-    _SOURCE_VALIDATION_ERROR = deserialize_validation_error(
+    _SOURCE_VALIDATION_ERROR = deserialize_attempt_error(
         state.get("source_validation_error"),
         TrainingValidationBoundaryReached,
+        "boundary",
     )
     _VALIDATION_PARTIAL_STATE = copy.deepcopy(
         state.get("validation_partial_state")
     )
-    _restore_usage_tracking_checkpoint(
+    restore_usage_tracking_checkpoint(
         state.get("usage_ledger_offset")
     )
 
@@ -732,68 +749,7 @@ def _observe_reward_group(args, samples: list[Sample], *, kind: str) -> None:
             _ZERO_VARIANCE_GROUPS_BY_KIND.get(kind, 0) + 1
         )
 
-    metadata = [sample.metadata or {} for sample in samples]
-    if not metadata or any(
-        item.get("raw_rubric_score") is None for item in metadata
-    ):
-        return
-    _DIRECT_DIAGNOSTICS["groups"] = (
-        _DIRECT_DIAGNOSTICS.get("groups", 0) + 1
-    )
-    predicted_zero = bool(metadata[0].get("predicted_zero_variance"))
-    explicit_abstain = bool(metadata[0].get("explicit_abstain"))
-    _DIRECT_DIAGNOSTICS["predicted_zero_groups"] = (
-        _DIRECT_DIAGNOSTICS.get("predicted_zero_groups", 0)
-        + int(predicted_zero)
-    )
-    _DIRECT_DIAGNOSTICS["explicit_abstain_groups"] = (
-        _DIRECT_DIAGNOSTICS.get("explicit_abstain_groups", 0)
-        + int(explicit_abstain)
-    )
-    _DIRECT_DIAGNOSTICS["rollouts"] = (
-        _DIRECT_DIAGNOSTICS.get("rollouts", 0) + len(metadata)
-    )
-    _DIRECT_DIAGNOSTICS["collapse_rollouts"] = (
-        _DIRECT_DIAGNOSTICS.get("collapse_rollouts", 0)
-        + sum(bool(item.get("collapse_reward_applied")) for item in metadata)
-    )
-
-    if any(item.get("raw_gt_score") is None for item in metadata):
-        return
-    gt_values = [float(item["raw_gt_score"]) for item in metadata]
-    judge_values = [float(item["raw_rubric_score"]) for item in metadata]
-    for left in range(len(samples)):
-        for right in range(left + 1, len(samples)):
-            gt_delta = gt_values[left] - gt_values[right]
-            if abs(gt_delta) <= 1e-12:
-                continue
-            judge_delta = judge_values[left] - judge_values[right]
-            _DIRECT_DIAGNOSTICS["gt_pairs"] = (
-                _DIRECT_DIAGNOSTICS.get("gt_pairs", 0) + 1
-            )
-            if (gt_delta > 0.0 and judge_delta > 1e-12) or (
-                gt_delta < 0.0 and judge_delta < -1e-12
-            ):
-                _DIRECT_DIAGNOSTICS["gt_correct"] = (
-                    _DIRECT_DIAGNOSTICS.get("gt_correct", 0) + 1
-                )
-
-    actual_variance = max(gt_values) - min(gt_values) > 1e-12
-    for prefix, predicts_variance in (
-        ("variance", not predicted_zero),
-        ("stage1", not explicit_abstain),
-    ):
-        outcome = (
-            "tp"
-            if actual_variance and predicts_variance
-            else "fn"
-            if actual_variance
-            else "fp"
-            if predicts_variance
-            else "tn"
-        )
-        key = f"{prefix}_{outcome}"
-        _DIRECT_DIAGNOSTICS[key] = _DIRECT_DIAGNOSTICS.get(key, 0) + 1
+    observe_direct_group(_DIRECT_DIAGNOSTICS, samples)
 
 
 def _record_task_disposition(
@@ -803,7 +759,7 @@ def _record_task_disposition(
     reason: str,
 ) -> None:
     for group_id in _expected_usage_group_specs(task):
-        _record_usage_disposition(
+        record_usage_disposition(
             group_id,
             disposition=disposition,
             reason=reason,
@@ -812,9 +768,7 @@ def _record_task_disposition(
 
 @ray.remote(num_cpus=2)
 class _LanesNodeWorker:
-    """Per-physical-node executor for v1 lane bundle tasks.
-
-    Identical pattern to v0's _PDSNodeWorker but atomic-only."""
+    """Per-physical-node executor for atomic lane bundle tasks."""
 
     def __init__(self, name: str = "", max_workers: int = 8, max_tasks_per_child: int = 5):
         self.name = name
@@ -947,7 +901,7 @@ atexit.register(_shutdown_node_workers)
 
 
 def _lanes_values_from_env() -> dict[str, Any]:
-    """Read v1 lane-specific knobs from env."""
+    """Read lane-specific knobs from env."""
     def _int(name, default=None):
         v = os.environ.get(name, "")
         return int(v) if v else default
@@ -997,7 +951,6 @@ def _lanes_values_from_env() -> dict[str, Any]:
         # GT-only training: skip rubric/judge in trajectory_search_parallel
         # and use branch.gt_score as the reward in the bundler.
         "disable_rubric": _bool("SWE_AGENT_LANES_DISABLE_RUBRIC", False),
-        "gt_on_submit": _bool("SWE_AGENT_LANES_GT_ON_SUBMIT", False),
         # Shared evaluator reward kind, identical to naive in GT-only mode.
         "reward_kind": (os.environ.get("SWE_AGENT_LANES_REWARD_KIND") or "joint").lower(),
         "joint_alpha": _float("SWE_AGENT_LANES_JOINT_ALPHA", 1.0),
@@ -1198,7 +1151,7 @@ def _replay_checkpoint_pending_tasks(
             reason="checkpoint_replay",
         )
         source_group_index = checkpoint_task_source_group_index(task)
-        base_usage_prefix = _usage_group_prefix(
+        base_usage_prefix = build_usage_group_prefix(
             phase=str(task.get("usage_phase") or "train"),
             rollout_id=int(rollout_id),
             instance_id=str(task["instance_id"]),
@@ -1241,7 +1194,7 @@ def _replay_checkpoint_pending_tasks(
                 "rubric_base_url": rubric_base_url,
                 "policy_api_key": policy_api_key,
                 "rubric_api_key": rubric_api_key,
-                "usage_ledger": _ensure_usage_tracking(),
+                "usage_ledger": ensure_usage_tracking(),
                 # The durable prefix already contains one approximate cost
                 # for this pending source instance. Do not charge its
                 # checkpoint re-execution a second time.
@@ -1392,7 +1345,7 @@ def _submit_until_full(
                 )
                 continue
             source_group_index = int(prompt_group[0].group_index)
-            base_usage_prefix = _usage_group_prefix(
+            base_usage_prefix = build_usage_group_prefix(
                 phase="train",
                 rollout_id=rollout_id,
                 instance_id=instance_id,
@@ -1436,7 +1389,7 @@ def _submit_until_full(
                 "rubric_base_url": rubric_base_url,
                 "policy_api_key": policy_api_key,
                 "rubric_api_key": rubric_api_key,
-                "usage_ledger": _ensure_usage_tracking(),
+                "usage_ledger": ensure_usage_tracking(),
                 "usage_group_prefix": usage_prefix,
                 "policy_version": policy_version,
             }
@@ -1462,7 +1415,6 @@ def _submit_until_full(
 def _harvest_ready(
     *,
     args,
-    target: str,
     block: bool,
     current_rollout_id: int | None = None,
 ) -> int:
@@ -1581,7 +1533,7 @@ def _harvest_ready(
             try:
                 ray.get(ref)
             except Exception as exc:
-                _raise_fatal_ray_infrastructure_error(
+                raise_fatal_ray_infrastructure_error(
                     exc,
                     collector="lanes",
                     instance_id=task.get("instance_id"),
@@ -1598,7 +1550,7 @@ def _harvest_ready(
         try:
             result = ray.get(ref)
         except Exception as exc:
-            _raise_fatal_ray_infrastructure_error(
+            raise_fatal_ray_infrastructure_error(
                 exc,
                 collector="lanes",
                 instance_id=task.get("instance_id"),
@@ -1667,10 +1619,7 @@ def _harvest_ready(
             )
             del result, ref
             continue
-        # Target selection: v1 first pass only generates policy_groups.
-        groups = (
-            bundle.policy_groups if target == "policy" else bundle.rubric_groups
-        )
+        groups = bundle.policy_groups
         bundle_metadata = getattr(bundle, "metadata", None) or {}
         skipped_group_reasons = dict(
             bundle_metadata.get("skipped_group_reasons") or {}
@@ -1725,13 +1674,12 @@ def _harvest_ready(
                 )
             samples, truncated_here = build_rollout_samples(
                 groups=[group],
-                include_turn_rewards=False,
                 max_sample_tokens=max_sample_tokens,
             )
             _TRUNCATED_OVERSIZED += truncated_here
             if len(samples) != int(task["m"]):
                 mark_invalid(usage_group_id, "wrong_sample_count")
-                _record_usage_disposition(
+                record_usage_disposition(
                     usage_group_id,
                     disposition="invalid",
                     reason="wrong_sample_count",
@@ -1752,7 +1700,7 @@ def _harvest_ready(
                 if not filter_out.keep:
                     reason = filter_out.reason or "unspecified"
                     mark_filtered(usage_group_id, reason)
-                    _record_usage_disposition(
+                    record_usage_disposition(
                         usage_group_id,
                         disposition="filtered",
                         reason=reason,
@@ -1830,14 +1778,14 @@ def _harvest_ready(
                 )
             reason = f"topology_skip:{str(raw_reason or 'unspecified')}"
             mark_filtered(skipped_usage_id, reason)
-            _record_usage_disposition(
+            record_usage_disposition(
                 skipped_usage_id,
                 disposition="filtered",
                 reason=reason,
             )
         for missing_group_id in expected_usage_ids - accounted_usage_ids:
             mark_invalid(missing_group_id, "missing_group")
-            _record_usage_disposition(
+            record_usage_disposition(
                 missing_group_id,
                 disposition="invalid",
                 reason="missing_group",
@@ -1888,7 +1836,7 @@ def _drop_stale_buffer(current_rollout_id: int) -> None:
             kept.append(group)
             continue
         _mark_expected_stale(group.group_kind)
-        _record_usage_disposition(
+        record_usage_disposition(
             group.usage_group_id,
             disposition="dropped",
             reason="stale",
@@ -1913,7 +1861,7 @@ def _discard_excess_buffer(*, reason: str = "excess_after_quota") -> int:
             _EXCESS_DROPPED_BY_KIND,
             group.group_kind,
         )
-        _record_usage_disposition(
+        record_usage_disposition(
             group.usage_group_id,
             disposition="dropped",
             reason=reason,
@@ -2058,7 +2006,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         if resume_state is not None
         else time.perf_counter()
     )
-    target = os.environ.get("SWE_AGENT_GRPO_TARGET", "policy")
     if resume_state is not None:
         attempted_at_start = int(resume_state["attempted_at_start"])
         attempted_by_kind_at_start = dict(
@@ -2183,9 +2130,9 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     )
 
     logger.info(
-        "[lanes-async] generate_rollout START rollout_id=%d target=%s "
+        "[lanes-async] generate_rollout START rollout_id=%d "
         "target_groups=%d max_pending=%d buffer_at_entry=%d pending_at_entry=%d",
-        rollout_id, target, target_groups, max_pending,
+        rollout_id, target_groups, max_pending,
         len(_BUFFER), len(_PENDING),
     )
 
@@ -2252,7 +2199,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
 
     _harvest_ready(
         args=args,
-        target=target,
         current_rollout_id=rollout_id,
         block=False,
     )
@@ -2283,7 +2229,6 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
             )
         _harvest_ready(
             args=args,
-            target=target,
             current_rollout_id=rollout_id,
             block=bool(_PENDING),
         )
@@ -2318,7 +2263,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                 len(_BUFFER), target_groups, len(_PENDING), submitted,
             )
             logger.info("[lanes-mem] %s", " | ".join(mems))
-            _emit_heartbeat(
+            emit_heartbeat(
                 source="lanes",
                 rollout_id=rollout_id,
                 elapsed_seconds=time.perf_counter() - wait_started,
@@ -2341,7 +2286,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
                     )
                 raise _SOURCE_BUDGET_ERROR
             raise RuntimeError(
-                f"Lanes async did not satisfy {target} quota "
+                "Lanes async did not satisfy policy quota "
                 f"{{'all': {target_groups}}}; "
                 f"buffer={_buffer_kind_counts()} and no pending instance."
             )
@@ -2491,7 +2436,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         for kind in ("root", "beam")
     }
     accepted_step = len(selected_groups)
-    overall_outcome_metrics = _group_outcome_metrics(
+    overall_outcome_metrics = group_outcome_stats(
         attempted=attempted_step,
         accepted=accepted_step,
         invalid=invalid_step,
@@ -2518,7 +2463,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
         kind_accepted = selected_kind_counts.get(kind, 0)
         kind_excess = excess_kind_counts.get(kind, 0)
         kind_outcome_metrics.update(
-            _group_outcome_metrics(
+            group_outcome_stats(
                 attempted=kind_attempted,
                 accepted=kind_accepted,
                 invalid=kind_invalid,
@@ -2669,7 +2614,7 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     output = RolloutFnTrainOutput(
         samples=samples,
         metrics={
-            "swe_agent/target": target,
+            "swe_agent/target": "policy",
             "swe_agent/samples": len(samples),
             "swe_agent/groups": len(selected_groups),
             "swe_agent/pending_instances": (
@@ -2770,9 +2715,9 @@ def generate_rollout(args, rollout_id: int, data_buffer, evaluation: bool = Fals
     # partial or a fail-closed refill does not claim that untrained tokens
     # participated in an update.
     for group in selected_groups:
-        _record_usage_disposition(
+        record_usage_disposition(
             group.usage_group_id,
             disposition="accepted",
         )
-    output.metrics.update(_usage_metrics(commit_update=True))
+    output.metrics.update(usage_metrics(commit_update=True))
     return output

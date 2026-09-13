@@ -261,6 +261,7 @@ def _load_collector(monkeypatch, filename: str):
         ),
         "swe_agent.policy_version": _module(
             "swe_agent.policy_version",
+            assert_policy_staleness=lambda *args, **kwargs: 0,
             checkpoint_policy_stale_lag=_checkpoint_policy_stale_lag,
             committed_policy_version=lambda **_kwargs: "checkpoint-base",
             observed_policy_version=lambda: "checkpoint-base",
@@ -268,8 +269,8 @@ def _load_collector(monkeypatch, filename: str):
         ),
         "swe_agent.usage": usage_module,
         "train_agent": _module("train_agent"),
-        "train_agent.collect_grpo_rollout": _module(
-            "train_agent.collect_grpo_rollout",
+        "train_agent.sample_conversion": _module(
+            "train_agent.sample_conversion",
             build_rollout_samples=lambda **kwargs: ([], 0),
         ),
         "train_agent.serving": _module("train_agent.serving"),
@@ -391,23 +392,25 @@ def test_naive_wrapper_defaults_to_fair_joint_reward(monkeypatch):
     assert forwarded == []
     assert args.naive_reward_kind == "joint"
     assert args.naive_all_pass_reward == 1.0
-    assert args.validation_temperature == 0.2
+    assert args.validation_temperature == 0.7
+    assert args.validation_completion_max_tokens == 10240
+    assert args.validation_context_length == 128000
     assert args.validation_top_p == 0.95
     assert args.validation_process_workers == 8
     assert args.naive_gt_eval_timeout == 600
     assert args.naive_rollout_max_attempts == 8
-    assert args.validation_gt_eval_timeout == 1800
+    assert args.validation_gt_eval_timeout == 600
     module._export_naive_env(args)
     assert module.os.environ["SWE_AGENT_NAIVE_REWARD_KIND"] == "joint"
     assert module.os.environ["SWE_AGENT_NAIVE_ALL_PASS_REWARD"] == "1.0"
-    assert module.os.environ["SWE_AGENT_VALIDATION_TEMPERATURE"] == "0.2"
+    assert module.os.environ["SWE_AGENT_VALIDATION_TEMPERATURE"] == "0.7"
     assert module.os.environ["SWE_AGENT_VALIDATION_TOP_P"] == "0.95"
     assert module.os.environ["SWE_AGENT_VALIDATION_PROCESS_WORKERS"] == "8"
     assert module.os.environ["SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT"] == "600"
     assert module.os.environ["SWE_AGENT_NAIVE_ROLLOUT_MAX_ATTEMPTS"] == "8"
     assert (
         module.os.environ["SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT"]
-        == "1800"
+        == "600"
     )
 
 
@@ -462,14 +465,26 @@ def test_lanes_wrapper_exports_explicit_lane_c_token_limits(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("filename", "parse_name", "export_name"),
+    (
+        "filename",
+        "parse_name",
+        "export_name",
+        "requested_timeout",
+        "expected_timeout",
+    ),
     [
-        ("grpo_async_naive.py", "_parse_naive_args", "_export_naive_env"),
-        ("grpo_async_lanes.py", "_parse_lanes_args", "_export_lanes_env"),
+        ("grpo_async_naive.py", "_parse_naive_args", "_export_naive_env", 2400, 600),
+        ("grpo_async_naive.py", "_parse_naive_args", "_export_naive_env", 480, 480),
+        ("grpo_async_lanes.py", "_parse_lanes_args", "_export_lanes_env", 2400, 2400),
     ],
 )
 def test_wrappers_export_explicit_validation_sampling(
-    monkeypatch, filename, parse_name, export_name
+    monkeypatch,
+    filename,
+    parse_name,
+    export_name,
+    requested_timeout,
+    expected_timeout,
 ):
     module = _load_file(
         monkeypatch,
@@ -483,7 +498,7 @@ def test_wrappers_export_explicit_validation_sampling(
             "--validation-top-p",
             "0.9",
             "--validation-gt-eval-timeout",
-            "2400",
+            str(requested_timeout),
         ]
     )
     assert forwarded == []
@@ -492,7 +507,7 @@ def test_wrappers_export_explicit_validation_sampling(
     assert module.os.environ["SWE_AGENT_VALIDATION_TOP_P"] == "0.9"
     assert (
         module.os.environ["SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT"]
-        == "2400"
+        == str(expected_timeout)
     )
 
 
@@ -535,7 +550,7 @@ def test_validation_manifest_preserves_fold_fields_and_physical_split(
             SimpleNamespace(
                 name="fold0_val",
                 path=str(manifest),
-                n_samples_per_eval_prompt=1,
+                n_samples_per_eval_prompt=3,
                 metadata_key="metadata",
                 metadata_overrides={},
                 min_eval_samples=2,
@@ -545,8 +560,16 @@ def test_validation_manifest_preserves_fold_fields_and_physical_split(
     rows = module._validation_rows_from_args(args)
     assert [row[1]["instance_id"] for row in rows] == [
         "django__django-1",
+        "django__django-1",
+        "django__django-1",
+        "pytest-dev__pytest-2",
+        "pytest-dev__pytest-2",
         "pytest-dev__pytest-2",
     ]
+    assert [row[1]["validation_sample_index"] for row in rows] == [
+        0, 1, 2, 0, 1, 2
+    ]
+    assert all(row[1]["validation_samples_per_instance"] == 3 for row in rows)
     assert all(row[1]["split"] == "test" for row in rows)
     assert all(row[1]["subset"] == "verified" for row in rows)
     assert all(row[1]["fold_partition"] == "validation" for row in rows)
@@ -830,6 +853,10 @@ def test_stale_one_buffer_contract_keeps_current_and_previous_only(
             samples=[_sample_for_rollout(module, rollout_id)],
             rollout_id=rollout_id,
             usage_group_id=f"train/r{rollout_id:04d}/instance:g0",
+            source_task={
+                "instance_id": "instance",
+                "source_group_index": rollout_id,
+            },
         )
     else:
         make_group = lambda rollout_id: module._BufferedGroup(
@@ -848,6 +875,10 @@ def test_stale_one_buffer_contract_keeps_current_and_previous_only(
 
     assert [group.rollout_id for group in module._BUFFER] == [3, 4]
     assert module._STALE_DROPPED_GROUPS == 1
+    if filename == "collect_naive_rollout_async.py":
+        assert len(module._SOURCE_RETRY_TASKS) == 1
+        assert module._SOURCE_RETRY_TASKS[0]["instance_id"] == "instance"
+        assert module._SOURCE_RETRY_TASKS[0]["stale_retry_attempt"] == 1
     if filename == "collect_lanes_rollout_async.py":
         assert module._STALE_DROPPED_BY_KIND == {"root": 1}
     events = sys.modules["swe_agent.usage"]._test_state["events"]
@@ -882,6 +913,11 @@ def test_stale_buffer_contract_uses_true_policy_checkpoint(
         }
         if filename == "collect_lanes_rollout_async.py":
             kwargs["group_kind"] = "root"
+        else:
+            kwargs["source_task"] = {
+                "instance_id": "instance",
+                "source_group_index": 1,
+            }
         return module._BufferedGroup(**kwargs)
 
     module._BUFFER[:] = [
@@ -896,6 +932,8 @@ def test_stale_buffer_contract_uses_true_policy_checkpoint(
         for group in module._BUFFER
     ] == ["checkpoint-0000000"]
     assert module._STALE_DROPPED_GROUPS == 1
+    if filename == "collect_naive_rollout_async.py":
+        assert len(module._SOURCE_RETRY_TASKS) == 1
 
 
 def test_naive_pending_stale_group_is_dropped_before_attempt_denominator(
@@ -905,9 +943,13 @@ def test_naive_pending_stale_group_is_dropped_before_attempt_denominator(
     monkeypatch.setenv("RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl"))
     ref = object()
     module._PENDING[ref] = {
+        "index": 7,
         "rollout_id": 2,
         "policy_version": "checkpoint-0000001",
         "instance_id": "django__django-1",
+        "source_group_index": 17,
+        "subset": "verified",
+        "split": "test",
         "usage_group_id": "train/r0002/instance:g0",
         "_endpoints_picked": [],
     }
@@ -928,19 +970,160 @@ def test_naive_pending_stale_group_is_dropped_before_attempt_denominator(
             max_tokens_per_gpu=0,
             context_parallel_size=1,
         ),
-        target="policy",
         current_rollout_id=4,
         block=True,
     ) == 0
     assert module._TOTAL_GROUPS_ATTEMPTED == 0
     assert module._INFRA_DROPPED_GROUPS == 0
     assert module._STALE_DROPPED_GROUPS == 1
+    assert module._STALE_REQUEUED_GROUPS == 1
     assert module._PENDING == {}
+    assert len(module._SOURCE_RETRY_TASKS) == 1
+    retry = module._SOURCE_RETRY_TASKS[0]
+    assert retry["instance_id"] == "django__django-1"
+    assert retry["source_group_index"] == 17
+    assert retry["stale_retry_attempt"] == 1
+    assert "_endpoints_picked" not in retry
     events = sys.modules["swe_agent.usage"]._test_state["events"]
     assert [
         (event["group_id"], event["disposition"], event["reason"])
         for event in events
     ] == [("train/r0002/instance:g0", "dropped", "stale")]
+
+
+def test_naive_worker_policy_abort_requeues_same_source(monkeypatch, tmp_path):
+    module = _load_collector(monkeypatch, "collect_naive_rollout_async.py")
+    monkeypatch.setenv("RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl"))
+    ref = object()
+    module._PENDING[ref] = {
+        "index": 8,
+        "rollout_id": 4,
+        "policy_version": "checkpoint-0000003",
+        "instance_id": "django__django-2",
+        "source_group_index": 18,
+        "subset": "verified",
+        "split": "test",
+        "usage_group_id": "train/r0004/instance:g0",
+        "_endpoints_picked": [],
+    }
+    monkeypatch.setattr(
+        module.ray,
+        "wait",
+        lambda *_args, **_kwargs: ([ref], []),
+    )
+    monkeypatch.setattr(
+        module.ray,
+        "get",
+        lambda _ref: {
+            "bundle": None,
+            "error": "PolicyVersionMismatch: group cancelled",
+            "instance_id": "django__django-2",
+        },
+    )
+
+    assert module._harvest_ready(
+        args=SimpleNamespace(
+            dynamic_sampling_filter_path=None,
+            max_tokens_per_gpu=0,
+            context_parallel_size=1,
+        ),
+        current_rollout_id=4,
+        block=True,
+    ) == 0
+    assert module._TOTAL_GROUPS_ATTEMPTED == 0
+    assert module._INFRA_DROPPED_GROUPS == 0
+    assert module._FAILED_INSTANCES == 0
+    assert module._STALE_DROPPED_GROUPS == 1
+    assert module._STALE_REQUEUED_GROUPS == 1
+    assert [
+        (task["instance_id"], task["source_group_index"])
+        for task in module._SOURCE_RETRY_TASKS
+    ] == [("django__django-2", 18)]
+
+
+def test_naive_zero_variance_resample_is_a_filtered_attempt(
+    monkeypatch, tmp_path
+):
+    module = _load_collector(monkeypatch, "collect_naive_rollout_async.py")
+    monkeypatch.setenv("RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl"))
+    usage_group_id = "train/r0001/django__django-3/t000019:g0"
+    ref = object()
+    module._PENDING[ref] = {
+        "index": 9,
+        "rollout_id": 1,
+        "policy_version": "checkpoint-0000000",
+        "instance_id": "django__django-3",
+        "source_group_index": 19,
+        "subset": "verified",
+        "split": "test",
+        "usage_group_id": usage_group_id,
+        "m": 8,
+        "_endpoints_picked": [],
+    }
+    bundle = SimpleNamespace(
+        policy_groups=[SimpleNamespace(metadata={})],
+        metadata={},
+    )
+    monkeypatch.setattr(
+        module.ray,
+        "wait",
+        lambda *_args, **_kwargs: ([ref], []),
+    )
+    monkeypatch.setattr(
+        module.ray,
+        "get",
+        lambda _ref: {
+            "bundle": bundle,
+            "error": "",
+            "policy_version": "checkpoint-0000000",
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "build_rollout_samples",
+        lambda **_kwargs: (
+            [module.Sample(metadata={}, reward=1.0) for _ in range(8)],
+            0,
+        ),
+    )
+    monkeypatch.setattr(module, "load_function", lambda _path: object())
+    monkeypatch.setattr(
+        module,
+        "call_dynamic_filter",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            keep=False,
+            reason="direct_predicted_zero_variance",
+        ),
+    )
+
+    assert module._harvest_ready(
+        args=SimpleNamespace(
+            dynamic_sampling_filter_path="dynamic.filter",
+            max_tokens_per_gpu=0,
+            context_parallel_size=1,
+            reward_key=None,
+        ),
+        current_rollout_id=1,
+        block=True,
+    ) == 0
+    assert module._TOTAL_GROUPS_ATTEMPTED == 1
+    assert module._FILTER_DROPPED_GROUPS == 1
+    assert module._FILTER_DROP_REASONS == {
+        "direct_predicted_zero_variance": 1
+    }
+    assert module._REWARD_GROUPS_OBSERVED == 1
+    assert module._ZERO_VARIANCE_GROUPS == 1
+    assert module._BUFFER == []
+    assert len(module._SOURCE_RETRY_TASKS) == 1
+    retry = module._SOURCE_RETRY_TASKS[0]
+    assert retry["instance_id"] == "django__django-3"
+    assert retry["source_group_index"] == 19
+    assert retry["variance_resample_attempt"] == 1
+    events = sys.modules["swe_agent.usage"]._test_state["events"]
+    assert [
+        (event["group_id"], event["disposition"], event["reason"])
+        for event in events
+    ] == [(usage_group_id, "filtered", "zero_variance_resample")]
 
 
 def test_depth2_pending_stale_task_drops_root_and_beam_atomically(
@@ -975,7 +1158,6 @@ def test_depth2_pending_stale_task_drops_root_and_beam_atomically(
             max_tokens_per_gpu=0,
             context_parallel_size=1,
         ),
-        target="policy",
         current_rollout_id=4,
         block=True,
     ) == 0
@@ -1045,7 +1227,7 @@ def test_collectors_fail_fast_on_systemic_ray_failure(
 
     monkeypatch.setattr(module.ray, "get", fail_get)
     infrastructure_globals = (
-        module._raise_fatal_ray_infrastructure_error.__globals__
+        module.raise_fatal_ray_infrastructure_error.__globals__
     )
     with pytest.raises(
         infrastructure_globals["CollectorInfrastructureError"],
@@ -1057,7 +1239,6 @@ def test_collectors_fail_fast_on_systemic_ray_failure(
                 max_tokens_per_gpu=0,
                 context_parallel_size=1,
             ),
-            target="policy",
             current_rollout_id=1,
             block=True,
         )
@@ -1081,7 +1262,7 @@ def test_collectors_keep_ordinary_ray_task_error_as_invalid(
 ):
     module = _load_collector(monkeypatch, filename)
     infrastructure_globals = (
-        module._raise_fatal_ray_infrastructure_error.__globals__
+        module.raise_fatal_ray_infrastructure_error.__globals__
     )
     assert not infrastructure_globals["_is_fatal_ray_infrastructure_error"](
         RuntimeError("ordinary per-instance runner failure")
@@ -1139,7 +1320,6 @@ def test_naive_stale_one_samples_retain_source_policy_version(
             context_parallel_size=1,
             reward_key=None,
         ),
-        target="policy",
         current_rollout_id=4,
         block=True,
     ) == 1
@@ -1543,7 +1723,6 @@ def test_lanes_harvest_distinguishes_missing_and_topology_skipped_depth2_group(
             max_tokens_per_gpu=0,
             context_parallel_size=1,
         ),
-        target="policy",
         block=True,
     )
 
@@ -1635,7 +1814,6 @@ def test_lanes_harvest_normalizes_zero_variance_disposition(
             max_tokens_per_gpu=0,
             context_parallel_size=1,
         ),
-        target="policy",
         block=True,
     )
 
@@ -1706,7 +1884,6 @@ def test_lanes_task_failures_count_each_expected_group_once(
             max_tokens_per_gpu=0,
             context_parallel_size=1,
         ),
-        target="policy",
         block=True,
     ) == 0
 
@@ -1723,11 +1900,11 @@ def test_lanes_task_failures_count_each_expected_group_once(
     assert {event["disposition"] for event in events} == {"invalid"}
 
 
-def test_group_outcome_metrics_use_attempted_denominator_and_conserve(
+def test_group_outcome_stats_allow_nonterminal_resample_attempts(
     monkeypatch
 ):
     module = _load_collector(monkeypatch, "collect_naive_rollout_async.py")
-    metrics = module._group_outcome_metrics(
+    metrics = module.group_outcome_stats(
         attempted=8,
         accepted=3,
         invalid=2,
@@ -1748,14 +1925,22 @@ def test_group_outcome_metrics_use_attempted_denominator_and_conserve(
             "swe_agent/groups_excess_rate",
         )
     ) == pytest.approx(1.0)
-    with pytest.raises(AssertionError, match="conservation failed"):
-        module._group_outcome_metrics(
-            attempted=8,
-            accepted=3,
-            invalid=2,
-            dynamic_filtered=1,
-            excess=1,
+    resampled = module.group_outcome_stats(
+        attempted=8,
+        accepted=3,
+        invalid=2,
+        dynamic_filtered=1,
+        excess=1,
+    )
+    assert sum(
+        resampled[key]
+        for key in (
+            "swe_agent/groups_accepted_rate",
+            "swe_agent/groups_invalid_rate",
+            "swe_agent/groups_dynamic_filtered_rate",
+            "swe_agent/groups_excess_rate",
         )
+    ) == pytest.approx(7 / 8)
 
 
 
@@ -1789,7 +1974,6 @@ def test_naive_runner_failure_is_one_invalid_group_after_rollout_retries(
             max_tokens_per_gpu=0,
             context_parallel_size=1,
         ),
-        target="policy",
         block=True,
     ) == 0
     assert module._TOTAL_GROUPS_ATTEMPTED == 1
@@ -2357,6 +2541,68 @@ def test_collectors_stop_source_dispatch_on_instance_budget(
     ]
 
 
+def test_naive_collector_discards_terminal_source_work(monkeypatch, tmp_path):
+    module = _load_collector(monkeypatch, "collect_naive_rollout_async.py")
+    monkeypatch.setenv(
+        "RLER_USAGE_LEDGER_PATH", str(tmp_path / "usage.jsonl")
+    )
+    cancelled = []
+    released = []
+    monkeypatch.setattr(
+        module.ray,
+        "cancel",
+        lambda ref, force=False: cancelled.append((ref, force)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "_release_endpoints",
+        lambda endpoints: released.extend(endpoints),
+    )
+    ref = object()
+    usage_group_id = "train/r0010/repo__task-1/t000010:g0"
+    marker_dir = tmp_path / "branch-markers"
+    marker_dir.mkdir()
+    (marker_dir / "rollout-1.ready").touch()
+    task = {
+        "rollout_id": 10,
+        "usage_group_id": usage_group_id,
+        "_endpoints_picked": [["host-a", 30000], ["host-b", 30001]],
+        "_released_branch_indices": [0],
+        "_branch_done_dir": str(marker_dir),
+    }
+    module._REPLAY_PENDING_TASKS.append({"index": 11})
+    module._BUFFER.append(
+        module._BufferedGroup(
+            samples=[],
+            rollout_id=10,
+            usage_group_id=usage_group_id,
+        )
+    )
+    module._PENDING[ref] = task
+    module._VALIDATION_PARTIAL_STATE = {"boundary": 128}
+
+    result = module.discard_terminal_source_work()
+
+    assert result["pending"] == 1
+    assert result["replay_pending"] == 1
+    assert result["buffered_groups"] == 1
+    assert released == [("host-b", 30001)]
+    assert list(marker_dir.iterdir()) == []
+    assert cancelled == [(ref, False)]
+    assert module._PENDING == {}
+    assert module._REPLAY_PENDING_TASKS == []
+    assert module._BUFFER == []
+    assert module._VALIDATION_PARTIAL_STATE is None
+    events = sys.modules["swe_agent.usage"]._test_state["events"]
+    assert any(
+        event["group_id"] == usage_group_id
+        and event["disposition"] == "dropped"
+        and event["reason"] == "terminal_source_budget_lookahead"
+        for event in events
+    )
+
+
 def test_heartbeat_event_step_resumes_from_durable_last_pulse(
     monkeypatch, tmp_path
 ):
@@ -2376,7 +2622,7 @@ def test_heartbeat_event_step_resumes_from_durable_last_pulse(
     )
     monkeypatch.setitem(sys.modules, "wandb", _module("wandb", run=None))
 
-    module._emit_heartbeat(
+    module.emit_heartbeat(
         source="naive",
         rollout_id=9,
         elapsed_seconds=12.0,
@@ -2414,7 +2660,7 @@ def test_heartbeat_peeks_usage_without_committing_update_delta(
         ),
     )
 
-    module._emit_heartbeat(
+    module.emit_heartbeat(
         source="naive",
         rollout_id=1,
         elapsed_seconds=2.0,
@@ -2594,12 +2840,12 @@ def test_checkpoint_pending_replay_uses_current_routes_without_source_draw(
     )
     monkeypatch.setattr(
         module,
-        "_ensure_usage_tracking",
+        "ensure_usage_tracking",
         lambda: str(tmp_path / "usage.jsonl"),
     )
     monkeypatch.setattr(
         module,
-        "_record_usage_disposition",
+        "record_usage_disposition",
         lambda group_id, *, disposition, reason="", phase="train": (
             replay_dispositions.append(
                 {

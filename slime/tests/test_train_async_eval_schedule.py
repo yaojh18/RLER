@@ -14,9 +14,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY = (
     "__slime_train_instance_budget_exhausted__"
 )
-TRAIN_VALIDATION_BOUNDARY_KEY = "__slime_train_validation_boundary__"
 ROLLOUT_COLLECTOR_STATE_METADATA_KEY = (
     "__rler_rollout_collector_state_v1__"
+)
+VALIDATION_CHECKPOINT_MARKER_PREFIX = (
+    ".rler_validation_source_attempt_"
 )
 
 
@@ -60,8 +62,8 @@ def _load_train_async(monkeypatch):
             TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY=(
                 TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY
             ),
-            TRAIN_VALIDATION_BOUNDARY_KEY=(
-                TRAIN_VALIDATION_BOUNDARY_KEY
+            VALIDATION_CHECKPOINT_MARKER_PREFIX=(
+                VALIDATION_CHECKPOINT_MARKER_PREFIX
             ),
         ),
         "slime.utils": _module("slime.utils"),
@@ -75,6 +77,14 @@ def _load_train_async(monkeypatch):
         "slime.utils.misc": _module(
             "slime.utils.misc",
             should_run_periodic_action=should_run_periodic_action,
+        ),
+        "swe_agent": _module("swe_agent"),
+        "swe_agent.policy_version": _module(
+            "swe_agent.policy_version",
+            begin_policy_weight_update=None,
+            commit_policy_weight_update=None,
+            fail_policy_weight_update=None,
+            policy_version_for_checkpoint=None,
         ),
     }
     for name, module in stubs.items():
@@ -141,7 +151,9 @@ def _load_rollout_manager_methods(method_names, **globals_):
     return {name: namespace[name] for name in method_names}
 
 
-def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
+def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit(
+    tmp_path,
+):
     events = []
 
     class Ref:
@@ -238,6 +250,10 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
         Any=object,
         logger=Logger,
         ray=FakeRay,
+        Path=Path,
+        VALIDATION_CHECKPOINT_MARKER_PREFIX=(
+            VALIDATION_CHECKPOINT_MARKER_PREFIX
+        ),
         observed_policy_version=lambda: "checkpoint-0000003",
     )
 
@@ -252,6 +268,7 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
         drain_train_validations = methods["drain_train_validations"]
 
         def __init__(self):
+            self.args = SimpleNamespace(save=tmp_path)
             self.data_source = DataSource()
             self._train_validation_manager = ValidationManager()
             self._train_validation_refs = {}
@@ -259,6 +276,7 @@ def test_attempt_validation_schedule_is_nonblocking_and_drain_is_explicit():
         def get_train_instance_progress(self):
             return self.data_source.training_progress()
 
+    (tmp_path / "iter_0000003").mkdir()
     manager = Manager()
     manager._schedule_train_validation(
         attempted_instances=100,
@@ -349,7 +367,7 @@ def test_validation_actor_failure_is_acknowledged_without_retry():
     assert events == ["warning", ("ack", 100)]
 
 
-def test_validation_dispatch_failure_is_acknowledged_without_retry():
+def test_validation_dispatch_failure_is_acknowledged_without_retry(tmp_path):
     events = []
 
     class Logger:
@@ -378,6 +396,10 @@ def test_validation_dispatch_failure_is_acknowledged_without_retry():
 
     methods = _load_rollout_manager_methods(
         {"_schedule_train_validation"},
+        Path=Path,
+        VALIDATION_CHECKPOINT_MARKER_PREFIX=(
+            VALIDATION_CHECKPOINT_MARKER_PREFIX
+        ),
         observed_policy_version=lambda: "checkpoint-0000003",
         logger=Logger,
     )
@@ -388,6 +410,7 @@ def test_validation_dispatch_failure_is_acknowledged_without_retry():
         ]
 
         def __init__(self):
+            self.args = SimpleNamespace(save=tmp_path)
             self.data_source = DataSource()
             self._train_validation_refs = {}
             self._train_validation_manager = SimpleNamespace(
@@ -397,6 +420,7 @@ def test_validation_dispatch_failure_is_acknowledged_without_retry():
         def get_train_instance_progress(self):
             return self.data_source.training_progress()
 
+    (tmp_path / "iter_0000003").mkdir()
     manager = Manager()
     manager._schedule_train_validation(
         attempted_instances=100,
@@ -723,7 +747,6 @@ def test_instance_attempt_schedule_disables_update_schedule(monkeypatch):
         ("train_instance_budget", 1250),
         ("eval_instance_interval", 100),
         ("require_train_instance_budget_exhaustion", True),
-        ("stop_after_validation_attempt", 100),
     ],
 )
 def test_each_source_attempt_contract_flag_selects_control_loop(
@@ -733,7 +756,17 @@ def test_each_source_attempt_contract_flag_selects_control_loop(
 ):
     module = _load_train_async(monkeypatch)
     args = SimpleNamespace(**{flag: value})
-    assert module._uses_instance_attempt_control(args)
+    monkeypatch.setattr(
+        module,
+        "_train_instance_attempt_control",
+        lambda actual: ("instance", actual),
+    )
+    monkeypatch.setattr(
+        module,
+        "_train_upstream",
+        lambda actual: ("upstream", actual),
+    )
+    assert module.train(args) == ("instance", args)
 
 
 def test_unrelated_checkpoint_retention_does_not_select_control_loop(
@@ -741,7 +774,17 @@ def test_unrelated_checkpoint_retention_does_not_select_control_loop(
 ):
     module = _load_train_async(monkeypatch)
     args = SimpleNamespace(checkpoint_retain_latest=2)
-    assert not module._uses_instance_attempt_control(args)
+    monkeypatch.setattr(
+        module,
+        "_train_instance_attempt_control",
+        lambda actual: ("instance", actual),
+    )
+    monkeypatch.setattr(
+        module,
+        "_train_upstream",
+        lambda actual: ("upstream", actual),
+    )
+    assert module.train(args) == ("upstream", args)
 
 
 def test_upstream_train_preserves_event_trace_and_epoch_semantics(
@@ -1050,208 +1093,6 @@ def test_attempt_path_checkpoint_restores_exact_cursor_without_skipping(
     assert committed_snapshots[(1, 2)] == 3
 
 
-def test_attempt_boundary_retries_same_update_and_budget_stops_normally(
-    monkeypatch,
-):
-    module = _load_train_async(monkeypatch)
-    events = []
-
-    class Ref:
-        def __init__(self, value=None):
-            self.value = value
-
-    class FakeRay:
-        @staticmethod
-        def get(ref):
-            if isinstance(ref, list):
-                return [FakeRay.get(item) for item in ref]
-            assert isinstance(ref, Ref)
-            return ref.value
-
-    class RemoteMethod:
-        def __init__(self, callback):
-            self.callback = callback
-
-        def remote(self, *args, **kwargs):
-            return Ref(self.callback(*args, **kwargs))
-
-    class RolloutManager:
-        def __init__(self):
-            self.attempted = 0
-            self.last_validation = 0
-            self.generate_calls = []
-            self.generate_1_calls = 0
-            self.generate = RemoteMethod(self._generate)
-            self.eval = RemoteMethod(self._eval)
-            self.drain_train_validations = RemoteMethod(
-                self._drain_train_validations
-            )
-            self.get_train_instance_progress = RemoteMethod(
-                self._progress
-            )
-            self.save = RemoteMethod(self._save)
-            self.check_weights = RemoteMethod(lambda *args, **kwargs: None)
-            self.dispose = RemoteMethod(lambda: events.append(("dispose",)))
-
-        def _generate(self, rollout_id):
-            self.generate_calls.append(rollout_id)
-            events.append(("generate", rollout_id))
-            if rollout_id == 0:
-                self.attempted = 100
-                return "rollout-0"
-            if rollout_id == 1:
-                self.generate_1_calls += 1
-                if self.generate_1_calls == 1:
-                    return {
-                        TRAIN_VALIDATION_BOUNDARY_KEY: True,
-                        "attempted_instances": 100,
-                        "boundary": 100,
-                    }
-                self.attempted = 125
-                return "rollout-1"
-            assert rollout_id == 2
-            return {
-                TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY: True,
-                "attempted_instances": 125,
-                "budget": 125,
-            }
-
-        def _eval(self, rollout_id, attempted):
-            assert attempted == self.attempted
-            events.append(("eval", rollout_id, attempted))
-            return {
-                "eval/attempted": 50,
-                "eval/completed": 50,
-                "eval/incomplete": 0,
-            }
-
-        def _acknowledge(self, attempted):
-            assert attempted == self.attempted
-            self.last_validation = attempted
-            events.append(("ack", attempted))
-            return self._progress()
-
-        def _drain_train_validations(self, rollout_id, attempted):
-            self._eval(rollout_id, attempted)
-            return self._acknowledge(attempted)
-
-        def _progress(self):
-            return {
-                "attempted_instances": self.attempted,
-                "last_validation_attempt": self.last_validation,
-                "instance_budget": 125,
-                "eval_instance_interval": 100,
-            }
-
-        def _save(self, rollout_id):
-            events.append(
-                (
-                    "dataset_save",
-                    rollout_id,
-                    self.attempted,
-                    self.last_validation,
-                )
-            )
-
-    class Actor:
-        def update_weights(self):
-            events.append(("update_weights",))
-
-        def async_train(self, rollout_id, rollout_data, external_data=None):
-            events.append(("train", rollout_id, rollout_data))
-            return Ref()
-
-        def save_model(self, rollout_id, force_sync=False):
-            events.append(("model_save", rollout_id, force_sync))
-
-    manager = RolloutManager()
-    actor = Actor()
-    module.ray = FakeRay
-    module.configure_logger = lambda: None
-    module.init_tracking = lambda args: None
-    module.finish_tracking = lambda args: None
-    module.create_placement_groups = lambda args: {"rollout": object()}
-    module.create_rollout_manager = lambda args, pg: (manager, None)
-    module.create_training_models = (
-        lambda args, pgs, rollout_manager: (actor, None)
-    )
-    module._stage_checkpoint_dataset_state = (
-        lambda args, rollout_manager, *, rollout_id: (
-            FakeRay.get(rollout_manager.save.remote(rollout_id))
-            is None
-        )
-    )
-    module._commit_checkpoint_dataset_state = (
-        lambda args, *, rollout_id: None
-    )
-    args = SimpleNamespace(
-        colocate=False,
-        check_weight_update_equal=False,
-        start_rollout_id=0,
-        num_rollout=10,
-        use_critic=False,
-        save_interval=10,
-        rollout_global_dataset=True,
-        update_weights_interval=1,
-        eval_interval=1,
-        eval_instance_interval=100,
-        train_instance_budget=125,
-        require_train_instance_budget_exhaustion=True,
-        save="/does/not/matter/when-retention-is-disabled",
-        checkpoint_retain_latest=0,
-        async_save=False,
-    )
-
-    module.train(args)
-
-    assert manager.generate_calls == [0, 1, 1, 2]
-    assert [
-        event for event in events if event[0] == "train"
-    ] == [
-        ("train", 0, "rollout-0"),
-        ("train", 1, "rollout-1"),
-    ]
-    assert [
-        event for event in events if event[0] == "eval"
-    ] == [
-        ("eval", 1, 100),
-        ("eval", 1, 125),
-    ]
-    assert [
-        event for event in events if event[0] == "ack"
-    ] == [("ack", 100), ("ack", 125)]
-    generate_1_indices = [
-        index
-        for index, event in enumerate(events)
-        if event == ("generate", 1)
-    ]
-    assert len(generate_1_indices) == 2
-    update_indices = [
-        index
-        for index, event in enumerate(events)
-        if event == ("update_weights",)
-    ]
-    train_1_index = events.index(("train", 1, "rollout-1"))
-    # Rollout N+1 was already dispatched.  Training and weight sync for N do
-    # not wait for its control result; stale=1 permits that overlap.
-    assert any(
-        generate_1_indices[0] < index < generate_1_indices[1]
-        for index in update_indices
-    )
-    assert not any(
-        generate_1_indices[1] < index < train_1_index
-        for index in update_indices
-    )
-    # The terminal model is paired with the cursor after final validation.
-    assert (
-        "dataset_save",
-        1,
-        125,
-        125,
-    ) in events
-    assert ("model_save", 1, True) in events
-
-
 def test_required_budget_exhaustion_fails_before_final_validation_or_checkpoint(
     monkeypatch, tmp_path
 ):
@@ -1348,7 +1189,6 @@ def test_required_budget_exhaustion_fails_before_final_validation_or_checkpoint(
         eval_instance_interval=None,
         train_instance_budget=1250,
         require_train_instance_budget_exhaustion=True,
-        stop_after_validation_attempt=None,
         save=tmp_path,
         checkpoint_retain_latest=0,
         async_save=False,
@@ -1366,315 +1206,6 @@ def test_required_budget_exhaustion_fails_before_final_validation_or_checkpoint(
     assert not any(event[0] == "model_save" for event in events)
     assert not any(event[0] == "dispose" for event in events)
     assert ("finish",) not in events
-
-
-def test_exact_final_boundary_is_not_validated_twice(monkeypatch):
-    module = _load_train_async(monkeypatch)
-    eval_attempts = []
-
-    class Ref:
-        def __init__(self, value=None):
-            self.value = value
-
-    class FakeRay:
-        @staticmethod
-        def get(ref):
-            assert isinstance(ref, Ref)
-            return ref.value
-
-    class RemoteMethod:
-        def __init__(self, callback):
-            self.callback = callback
-
-        def remote(self, *args, **kwargs):
-            return Ref(self.callback(*args, **kwargs))
-
-    class RolloutManager:
-        def __init__(self):
-            self.last_validation = 0
-            self.after_boundary = False
-            self.generate = RemoteMethod(self._generate)
-            self.eval = RemoteMethod(self._eval)
-            self.drain_train_validations = RemoteMethod(
-                self._drain_train_validations
-            )
-            self.get_train_instance_progress = RemoteMethod(
-                self._progress
-            )
-            self.save = RemoteMethod(lambda rollout_id: None)
-            self.check_weights = RemoteMethod(lambda *args, **kwargs: None)
-            self.dispose = RemoteMethod(lambda: None)
-
-        def _generate(self, rollout_id):
-            if not self.after_boundary:
-                return {
-                    TRAIN_VALIDATION_BOUNDARY_KEY: True,
-                    "attempted_instances": 100,
-                    "boundary": 100,
-                }
-            return {
-                TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY: True,
-                "attempted_instances": 100,
-                "budget": 100,
-            }
-
-        def _eval(self, rollout_id, attempted):
-            eval_attempts.append(attempted)
-            return {
-                "eval/attempted": 50,
-                "eval/completed": 50,
-                "eval/incomplete": 0,
-            }
-
-        def _acknowledge(self, attempted):
-            self.last_validation = attempted
-            self.after_boundary = True
-            return self._progress()
-
-        def _drain_train_validations(self, rollout_id, attempted):
-            self._eval(rollout_id, attempted)
-            return self._acknowledge(attempted)
-
-        def _progress(self):
-            return {
-                "attempted_instances": 100,
-                "last_validation_attempt": self.last_validation,
-            }
-
-    class Actor:
-        def update_weights(self):
-            pass
-
-    manager = RolloutManager()
-    module.ray = FakeRay
-    module.configure_logger = lambda: None
-    module.init_tracking = lambda args: None
-    module.finish_tracking = lambda args: None
-    module.create_placement_groups = lambda args: {"rollout": object()}
-    module.create_rollout_manager = lambda args, pg: (manager, None)
-    module.create_training_models = (
-        lambda args, pgs, rollout_manager: (Actor(), None)
-    )
-    args = SimpleNamespace(
-        colocate=False,
-        check_weight_update_equal=False,
-        start_rollout_id=0,
-        num_rollout=10,
-        use_critic=False,
-        save_interval=10,
-        rollout_global_dataset=True,
-        update_weights_interval=1,
-        eval_interval=1,
-        eval_instance_interval=100,
-    )
-
-    module.train(args)
-    assert eval_attempts == [100]
-
-
-@pytest.mark.parametrize(
-    "refill_outcome",
-    ["success", "next_validation_boundary", "terminal_budget"],
-)
-def test_intermediate_chunk_partial_refill_is_checkpointed_or_fails_closed(
-    monkeypatch, tmp_path, refill_outcome
-):
-    module = _load_train_async(monkeypatch)
-    events = []
-
-    class Ref:
-        def __init__(self, value=None):
-            self.value = value
-
-    class FakeRay:
-        @staticmethod
-        def get(ref):
-            assert isinstance(ref, Ref)
-            return ref.value
-
-    class RemoteMethod:
-        def __init__(self, callback):
-            self.callback = callback
-
-        def remote(self, *args, **kwargs):
-            return Ref(self.callback(*args, **kwargs))
-
-    class RolloutManager:
-        def __init__(self):
-            self.attempted = 0
-            self.last_validation = 0
-            self.generate_calls = 0
-            self.generate = RemoteMethod(self._generate)
-            self.eval = RemoteMethod(self._eval)
-            self.drain_train_validations = RemoteMethod(
-                self._drain_train_validations
-            )
-            self.get_train_instance_progress = RemoteMethod(self._progress)
-            self.save = RemoteMethod(self._save)
-            self.check_weights = RemoteMethod(lambda *args, **kwargs: None)
-            self.dispose = RemoteMethod(
-                lambda: events.append(("dispose",))
-            )
-
-        def _generate(self, rollout_id):
-            assert rollout_id == 0
-            self.generate_calls += 1
-            events.append(("generate", rollout_id))
-            if self.generate_calls == 1:
-                self.attempted = 100
-                return {
-                    TRAIN_VALIDATION_BOUNDARY_KEY: True,
-                    "attempted_instances": 100,
-                    "boundary": 100,
-                    "preserved_partial": True,
-                    "preserved_group_count": 1,
-                    "preserved_group_kinds": {"root": 1},
-                }
-            assert self.last_validation == 100
-            if refill_outcome == "next_validation_boundary":
-                self.attempted = 200
-                return {
-                    TRAIN_VALIDATION_BOUNDARY_KEY: True,
-                    "attempted_instances": 200,
-                    "boundary": 200,
-                    "preserved_partial": True,
-                    "preserved_group_count": 1,
-                    "preserved_group_kinds": {"root": 1},
-                }
-            if refill_outcome == "terminal_budget":
-                self.attempted = 1250
-                return {
-                    TRAIN_INSTANCE_BUDGET_EXHAUSTED_KEY: True,
-                    "attempted_instances": 1250,
-                    "budget": 1250,
-                }
-            self.attempted = 103
-            return "refilled-rollout-0"
-
-        def _eval(self, rollout_id, attempted):
-            events.append(("eval", rollout_id, attempted))
-            return {
-                "eval/attempted": 50,
-                "eval/completed": 50,
-                "eval/incomplete": 0,
-            }
-
-        def _ack(self, attempted):
-            self.last_validation = attempted
-            events.append(("ack", attempted))
-            return self._progress()
-
-        def _drain_train_validations(self, rollout_id, attempted):
-            self._eval(rollout_id, attempted)
-            return self._ack(attempted)
-
-        def _progress(self):
-            return {
-                "attempted_instances": self.attempted,
-                "last_validation_attempt": self.last_validation,
-                "instance_budget": 1250,
-                "eval_instance_interval": 100,
-            }
-
-        def _save(self, rollout_id):
-            events.append(
-                (
-                    "dataset_save",
-                    rollout_id,
-                    self.attempted,
-                    self.last_validation,
-                )
-            )
-
-    class Actor:
-        def update_weights(self):
-            events.append(("update_weights",))
-
-        def async_train(self, rollout_id, rollout_data, external_data=None):
-            events.append(("train", rollout_id, rollout_data))
-            return Ref()
-
-        def save_model(self, rollout_id, force_sync=False):
-            events.append(("model_save", rollout_id, force_sync))
-
-    manager = RolloutManager()
-    actor = Actor()
-    module.ray = FakeRay
-    module.configure_logger = lambda: None
-    module.init_tracking = lambda args: None
-    module.finish_tracking = lambda args: None
-    module.create_placement_groups = lambda args: {"rollout": object()}
-    module.create_rollout_manager = lambda args, pg: (manager, None)
-    module.create_training_models = (
-        lambda args, pgs, rollout_manager: (actor, None)
-    )
-    module._stage_checkpoint_dataset_state = (
-        lambda args, rollout_manager, *, rollout_id: (
-            FakeRay.get(rollout_manager.save.remote(rollout_id))
-            is None
-        )
-    )
-    module._commit_checkpoint_dataset_state = (
-        lambda args, *, rollout_id: None
-    )
-    args = SimpleNamespace(
-        colocate=False,
-        check_weight_update_equal=False,
-        start_rollout_id=0,
-        num_rollout=10,
-        use_critic=False,
-        save_interval=10,
-        rollout_global_dataset=True,
-        update_weights_interval=1,
-        eval_interval=1,
-        eval_instance_interval=100,
-        train_instance_budget=1250,
-        stop_after_validation_attempt=100,
-        save=tmp_path,
-        checkpoint_retain_latest=0,
-        async_save=False,
-    )
-
-    if refill_outcome != "success":
-        error = (
-            "could not be refilled before the next validation boundary"
-            if refill_outcome == "next_validation_boundary"
-            else "could not be refilled before the terminal"
-        )
-        with pytest.raises(
-            RuntimeError,
-            match=error,
-        ):
-            module.train(args)
-        assert manager.generate_calls == 2
-        assert [
-            event for event in events if event[0] == "eval"
-        ] == [("eval", 0, 100)]
-        assert [
-            event for event in events if event[0] == "ack"
-        ] == [("ack", 100)]
-        assert not any(event[0] == "train" for event in events)
-        assert not any(event[0] == "dataset_save" for event in events)
-        assert not any(event[0] == "model_save" for event in events)
-        return
-
-    module.train(args)
-
-    assert manager.generate_calls == 2
-    assert [
-        event for event in events if event[0] == "eval"
-    ] == [("eval", 0, 100)]
-    assert [
-        event for event in events if event[0] == "train"
-    ] == [("train", 0, "refilled-rollout-0")]
-    assert (
-        "dataset_save",
-        0,
-        103,
-        100,
-    ) in events
-    assert ("model_save", 0, True) in events
-    assert events[-1] == ("dispose",)
 
 
 def test_budget_after_resume_persists_ack_with_existing_checkpoint(
@@ -1828,6 +1359,40 @@ def test_checkpoint_pruning_keeps_latest_complete_pairs(
     assert (tmp_path / "iter_0000002").is_dir()
     assert (tmp_path / "iter_0000003").is_dir()
     assert (tmp_path / "iter_not_numeric").is_dir()
+
+
+def test_checkpoint_pruning_preserves_validation_checkpoints(
+    monkeypatch,
+    tmp_path,
+):
+    module = _load_train_async(monkeypatch)
+    rollout_state = tmp_path / "rollout"
+    rollout_state.mkdir()
+    for checkpoint_id in (1, 2, 3, 4):
+        checkpoint_dir = tmp_path / f"iter_{checkpoint_id:07d}"
+        checkpoint_dir.mkdir()
+        (
+            rollout_state
+            / f"global_dataset_state_dict_{checkpoint_id}.pt"
+        ).touch()
+    marker = (
+        tmp_path
+        / "iter_0000001"
+        / f"{module.VALIDATION_CHECKPOINT_MARKER_PREFIX}000000128"
+    )
+    marker.write_text("policy_version=checkpoint-0000001\n")
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("4\n")
+
+    removed = module._prune_training_checkpoints(
+        SimpleNamespace(save=tmp_path, checkpoint_retain_latest=2),
+        latest_rollout_id=4,
+    )
+
+    assert removed == [2]
+    assert (tmp_path / "iter_0000001").is_dir()
+    assert not (tmp_path / "iter_0000002").exists()
+    assert (tmp_path / "iter_0000003").is_dir()
+    assert (tmp_path / "iter_0000004").is_dir()
 
 
 def test_dataset_state_commit_publishes_only_staged_file(
