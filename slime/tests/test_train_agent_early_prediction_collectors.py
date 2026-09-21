@@ -399,6 +399,7 @@ def test_naive_wrapper_defaults_to_fair_joint_reward(monkeypatch):
     assert args.validation_process_workers == 8
     assert args.naive_gt_eval_timeout == 600
     assert args.naive_rollout_max_attempts == 8
+    assert args.naive_skip_gt_evaluation is False
     assert args.validation_gt_eval_timeout == 600
     module._export_naive_env(args)
     assert module.os.environ["SWE_AGENT_NAIVE_REWARD_KIND"] == "joint"
@@ -407,11 +408,43 @@ def test_naive_wrapper_defaults_to_fair_joint_reward(monkeypatch):
     assert module.os.environ["SWE_AGENT_VALIDATION_TOP_P"] == "0.95"
     assert module.os.environ["SWE_AGENT_VALIDATION_PROCESS_WORKERS"] == "8"
     assert module.os.environ["SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT"] == "600"
+    assert module.os.environ["SWE_AGENT_NAIVE_EVALUATE_GT"] == "1"
     assert module.os.environ["SWE_AGENT_NAIVE_ROLLOUT_MAX_ATTEMPTS"] == "8"
     assert (
         module.os.environ["SWE_AGENT_VALIDATION_GT_EVAL_TIMEOUT"]
         == "600"
     )
+
+
+def test_naive_wrapper_allows_direct_reward_without_gt(monkeypatch):
+    module = _load_file(
+        monkeypatch,
+        "_test_grpo_async_naive_no_gt",
+        "slime/train_agent/run/grpo_async_naive.py",
+    )
+    args, forwarded = module._parse_naive_args(
+        [
+            "--naive-direct-reward-mode",
+            "direct_judge",
+            "--naive-skip-gt-evaluation",
+        ]
+    )
+
+    assert forwarded == []
+    module._export_naive_env(args)
+    assert module.os.environ["SWE_AGENT_NAIVE_EVALUATE_GT"] == "0"
+
+
+def test_naive_wrapper_rejects_gt_skip_without_direct_reward(monkeypatch):
+    module = _load_file(
+        monkeypatch,
+        "_test_grpo_async_naive_no_gt_invalid",
+        "slime/train_agent/run/grpo_async_naive.py",
+    )
+    args, _ = module._parse_naive_args(["--naive-skip-gt-evaluation"])
+
+    with pytest.raises(ValueError, match="requires.*direct_judge"):
+        module._export_naive_env(args)
 
 
 def test_lanes_wrapper_defaults_to_depth1_hosted_luna(monkeypatch):

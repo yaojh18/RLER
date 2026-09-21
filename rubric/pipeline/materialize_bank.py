@@ -8,7 +8,7 @@ import copy
 import json
 from pathlib import Path
 
-from common import atomic_json, load_json
+from RLER.rubric.pipeline.common import atomic_json, load_json
 
 
 def main() -> None:

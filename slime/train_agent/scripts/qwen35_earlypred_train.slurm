@@ -32,6 +32,17 @@ RLER_SOURCE_REL="${RLER_SOURCE_REL:-RLER}"
 LAUNCHER_ROOT_REL="$RLER_SOURCE_REL/slime/train_agent/scripts"
 RUN_ROOT_REL="${RUN_ROOT_REL:-tmp/rler_earlypred_final/runs}"
 DIRECT_CONTINUATION_384_TO_512="${DIRECT_CONTINUATION_384_TO_512:-0}"
+DIRECT_ROLLOUT_CUTOFF="${DIRECT_ROLLOUT_CUTOFF:-40}"
+DIRECT_HARD_ROLLOUT_CUTOFF="${DIRECT_HARD_ROLLOUT_CUTOFF:-0}"
+DIRECT_SKIP_GT_EVALUATION="${DIRECT_SKIP_GT_EVALUATION:-0}"
+case "$DIRECT_HARD_ROLLOUT_CUTOFF:$DIRECT_SKIP_GT_EVALUATION" in
+  0:0|0:1|1:0|1:1) ;;
+  *) echo "ERROR: Direct cutoff flags must be 0 or 1"; exit 2 ;;
+esac
+[ "$DIRECT_ROLLOUT_CUTOFF" -gt 0 ] || {
+  echo "ERROR: DIRECT_ROLLOUT_CUTOFF must be positive"
+  exit 2
+}
 case "$EXPERIMENT_METHOD" in
   baseline1)
     METHOD=baseline
@@ -47,11 +58,22 @@ case "$EXPERIMENT_METHOD" in
     ;;
   direct)
     METHOD=judge_direct_naive_rollout40
-    NAIVE_TRAIN_ASSISTANT_STEP_LIMIT=40
+    NAIVE_TRAIN_ASSISTANT_STEP_LIMIT="$DIRECT_ROLLOUT_CUTOFF"
     SWE_AGENT_NAIVE_DIRECT_REWARD_MODE=direct_judge
     case "$FOLD" in 0) EPOCH_INSTANCE_COUNT=222 ;; 1) EPOCH_INSTANCE_COUNT=226 ;; 2) EPOCH_INSTANCE_COUNT=230 ;; esac
     ;;
 esac
+if [ "$EXPERIMENT_METHOD" != direct ] \
+  && { [ "$DIRECT_HARD_ROLLOUT_CUTOFF" = 1 ] \
+    || [ "$DIRECT_SKIP_GT_EVALUATION" = 1 ]; }; then
+  echo "ERROR: Direct cutoff flags require EXPERIMENT_METHOD=direct"
+  exit 2
+fi
+NAIVE_ROLLOUT_STEP_LIMIT=250
+if [ "$EXPERIMENT_METHOD" = direct ] \
+  && [ "$DIRECT_HARD_ROLLOUT_CUTOFF" = 1 ]; then
+  NAIVE_ROLLOUT_STEP_LIMIT="$DIRECT_ROLLOUT_CUTOFF"
+fi
 DATA_VARIANT=baseline
 [ "$EXPERIMENT_METHOD" = direct ] && DATA_VARIANT=direct
 FOLD_DATA_REL="tmp/rler_earlypred_final/inputs/fold_$FOLD/$DATA_VARIANT"
@@ -103,9 +125,17 @@ NUM_ROLLOUT=64
 if [ "$DIRECT_CONTINUATION_384_TO_512" = "1" ]; then
   TRAIN_INSTANCE_BUDGET=128
 else
-  TRAIN_INSTANCE_BUDGET=384
+  TRAIN_INSTANCE_BUDGET="${TRAIN_INSTANCE_BUDGET_OVERRIDE:-384}"
 fi
-EVAL_INSTANCE_INTERVAL=128
+EVAL_INSTANCE_INTERVAL="${EVAL_INSTANCE_INTERVAL_OVERRIDE:-128}"
+[ "$TRAIN_INSTANCE_BUDGET" -gt 0 ] || {
+  echo "ERROR: TRAIN_INSTANCE_BUDGET must be positive"
+  exit 2
+}
+[ "$EVAL_INSTANCE_INTERVAL" -gt 0 ] || {
+  echo "ERROR: EVAL_INSTANCE_INTERVAL must be positive"
+  exit 2
+}
 TRAIN_GT_EVAL_TIMEOUT=600
 VALIDATION_GT_EVAL_TIMEOUT=600
 TRAIN_SAMPLES_PER_PROMPT=8
@@ -377,8 +407,8 @@ PY
         method_args=(
           --naive-output-root "$RUN_DIR/search"
           --naive-m "$TRAIN_SAMPLES_PER_PROMPT"
-          --naive-step-limit 250
-          --naive-train-assistant-step-limit 40
+          --naive-step-limit "$NAIVE_ROLLOUT_STEP_LIMIT"
+          --naive-train-assistant-step-limit "$NAIVE_TRAIN_ASSISTANT_STEP_LIMIT"
           --naive-instance-workers "$NAIVE_INSTANCE_WORKERS"
           --naive-max-pending "$NAIVE_MAX_PENDING"
           --naive-gt-eval-workers 8
@@ -400,6 +430,9 @@ PY
           --naive-direct-judge-model "$DIRECT_JUDGE_MODEL"
           --naive-direct-judge-api-base https://inference-api.nvidia.com/v1
         )
+        if [ "$DIRECT_SKIP_GT_EVALUATION" = 1 ]; then
+          method_args+=(--naive-skip-gt-evaluation)
+        fi
         ;;
     esac
 
@@ -501,13 +534,18 @@ EXPERIMENT_LABEL="f$FOLD-q35-$EXPERIMENT_METHOD"
 [ "$DIRECT_CONTINUATION_384_TO_512" = "0" ] \
   || EXPERIMENT_LABEL="$EXPERIMENT_LABEL-384to512"
 RUN_PROFILE_TAG=a1c4-64k2n
-RUN_SERIES=earlypred-q35-final
+RUN_SERIES="${RUN_SERIES:-earlypred-q35-final}"
 NAIVE_STEP_TAG=
-if { [ "$METHOD" = "baseline" ] \
+if [ "$EXPERIMENT_METHOD" = direct ] \
+  && [ "$DIRECT_HARD_ROLLOUT_CUTOFF" = 1 ]; then
+  NAIVE_STEP_TAG="-cutoff${DIRECT_ROLLOUT_CUTOFF}"
+elif { [ "$METHOD" = "baseline" ] \
   || [ "$METHOD" = "judge_direct_naive_rollout40" ]; } \
   && [ "$NAIVE_TRAIN_ASSISTANT_STEP_LIMIT" -gt 0 ]; then
   NAIVE_STEP_TAG="-trainfirst${NAIVE_TRAIN_ASSISTANT_STEP_LIMIT}"
 fi
+[ "$DIRECT_SKIP_GT_EVALUATION" = 0 ] \
+  || NAIVE_STEP_TAG="${NAIVE_STEP_TAG}-nogt"
 RUN_NAME="${RUN_SERIES}-${EXPERIMENT_LABEL}${NAIVE_STEP_TAG}${TRAINING_RECIPE_TAG}-${RUN_PROFILE_TAG}-rb${ROLLOUT_BATCH_SIZE}-gb${GLOBAL_BATCH_SIZE}-nr${NUM_ROLLOUT}-vt${VALIDATION_TEMPERATURE}-ctx${MODEL_CONTEXT_LENGTH}-mt${MAX_TOKENS_PER_GPU}-lpc${EXPECTED_LOG_PROBS_CHUNK_SIZE}"
 RUN_DIR_HOST="$HOST_ROOT/$RUN_ROOT_REL/$RUN_NAME"
 RUN_DIR="$WORKSPACE/$RUN_ROOT_REL/$RUN_NAME"
@@ -532,6 +570,8 @@ rm -f \
 export METHOD EXPERIMENT_METHOD FOLD RUN_PROFILE RUN_NAME RUN_DIR USAGE_LEDGER
 export FOLD_DATA_REL TRAIN_DATA_REL TRAIN_DATA
 export DIRECT_CONTINUATION_384_TO_512
+export DIRECT_ROLLOUT_CUTOFF DIRECT_HARD_ROLLOUT_CUTOFF
+export DIRECT_SKIP_GT_EVALUATION NAIVE_ROLLOUT_STEP_LIMIT
 export SWE_AGENT_NAIVE_DIRECT_REWARD_MODE
 export TRAINING_RECIPE TRAINING_CONFIG_PATH TRAIN_SAMPLES_PER_PROMPT
 export VALIDATION_HF_CONVERTER

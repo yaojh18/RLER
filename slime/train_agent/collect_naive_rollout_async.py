@@ -232,9 +232,10 @@ async def _apply_naive_direct_rewards(
     judge_top_p: float,
     enable_variance_detector: bool,
     collapse_reward_margin: float,
+    require_gt_diagnostics: bool = True,
     stale_check: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Apply the training-only direct reward after terminal GT scoring."""
+    """Apply the training-only Direct reward, optionally without terminal GT."""
 
     from swe_agent.direct_rubric_judge import (
         DirectRubricBank,
@@ -259,7 +260,7 @@ async def _apply_naive_direct_rewards(
             f"direct reward expected {expected_rollouts} rollouts, "
             f"got {len(record.rollouts)}"
         )
-    if any(
+    if require_gt_diagnostics and any(
         rollout.gt_score is None
         or not math.isfinite(float(rollout.gt_score))
         for rollout in record.rollouts
@@ -267,6 +268,12 @@ async def _apply_naive_direct_rewards(
         raise ValueError(
             "direct reward requires finite terminal GT diagnostics"
         )
+    if any(
+        rollout.gt_score is not None
+        and not math.isfinite(float(rollout.gt_score))
+        for rollout in record.rollouts
+    ):
+        raise ValueError("terminal GT diagnostics must be finite when present")
 
     bank = DirectRubricBank(Path(rubric_bank_path))
     if not bank.is_eligible(record.instance_id):
@@ -355,6 +362,7 @@ async def _apply_naive_direct_rewards(
     judged["terminal_gt_scores"] = {
         rollout.node_id: float(rollout.gt_score)
         for rollout in record.rollouts
+        if rollout.gt_score is not None
     }
     record.direct_judge = judged
     Path(record.run_dir, "direct_judge.json").write_text(
@@ -423,7 +431,7 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
         base_config = build_swebench_config(
             config_spec=[str(SWE_AGENT_TEXTBASED_CONFIG)],
             model=model_name,
-            model_class="route_textbased",
+            model_class=task.get("model_class", "route_textbased"),
         )
         image_name = get_swebench_docker_image_name(instance)
         environment_class = select_container_environment_class(
@@ -470,7 +478,11 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
             step_limit=task["step_limit"],
             gt_eval_workers=task.get("gt_eval_workers", 8),
             gt_eval_timeout=min(int(task.get("gt_eval_timeout", 600)), 600),
-            evaluate_gt=not bool(task.get("defer_gt_evaluation")),
+            evaluate_gt=(
+                bool(task["evaluate_gt"])
+                if "evaluate_gt" in task
+                else not bool(task.get("defer_gt_evaluation"))
+            ),
             rollout_pool_size=task.get("rollout_pool_size") or task["m"],
             rollout_max_attempts=task.get("rollout_max_attempts", 8),
             require_exact_token_info=bool(
@@ -575,12 +587,13 @@ def _naive_bundle_task(task: dict[str, Any]) -> dict[str, Any]:
                     collapse_reward_margin=float(
                         task["direct_collapse_reward_margin"]
                     ),
+                    require_gt_diagnostics=cfg.evaluate_gt,
                     stale_check=runner.check_policy_staleness,
                 )
             )
         bundle = (
             None
-            if task.get("defer_gt_evaluation")
+            if task.get("validation") and task.get("defer_gt_evaluation")
             else naive_record_to_bundle(record)
         )
         validation = None
@@ -1714,6 +1727,7 @@ def _naive_values_from_env() -> dict[str, Any]:
         "gt_eval_timeout": min(
             _int("SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT", 600), 600
         ),
+        "evaluate_gt": _bool("SWE_AGENT_NAIVE_EVALUATE_GT", True),
         "rollout_pool_size": _int("SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE"),
         "rollout_max_attempts": _int(
             "SWE_AGENT_NAIVE_ROLLOUT_MAX_ATTEMPTS", 8

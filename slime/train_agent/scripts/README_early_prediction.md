@@ -51,6 +51,24 @@ CONTINUATION_START_LOAD_DIR=/workspace/path/to/attempt384/torch_dist_release \
   slime/train_agent/scripts/qwen35_earlypred_train.slurm
 ```
 
+For the Fold0 rollout-cutoff ablation, the following variables make the
+training rollout physically stop at the Direct loss horizon and omit the
+training-only terminal GT diagnostic. `TRAIN_INSTANCE_BUDGET_OVERRIDE=512`
+and `EVAL_INSTANCE_INTERVAL_OVERRIDE=512` train two epochs and mark only the
+final checkpoint for deferred validation:
+
+```bash
+sbatch --export=ALL,FOLD=0,EXPERIMENT_METHOD=direct,\
+DIRECT_ROLLOUT_CUTOFF=10,DIRECT_HARD_ROLLOUT_CUTOFF=1,\
+DIRECT_SKIP_GT_EVALUATION=1,TRAIN_INSTANCE_BUDGET_OVERRIDE=512,\
+EVAL_INSTANCE_INTERVAL_OVERRIDE=512 \
+  slime/train_agent/scripts/qwen35_earlypred_train.slurm
+```
+
+Use `DIRECT_ROLLOUT_CUTOFF=10|20|30`. The Direct judge remains the sole
+optimizer reward. These flags are rejected for non-Direct methods; without
+them the three primary methods retain the contracts in the table above.
+
 ## Evaluation
 
 Create a JSON file containing `{"tasks": [...]}`. Each task has `label`,

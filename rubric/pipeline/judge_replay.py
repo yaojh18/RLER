@@ -7,7 +7,7 @@ import copy
 import json
 from typing import Any
 
-from prompts import HANDBOOK_RUBRIC_JUDGE_PROMPT
+from RLER.rubric.pipeline.prompts import HANDBOOK_RUBRIC_JUDGE_PROMPT
 
 JUDGE_TEMPERATURE = 0.02
 JUDGE_TOP_P = 1.0
@@ -85,7 +85,7 @@ async def judge_call(
     max_tokens: int,
 ) -> dict[str, Any]:
     from agent_rl.run_utils import freeform_thought_model_kwargs, route_completion_message
-    from model_runtime import model_kwargs
+    from RLER.rubric.pipeline.model_runtime import model_kwargs
 
     conversation = copy.deepcopy(request)
     format_errors = []

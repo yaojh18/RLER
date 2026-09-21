@@ -1,23 +1,22 @@
-# Automatic golden-reference rubric pipeline
+# Teacher-rubric pipeline
 
 This package retains only the model-driven pipeline used by the final bank. It
 does not contain human refinement, eligibility fitting, or abstention-threshold
 fitting.
 
 1. Use `prepare_collection.py` with a JSONL manifest of calculate-GT rollout
-   artifacts. It writes `instance_manifest.json` and one
-   `current_ledgers/<instance>.json` per task, retaining only historical
-   GT-variance groups and binding visible trajectory views, exact Luna scores,
-   the current handbook, and strict GT-difference pairs.
-2. Run `generate_refine.py initial-gen`, then `luna-eval`. Initial generation
-   retains any rubric with positive pairwise accuracy against its zero baseline.
-3. Run `sol-gen`, `luna-eval`, `sol-refine`, and `luna-eval`. Sol refinement is
-   mandatory for every failed candidate. Every generated addition is compared
-   with a zero baseline and retained when it has any positive strict-pair
-   signal; a modification is retained only when it strictly improves its
-   recorded parent rubric.
-4. `build_weight_problems.py` combines every accepted candidate without a
-   six-rubric prefilter. `optimize_weights.py` performs non-exhaustive
+   artifacts. The collection starts from an empty seed portfolio and retains only historical
+   GT-variance groups and binds the cutoff-visible trajectories to exact
+   terminal-reward difference pairs.
+2. Run `generate_refine.py teacher-gen`, then `luna-eval`. Each generated
+   rubric is evaluated independently and retained only when its strict-pair
+   accuracy exceeds 50%.
+3. Run `generate_refine.py teacher-refine` on every non-improving generated
+   rubric, then run `luna-eval` again. Refinement must return one changed rubric
+   per failed candidate, and it is retained only when its strict-pair accuracy
+   exceeds that direct candidate before refinement.
+4. `build_weight_problems.py` combines accepted generation and refinement
+   candidates without a six-rubric prefilter. `optimize_weights.py` performs non-exhaustive
    successive-halving plus coordinate/swap search with the fixed score mapping
    `1,2,4,6,8`. Legal weights are zero or 0.5 through 5.0 in 0.1 increments;
    at most six are active.

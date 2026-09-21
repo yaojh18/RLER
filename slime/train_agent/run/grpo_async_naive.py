@@ -46,6 +46,14 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
     )
     p.add_argument("--naive-gt-eval-workers", type=int, default=8)
     p.add_argument("--naive-gt-eval-timeout", type=int, default=600)
+    p.add_argument(
+        "--naive-skip-gt-evaluation",
+        action="store_true",
+        help=(
+            "Skip training-time verifiable reward evaluation. This is valid "
+            "only when Direct judge rewards supply the optimizer reward."
+        ),
+    )
     p.add_argument("--naive-rollout-pool-size", type=int, default=0)
     p.add_argument("--naive-rollout-max-attempts", type=int, default=8)
     p.add_argument("--naive-policy-temperature", type=float, default=1.0,
@@ -106,6 +114,14 @@ def _parse_naive_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[
 
 
 def _export_naive_env(ns: argparse.Namespace) -> None:
+    if (
+        ns.naive_skip_gt_evaluation
+        and ns.naive_direct_reward_mode != "direct_judge"
+    ):
+        raise ValueError(
+            "--naive-skip-gt-evaluation requires "
+            "--naive-direct-reward-mode=direct_judge"
+        )
     if ns.naive_output_root:
         os.environ["SWE_AGENT_NAIVE_OUTPUT_ROOT"] = ns.naive_output_root
 
@@ -131,6 +147,9 @@ def _export_naive_env(ns: argparse.Namespace) -> None:
     os.environ["SWE_AGENT_NAIVE_GT_EVAL_WORKERS"] = str(ns.naive_gt_eval_workers)
     os.environ["SWE_AGENT_NAIVE_GT_EVAL_TIMEOUT"] = str(
         min(ns.naive_gt_eval_timeout, 600)
+    )
+    os.environ["SWE_AGENT_NAIVE_EVALUATE_GT"] = (
+        "0" if ns.naive_skip_gt_evaluation else "1"
     )
     if ns.naive_rollout_pool_size:
         os.environ["SWE_AGENT_NAIVE_ROLLOUT_POOL_SIZE"] = str(ns.naive_rollout_pool_size)

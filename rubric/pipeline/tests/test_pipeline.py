@@ -8,10 +8,10 @@ import sys
 import numpy as np
 import pytest
 
-import build_weight_problems
-import generate_refine
-import optimize_weights
-from common import rubric_key
+import RLER.rubric.pipeline.build_weight_problems as build_weight_problems
+import RLER.rubric.pipeline.generate_refine as generate_refine
+import RLER.rubric.pipeline.optimize_weights as optimize_weights
+from RLER.rubric.pipeline.common import rubric_key
 
 
 def _rubric(title: str = "Visible implementation") -> dict:
@@ -42,6 +42,8 @@ def _candidate(stage: str, *, action: str = "add", parent: str | None = None) ->
         "stage": stage,
         "action": action,
         "parent_rubric_key": parent,
+        "semantic_dimension": rubric["title"],
+        "reason": "fixture",
         "rubric": rubric,
     }
 
@@ -74,7 +76,7 @@ def _ledger(candidate: dict, raw_scores: tuple[int, int], *, parent_correct: int
     }
 
 
-def test_initial_generation_uses_zero_baseline_not_majority_gate():
+def test_initial_generation_uses_strict_majority_baseline():
     candidate = _candidate("initial_gen")
     result = asyncio.run(
         generate_refine.evaluate_candidate(
@@ -84,28 +86,32 @@ def test_initial_generation_uses_zero_baseline_not_majority_gate():
             max_tokens=128,
         )
     )
-    assert result["baseline_kind"] == "generation_zero"
+    assert result["baseline_kind"] == "strict_majority_0.5"
+    assert result["baseline_correct"] == 0.5
     assert result["candidate_correct"] == 1
     assert result["strictly_improves_baseline"] is True
 
 
 def test_refinement_must_strictly_improve_its_parent():
-    parent = "a" * 64
-    candidate = _candidate("sol_refine", action="modify", parent=parent)
+    candidate = _candidate("sol_refine")
+    candidate["direct_parent_correct"] = 0
+    candidate["direct_parent_strict_pairs"] = 1
+    candidate["direct_parent_pairwise_accuracy"] = 0.0
     result = asyncio.run(
         generate_refine.evaluate_candidate(
             candidate=candidate,
-            ledger=_ledger(candidate, (1, 5), parent_correct=0),
+            ledger=_ledger(candidate, (1, 5)),
             semaphore=asyncio.Semaphore(1),
             max_tokens=128,
         )
     )
+    assert result["baseline_kind"] == "direct_parent_candidate"
     assert result["candidate_correct"] == result["baseline_correct"] == 0
     assert result["strictly_improves_baseline"] is False
 
 
-def test_later_generation_uses_zero_baseline():
-    rejected = _candidate("sol_gen", action="add")
+def test_initial_generation_rejects_nonmajority_ordering():
+    rejected = _candidate("initial_sol_generation", action="add")
     rejected_result = asyncio.run(
         generate_refine.evaluate_candidate(
             candidate=rejected,
@@ -114,7 +120,7 @@ def test_later_generation_uses_zero_baseline():
             max_tokens=128,
         )
     )
-    accepted = _candidate("sol_gen", action="add")
+    accepted = _candidate("initial_sol_generation", action="add")
     accepted_result = asyncio.run(
         generate_refine.evaluate_candidate(
             candidate=accepted,
@@ -123,9 +129,20 @@ def test_later_generation_uses_zero_baseline():
             max_tokens=128,
         )
     )
-    assert rejected_result["baseline_kind"] == "generation_zero"
+    assert rejected_result["baseline_kind"] == "strict_majority_0.5"
     assert rejected_result["strictly_improves_baseline"] is False
     assert accepted_result["strictly_improves_baseline"] is True
+
+
+def test_initial_generation_uses_rubric_only_schema():
+    ledger = {"current_reference_statistics": []}
+    values = generate_refine.validate_generation(
+        {"reference_golden_rubrics": [_rubric()]}, ledger
+    )
+    assert len(values) == 1
+    assert values[0]["stage"] == "initial_sol_generation"
+    assert values[0]["action"] == "add"
+    assert values[0]["parent_rubric_key"] is None
 
 
 def test_refinement_cannot_skip_a_failed_candidate():
@@ -149,6 +166,35 @@ def test_refinement_cannot_skip_a_failed_candidate():
             failed,
             candidates,
         )
+
+
+def test_refinement_records_direct_parent_baseline():
+    original = _candidate("initial_sol_generation")
+    failed = [
+        {
+            "candidate_id": original["candidate_id"],
+            "candidate_correct": 3,
+            "strict_pairs": 8,
+        }
+    ]
+    refined = _rubric("Refined visible implementation")
+    values = generate_refine.validate_refinement(
+        {
+            "decisions": [
+                {
+                    "candidate_id": original["candidate_id"],
+                    "action": "refine",
+                    "reason": "Clarify the evidence boundary.",
+                    "rubric": refined,
+                }
+            ]
+        },
+        failed,
+        {"candidates": [original]},
+    )
+    assert values[0]["direct_parent_correct"] == 3
+    assert values[0]["direct_parent_strict_pairs"] == 8
+    assert values[0]["direct_parent_pairwise_accuracy"] == 0.375
 
 
 def test_candidate_filter_keeps_any_record_with_strict_gain(tmp_path: Path):

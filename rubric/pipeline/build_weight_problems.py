@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Filter positive generated/refined rubrics and build robust-weight inputs.
 
-The input is the frozen collection produced for ``generate_refine.py``.  Every
-candidate must already have a Luna evaluation on exactly those groups.  Initial
-generation is retained when it beats its zero baseline. A modification must
-strictly improve its recorded parent rubric.
+The input is the frozen collection produced for ``generate_refine.py``. Every
+candidate must already have a Luna evaluation on exactly those groups. Initial
+generation is retained when it exceeds the strict 50% pairwise baseline, and a
+refinement is retained only when it strictly improves its direct candidate.
 No candidate is deleted here for portfolio size: zero weights and the six-rubric
 limit are applied only by ``optimize_weights.py``.
 """
@@ -20,7 +20,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from common import (
+from RLER.rubric.pipeline.common import (
     atomic_json,
     load_json,
     normalized_pair,
@@ -36,11 +36,6 @@ def direction(rubric: dict[str, Any]) -> int:
     if value == "negative":
         return -1
     raise ValueError(f"invalid rubric direction: {value!r}")
-
-
-def references(wrapper: dict[str, Any]) -> list[dict[str, Any]]:
-    handbook = wrapper.get("handbook", wrapper)
-    return handbook["rubric_and_weight_guidance"]["reference_golden_rubrics"]
 
 
 def candidate_sources(specifications: list[str]) -> list[tuple[Path, Path]]:
@@ -104,21 +99,8 @@ def build_instance(
     group_by_key = {str(group["group_key"]): group for group in groups}
     if len(group_by_key) != len(groups):
         raise ValueError(f"duplicate group key: {instance_id}")
-
-    handbook_path = Path(ledger["current_handbook"]["path"])
-    wrapper = load_json(handbook_path)
     rubric_by_contract: dict[str, dict[str, Any]] = {}
     scores_by_contract: dict[str, dict[str, dict[str, int]]] = {}
-    for rubric in references(wrapper):
-        contract = rubric_key(rubric)
-        rubric_by_contract[contract] = copy.deepcopy(rubric)
-        scores_by_contract[contract] = {
-            key: {
-                str(node_id): int(value["raw_score"])
-                for node_id, value in group["rubric_scores"][contract]["raw_scores"].items()
-            }
-            for key, group in group_by_key.items()
-        }
 
     for candidate, evaluation in accepted:
         rubric = candidate["rubric"]
@@ -130,6 +112,9 @@ def build_instance(
             raise ValueError(f"conflicting duplicate candidate scores: {instance_id}/{contract}")
         rubric_by_contract.setdefault(contract, copy.deepcopy(rubric))
         scores_by_contract.setdefault(contract, cells)
+
+    if not rubric_by_contract:
+        raise ValueError(f"no generated or refined rubric passed filtering: {instance_id}")
 
     candidate_ids = list(rubric_by_contract)
     pairs = []
@@ -184,11 +169,15 @@ def build_instance(
         },
         "accepted_generated_or_refined_rubrics": len(accepted),
     }
-    base_wrapper = copy.deepcopy(wrapper)
-    base_handbook = base_wrapper.get("handbook", base_wrapper)
-    base_handbook["rubric_and_weight_guidance"][
-        "reference_golden_rubrics"
-    ] = rubrics
+    base_wrapper = {
+        "schema_version": "teacher_rubric_optimizer_base.v1",
+        "instance_id": instance_id,
+        "handbook": {
+            "rubric_and_weight_guidance": {
+                "reference_golden_rubrics": copy.deepcopy(rubrics)
+            }
+        },
+    }
     atomic_json(output_root / "instances" / f"{instance_id}.json", problem)
     atomic_json(output_root / "base_handbooks" / f"{instance_id}.json", base_wrapper)
     return {

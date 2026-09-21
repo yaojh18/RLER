@@ -53,6 +53,15 @@ PY
   local hf_root=$source
   mkdir -p "$task_root" "$logs"
 
+  if [ -s "$results/summary.json" ] && python3 - "$results/summary.json" <<'PY'
+import json, sys
+summary = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if summary.get("status") == "complete" else 1)
+PY
+  then
+    return 0
+  fi
+
   if [ ! -s "$source/model.safetensors.index.json" ] && [ ! -s "$source/model.safetensors" ]; then
     hf_root=$task_root/hf_checkpoint
     if [ ! -s "$hf_root/model.safetensors.index.json" ] && [ ! -s "$hf_root/model.safetensors" ]; then
@@ -119,8 +128,10 @@ PY
     --completion-max-tokens 10240 --temperature 0.7 --top-p 0.95 \
     --gt-eval-timeout 600 --policy-workers 8 --gt-eval-workers 16 \
     --infrastructure-retries 3 "${reuse[@]}" >"$logs/evaluation.log" 2>&1
+  local evaluation_rc=$?
   cleanup_servers
   trap - RETURN INT TERM
+  return "$evaluation_rc"
 }
 
 while true; do

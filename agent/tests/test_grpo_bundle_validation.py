@@ -200,6 +200,47 @@ def test_naive_prefix_training_physically_discards_terminal_continuation():
     assert sample.metadata["n_discarded_steps"] == 1
 
 
+def test_naive_direct_reward_does_not_require_terminal_gt():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "problem"},
+        {
+            "role": "assistant",
+            "content": "inspect",
+            "prompt_token_ids": [1, 2],
+            "token_ids": [3],
+            "logprobs": [-0.1],
+        },
+    ]
+    record = NaiveRecord(
+        instance_id="instance",
+        run_dir="run",
+        task_id="instance",
+        config={"train_assistant_step_limit": 10},
+        rollouts=[
+            NaiveRollout(
+                rollout_index=0,
+                node_id="direct-no-gt",
+                messages=messages,
+                step_cards=[{"step": 1}],
+                gt_score=None,
+                training_reward=0.75,
+                judge_score=0.75,
+                reward_source="direct_golden_rubric_judge",
+            )
+        ],
+    )
+
+    bundle = naive_record_to_bundle(record)
+
+    sample = bundle.policy_groups[0].samples[0]
+    assert sample.reward == 0.75
+    assert sample.metadata["raw_gt_score"] is None
+    assert sample.metadata["raw_rubric_score"] == 0.75
+    assert sample.metadata["n_full_trace_steps"] == 1
+    assert sample.metadata["n_discarded_steps"] == 0
+
+
 class _PolicyVersionCaptureBackend:
     def __init__(self):
         self.agent_config = {"step_limit": 250}

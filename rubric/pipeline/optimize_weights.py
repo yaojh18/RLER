@@ -26,7 +26,7 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
-from common import (
+from RLER.rubric.pipeline.common import (
     atomic_json,
     load_json,
     rubric_key,

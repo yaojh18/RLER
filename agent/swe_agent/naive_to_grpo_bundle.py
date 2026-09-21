@@ -36,7 +36,9 @@ def _build_rollout_sample(
     assemble (last_asst.prompt_token_ids + last_asst.token_ids) as the
     full sequence and set mask=1 only on each assistant turn's tokens.
     """
-    if rollout.error is not None or rollout.gt_score is None:
+    if rollout.error is not None or (
+        rollout.training_reward is None and rollout.gt_score is None
+    ):
         return None
     reward = float(
         rollout.training_reward

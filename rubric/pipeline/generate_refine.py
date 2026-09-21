@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
-"""Sol synthesis/refinement and current-batch Luna rubric evaluation."""
+"""Generate, refine, and evaluate the final teacher-rubric portfolio."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import copy
 import json
 import re
 import traceback
 from pathlib import Path
 from typing import Any
 
-from common import (
+from RLER.rubric.pipeline.common import (
     atomic_json,
     load_json,
     rubric_contract,
     rubric_key,
 )
-from judge_replay import (
+from RLER.rubric.pipeline.judge_replay import (
     HANDBOOK_RUBRIC_JUDGE_PROMPT,
     JUDGE_TEMPERATURE,
     JUDGE_TOP_P,
@@ -28,10 +27,10 @@ from judge_replay import (
 )
 
 
-SOL_MODEL = "openai/azure/openai/gpt-5.6-sol"
+TEACHER_MODEL = "openai/azure/openai/gpt-5.6-sol"
 LUNA_MODEL = "openai/azure/openai/gpt-5.6-luna"
-MAX_PROPOSALS = 3
-CONTEXT_TOKEN_TARGET = 250_000
+MAX_TEACHER_RUBRICS = 6
+CONTEXT_TOKEN_TARGET = 220_000
 APPLIES_WHEN_FORBIDDEN = re.compile(
     r"\b(?:judge|score|scoring|weight|anchor|credit|penali[sz]e|grade)\b|"
     r"\b(?:inspect|look for|compare|verify)\b",
@@ -44,46 +43,73 @@ LEAKAGE = re.compile(
 )
 
 
-SOL_GENERATION_SYSTEM = """
-You synthesize a small set of candidate improvements to one instance-specific
-golden rubric portfolio for SWE early-trajectory judging. You receive the
-current handbook, all current-batch rollout-40 groups for this instance, Luna's
-individual rubric scores and evidence, and private final joint values used only
-as supervision.
+TEACHER_GENERATION_SYSTEM = """
+You create the initial instance-specific golden rubric portfolio for SWE
+early-trajectory judging. You receive the task and every frozen current-batch
+rollout-40 group for this instance. Each group contains cutoff-visible
+trajectories and private final joint values used only as supervision.
 
-Propose one to three high-impact changes. A proposal is either:
-- `modify`: a replacement for one exact current golden rubric while preserving
-  its useful semantic dimension; or
-- `add`: one genuinely new, non-redundant observable dimension that the current
-  golden portfolio does not cover.
+Return one to six complete, complementary reference golden rubrics. Use the
+available capacity when the task has several independently observable causal
+dimensions; do not under-specify a complex task. Useful dimensions commonly
+include task-causal diagnosis, the precise implementation boundary, decisive
+tests or runtime evidence, compatibility/regression protection, and recovery
+from contradictory evidence. Do not create redundant rubrics or split one
+dimension merely to fill the limit.
 
-The downstream acceptance test is the candidate rubric's own strict
-GT-difference pairwise accuracy on all supplied groups. Do not optimize aggregate
-portfolio weights here. Diagnose why the current rubric ties or reverses visible
-behavior: missing evidence authority, ambiguous scale anchors, wrong polarity,
-overlapping scope, failure to distinguish applied work from proposed work, or a
-missing causal dimension. A candidate must be usable on future rollouts of this
-same task, not memorize these branches.
+Each rubric must independently help order the supplied trajectories and remain
+valid for future rollouts of this same task. Focus on observable evidence at the
+cutoff. Never encode aliases, group IDs, private values, reward ordering, future
+actions, final outcomes, model names, or stage position as a proxy. Legitimate
+ties remain ties. Do not claim that proposed work was applied or tested.
 
-Preserve cutoff-visible, task-causal evidence only. Never encode aliases, group
-IDs, private values, reward orderings, future actions, final outcomes, model
-names, or stage progress as a proxy. Legitimate ties remain ties. Do not invent
-distinctions when future outcomes cannot be inferred from the visible prefix.
-
-The individual judge sees title, polarity, description, metadata, and scale. Put
-precise evidence sources, precedence, prerequisites, non-evidence, and
+The individual judge sees title, polarity, description, metadata, and scale.
+Put precise evidence sources, precedence, prerequisites, non-evidence, and
 contradiction caps in metadata and mutually exclusive scale anchors.
-`applies_when` is visible only to the rubric generator and must contain selection
-conditions, never instructions for how to judge or score evidence.
+`applies_when` is visible only to the rubric generator and must contain task or
+evidence selection conditions, never instructions to judge, inspect, score,
+weight, grade, compare, or verify evidence.
+
+Every rubric has this complete schema:
+{
+  "title": "...",
+  "polarity": "positive or negative",
+  "weight": 1.0,
+  "applies_when": ["selection condition only"],
+  "description": "observable criterion",
+  "metadata": {
+    "stage": "...",
+    "judge_focus": "specific visible evidence",
+    "evidence_authority": "which visible evidence wins conflicts",
+    "hard_gate": "prerequisite for higher anchors",
+    "contradiction_rule": "visible evidence that caps credit",
+    "oracle_test": "task-specific semantic reference",
+    "failure_mode": "common misjudgment this rubric prevents"
+  },
+  "scale": {"1":"...","2":"...","3":"...","4":"...","5":"..."}
+}
+
+Return exactly one JSON object with exactly one top-level field:
+{"reference_golden_rubrics": [rubric, ...]}
+Return no handbook, stages, behavior lists, abstain guidance, weights policy,
+analysis, or prose outside that JSON object.
+""".strip()
+
+
+TEACHER_REFINE_SYSTEM = """
+You repair failed candidate golden rubrics for one fixed SWE instance. Each candidate was already judged by judge model on every current-batch rollout-40 group. You receive its full wrong-pair evidence, private final values used only as supervision, the complete current portfolio, and visible trajectory views.
+
+For every supplied failed candidate, return exactly one corrected rubric. Deletion and abstention are forbidden at this stage: portfolio pruning belongs only to downstream weight optimization through zero weight and the six-rubric limit. Preserve the candidate's intended semantic dimension. Use judging evidence to repair evidence authority, hard gates, contradiction caps, mutually exclusive anchors, polarity, or scope. Even when the repair may fail, make the best truthful cutoff-observable attempt.
+
+Never encode aliases, group IDs, judge scores, private values, reward ordering, future actions, final outcomes, model names, or progress proxies. `applies_when` contains only rubric-generator selection conditions.
 
 Output exactly one JSON object:
 {
-  "proposals": [
+  "decisions": [
     {
-      "action": "modify or add",
-      "parent_rubric_key": "exact supplied parent id, or null for add",
-      "semantic_dimension": "short task-causal dimension",
-      "reason": "why this can improve current single-rubric ordering",
+      "candidate_id": "exact supplied id",
+      "action": "refine",
+      "reason": "specific causal diagnosis and attempted repair",
       "rubric": {
         "title": "...",
         "polarity": "positive or negative",
@@ -92,72 +118,18 @@ Output exactly one JSON object:
         "description": "observable criterion",
         "metadata": {
           "stage": "...",
-          "judge_focus": "specific visible evidence to inspect",
-          "evidence_authority": "which visible evidence wins conflicts",
-          "hard_gate": "prerequisite for higher anchors",
-          "contradiction_rule": "visible evidence that caps credit",
-          "oracle_test": "task-specific semantic reference",
-          "failure_mode": "common misjudgment this rubric prevents"
+          "judge_focus": "...",
+          "evidence_authority": "...",
+          "hard_gate": "...",
+          "contradiction_rule": "...",
+          "oracle_test": "...",
+          "failure_mode": "..."
         },
         "scale": {"1":"...","2":"...","3":"...","4":"...","5":"..."}
       }
     }
   ]
 }
-Return no prose outside the JSON object.
-""".strip()
-
-
-INITIAL_GENERATION_SYSTEM = """
-You create the initial instance-specific golden rubric portfolio for SWE
-early-trajectory judging. You receive historical rollout groups, visible
-trajectory prefixes, and private final joint values used only as supervision.
-
-Generate one to six non-redundant, task-causal rubrics. Each rubric must judge
-only evidence visible at the cutoff and must distinguish behavior that can
-explain strict final-value differences. Do not generate task summaries, good or
-bad behavior prose, aliases, group IDs, private values, reward orderings, future
-actions, or final outcomes. Legitimate ties remain ties.
-
-Output the same JSON proposal schema as the supplied generation contract. Every
-proposal must use action `add` and a null parent_rubric_key. Return no
-prose outside the JSON object.
-""".strip()
-
-
-SOL_REFINE_SYSTEM = """
-You repair failed candidate golden rubrics for one fixed SWE instance. Each
-candidate was already judged by Luna on every current-batch rollout-40 group.
-You receive its full wrong-pair evidence, the private final values, the complete
-current portfolio, and the visible trajectory views.
-
-For every supplied failed candidate, return one corrected rubric. You may not
-delete, skip, or return no-fix: an incorrect repair is rejected downstream, but
-an unattempted repair can never improve the bank. Preserve the candidate's
-intended semantic dimension; do not turn it into a broad outcome predictor.
-Use Luna's actual evidence to repair the precise judge interface:
-evidence authority, hard gates, contradictory-evidence caps, mutually exclusive
-scale anchors, polarity, or scope. See the other golden rubrics and successful
-candidates so the replacement is not redundant.
-
-Never encode aliases, group IDs, scores, private values, reward orderings,
-future actions, final outcomes, model names, or progress proxies. `applies_when`
-contains only rubric-generator selection conditions. Judge-facing evidence
-instructions belong in description, metadata, and scale.
-
-Output exactly one JSON object:
-{
-  "decisions": [
-    {
-      "candidate_id": "exact supplied id",
-      "action": "refine",
-      "reason": "specific causal diagnosis",
-      "rubric": {"complete": "rubric schema"}
-    }
-  ]
-}
-For refine decisions, `rubric` has the complete schema used by the supplied
-candidate, including all five scale anchors and all seven metadata fields.
 Return every candidate_id exactly once and no prose outside JSON.
 """.strip()
 
@@ -258,34 +230,13 @@ def node_aliases(group: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def compact_group(
-    group: dict[str, Any], trajectory_limit: int, evidence_limit: int
-) -> dict[str, Any]:
+def compact_group(group: dict[str, Any], trajectory_limit: int) -> dict[str, Any]:
     source_path = Path(group["source"])
     source = load_json(source_path)
     view = parse_generation_view(source)
     aliases = node_aliases(group)
     if len(view["continuations"]) != len(group["node_ids"]):
         raise ValueError("continuation/node count drift")
-    rubric_scores = []
-    for contract_sha, record in group["rubric_scores"].items():
-        rubric_scores.append(
-            {
-                "rubric_key": contract_sha,
-                "title": record["rubric"]["title"],
-                "strict_correct": record["strict_correct"],
-                "strict_pairs": record["strict_pairs"],
-                "scores": {
-                    aliases[node_id]: {
-                        "raw": value["raw_score"],
-                        "evidence": truncate_middle(
-                            str(value.get("evidence") or ""), evidence_limit
-                        ),
-                    }
-                    for node_id, value in record["raw_scores"].items()
-                },
-            }
-        )
     return {
         "update_step": group["update_step"],
         "trajectories": {
@@ -294,7 +245,6 @@ def compact_group(
                 group["node_ids"], view["continuations"]
             )
         },
-        "current_golden_rubric_outcomes": rubric_scores,
         "private_final_joint_values": {
             aliases[node_id]: value
             for node_id, value in group["gt_joint_rewards"].items()
@@ -303,96 +253,61 @@ def compact_group(
 
 
 def build_generation_prompt(ledger: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    handbook_wrapper = load_json(Path(ledger["current_handbook"]))
-    handbook = handbook_wrapper.get("handbook", handbook_wrapper)
     first_source = load_json(Path(ledger["current_groups"][0]["source"]))
     problem = parse_generation_view(first_source)["question_text"]
-    profiles = ((20_000, 600), (16_000, 500), (12_000, 400), (8_000, 320), (5_000, 240))
-    for trajectory_limit, evidence_limit in profiles:
+    trajectory_limits = (20_000, 16_000, 12_000, 8_000, 5_000)
+    for trajectory_limit in trajectory_limits:
         groups = [
-            compact_group(group, trajectory_limit, evidence_limit)
+            compact_group(group, trajectory_limit)
             for group in ledger["current_groups"]
         ]
-        payload = {
-            "task": problem,
-            "current_handbook": handbook,
-            "current_reference_single_rubric_statistics": ledger[
-                "current_reference_statistics"
-            ],
-            "current_rollout_groups": groups,
-        }
-        prompt = SOL_GENERATION_SYSTEM + "\n\n## Instance packet\n" + json.dumps(
+        payload = {"task": problem, "historical_rollout_groups": groups}
+        prompt = TEACHER_GENERATION_SYSTEM + "\n\n## Instance packet\n" + json.dumps(
             payload, ensure_ascii=False, indent=2
         )
         if prompt_tokens(prompt) <= CONTEXT_TOKEN_TARGET:
             return prompt, {
                 "trajectory_char_limit": trajectory_limit,
-                "evidence_char_limit": evidence_limit,
                 "approximate_prompt_tokens": prompt_tokens(prompt),
             }
-    raise ValueError(f"Sol generation prompt exceeds context: {ledger['instance_id']}")
+    raise ValueError(f"teacher generation prompt exceeds context: {ledger['instance_id']}")
 
 
 def validate_generation(
     parsed: dict[str, Any],
     ledger: dict[str, Any],
-    *,
-    initial: bool = False,
 ) -> list[dict[str, Any]]:
-    values = parsed.get("proposals")
-    maximum = 6 if initial else MAX_PROPOSALS
-    if not isinstance(values, list) or not 1 <= len(values) <= maximum:
-        raise ValueError(f"proposals must contain one through {maximum} items")
-    references = {
-        item["rubric_key"]: item["rubric"]
-        for item in ledger["current_reference_statistics"]
-    }
-    reference_contracts = set(references)
-    reference_titles = {item["title"] for item in references.values()}
+    if not isinstance(parsed, dict) or set(parsed) != {"reference_golden_rubrics"}:
+        raise ValueError("initial generation must return only reference_golden_rubrics")
+    rubrics = parsed["reference_golden_rubrics"]
+    if not isinstance(rubrics, list) or not 1 <= len(rubrics) <= MAX_TEACHER_RUBRICS:
+        raise ValueError("reference_golden_rubrics must contain one to six rubrics")
+    if ledger["current_reference_statistics"]:
+        raise ValueError("initial rubric generation requires an empty seed portfolio")
     candidate_contracts = []
     candidate_titles = []
     normalized = []
-    for index, value in enumerate(values):
-        if not isinstance(value, dict) or value.get("action") not in {"modify", "add"}:
-            raise ValueError("proposal action must be modify or add")
-        action = value["action"]
-        if initial and action != "add":
-            raise ValueError("initial generation may only add rubrics")
-        parent = value.get("parent_rubric_key")
-        if action == "modify" and parent not in reference_contracts:
-            raise ValueError("modify proposal has unknown parent contract")
-        if action == "add" and parent is not None:
-            raise ValueError("add proposal must have null parent contract")
-        if not isinstance(value.get("semantic_dimension"), str) or not value[
-            "semantic_dimension"
-        ].strip():
-            raise ValueError("proposal lacks semantic_dimension")
-        if not isinstance(value.get("reason"), str) or not value["reason"].strip():
-            raise ValueError("proposal lacks reason")
-        rubric = validate_rubric(value.get("rubric"))
+    for index, value in enumerate(rubrics):
+        rubric = validate_rubric(value)
         contract_sha = rubric_key(rubric)
-        if contract_sha in reference_contracts:
-            raise ValueError("proposal duplicates a current reference contract")
-        if action == "add" and rubric["title"] in reference_titles:
-            raise ValueError("add proposal duplicates a current reference title")
         candidate_contracts.append(contract_sha)
         candidate_titles.append(rubric["title"])
         normalized.append(
             {
-                "candidate_id": f"sol-gen-{index}-{contract_sha[:12]}",
-                "stage": "initial_gen" if initial else "sol_gen",
-                "action": action,
-                "parent_rubric_key": parent,
-                "semantic_dimension": value["semantic_dimension"],
-                "reason": value["reason"],
+                "candidate_id": f"initial-sol-{index}-{contract_sha[:12]}",
+                "stage": "initial_sol_generation",
+                "action": "add",
+                "parent_rubric_key": None,
+                "semantic_dimension": rubric["title"],
+                "reason": "initial rubric-only Sol generation",
                 "rubric": rubric,
                 "candidate_rubric_key": contract_sha,
             }
         )
     if len(candidate_contracts) != len(set(candidate_contracts)):
-        raise ValueError("generation contains duplicate candidate contracts")
+        raise ValueError("initial generation contains duplicate rubric contracts")
     if len(candidate_titles) != len(set(candidate_titles)):
-        raise ValueError("generation contains duplicate candidate titles")
+        raise ValueError("initial generation contains duplicate rubric titles")
     return normalized
 
 
@@ -407,6 +322,14 @@ def build_refine_prompt(
     ]
     if not failed:
         return "", [], {"approximate_prompt_tokens": 0}
+    accepted_records = [
+        item
+        for item in evaluation["records"]
+        if item.get("strictly_improves_baseline") is True
+    ]
+    accepted = [
+        by_candidate[item["candidate_id"]]["rubric"] for item in accepted_records
+    ]
     feedback = []
     for record in failed:
         candidate = by_candidate[record["candidate_id"]]
@@ -465,20 +388,60 @@ def build_refine_prompt(
                 ],
             }
         )
-    generation_prompt, profile = build_generation_prompt(ledger)
-    packet_marker = generation_prompt.index("## Instance packet")
-    prompt = "\n\n".join(
-        [
-            SOL_REFINE_SYSTEM,
-            generation_prompt[packet_marker:],
-            "## Failed candidate Luna outcomes",
-            json.dumps(feedback, ensure_ascii=False, indent=2),
-        ]
-    )
-    if prompt_tokens(prompt) > CONTEXT_TOKEN_TARGET:
-        raise ValueError(f"Sol refinement prompt exceeds context: {ledger['instance_id']}")
-    profile["approximate_prompt_tokens"] = prompt_tokens(prompt)
-    return prompt, failed, profile
+    first_source = load_json(Path(ledger["current_groups"][0]["source"]))
+    problem = parse_generation_view(first_source)["question_text"]
+    trajectory_limits = (20_000, 16_000, 12_000, 8_000, 5_000)
+    for trajectory_limit in trajectory_limits:
+        groups = []
+        for group in ledger["current_groups"]:
+            rendered = compact_group(group, trajectory_limit)
+            aliases = node_aliases(group)
+            outcomes = []
+            for record in accepted_records:
+                candidate = by_candidate[record["candidate_id"]]
+                group_outcome = next(
+                    value
+                    for value in record["group_outcomes"]
+                    if value["group_key"] == group["group_key"]
+                )
+                outcomes.append(
+                    {
+                        "rubric_key": candidate["candidate_rubric_key"],
+                        "title": candidate["rubric"]["title"],
+                        "strict_correct": group_outcome["strict_correct"],
+                        "strict_pairs": group_outcome["strict_pairs"],
+                        "scores": {
+                            aliases[node_id]: {
+                                "raw": value["raw_score"],
+                                "evidence": truncate_middle(
+                                    str(value.get("evidence") or ""), 600
+                                ),
+                            }
+                            for node_id, value in group_outcome["raw_scores"].items()
+                        },
+                    }
+                )
+            rendered["current_golden_rubric_outcomes"] = outcomes
+            groups.append(rendered)
+        payload = {
+            "task": problem,
+            "current_reference_golden_rubrics": accepted,
+            "current_rollout_groups": groups,
+        }
+        prompt = "\n\n".join(
+            [
+                TEACHER_REFINE_SYSTEM,
+                "## Instance packet\n" + json.dumps(payload, ensure_ascii=False, indent=2),
+                "## Failed candidate Luna outcomes\n"
+                + json.dumps(feedback, ensure_ascii=False, indent=2),
+            ]
+        )
+        if prompt_tokens(prompt) <= CONTEXT_TOKEN_TARGET:
+            return prompt, failed, {
+                "trajectory_char_limit": trajectory_limit,
+                "approximate_prompt_tokens": prompt_tokens(prompt),
+            }
+    raise ValueError(f"teacher refinement prompt exceeds context: {ledger['instance_id']}")
 
 
 def validate_refinement(
@@ -489,6 +452,7 @@ def validate_refinement(
     if not isinstance(decisions, list) or [item.get("candidate_id") for item in decisions] != expected:
         raise ValueError("refinement decisions must cover failed candidates in order")
     source = {item["candidate_id"]: item for item in candidates["candidates"]}
+    records = {item["candidate_id"]: item for item in failed}
     output = []
     contracts = []
     titles = []
@@ -513,6 +477,12 @@ def validate_refinement(
                 "semantic_dimension": source[candidate_id]["semantic_dimension"],
                 "reason": str(value.get("reason") or ""),
                 "source_candidate_id": candidate_id,
+                "direct_parent_correct": records[candidate_id]["candidate_correct"],
+                "direct_parent_strict_pairs": records[candidate_id]["strict_pairs"],
+                "direct_parent_pairwise_accuracy": records[candidate_id][
+                    "candidate_correct"
+                ]
+                / records[candidate_id]["strict_pairs"],
                 "rubric": rubric,
                 "candidate_rubric_key": contract_sha,
             }
@@ -522,10 +492,10 @@ def validate_refinement(
     return output
 
 
-async def call_sol(
+async def call_teacher(
     *, prompt: str, validator: Any, semaphore: asyncio.Semaphore
 ) -> tuple[dict[str, Any], Any, list[str]]:
-    from model_runtime import call_json
+    from RLER.rubric.pipeline.model_runtime import call_json
 
     conversation: list[dict[str, str]] = [{"role": "user", "content": prompt}]
     errors = []
@@ -533,7 +503,7 @@ async def call_sol(
         for attempt in range(3):
             result = await call_json(
                 route_name="final_golden_rubric_refinement",
-                model=SOL_MODEL,
+                model=TEACHER_MODEL,
                 messages=conversation,
                 temperature=0.02,
                 max_tokens=20_480,
@@ -556,10 +526,10 @@ async def call_sol(
                 ]
                 continue
             return result, validated, errors
-    raise AssertionError("unreachable Sol validation loop")
+    raise AssertionError("unreachable teacher validation loop")
 
 
-async def run_sol(args: argparse.Namespace, *, refine: bool) -> None:
+async def run_teacher(args: argparse.Namespace, *, refine: bool) -> None:
     ids = selected_ids(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(args.concurrency)
@@ -575,18 +545,13 @@ async def run_sol(args: argparse.Namespace, *, refine: bool) -> None:
             cached = load_json(output)
             if cached.get("status") == "success":
                 return
-            raise ValueError(f"incomplete cached Sol artifact: {output}")
+            raise ValueError(f"incomplete cached teacher artifact: {output}")
         try:
             if not refine:
                 prompt, profile = build_generation_prompt(ledger)
-                initial = args.command == "initial-gen"
-                if initial:
-                    prompt = INITIAL_GENERATION_SYSTEM + prompt[prompt.index("\n\n## Instance packet") :]
-                result, candidates, semantic_errors = await call_sol(
+                result, candidates, semantic_errors = await call_teacher(
                     prompt=prompt,
-                    validator=lambda parsed: validate_generation(
-                        parsed, ledger, initial=initial
-                    ),
+                    validator=lambda parsed: validate_generation(parsed, ledger),
                     semaphore=semaphore,
                 )
             else:
@@ -599,10 +564,10 @@ async def run_sol(args: argparse.Namespace, *, refine: bool) -> None:
                     atomic_json(
                         output,
                         {
-                            "schema_version": "final_golden_sol_refinement.v1",
+                            "schema_version": "teacher_rubric_refinement.v1",
                             "status": "success",
                             "instance_id": instance_id,
-                            "model": SOL_MODEL,
+                            "model": TEACHER_MODEL,
                             "temperature": 0.02,
                             "profile": profile,
                             "candidates": [],
@@ -612,7 +577,7 @@ async def run_sol(args: argparse.Namespace, *, refine: bool) -> None:
                         sort_keys=True,
                     )
                     return
-                result, candidates, semantic_errors = await call_sol(
+                result, candidates, semantic_errors = await call_teacher(
                     prompt=prompt,
                     validator=lambda parsed: validate_refinement(
                         parsed, failed, candidates_payload
@@ -623,17 +588,13 @@ async def run_sol(args: argparse.Namespace, *, refine: bool) -> None:
                 output,
                 {
                     "schema_version": (
-                        "final_golden_sol_refinement.v1"
+                        "teacher_rubric_refinement.v1"
                         if refine
-                        else (
-                            "initial_golden_sol_generation.v1"
-                            if args.command == "initial-gen"
-                            else "final_golden_sol_generation.v1"
-                        )
+                        else "teacher_rubric_generation.v1"
                     ),
                     "status": "success",
                     "instance_id": instance_id,
-                    "model": SOL_MODEL,
+                    "model": TEACHER_MODEL,
                     "temperature": 0.02,
                     "profile": profile,
                     "candidates": candidates,
@@ -663,36 +624,6 @@ def candidate_values(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in payload.get("candidates") or [] if item.get("rubric")]
 
 
-def exact_source_records(
-    group: dict[str, Any], candidate: dict[str, Any]
-) -> dict[str, dict[str, Any]]:
-    contract_sha = candidate["candidate_rubric_key"]
-    current = group["rubric_scores"].get(contract_sha)
-    if current is not None:
-        return copy.deepcopy(current["raw_scores"])
-    source = load_json(Path(group["source"]))
-    candidate_criterion = criterion(candidate["rubric"])
-    matches = [
-        index
-        for index, rubric in enumerate(source["rubrics"])
-        if criterion(rubric) == candidate_criterion
-    ]
-    if len(matches) > 1:
-        raise ValueError("candidate matches duplicate adaptive rubrics")
-    if not matches:
-        return {}
-    index = matches[0]
-    output = {}
-    for node_id, records in zip(group["node_ids"], source["score_records"]):
-        record = records[index]
-        output[node_id] = {
-            "raw_score": int(record["score_raw"]),
-            "evidence": str(record.get("evidence") or ""),
-            "origin": "current_adaptive_exact_reuse",
-        }
-    return output
-
-
 async def evaluate_candidate(
     *,
     candidate: dict[str, Any],
@@ -706,7 +637,14 @@ async def evaluate_candidate(
     all_wrong = []
     for group in ledger["current_groups"]:
         aliases = node_aliases(group)
-        records = exact_source_records(group, candidate)
+        cached = (group.get("rubric_scores") or {}).get(
+            candidate["candidate_rubric_key"]
+        )
+        records: dict[str, dict[str, Any]] = (
+            {node_id: dict(value) for node_id, value in cached["raw_scores"].items()}
+            if cached is not None
+            else {}
+        )
         missing_nodes = [node for node in group["node_ids"] if node not in records]
         if missing_nodes:
             source = load_json(Path(group["source"]))
@@ -778,19 +716,18 @@ async def evaluate_candidate(
     if total_pairs != ledger["counts"]["strict_gt_difference_pairs"]:
         raise ValueError("candidate evaluation denominator drift")
     parent = candidate.get("parent_rubric_key")
-    if candidate["action"] == "add":
-        baseline_correct = 0
-        improves = total_correct > 0
-        baseline_kind = "generation_zero"
-    else:
-        baseline = next(
-            item
-            for item in ledger["current_reference_statistics"]
-            if item["rubric_key"] == parent
-        )
-        baseline_correct = int(baseline["strict_correct"])
+    if "direct_parent_correct" in candidate:
+        if int(candidate["direct_parent_strict_pairs"]) != total_pairs:
+            raise ValueError("refinement direct-parent denominator drift")
+        baseline_correct = int(candidate["direct_parent_correct"])
         improves = total_correct > baseline_correct
-        baseline_kind = "parent_single_rubric"
+        baseline_kind = "direct_parent_candidate"
+    elif candidate["action"] == "add":
+        baseline_correct = total_pairs / 2
+        improves = total_correct > baseline_correct
+        baseline_kind = "strict_majority_0.5"
+    else:
+        raise ValueError("unsupported teacher-rubric candidate stage")
     return {
         "candidate_id": candidate["candidate_id"],
         "candidate_rubric_key": candidate["candidate_rubric_key"],
@@ -799,6 +736,7 @@ async def evaluate_candidate(
         "rubric": candidate["rubric"],
         "baseline_kind": baseline_kind,
         "baseline_correct": baseline_correct,
+        "baseline_accuracy": baseline_correct / total_pairs,
         "candidate_correct": total_correct,
         "strict_pairs": total_pairs,
         "candidate_accuracy": total_correct / total_pairs,
@@ -860,7 +798,7 @@ async def run_luna_eval(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("initial-gen", "sol-gen", "sol-refine"):
+    for name in ("teacher-gen", "teacher-refine"):
         child = sub.add_parser(name)
         child.add_argument("--collection-root", type=Path, required=True)
         child.add_argument("--output-dir", type=Path, required=True)
@@ -868,7 +806,7 @@ def parse_args() -> argparse.Namespace:
         child.add_argument("--world-size", type=int, default=1)
         child.add_argument("--concurrency", type=int, default=4)
         child.add_argument("--force", action="store_true")
-        if name == "sol-refine":
+        if name == "teacher-refine":
             child.add_argument("--candidate-dir", type=Path, required=True)
             child.add_argument("--evaluation-dir", type=Path, required=True)
     child = sub.add_parser("luna-eval")
@@ -889,10 +827,10 @@ def main() -> None:
     args = parse_args()
     if args.world_size <= 0 or not 0 <= args.rank < args.world_size:
         raise ValueError("invalid rank/world-size")
-    if args.command in {"initial-gen", "sol-gen"}:
-        asyncio.run(run_sol(args, refine=False))
-    elif args.command == "sol-refine":
-        asyncio.run(run_sol(args, refine=True))
+    if args.command == "teacher-gen":
+        asyncio.run(run_teacher(args, refine=False))
+    elif args.command == "teacher-refine":
+        asyncio.run(run_teacher(args, refine=True))
     elif args.command == "luna-eval":
         asyncio.run(run_luna_eval(args))
     else:
