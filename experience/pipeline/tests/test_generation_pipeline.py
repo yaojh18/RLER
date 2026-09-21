@@ -34,7 +34,7 @@ def _context():
     }
 
 
-def test_glm_then_gpt_keeps_only_locally_improving_attempt(
+def test_sol_generation_then_refinement_keeps_only_locally_improving_attempt(
     monkeypatch, tmp_path
 ) -> None:
     generator = ExperienceGenerator()
@@ -97,8 +97,8 @@ def test_glm_then_gpt_keeps_only_locally_improving_attempt(
         )
     )
     assert calls == [
-        "nvidia/zai-org/glm-5.2",
-        "openai/openai/gpt-5.5",
+        "openai/azure/openai/gpt-5.6-sol",
+        "openai/azure/openai/gpt-5.6-sol",
     ]
     assert [row["accepted"] for row in result["attempts"]] == [False, True]
     assert result["accepted_attempt"]["attempt"] == 2

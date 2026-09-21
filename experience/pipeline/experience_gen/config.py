@@ -10,8 +10,8 @@ MODEL_COMPLETION_TOKENS = 20_480
 class ModelConfig:
     """The accepted model schedule from the final experiment."""
 
-    generator: str = "nvidia/zai-org/glm-5.2"
-    refiner: str = "openai/openai/gpt-5.5"
+    generator: str = "openai/azure/openai/gpt-5.6-sol"
+    refiner: str = "openai/azure/openai/gpt-5.6-sol"
     judge: str = "nvidia/nvidia/nemotron-3-ultra"
     temperature: float = 0.1
     judge_temperature: float = 0.01

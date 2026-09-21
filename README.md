@@ -1,95 +1,153 @@
 <div align="center">
-<img src="rl/open-instruct/assets/dr_tulu_logo.png" alt="DR Tulu" width="500"/>
 
-# DR Tulu: Reinforcement Learning with Evolving Rubrics for Deep Research
+# Before the Rollout Ends
 
+### Early Terminal Reward Prediction through Contextual Rubric for Long-horizon Coding Agents
 
-[**Paper**](https://allenai.org/papers/drtulu) • [**Data & Models**](https://huggingface.co/collections/rl-research/dr-tulu) • [**Blogpost**](http://allenai.org/blog/dr-tulu) • [**Video**](https://youtu.be/4i0W9qAf8K8)• [**Interactive Demo**](https://www.dr-tulu.org)
 </div>
 
-DR Tulu-8B is the first open Deep Research (DR) model trained for long-form DR tasks. DR Tulu-8B matches OpenAI DR on long-form DR benchmarks.
+Long-horizon coding agents normally receive verifiable feedback only after an expensive sequence of tool calls. **Contextual Rubric-guided Early Reward (CRER)** instead evaluates the behavioral evidence already visible in a trajectory prefix with task- and stage-specific rubrics. The same interface is used to guide test-time search and to provide dense, verifier-free rewards for reinforcement learning.
 
-<div align="center">
-<img src="assets/rler_teaser.png" alt="DR Tulu Overview" width="800"/>
-</div>
+This repository contains the code and frozen artifacts for the CRER experiments on SWE-bench Verified. The test-time scaling (TTS) experiments cover Qwen and Nemotron policies. The reinforcement-learning experiments cover Qwen3.5-9B only and compare CRER with controlled TMax and TMax-40 baselines.
 
 ---
 
-## Release Notes 
-- Feburary 9, 2026: 🔥 We released a free interactive demo for DR Tulu-8B! Try it out at [dr-tulu.org](https://www.dr-tulu.org/chat)!
-- November 19, 2025: Initial code release.
-- November 25, 2025: We released our interactive CLI demo code, along with additional documentation for evaluation, training, and our new RL checkpoints.
-
 ## Overview
 
-This repository contains three main components:
+This repository contains four main components:
 
-- **[`agent/`](agent/)**: SWE-agent rollout code plus the shared `agent_rl`
-  training/runtime interfaces.
+- **[`agent/`](agent/)**: the mini-SWE-agent-based rollout, TTS algorithm, and shared RL runtime interfaces.
 
-- **[`rl/`](rl/open-instruct/)**: RL training code based on [Open-Instruct](https://github.com/allenai/open-instruct) for training deep research agents with GRPO and evolving rubrics.
+- **[`experience/`](experience/)**: the final Qwen and Nemotron TTS experience banks and the automatic experience generation, refinement, keyword extraction, jand filtering pipeline.
 
-- **[`sft/`](sft/llama-factory/)**: SFT training code based on [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) for supervised fine-tuning of deep research agents.
+- **[`rubric/`](rubric/)**: the Qwen RL teacher-generated rubric bank and the automatic rubric generation, refinement, judge filter, robust weight optimization, and bank materialization pipeline.
 
-For detailed setup and usage instructions, see the README files in each subdirectory.
+- **[`slime/`](slime/)**: the RL training framework and the final Qwen3.5-9B three-fold training/evaluation launchers. The frozen split definition and reproduction scripts live in [`slime/train_agent/scripts/`](slime/train_agent/scripts/).
 
 ---
 
 ## Agent setup
 
-Install the current SWE-agent package from `agent/`:
+Install the maintained SWE-agent package from `agent/` in a Python 3.10 or newer environment:
 
 ```bash
 cd agent
 uv pip install -e .
 ```
 
-See [`agent/README.md`](agent/README.md) for the maintained rollout entry points.
+The primary rollout entry points are:
+
+- `swe_agent/run/run_swe_agent.py` for ordinary rollouts and evaluation;
+- `swe_agent/run/search_swe_agent.py` for trajectory search;
+- `swe_agent/run/aggregate_swe_agent.py` for aggregation over saved
+  trajectories.
+
+See [`agent/README.md`](agent/README.md) for the maintained package boundary and runtime interfaces.
 
 ---
 
-## Training
+## Pipelines and training
 
-### Supervised Fine-Tuning (SFT)
+### Test-Time Scaling (TTS)
 
-For supervised fine-tuning of deep research agents using high-quality demonstration data:
+CRER retrieves judging experience distilled from related historical tasks, synthesizes rubrics for the current task and trajectory stage, and uses the resulting scores to allocate the remaining rollout budget. The released Qwen and Nemotron experience banks are under [`experience/`](experience/).
+
+The automatic bank-construction pipeline starts from collected rollouts with terminal ground-truth calculation enabled. It generates and refines experience for historical failure groups, extracts both model-summarized and query-overlap keywords, replays the provisional bank, and jointly filters experiences and keywords using the replay judgments:
 
 ```bash
-cd sft/llama-factory/
-# See sft/llama-factory/README.md for detailed instructions
+PYTHONPATH=experience/pipeline python -m experience_gen.cli prepare-contexts \
+  --plan /path/to/plan.json \
+  --workspace-root /path/to/workspace \
+  --output /path/to/contexts.json
 ```
 
-See [`sft/llama-factory/README.md`](sft/llama-factory/) for complete SFT training setup and configuration.
+See [`experience/pipeline/README.md`](experience/pipeline/) for the complete
+stage contract, inputs, resume behavior, and tests.
 
 ### Reinforcement Learning (RL)
 
-For training deep research agents with GRPO and evolving rubrics:
+The RL experiments use the same Qwen3.5-9B policy, optimizer, sampling
+configuration, and repository-disjoint folds for all methods. Only the reward,
+loss horizon, and eligible training cohort differ:
+
+| Method | Training rollout | Actor loss horizon | Reward | Training cohort |
+| --- | --- | --- | --- | --- |
+| TMax (`baseline1`) | full | full | terminal verifier | all training instances |
+| TMax-40 (`baseline2`) | full | first 40 assistant turns | terminal verifier | all training instances |
+| CRER (`direct`) | full | first 40 assistant turns | golden-rubric judge | eligible training instances |
+
+The golden-reference rubric pipeline generates and re-judges task-specific
+criteria from historical rollout groups, retains useful generations and
+refinements, and performs robust joint weight optimization. The final bank
+allows at most six active rubrics per task; zero-weight rubrics are removed
+during materialization. See
+[`rubric/pipeline/README.md`](rubric/pipeline/) for the frozen pipeline.
+
+The only released split definition is
+[`final_fold_config.json`](slime/train_agent/scripts/final_fold_config.json).
+Each of its three folds contains 250 training, 50 validation, and 200 test
+instances. To launch a two-node training run:
 
 ```bash
-cd rl/open-instruct/
-# See rl/open-instruct/README.md for detailed instructions
+sbatch --export=ALL,FOLD=0,EXPERIMENT_METHOD=direct \
+  slime/train_agent/scripts/qwen35_earlypred_train.slurm
 ```
 
-See [`rl/open-instruct/README.md`](rl/open-instruct/) for complete RL training setup, including reward model training and policy optimization.
+Choose `FOLD=0|1|2` and
+`EXPERIMENT_METHOD=baseline1|baseline2|direct`. Runs train continuously from
+the base checkpoint. The default 384-attempt budget emits the 128, 256, and
+384 checkpoints; setting `TRAIN_INSTANCE_BUDGET_OVERRIDE=512` also emits the
+512 checkpoint. Training supports Slurm requeue and resume.
+
+Validation and test jobs take a JSON task manifest and run rollout-only
+evaluation, without allocating a Megatron actor:
+
+```bash
+sbatch --export=ALL,EVAL_TASKS_CONFIG=path/to/tasks.json \
+  slime/train_agent/scripts/qwen35_earlypred_eval.slurm
+```
+
+See the
+[`RL reproduction guide`](slime/train_agent/scripts/README_early_prediction.md)
+for the exact training, continuation, evaluation, and external-artifact
+requirements.
+
+### Tests
+
+The automatic artifact pipelines have model-free unit tests:
+
+```bash
+PYTHONPATH=experience/pipeline:agent \
+  agent/.venv/bin/python -m pytest -q experience/pipeline/tests
+
+PYTHONPATH=.. \
+  agent/.venv/bin/python -m pytest -q rubric/pipeline/tests
+```
 
 ---
 
 ## Acknowledgments
 
-DR Tulu is provided by The Allen Institute for Artificial Intelligence (Ai2). The code for this project is developed in collaboration with student researchers at the University of Washington, Carnegie Mellon University, and MIT.
+This project builds on the mini-SWE-agent scaffold and the vendored
+[`slime`](slime/) RL framework, and evaluates coding agents on SWE-bench
+Verified. We thank the maintainers and contributors of these projects. We would like to thank NVIDIA for GPU and Inference API support.
 
 ---
 
 ## Citation and Contact
 
-If you find our work useful, please cite:
+If you find this work useful, please cite:
 
 ```bibtex
-@article{shao2025dr,
-  title={DR Tulu: Reinforcement Learning with Evolving Rubrics for Deep Research},
-  author={Shao, Rulin and Asai, Akari and Shen, Shannon Zejiang and Ivison, Hamish and Kishore, Varsha and Zhuo, Jingming and Zhao, Xinran and Park, Molly and Finlayson, Samuel G and Sontag, David and others},
-  journal={arXiv preprint arXiv:2511.19399},
-  year={2025}
+@article{yao2026before,
+  title={Before the Rollout Ends: Early Terminal Reward Prediction through
+         Contextual Rubric for Long-horizon Coding Agents},
+  author={Yao, Jihan and Zeng, Sihan and Feng, Shangbin and Fan, Zhiyuan and
+          Zhu, Banghua and Tsvetkov, Yulia},
+  year={2026}
 }
 ```
-If you have any questions, you can contact [Rulin Shao](https://rulinshao.github.io/), [Akari Asai](https://akariasai.github.io/), [Shannon Shen](https://www.szj.io/), and [Hamish Ivison](https://ivison.id.au/) or open a github issue. 
+
+For questions, please open an issue or contact `jihany2@cs.washington.edu`.
+
+The repository is released under the [Apache License 2.0](LICENSE).

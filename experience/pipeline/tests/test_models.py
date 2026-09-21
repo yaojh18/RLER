@@ -14,6 +14,8 @@ from experience_gen.config import (
 
 def test_model_completion_cap() -> None:
     config = ModelConfig()
+    assert config.generator == "openai/azure/openai/gpt-5.6-sol"
+    assert config.refiner == "openai/azure/openai/gpt-5.6-sol"
     assert config.max_tokens == 20_480
     assert MODEL_COMPLETION_TOKENS == 20_480
     assert config.retry_max_tokens == MODEL_COMPLETION_TOKENS
@@ -43,7 +45,7 @@ def test_json_client_retries_with_litellm(monkeypatch) -> None:
     )
     parsed, messages = asyncio.run(
         models.JsonModelClient().call(
-            model="openai/openai/gpt-5.5",
+            model="openai/azure/openai/gpt-5.6-sol",
             system="system",
             user="user",
             max_tokens=256,
@@ -70,7 +72,7 @@ def test_gpt_litellm_transport_preserves_gateway_model_id(monkeypatch) -> None:
     monkeypatch.setattr(models, "run_litellm_completion_async", fake_completion)
     message = asyncio.run(
         models.litellm_message(
-            model="openai/openai/gpt-5.5",
+            model="openai/azure/openai/gpt-5.6-sol",
             messages=[{"role": "user", "content": "return JSON"}],
             max_tokens=512,
             temperature=0.1,
@@ -80,7 +82,7 @@ def test_gpt_litellm_transport_preserves_gateway_model_id(monkeypatch) -> None:
         )
     )
     assert message["content"] == '{"status":"ok"}'
-    assert calls[0]["model_name"] == "openai/openai/openai/gpt-5.5"
+    assert calls[0]["model_name"] == "openai/azure/openai/gpt-5.6-sol"
     assert calls[0]["reasoning_effort"] == "high"
     assert "temperature" not in calls[0]
     assert "top_p" not in calls[0]
@@ -103,7 +105,7 @@ def test_json_client_preserves_invalid_messages(monkeypatch) -> None:
     with pytest.raises(models.InvalidJsonResponse) as caught:
         asyncio.run(
             models.JsonModelClient().call(
-                model="nvidia/zai-org/glm-5.2",
+                model="openai/azure/openai/gpt-5.6-sol",
                 system="system",
                 user="user",
                 max_tokens=128,

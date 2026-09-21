@@ -147,7 +147,7 @@ async def generate_overfits(
             "judge": model_config.judge,
         },
         "acceptance": (
-            "keep the first GLM/GPT attempt whose replay has no judge error and "
+            "keep the first generation/refinement attempt whose replay has no judge error and "
             "strictly improves tie-aware success or pairwise accuracy"
         ),
         "targets": len(rows),

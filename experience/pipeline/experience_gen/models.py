@@ -26,8 +26,9 @@ async def litellm_message(
 
     kwargs = copy.deepcopy(model_kwargs or {})
     if model.startswith("openai/"):
-        # LiteLLM consumes the first "openai/" as its provider prefix. Add one
-        # so the gateway still receives the canonical openai/openai/gpt-* ID.
+        # The configured model is already a complete LiteLLM route such as
+        # openai/azure/openai/gpt-5.6-sol. Preserve it exactly so experience
+        # generation uses the same effective endpoint as the rubric pipeline.
         kwargs.pop("extra_body", None)
         kwargs["reasoning_effort"] = "high"
     else:
@@ -35,10 +36,7 @@ async def litellm_message(
         kwargs["temperature"] = temperature
         kwargs["top_p"] = top_p
     completion = await run_litellm_completion_async(
-        # LiteLLM consumes the first ``openai/`` component as its provider.
-        # Preserve the canonical gateway model ID by adding the transport
-        # provider prefix at the only call site that needs it.
-        model_name=f"openai/{model}" if model.startswith("openai/") else model,
+        model_name=model,
         messages=messages,
         usage_model_role=route_name,
         max_tokens=max_tokens,
