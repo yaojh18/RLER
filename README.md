@@ -134,20 +134,4 @@ Verified. We thank the maintainers and contributors of these projects. We would 
 
 ---
 
-## Citation and Contact
-
-If you find this work useful, please cite:
-
-```bibtex
-@article{yao2026before,
-  title={Before the Rollout Ends: Early Terminal Reward Prediction through
-         Contextual Rubric for Long-horizon Coding Agents},
-  author={Yao, Jihan and Zeng, Sihan and Feng, Shangbin and Fan, Zhiyuan and
-          Zhu, Banghua and Tsvetkov, Yulia},
-  year={2026}
-}
-```
-
-For questions, please open an issue or contact `jihany2@cs.washington.edu`.
-
 The repository is released under the [Apache License 2.0](LICENSE).
