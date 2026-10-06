@@ -2,13 +2,25 @@
 
 # Before the Rollout Ends
 
-### Early Terminal Reward Prediction through Contextual Rubric for Long-horizon Coding Agents
+### Early Terminal Reward Prediction for Long-horizon Coding Agents
+
+[![arXiv](https://img.shields.io/badge/arXiv-2609.31995-b31b1b.svg)](https://arxiv.org/abs/2609.31995)
+[![Models](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-yellow)](https://huggingface.co/yaojh18/CRER_model)
+[![Data](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Data-yellow)](https://huggingface.co/datasets/yaojh18/CRER)
 
 </div>
 
-Long-horizon coding agents normally receive verifiable feedback only after an expensive sequence of tool calls. **Contextual Rubric-guided Early Reward (CRER)** instead evaluates the behavioral evidence already visible in a trajectory prefix with task- and stage-specific rubrics. The same interface is used to guide test-time search and to provide dense, verifier-free rewards for reinforcement learning.
+Long-horizon coding agents normally receive verifiable feedback only after an expensive sequence of tool calls. **Contextual Early Reward (CER)** instead forecasts the final reward from the behavioral evidence already visible in a trajectory prefix, scoring it with task- and stage-specific contextual rubrics. The same interface is used to guide test-time search and to provide dense, verifier-free rewards for reinforcement learning.
 
-This repository contains the code and frozen artifacts for the CRER experiments on SWE-bench Verified. The test-time scaling (TTS) experiments cover Qwen and Nemotron policies. The reinforcement-learning experiments cover Qwen3.5-9B only and compare CRER with controlled TMax and TMax-40 baselines.
+This repository contains the code and frozen artifacts for the CER experiments on SWE-bench Verified. The test-time scaling (TTS) experiments cover Nemotron 3 Ultra and Qwen 3.6 27B policies. The reinforcement-learning experiments cover Qwen 3.5 9B only and compare CER with controlled TMax and TMax-40 baselines.
+
+---
+
+## Resources
+
+- **Paper**: [arXiv:2609.31995](https://arxiv.org/abs/2609.31995)
+- **Models**: [yaojh18/CRER_model](https://huggingface.co/yaojh18/CRER_model)
+- **Experiment data**: [yaojh18/CRER](https://huggingface.co/datasets/yaojh18/CRER)
 
 ---
 
@@ -18,11 +30,11 @@ This repository contains four main components:
 
 - **[`agent/`](agent/)**: the mini-SWE-agent-based rollout, TTS algorithm, and shared RL runtime interfaces.
 
-- **[`experience/`](experience/)**: the final Qwen and Nemotron TTS experience banks and the automatic experience generation, refinement, keyword extraction, jand filtering pipeline.
+- **[`experience/`](experience/)**: the final Nemotron 3 Ultra and Qwen 3.6 27B TTS experience banks and the automatic experience generation, refinement, keyword extraction, and filtering pipeline.
 
-- **[`rubric/`](rubric/)**: the Qwen RL teacher-generated rubric bank and the automatic rubric generation, refinement, judge filter, robust weight optimization, and bank materialization pipeline.
+- **[`rubric/`](rubric/)**: the Qwen 3.5 9B RL teacher-generated rubric bank and the automatic rubric generation, refinement, judge filter, robust weight optimization, and bank materialization pipeline.
 
-- **[`slime/`](slime/)**: the RL training framework and the final Qwen3.5-9B three-fold training/evaluation launchers. The frozen split definition and reproduction scripts live in [`slime/train_agent/scripts/`](slime/train_agent/scripts/).
+- **[`slime/`](slime/)**: the RL training framework and the final Qwen 3.5 9B three-fold training/evaluation launchers. The frozen split definition and reproduction scripts live in [`slime/train_agent/scripts/`](slime/train_agent/scripts/).
 
 ---
 
@@ -50,7 +62,7 @@ See [`agent/README.md`](agent/README.md) for the maintained package boundary and
 
 ### Test-Time Scaling (TTS)
 
-CRER retrieves judging experience distilled from related historical tasks, synthesizes rubrics for the current task and trajectory stage, and uses the resulting scores to allocate the remaining rollout budget. The released Qwen and Nemotron experience banks are under [`experience/`](experience/).
+CER retrieves judging experience distilled from related historical tasks, synthesizes rubrics for the current task and trajectory stage, and uses the resulting scores to allocate the remaining rollout budget. The released Nemotron 3 Ultra and Qwen 3.6 27B experience banks are under [`experience/`](experience/).
 
 The automatic bank-construction pipeline starts from collected rollouts with terminal ground-truth calculation enabled. It generates and refines experience for historical failure groups, extracts both model-summarized and query-overlap keywords, replays the provisional bank, and jointly filters experiences and keywords using the replay judgments:
 
@@ -66,7 +78,7 @@ stage contract, inputs, resume behavior, and tests.
 
 ### Reinforcement Learning (RL)
 
-The RL experiments use the same Qwen3.5-9B policy, optimizer, sampling
+The RL experiments use the same Qwen 3.5 9B policy, optimizer, sampling
 configuration, and repository-disjoint folds for all methods. Only the reward,
 loss horizon, and eligible training cohort differ:
 
@@ -74,7 +86,7 @@ loss horizon, and eligible training cohort differ:
 | --- | --- | --- | --- | --- |
 | TMax (`baseline1`) | full | full | terminal verifier | all training instances |
 | TMax-40 (`baseline2`) | full | first 40 assistant turns | terminal verifier | all training instances |
-| CRER (`direct`) | full | first 40 assistant turns | golden-rubric judge | eligible training instances |
+| CER (`direct`) | full | first 40 assistant turns | golden-rubric judge | eligible training instances |
 
 The golden-reference rubric pipeline generates and re-judges task-specific
 criteria from historical rollout groups, retains useful generations and
@@ -126,11 +138,80 @@ PYTHONPATH=.. \
 
 ---
 
+## Main results
+
+All experiments are on SWE-bench Verified (500 instances).
+
+### Test-time scaling
+
+RM@k is the resolved rate (%) of the highest-scored rollout among *k* samples. CER@*k* scores unfinished prefixes at a cutoff of *k* agent steps. Top-tie is the fraction (%) of tasks where several trajectories share the highest score. Tok./Ins. counts both online rollout and judging tokens, the unit is million.
+
+| Method | Nemotron 3 Ultra<br>RM@4 | RM@8 | Top-tie | Tok./Ins. | Qwen 3.6 27B<br>RM@4 | RM@8 | Top-tie | Tok./Ins. |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Random | 59.0 | 58.6 | — | 3.15 | 64.8 | 64.5 | — | 0.64 |
+| SWE-RM | 62.2 | 61.6 | 17.8 | 25.67 | 66.2 | 67.6 | 18.0 | 5.27 |
+| OpenHands Critic@20 | 57.6 | 57.8 | 3.2 | 3.91 | 64.4 | 64.2 | 1.6 | 1.57 |
+| OpenHands Critic@40 | 60.4 | 58.4 | 2.8 | 5.70 | 65.0 | 64.0 | 0.6 | 2.99 |
+| OpenHands Critic@60 | 61.8 | 60.4 | 2.4 | 7.93 | 65.4 | 63.4 | 1.2 | 4.07 |
+| OpenHands Critic@80 | 61.4 | 59.6 | 2.0 | 10.25 | 66.4 | 64.6 | 1.0 | 4.65 |
+| OpenHands Rubrics | 59.8 | 58.4 | 1.4 | 25.57 | 63.8 | 62.0 | 1.4 | 5.31 |
+| Agentic Rubrics | 63.0 | 62.8 | 57.2 | 25.51 | 65.6 | 65.6 | 88.8 | 5.36 |
+| Adaptive Rubrics | 63.0 | 63.4 | 56.8 | 25.95 | 69.2 | 69.4 | 31.4 | 5.38 |
+| **CER@20** | 64.4 | 64.8 | 11.8 | 3.96 | 67.2 | 68.6 | 3.0 | 1.89 |
+| **CER@40** | 64.4 | 65.2 | 13.1 | 6.28 | 69.2 | 70.2 | 8.6 | 3.99 |
+| **CER@60** | **66.6** | **67.6** | 11.2 | 9.14 | **71.0** | **71.4** | 13.6 | 5.01 |
+| **CER@80** | 66.2 | **67.6** | 12.8 | 11.22 | **71.0** | 71.0 | 21.1 | 5.34 |
+| *Best-of-N (oracle)* | *73.0* | *76.2* | — | *25.19* | *76.4* | *78.6* | — | *5.11* |
+
+CER improves RM@8 over the strongest baseline by **4.2 pp** on Nemotron 3 Ultra and **2.0 pp** on Qwen 3.6 27B. On Nemotron 3 Ultra, it needs only **15.3%** of the tokens to match the best baseline.
+
+### Reinforcement learning
+
+Mean test resolved rate (%) ± 95% CI for Qwen 3.5 9B on the three repository-disjoint folds. The CI is computed from eight evaluation replicates (one rollout per test instance each), so it reflects evaluation sampling only, not training variance.
+
+| Method | Fold 0 | Fold 1 | Fold 2 | Mean |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen 3.5 9B (base) | 44.6 ± 1.2 | 43.1 ± 1.7 | 45.6 ± 2.7 | 44.5 ± 0.8 |
+| TMax | 49.7 ± 1.0 | 49.1 ± 2.7 | 50.3 ± 2.0 | 49.7 ± 1.1 |
+| TMax-40 | 49.6 ± 1.6 | 49.1 ± 2.3 | 50.7 ± 1.9 | 49.8 ± 0.8 |
+| **CER** | **52.7 ± 2.1** | **49.8 ± 2.1** | **52.4 ± 1.0** | **51.6 ± 0.9** |
+
+CER beats full-rollout TMax by **1.9 pp** and uses **52.7%** fewer online policy-and-judge tokens during RL.
+
+---
+
+## Insights
+
+Some of what didn't make it into the paper is, in our view, even more important than what we reported in the paper. Please take the insights below with a grain of salt: they have not been carefully examined.
+
+We originally started this project to reproduce the rubric-based agentic RL results from the GLM 5.2 technical report, and we soon realized it was much harder than we had expected. Rubrics only help agentic RL training when they are of very high quality, and none of the open-source agentic rubric papers we followed met that bar, whether their rubrics were collected from real-world data or generated by a teacher model. (Fewer and fewer academic papers actually deliver what they claim. Lol.) We eventually found a way to curate high-quality rubrics, but it is expensive, and we are fairly sure it is not the solution in the frontier labs, since it relies on costly teacher models and a large pool of historical rollouts.
+
+Internally, we ran more experiments. After carefully examining the training results, we found that rubrics help only on groups that verifiable rewards cannot differentiate, and that they encourage more stable and user-friendly agent behavior. You might then ask: why not use rubric rewards for the groups that verifiable rewards cannot differentiate, and verifiable rewards for the groups they can? That would combine the strengths of both, since verifiable rewards are less noisy but sparse, while rubric rewards are the opposite. We did exactly that, and found a training recipe for both SFT and RL that combines the two reward types and substantially outperforms training with verifiable rewards alone. Unfortunately, we can't publish these results. As you might imagine, though, it takes more than a simple combination: handling issues like calibration and judging noise involves a lot of engineering tricks.
+
+Finally, the depressing news. Because high-quality rubrics are expensive to obtain, we could not show that they beat simply training on more data. We can't share the exact numbers, but picture something like this: training on 2x data of 80% quality beats training on 1x data of 100% quality, while the two cost roughly the same to obtain. And since 80%-quality data is so easy to come by (you know where it comes from :)), this is close to a death sentence for data-selection research. Or perhaps what we really need is a much cheaper data-selection recipe that still matches the performance of CER.
+
+---
+
 ## Acknowledgments
 
 This project builds on the mini-SWE-agent scaffold and the vendored
 [`slime`](slime/) RL framework, and evaluates coding agents on SWE-bench
 Verified. We thank the maintainers and contributors of these projects. We would like to thank NVIDIA for GPU and Inference API support.
+
+---
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@article{yao2026before,
+  title   = {Before the Rollout Ends: Early Terminal Reward Prediction for Long-horizon Coding Agents},
+  author  = {Yao, Jihan and Zeng, Sihan and Feng, Shangbin and Fan, Zhiyuan and Zhu, Banghua and Tsvetkov, Yulia},
+  journal = {arXiv preprint arXiv:2609.31995},
+  year    = {2026}
+}
+```
 
 ---
 
